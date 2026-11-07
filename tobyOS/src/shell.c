@@ -31754,6 +31754,9 @@ void shell_host_forked(void);                    /* host.c: the child's pid */
  * what `trap - TERM` would go back to becomes the default. */
 void host_fd_sync(void);                         /* host.c (finding 618) */
 void host_child_drop_script_fd(void);           /* host.c (finding 637) */
+/* The line level a forked child's own command runs at, whose frame is
+ * applied for good (shell_io_frame_install, finding 639); 0: none. */
+static int g_io_own_depth;
 static void shell_child_std_take(void);          /* (638; see the frames) */
 static int shell_fork(void) {
     host_fd_sync();             /* the table as the child's commands list it */
@@ -31761,6 +31764,7 @@ static int shell_fork(void) {
     if (pid == 0) {
         shell_host_forked();
         host_child_drop_script_fd();    /* bash's children have no 255 */
+        g_io_own_depth = 0;             /* the child arms its own */
         g_replace_ok = true;
         g_async_payload = false;
         shell_child_signals();
@@ -45395,6 +45399,10 @@ struct shell_io_frame {
     unsigned std_replaced;          /* bit I: it gave 0, 1 or 2 another file */
     struct file *std_set[3];        /* ...that one */
     unsigned long gen;              /* g_io_frame_gen at its install */
+    /* A forked child's own command's redirections, applied for good: what
+     * they replaced is let go, no saved copy, and the frame is never
+     * undone (shell_io_frame_install, finding 639) */
+    bool final;
 };
 
 /* The frames in force, newest first: what bash has saved copies of, for
@@ -45442,6 +45450,7 @@ int host_file_fd(struct file *f);
 static struct shell_io_frame *shell_std_frame_of(int n) {
     for (struct shell_io_frame *f = g_io_frames; f; f = f->up) {
         if (f->gen <= g_std_floor_gen) break;
+        if (f->final) continue;         /* for good: the base has it (639) */
         if (f->std_replaced & (1u << n)) return f;
     }
     return 0;
@@ -45465,6 +45474,7 @@ int shell_host_fd_saved(struct file **set, struct file **old, int *std, int max)
         for (int i = 0; i < 3 && k < max; i++) {
             struct shell_io_frame *f = v[j];
             if (!(f->std_replaced & (1u << i))) continue;
+            if (f->final) continue;         /* for good: none kept (639) */
             struct file *o = f->old_fd[i];
             if (o && o->kind == FILE_KIND_NULL) continue;    /* was closed */
             set[k] = f->std_set[i];
@@ -45563,6 +45573,24 @@ static int shell_io_frame_install(struct shell_io_frame *frame,
         if (g_shell_fd[i] != frame->old_fd[i]) frame->std_replaced |= 1u << i;
     }
     frame->gen = ++g_io_frame_gen;
+    frame->final = false;
+#ifdef SHELL_HOSTED
+    /* A FORKED CHILD'S OWN COMMAND'S REDIRECTIONS ARE FOR GOOD, as bash's
+     * child applies them: the command the child was forked for -- a ( )'s
+     * own, an async command's, a pipeline element's -- puts its files at
+     * 0-2 with no saved copy of what they replaced, which goes; an inner
+     * command's are undone as anywhere (`( ls /proc/$BASHPID/fd > f; : )
+     * 2>/dev/null` is 0 1 2 in bash, `( { ...; } 2>/dev/null; : )` 0 1 2
+     * 10; logs/b45 td16 v1-v4 v7 v12 v13, td17 w8 w12; finding 639). The
+     * one frame installed at the child's own level (g_io_own_depth). A
+     * coprocess's are undone: bash keeps its saved copy (v5). */
+    if (g_io_own_depth > 0 && g_exec_line_depth == g_io_own_depth) {
+        frame->final = true;
+        g_io_own_depth = 0;
+        for (int i = 0; i < 3; i++)
+            if (frame->std_replaced & (1u << i)) g_std_base[i] = frame->std_set[i];
+    }
+#endif
     return 0;
 }
 
@@ -45575,6 +45603,18 @@ static void shell_child_std_take(void) {
     for (int n = 0; n < 3; n++) g_std_base[n] = g_shell_fd[n];
     g_std_floor_gen = g_io_frame_gen;
     host_std_sync();
+}
+#endif
+
+#ifdef SHELL_HOSTED     /* (639) */
+/* A frame that stays in force for good: out of the stack, its 0-2 the
+ * base's (the kept frames of a forked child's EXIT trap, 618 and 639) */
+static void shell_io_frame_unlink(struct shell_io_frame *frame);
+static void shell_io_frame_for_good(struct shell_io_frame *frame) {
+    shell_io_frame_unlink(frame);
+    if (frame->final) return;            /* (the base has them already) */
+    for (int i = 0; i < 3; i++)
+        if (frame->std_replaced & (1u << i)) g_std_base[i] = frame->std_set[i];
 }
 #endif
 
@@ -46075,9 +46115,18 @@ struct file *shell_current_diag_file(void) {
 
 static void shell_restore_io_frame(struct shell_io_frame *frame) {
     if (!frame || !frame->old_fd) return;
+#ifdef SHELL_HOSTED
+    bool kept = frame->final ||
+                (g_io_keep_depth > 0 && frame->line_depth == g_io_keep_depth);
+    if (kept) shell_io_frame_for_good(frame);
+    else shell_io_frame_unlink(frame);
+    if (kept) {
+#else
     shell_io_frame_unlink(frame);
     if (g_io_keep_depth > 0 && frame->line_depth == g_io_keep_depth) {
-        /* kept: the table stays as the frame made it, and owns its files */
+#endif
+        /* kept: the table stays as the frame made it, and owns its files
+         * (a forked child's own command's redirections, too: for good) */
         if (frame->old_fd != frame->old_base) kfree(frame->old_fd);
         if (frame->owned != frame->owned_base) kfree(frame->owned);
         frame->old_fd = 0;
@@ -46588,6 +46637,13 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
         struct shell_io_frame keep;
         memset(&keep, 0, sizeof keep);
         if (shell_io_frame_install(&keep, &fds) == 0) {
+            /* ...and the frame, this function's own, off the stack of them
+             * at once: it stayed linked as it went out of scope (639) */
+#ifdef SHELL_HOSTED
+            shell_io_frame_for_good(&keep);
+#else
+            shell_io_frame_unlink(&keep);
+#endif
             if (keep.old_fd != keep.old_base) kfree(keep.old_fd);
             if (keep.owned != keep.owned_base) kfree(keep.owned);
         }
@@ -47041,6 +47097,40 @@ static bool shell_child_runs_exit_trap(const char *text, bool async, bool piped)
     return true;
 }
 
+#ifdef SHELL_HOSTED
+/* Is TEXT ONE COMMAND -- a simple or compound one with its redirections --
+ * and no list: no `;`, `&`, `&&`, `||`, `|` or newline between commands at
+ * its own level? An async child's text that is one is the command the
+ * child was forked for, whose redirections bash's child applies for good;
+ * an and-or list's are each its command's, undone (finding 639). */
+static bool shell_text_one_command(const char *text) {
+    struct shell_scan sc;
+    shell_scan_init(&sc);
+    for (const char *p = text; *p; ) {
+        while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+        if (!*p) break;
+        if (!shell_scan_incomplete(&sc)) {
+            bool sep = *p == ';' || *p == '\n' || *p == '|' ||
+                       (*p == '&' && p[1] != '>');
+            if (sep) {
+                const char *q = p + 1;
+                if (*p == ';' || *p == '\n')
+                    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n' ||
+                           *q == ';')
+                        q++;
+                if (*p != ';' && *p != '\n') return false;
+                if (*q) return false;           /* a command follows */
+                return true;
+            }
+        }
+        const char *before = p;
+        shell_scan_token(&sc, &p);
+        if (p <= before) p = before + 1;
+    }
+    return true;
+}
+#endif
+
 /* AN ASYNCHRONOUS PIPELINE IS A JOB OF ONE PROCESS AN ELEMENT, every one a
  * child of the shell -- bash's execute_pipeline forks each element from
  * the shell, all into one process group (the first element's) under job
@@ -47163,6 +47253,7 @@ static bool shell_background_pipeline(const char *text, int *rcp) {
             }
             if (r) file_close(r);              /* the read end of its own output */
             shell_child_std_take();            /* its pipe ends its 0 and 1 (638) */
+            g_io_own_depth = g_exec_line_depth + 1;  /* its redirections for good (639) */
             jobs_forget_all();
             shell_trap_clear_caught();
             g_subshell_depth++;
@@ -47179,6 +47270,7 @@ static bool shell_background_pipeline(const char *text, int *rcp) {
             if (exit_trap) g_io_keep_depth = g_exec_line_depth + 1;
             execute_line_text(stages[i]);
             g_io_keep_depth = 0;
+            g_io_own_depth = 0;
             int st = g_last_status;
             if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
             if (exit_trap) st = shell_run_exit_trap(st);
@@ -47269,6 +47361,9 @@ static void shell_async_child_body(const char *text, bool async_ign,
     }
 #ifdef SHELL_HOSTED
     shell_child_std_take();     /* its 0 the /dev/null, as bash's child's (638) */
+    /* ...and its command's own redirections for good when the text is one
+     * command (639) */
+    if (shell_text_one_command(text)) g_io_own_depth = g_exec_line_depth + 1;
 #endif
     /* an asynchronous command is a subshell, its words expanded in it:
      * `echo $BASH_SUBSHELL &` prints 1 */
@@ -47311,6 +47406,9 @@ static void shell_async_child_body(const char *text, bool async_ign,
     if (exit_trap) g_io_keep_depth = g_exec_line_depth + 1;
     execute_line_text(text);
     g_io_keep_depth = 0;
+#ifdef SHELL_HOSTED
+    g_io_own_depth = 0;
+#endif
     int st = g_last_status;
     if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
     if (exit_trap) st = shell_run_exit_trap(st);
@@ -48613,6 +48711,9 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
                     if (pipes_w[j] && pipes_w[j] != out) file_close(pipes_w[j]);
                 }
                 shell_child_std_take();     /* (638) */
+                /* the stage's frame -- its pipe ends and its redirections
+                 * -- is this process's 0-2 for good (639) */
+                g_io_own_depth = g_exec_line_depth;
                 int crc = shell_run_pipeline_shell_stage(&pl->stage[i], in, out);
                 if (crc < 0) crc = 127;
                 _exit(crc & 0xff);
@@ -53675,6 +53776,11 @@ static bool shell_try_subshell_command(const char *src) {
     bool io_active = false;
     if (redirs.redir_count > 0) {
         shell_note_compound_stdin(&redirs);            /* bash's stdin_redir */
+#ifdef SHELL_HOSTED
+        /* a forked ( )'s own redirections are its process's for good, no
+         * saved copy (639); merged, the async child armed it already */
+        if (forked_child && !merge) g_io_own_depth = g_exec_line_depth;
+#endif
         if (shell_enter_io_frame(&redirs, "subshell", &io_frame) < 0) {
 #ifdef SHELL_HOSTED
             if (forked_child) _exit(1);
@@ -54806,6 +54912,7 @@ static bool shell_try_compound_pipeline(const char *src) {
             if (r) file_close(r);
 #ifdef SHELL_HOSTED
             shell_child_std_take();     /* its pipe ends its 0 and 1 (638) */
+            g_io_own_depth = g_exec_line_depth + 1;  /* its redirections for good (639) */
 #endif
             /* THE PARENT'S TRAPS ARE SHOWN HERE, NOT RUN: a stage is a
              * subshell, where `trap` lists them (Oils 1221: `trap | cat`)
@@ -54834,6 +54941,9 @@ static bool shell_try_compound_pipeline(const char *src) {
             execute_line_text(stages[i]);
             shell_lmap_pop_copy();
             g_io_keep_depth = 0;
+#ifdef SHELL_HOSTED
+            g_io_own_depth = 0;
+#endif
             int crc = g_last_status;
             if (g_shell_flow == SHELL_FLOW_EXIT) crc = g_shell_flow_status;
             if (exit_trap) crc = shell_run_exit_trap(crc);
