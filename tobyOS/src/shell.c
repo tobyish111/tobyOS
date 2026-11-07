@@ -31222,6 +31222,7 @@ static void shell_fd_state_release_owned(struct shell_fd_state *st);
 static int shell_fd_state_owned_list(struct shell_fd_state *st,
                                      struct file **out, int max);
 void host_spawn_move_set(struct file *const *v, int n);    /* host.c */
+void host_std_sync(void);                                 /* host.c */
 #endif
 static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                                            char **argv, bool background,
@@ -45388,6 +45389,14 @@ struct shell_io_frame {
 /* The frames in force, newest first: what bash has saved copies of, for
  * the host's listing of the shell's descriptors (finding 618). */
 static struct shell_io_frame *g_io_frames;
+/* What `exec` made the shell's 0, 1 and 2 (0: the process's own), beneath
+ * every frame -- the shell's 0-2 as bash has them, which the table's slots
+ * are not always: tsh points them at a pipe or a capture for a moment of
+ * its own routing (a pipeline's stage, a $( )), which is no redirection of
+ * bash's (shell_host_std_decl, 635). */
+#ifdef SHELL_HOSTED
+static struct file *g_std_base[3];
+#endif
 
 #ifdef SHELL_HOSTED
 /* The host's questions about the shell's table (host.c host_fd_sync). */
@@ -45399,6 +45408,16 @@ int shell_host_fd_slots(struct file ***tab) {
 bool shell_host_fd_frozen(void);
 bool shell_host_fd_frozen(void) { return g_comsub_level > 0; }
 int host_file_fd(struct file *f);
+/* THE SHELL'S OWN N (0-2), as bash's redirections have made it: the
+ * newest frame's that replaced it, else exec's, else 0 for the process's
+ * own (host_std_sync, 635). */
+struct file *shell_host_std_decl(int n);
+struct file *shell_host_std_decl(int n) {
+    if (n < 0 || n > 2) return 0;
+    for (struct shell_io_frame *f = g_io_frames; f; f = f->up)
+        if (f->std_replaced & (1u << n)) return f->std_set[n];
+    return g_std_base[n];
+}
 /* Where bash holds a saved copy: each 0, 1 or 2 a frame in force gave
  * another file while it was open, oldest frame first -- SET[k] the file the
  * frame put there, OLD[k] the one it replaced, STD[k] which. */
@@ -46035,6 +46054,9 @@ static void shell_restore_io_frame(struct shell_io_frame *frame) {
     frame->n = 0;
     shell_fd_moves_settle(frame->cmd);
     frame->cmd = 0;
+#ifdef SHELL_HOSTED
+    host_std_sync();        /* 0-2 back as the table now says (618) */
+#endif
 }
 
 /* A write to a builtin's redirected stdout that FAILED.
@@ -47872,19 +47894,45 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
              * coprocess's input left `cat` waiting for good (logs/b12 p80).
              * Not a file the new table still names (`exec 4>&3` keeps 3),
              * and not 0-2, whose empty slot means the process's own. */
-            for (int i = 3; i < fds.n && i < g_shell_fd_cap; i++) {
+            /* ...0-2 too, in /bin/tsh, whose 0-2 are the files exec gave
+             * them now (host_std_sync, 618): `exec >f; exec >g` let f go
+             * in bash, and tsh kept it at a number of its own */
+#ifdef SHELL_HOSTED
+            const int exec_lo = 0;
+#else
+            const int exec_lo = 3;
+#endif
+            for (int i = exec_lo; i < fds.n && i < g_shell_fd_cap; i++) {
                 struct file *old = g_shell_fd[i];
                 if (!old || old == fds.fd[i]) continue;
                 bool kept = false;
                 for (int k = 0; k < fds.n && !kept; k++)
                     if (fds.fd[k] == old) kept = true;
+                /* (nor one a redirection in force will put back) */
+                for (struct shell_io_frame *fr = g_io_frames; fr && !kept; fr = fr->up)
+                    for (int k = 0; k < fr->n && !kept; k++)
+                        if (fr->old_fd[k] == old) kept = true;
                 if (!kept) file_close(old);
             }
+#ifdef SHELL_HOSTED
+            /* (what exec gave 0-2: the newest frame's that replaced it, or
+             * the base beneath them all -- shell_host_std_decl) */
+            for (int i = 0; i < 3 && i < fds.n; i++) {
+                if (fds.fd[i] == g_shell_fd[i]) continue;
+                struct shell_io_frame *fr = g_io_frames;
+                while (fr && !(fr->std_replaced & (1u << i))) fr = fr->up;
+                if (fr) fr->std_set[i] = fds.fd[i];
+                else g_std_base[i] = fds.fd[i];
+            }
+#endif
             for (int i = 0; i < fds.n; i++) {
                 g_shell_fd[i] = fds.fd[i];
                 fds.owned[i] = false;   /* the shell keeps them now */
             }
             shell_fd_state_close_owned(&fds);   /* the arrays only */
+#ifdef SHELL_HOSTED
+            host_std_sync();                    /* (635) */
+#endif
             return 0;
         }
 

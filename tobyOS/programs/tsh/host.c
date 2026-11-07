@@ -400,10 +400,18 @@ void  kfree(void *p)               { free(p); }
 struct hcell {
     int fd;             /* -1: released (host_file_release) or closed */
     int refs;           /* the handles that name it */
+    /* N + 1 for a handle on the process's own N (0-2) as it started --
+     * file_std_handle, console_file_make: it follows the original N where
+     * host_std_sync puts it (635). 0 for any other. */
+    int stdref;
 };
 #define HOST_NREG 1024
+/* The live handles on an original 0-2 (stdref): host_stdref_detach and
+ * host_stdref_attach move them as the original leaves and comes back. */
+#define HOST_NSTDREF 64
+static struct hcell *g_stdref[HOST_NSTDREF];
 static struct hcell *g_reg[HOST_NREG];
-static struct hcell g_dead_cell = { -1, 1 << 30 };   /* a closed vfs_file's */
+static struct hcell g_dead_cell = { -1, 1 << 30, 0 };   /* a closed vfs_file's */
 
 static void hcell_reg(struct hcell *c) {
     if (c->fd >= 3 && c->fd < HOST_NREG) g_reg[c->fd] = c;
@@ -459,6 +467,21 @@ struct file *file_clone(struct file *src) {
     return f;
 }
 
+/* WHAT REAL 0, 1 AND 2 HOLD (host_std_sync, finding 618): the process's
+ * own descriptor as it started (ORIG), a cell moved there (CELL, its fd
+ * that number), a copy of a cell that sits elsewhere (COPY), nothing
+ * (CLOSED), or a copy of one since let go (STALE: the file is still open
+ * there, and nothing names it). g_orig_fd[n]: where the original n is now
+ * -- n, a saved number from 10 up, or -1 when let go for good. */
+#define HSTD_ORIG   0
+#define HSTD_CELL   1
+#define HSTD_COPY   2
+#define HSTD_CLOSED 3
+#define HSTD_STALE  4
+static int g_std_kind[3];
+static struct hcell *g_std_cell[3];
+static int g_orig_fd[3] = { 0, 1, 2 };
+
 void file_close(struct file *f) {
     if (!f) return;
     if (f->kind == FILE_KIND_VFS) {
@@ -466,8 +489,16 @@ void file_close(struct file *f) {
         struct hcell *c = (struct hcell *)f->vfs.priv;
         if (c && c != &g_dead_cell && --c->refs == 0) {
             /* 0/1/2 are this process's own standard descriptors: closing one
-             * because a redirect went out of scope would silence the shell. */
+             * because a redirect went out of scope would silence the shell
+             * -- the sync puts back what the shell's table says there */
             if (c->fd > 2) close(c->fd);
+            for (int n = 0; n < 3; n++)
+                if (g_std_cell[n] == c) {
+                    g_std_cell[n] = 0;
+                    g_std_kind[n] = HSTD_STALE;
+                }
+            for (int i = 0; i < HOST_NSTDREF; i++)
+                if (g_stdref[i] == c) g_stdref[i] = 0;
             hcell_unreg(c);
             free(c);
         }
@@ -586,10 +617,45 @@ void file_pos_set(struct file *f, size_t pos) {
 /* Unlike the kernel, a user process really does have three distinct standard
  * descriptors, so the fd number selects one. This is what makes `1>&2` reach
  * the actual stderr instead of collapsing back to stdout. */
+/* (a handle on the process's original N: noted, to follow it -- 635) */
+static void host_stdref_note(struct file *f, int n) {
+    struct hcell *c = f ? (struct hcell *)f->vfs.priv : 0;
+    if (!c) return;
+    c->stdref = n + 1;
+    for (int i = 0; i < HOST_NSTDREF; i++)
+        if (!g_stdref[i]) { g_stdref[i] = c; return; }
+}
+
+/* The original N is about to leave N: each live handle on it there gets
+ * a descriptor of its own, a copy of N made now -- one each, so that no two
+ * cells share a number. */
+static void host_stdref_detach(int n) {
+    for (int i = 0; i < HOST_NSTDREF; i++) {
+        struct hcell *c = g_stdref[i];
+        if (!c || c->stdref != n + 1 || c->fd != n) continue;
+        int d = dup(n);
+        if (d < 0) continue;
+        c->fd = d;
+        hcell_reg(c);
+    }
+}
+
+/* ...and is back at N: the copies go, and the handles are N again. */
+static void host_stdref_attach(int n) {
+    for (int i = 0; i < HOST_NSTDREF; i++) {
+        struct hcell *c = g_stdref[i];
+        if (!c || c->stdref != n + 1 || c->fd < 3) continue;
+        close(c->fd);
+        hcell_unreg(c);
+        c->fd = n;
+    }
+}
+
 struct file *file_std_handle(int fd) {
     if (fd < 0 || fd > 2) return 0;
     struct file *f = hf_make(fd);
     if (f) f->vfs.size = VF_UNSEEKABLE;
+    host_stdref_note(f, fd);
     return f;
 }
 
@@ -652,6 +718,7 @@ int pipe_create(struct file **out_r, struct file **out_w) {
 struct file *console_file_make(void) {
     struct file *f = hf_make(0);
     if (f) f->vfs.size = VF_UNSEEKABLE;
+    host_stdref_note(f, 0);
     return f;
 }
 
@@ -1330,10 +1397,185 @@ static struct hcell *host_slot_cell(struct file *f) {
     return c;
 }
 
+extern struct file *shell_host_std_decl(int n);
+
+/* Is cell C named by something but the shell's N: another of its 0-2, as
+ * bash's redirections made them, or a slot of 3 and up? N of -1: by
+ * anything. Of the 0-2 only those below N count: when several name one
+ * file and no slot does, the lowest has the descriptor itself and the rest
+ * copies -- `exec 2>&3; exec 3>&-` leaves 1 and 2, as bash's. */
+static bool host_cell_slotted_else(struct file **tab, int ns, struct hcell *c,
+                                   int n) {
+    for (int m = 0; m < 3; m++)
+        if (m != n && (n < 0 || m < n) &&
+            host_slot_cell(shell_host_std_decl(m)) == c)
+            return true;
+    for (int m = 3; m < ns && m < HOST_NREG; m++)
+        if (host_slot_cell(tab[m]) == c) return true;
+    return false;
+}
+
+/* THE SHELL'S 0, 1 AND 2 ARE THIS PROCESS'S TOO, as bash's are: `exec >f`
+ * puts f at 1, the file's own descriptor going, and a command's or a
+ * group's redirection of 0-2 puts its file there while the one it replaced
+ * waits at a number from 10 up, bash's saved copy, until the redirection
+ * ends. tsh's 0-2 stayed its own -- its stdin reader, its prompt and its
+ * stdout write them -- and the file a redirection gave sat at a number of
+ * its own: `exec >f; ls /proc/$$/fd` listed 0 1 2 255 3 where bash's is
+ * 0 1 2 255, and a group's `>&-` left 1 open, 0 1 10 2 255 for bash's 0 10 2
+ * 255 (logs/b44 fd3 s1-s3 s9). Made when a child is about to start, when a
+ * redirection ends (the slots back as they were, so the shell's own reads
+ * and writes of 0-2 see what they saw before) and after exec's (finding
+ * 618). */
+void host_std_sync(void) {
+    if (shell_host_fd_frozen()) return;
+    struct file **tab = 0;
+    int ns = shell_host_fd_slots(&tab);
+    if (ns > HOST_NREG) ns = HOST_NREG;
+    struct file *set[16], *old[16];
+    int std[16];
+    int k = shell_host_fd_saved(set, old, std, 16);
+    /* what each slot says: ORIG for none, CLOSED, or a cell; -1 for a
+     * handle of no descriptor (left as it is) */
+    int wk[3];
+    struct hcell *wc[3] = { 0, 0, 0 };
+    bool need[3] = { false, false, false };
+    for (int n = 0; n < 3; n++) {
+        /* (bash's 0-2: the redirections', not a slot tsh has pointed at a
+         * pipe or a capture for its own routing -- 635) */
+        struct file *f = shell_host_std_decl(n);
+        if (!f) wk[n] = HSTD_ORIG;
+        else if (host_slot_closed(f)) wk[n] = HSTD_CLOSED;
+        else if ((wc[n] = host_slot_cell(f)) != 0) wk[n] = HSTD_CELL;
+        else wk[n] = -1;
+        if (wk[n] == HSTD_ORIG) need[n] = true;
+    }
+    for (int i = 0; i < k; i++)
+        if (!old[i] && std[i] >= 0 && std[i] < 3) need[std[i]] = true;
+    /* the saved copies first, in bash's order: what each redirection in
+     * force replaced, from 10 up -- the original, or the cell it held */
+    for (int i = 0; i < k; i++) {
+        int n = std[i];
+        if (n < 0 || n > 2 || wk[n] < 0) continue;
+        if (!old[i]) {
+            if (g_orig_fd[n] != n || wk[n] == HSTD_ORIG) continue;
+            int to = host_free_fd(10, -1);
+            if (to >= 0 && dup2(n, to) == to) {
+                g_orig_fd[n] = to;
+                host_stdref_detach(n);
+            }
+            continue;
+        }
+        struct hcell *oc = host_slot_cell(old[i]);
+        if (!oc || (wk[n] == HSTD_CELL && wc[n] == oc)) continue;
+        if (oc->fd == n && g_std_kind[n] == HSTD_CELL && g_std_cell[n] == oc) {
+            int to = host_free_fd(10, -1);
+            if (to >= 0 && dup2(n, to) == to) {
+                oc->fd = to;
+                hcell_reg(oc);
+                g_std_kind[n] = HSTD_COPY;      /* until it is replaced */
+            }
+            continue;
+        }
+        /* ...one N holds a copy of -- `exec 2>&1`, then `g 2>/dev/null`:
+         * bash's saved copy is of its 2, that copy (shparity
+         * fd-numbers-listed) */
+        if (g_std_cell[n] == oc && g_std_kind[n] == HSTD_COPY) {
+            int to = host_free_fd(10, -1);
+            if (to >= 0 && dup2(n, to) == to) g_mir[to] = true;
+            continue;
+        }
+        /* ...an outer redirection's file the shell never had at N --
+         * `{ { ls; } 2>f; } 2>g`: bash's saved copy of g is the inner one's,
+         * from 10 up, and g has no number of its own (logs/b44 fd3 s8) */
+        if (oc->fd < 3 || oc->fd >= 10) continue;
+        int to = host_free_fd(10, -1);
+        if (to < 0) continue;
+        if (host_cell_slotted_else(tab, ns, oc, -1)) {
+            if (dup2(oc->fd, to) == to) g_mir[to] = true;
+        } else {
+            (void)hcell_move(oc, to);
+        }
+    }
+    for (int n = 0; n < 3; n++) {
+        if (wk[n] < 0) continue;
+        if (wk[n] == HSTD_ORIG && g_std_kind[n] == HSTD_ORIG && g_orig_fd[n] == n)
+            continue;
+        if (wk[n] == HSTD_CLOSED && g_std_kind[n] == HSTD_CLOSED) continue;
+        if (wk[n] == HSTD_CELL && g_std_cell[n] == wc[n]) {
+            struct hcell *c = wc[n];
+            if (g_std_kind[n] == HSTD_CELL && c->fd == n) continue;
+            bool shared = (c->fd <= 2 && c->fd != n) ||
+                          host_cell_slotted_else(tab, ns, c, n);
+            if (g_std_kind[n] == HSTD_COPY && shared) continue;
+            if (g_std_kind[n] == HSTD_COPY && c->fd > 2) {
+                /* a copy whose own descriptor no other slot names now --
+                 * `exec >&3; exec 3>&-` -- is the descriptor itself: 3 goes,
+                 * as bash's does */
+                close(c->fd);
+                hcell_unreg(c);
+                c->fd = n;
+                g_std_kind[n] = HSTD_CELL;
+                continue;
+            }
+        }
+        /* a cell that is here and still named elsewhere goes elsewhere */
+        if (g_std_kind[n] == HSTD_CELL && g_std_cell[n] && g_std_cell[n]->fd == n) {
+            struct hcell *d = g_std_cell[n];
+            int to = host_free_fd(3, -1);
+            if (to >= 0 && dup2(n, to) == to) {
+                d->fd = to;
+                hcell_reg(d);
+            }
+        }
+        /* ...and the original, here and needed for later, to a saved
+         * number; not needed (exec's), it goes */
+        /* (a handle on the original -- `exec 3>&1` of the process's own 1
+         * -- keeps it, where it then is: exec's 3 lists the old 1) */
+        if (g_orig_fd[n] == n && wk[n] != HSTD_ORIG) {
+            host_stdref_detach(n);
+            int to = need[n] ? host_free_fd(10, -1) : -1;
+            if (to >= 0 && dup2(n, to) == to) g_orig_fd[n] = to;
+            else g_orig_fd[n] = -1;
+        }
+        if (wk[n] == HSTD_ORIG) {
+            if (g_orig_fd[n] >= 0 && g_orig_fd[n] != n) {
+                int from = g_orig_fd[n];
+                if (dup2(from, n) == n) {
+                    close(from);
+                    g_orig_fd[n] = n;
+                    host_stdref_attach(n);
+                }
+            } else if (g_orig_fd[n] < 0) {
+                (void)close(n);
+            }
+            g_std_kind[n] = g_orig_fd[n] == n ? HSTD_ORIG : HSTD_CLOSED;
+            g_std_cell[n] = 0;
+        } else if (wk[n] == HSTD_CLOSED) {
+            (void)close(n);
+            g_std_kind[n] = HSTD_CLOSED;
+            g_std_cell[n] = 0;
+        } else {
+            struct hcell *c = wc[n];
+            bool shared = c->fd <= 2 || host_cell_slotted_else(tab, ns, c, n);
+            if (dup2(c->fd, n) == n) {
+                if (!shared) {
+                    close(c->fd);
+                    hcell_unreg(c);
+                    c->fd = n;
+                }
+                g_std_kind[n] = shared ? HSTD_COPY : HSTD_CELL;
+                g_std_cell[n] = c;
+            }
+        }
+    }
+}
+
 void host_fd_sync(void) {
     if (shell_host_fd_frozen()) return;
     for (int n = 3; n < HOST_NREG; n++)          /* the copies, made again */
         if (g_mir[n]) { close(n); g_mir[n] = false; }
+    host_std_sync();                             /* 0-2 first (618) */
     struct file **tab = 0;
     int ns = shell_host_fd_slots(&tab);
     if (ns > HOST_NREG) ns = HOST_NREG;
@@ -1351,28 +1593,8 @@ void host_fd_sync(void) {
             (void)hcell_move(c, n);
         }
     }
-    /* bash's saved copies, from 10 up, in the order bash makes them. The
-     * shell's own 0-2 stay where they are, so the number goes to the file
-     * the redirection gave -- its own descriptor, moved there, where it is
-     * no slot's -- and the old one is copied there otherwise: the numbers
-     * are bash's, the 0-2 they stand beside are tsh's. */
-    struct file *set[16], *old[16];
-    int std[16];
-    int k = shell_host_fd_saved(set, old, std, 16);
-    for (int i = 0; i < k; i++) {
-        int to = host_free_fd(10, -1);
-        if (to < 0) break;
-        struct hcell *c = host_slot_cell(set[i]);
-        bool slotted = c && c->fd >= 3 && c->fd < ns && host_slot_cell(tab[c->fd]) == c;
-        if (c && c->fd >= 10 && !slotted) continue;      /* there already */
-        if (c && c->fd >= 3 && !slotted) {
-            (void)hcell_move(c, to);
-            continue;
-        }
-        struct hcell *oc = host_slot_cell(old[i]);
-        int from = oc ? oc->fd : std[i];
-        if (from >= 0 && dup2(from, to) == to) g_mir[to] = true;
-    }
+    /* (bash's saved copies, from 10 up, are host_std_sync's: what each
+     * redirection of 0-2 in force replaced, beside the file it gave) */
 }
 
 /* bash runs a script from its descriptor 255 (and its children have none
