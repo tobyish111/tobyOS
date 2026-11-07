@@ -10291,9 +10291,22 @@ static int shell_locals_push(const char *name, int depth) {
  * starts from nothing. bash keeps the value -- re-declaring a variable that is
  * already local in the same function is a no-op. Re-pushing also left two save
  * slots for one variable, so the restore ran twice on the way out. */
+/* THE SCOPE A DEPTH IS IN: a function call's, from its body's depth up --
+ * a `.` (a reader, one deeper) makes no scope of its own in bash, so a
+ * sourced file's `declare` in a function is the function's: over the
+ * function's readonly local it is refused, where tsh made a new local of
+ * the deeper depth (logs/b45 td4 r28). The depth itself outside every
+ * function. */
+static int sh_scope_floor(int depth) {
+    return (g_fn_local_depth > 0 && g_fn_local_depth <= depth)
+               ? g_fn_local_depth : depth;
+}
+
 static bool shell_local_declared_here(const char *name, int depth) {
+    int lo = sh_scope_floor(depth);
     for (int i = g_localc - 1; i >= 0; i--)
-        if (g_locals[i].depth == depth && !g_locals[i].dead && g_locals[i].name &&
+        if (g_locals[i].depth >= lo && g_locals[i].depth <= depth &&
+            !g_locals[i].dead && g_locals[i].name &&
             strcmp(g_locals[i].name, name) == 0) {
             /* ...unless a prefix binding made since hides it: `v=x eval
              * 'local v=y'` in a function is a NEW local, the one that
@@ -10399,10 +10412,11 @@ static bool shell_localvar_inherit(void);
 /* Is the binding of `name` a CALLER's local -- the newest live local of the
  * name made below `depth`? */
 static bool shell_local_of_caller(const char *name, int depth) {
+    int lo = sh_scope_floor(depth);
     for (int i = g_localc - 1; i >= 0; i--)
         if (!g_locals[i].dead && g_locals[i].name &&
             strcmp(g_locals[i].name, name) == 0)
-            return g_locals[i].depth < depth;
+            return g_locals[i].depth < lo;
     return false;
 }
 
