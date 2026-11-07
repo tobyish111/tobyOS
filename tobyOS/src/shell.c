@@ -1047,6 +1047,9 @@ static int g_exec_list;
 static int g_script_depth;
 static int g_subshell_depth;
 static int g_comsub_level;      /* command substitutions running, nested */
+/* ...of them run in this process, not a forked child (shell_host_fd_frozen:
+ * a forked one's process is its own, 638) */
+static int g_comsub_inproc;
 /* bash's current_command_number: 1 at startup, one more for each command
  * the top-level reader runs (eval.c's reader_loop -- not eval, `.`, a
  * substitution or -c). \# shows it -- less one in ${var@P} and PS4, which
@@ -31751,6 +31754,7 @@ void shell_host_forked(void);                    /* host.c: the child's pid */
  * what `trap - TERM` would go back to becomes the default. */
 void host_fd_sync(void);                         /* host.c (finding 618) */
 void host_child_drop_script_fd(void);           /* host.c (finding 637) */
+static void shell_child_std_take(void);          /* (638; see the frames) */
 static int shell_fork(void) {
     host_fd_sync();             /* the table as the child's commands list it */
     int pid = fork();
@@ -31813,6 +31817,7 @@ static void shell_capture_body(const char *cmd, bool forked) {
     bool ee_saved = g_opt_errexit;
     if (!inherit_ee) g_opt_errexit = false;
     g_comsub_level++;
+    if (!forked) g_comsub_inproc++;
     /* A SUBSTITUTION CONTAINS A COMMAND LIST, NOT A LINE.
      *
      *     foo=`cat <<EOM
@@ -31894,6 +31899,7 @@ static void shell_capture_body(const char *cmd, bool forked) {
     }
     if (!inherit_ee) g_opt_errexit = ee_saved;
     g_comsub_level--;
+    if (!forked) g_comsub_inproc--;
     if (!sub_frame) shell_alias_restore(&saved_aliases);
 
     /* A SUBSTITUTION IS A SUBSHELL, so `exit` inside it ends THAT, not us:
@@ -31989,6 +31995,7 @@ static int shell_capture_forked(const char *cmd, struct shell_sb *out) {
         file_close(r);
         g_jobs_silent = true;
         g_shell_fd[1] = w;
+        shell_child_std_take();         /* its 1 is the pipe (638) */
         shell_set_output(shell_file_output, w);
         printk_set_sink_mode(0, 0, false);
         shell_capture_body(cmd, true);           /* exits */
@@ -37819,6 +37826,7 @@ static bool shell_procsub_make(const char *text, bool input,
          * read three empty files. */
         g_shell_fd[input ? 1 : 0] = child_end;
         if (!input) g_shell_in = 0;
+        shell_child_std_take();         /* the pipe is its own 1 or 0 (638) */
         /* Inside `$( )` the shell's output is being captured into a spill
          * file. This child's output belongs to the pipe. */
         shell_set_output(0, 0);
@@ -45386,6 +45394,7 @@ struct shell_io_frame {
     struct shell_io_frame *up;      /* the one installed before it (g_io_frames) */
     unsigned std_replaced;          /* bit I: it gave 0, 1 or 2 another file */
     struct file *std_set[3];        /* ...that one */
+    unsigned long gen;              /* g_io_frame_gen at its install */
 };
 
 /* The frames in force, newest first: what bash has saved copies of, for
@@ -45399,6 +45408,21 @@ static struct shell_io_frame *g_io_frames;
 #ifdef SHELL_HOSTED
 static struct file *g_std_base[3];
 #endif
+/* Each frame's install, counted (shell_io_frame_install). */
+static unsigned long g_io_frame_gen;
+#ifdef SHELL_HOSTED
+/* A FORKED CHILD'S 0-2 ARE ITS PROCESS'S OWN, as bash's child's are: the
+ * pipe a pipeline element writes, a $( )'s or a <( )'s pipe, an async
+ * command's /dev/null, a coprocess's pipes are its 0, 1 and 2 -- tsh's
+ * child pointed its slots at them and left its descriptors its parent's,
+ * the pipe at a number of its own (`{ ls -l /proc/$BASHPID/fd; :; } |
+ * cat` listed 1 as the terminal and the pipe as 5; logs/b45 td17 w9 w10
+ * w12, td13 r9, td12 k2; finding 638). shell_child_std_take makes the
+ * slots the base when the child's routing is done; the frames in force
+ * then, its parent's, are beneath it -- their saved copies stay, as a
+ * fork keeps bash's (w1-w3), but they no longer say what 0-2 are. */
+static unsigned long g_std_floor_gen;
+#endif
 
 #ifdef SHELL_HOSTED
 /* The host's questions about the shell's table (host.c host_fd_sync). */
@@ -45408,17 +45432,25 @@ int shell_host_fd_slots(struct file ***tab) {
     return g_shell_fd_cap;
 }
 bool shell_host_fd_frozen(void);
-bool shell_host_fd_frozen(void) { return g_comsub_level > 0; }
+bool shell_host_fd_frozen(void) { return g_comsub_inproc > 0; }
 int host_file_fd(struct file *f);
 /* THE SHELL'S OWN N (0-2), as bash's redirections have made it: the
  * newest frame's that replaced it, else exec's, else 0 for the process's
  * own (host_std_sync, 635). */
+/* (the frame that says it: the newest that replaced N of those installed
+ * since a forked child took its own 0-2 -- 638) */
+static struct shell_io_frame *shell_std_frame_of(int n) {
+    for (struct shell_io_frame *f = g_io_frames; f; f = f->up) {
+        if (f->gen <= g_std_floor_gen) break;
+        if (f->std_replaced & (1u << n)) return f;
+    }
+    return 0;
+}
 struct file *shell_host_std_decl(int n);
 struct file *shell_host_std_decl(int n) {
     if (n < 0 || n > 2) return 0;
-    for (struct shell_io_frame *f = g_io_frames; f; f = f->up)
-        if (f->std_replaced & (1u << n)) return f->std_set[n];
-    return g_std_base[n];
+    struct shell_io_frame *f = shell_std_frame_of(n);
+    return f ? f->std_set[n] : g_std_base[n];
 }
 /* Where bash holds a saved copy: each 0, 1 or 2 a frame in force gave
  * another file while it was open, oldest frame first -- SET[k] the file the
@@ -45530,8 +45562,21 @@ static int shell_io_frame_install(struct shell_io_frame *frame,
         frame->std_set[i] = g_shell_fd[i];
         if (g_shell_fd[i] != frame->old_fd[i]) frame->std_replaced |= 1u << i;
     }
+    frame->gen = ++g_io_frame_gen;
     return 0;
 }
+
+#ifdef SHELL_HOSTED
+/* A forked child's 0-2 from here on are its slots' (finding 638): call it
+ * once the child's routing is done -- the pipe ends, the /dev/null, the
+ * coprocess's pipes in place -- before its text runs. */
+void host_std_sync(void);
+static void shell_child_std_take(void) {
+    for (int n = 0; n < 3; n++) g_std_base[n] = g_shell_fd[n];
+    g_std_floor_gen = g_io_frame_gen;
+    host_std_sync();
+}
+#endif
 
 /* (and out of the stack again: the frame and any installed after it that
  * never came off -- 618) */
@@ -47117,6 +47162,7 @@ static bool shell_background_pipeline(const char *text, int *rcp) {
                 shell_host_async_signals();    /* bash's setup_async_signals */
             }
             if (r) file_close(r);              /* the read end of its own output */
+            shell_child_std_take();            /* its pipe ends its 0 and 1 (638) */
             jobs_forget_all();
             shell_trap_clear_caught();
             g_subshell_depth++;
@@ -47221,6 +47267,9 @@ static void shell_async_child_body(const char *text, bool async_ign,
         struct file *dn = shell_open_vfs_file("/dev/null", false, false, "shell");
         if (dn) g_shell_fd[0] = dn;
     }
+#ifdef SHELL_HOSTED
+    shell_child_std_take();     /* its 0 the /dev/null, as bash's child's (638) */
+#endif
     /* an asynchronous command is a subshell, its words expanded in it:
      * `echo $BASH_SUBSHELL &` prints 1 */
     g_subshell_depth++;
@@ -47921,8 +47970,9 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
              * the base beneath them all -- shell_host_std_decl) */
             for (int i = 0; i < 3 && i < fds.n; i++) {
                 if (fds.fd[i] == g_shell_fd[i]) continue;
-                struct shell_io_frame *fr = g_io_frames;
-                while (fr && !(fr->std_replaced & (1u << i))) fr = fr->up;
+                /* (the frame that says what N is, or the base: a forked
+                 * child's parent's frames are beneath its own 0-2 -- 638) */
+                struct shell_io_frame *fr = shell_std_frame_of(i);
                 if (fr) fr->std_set[i] = fds.fd[i];
                 else g_std_base[i] = fds.fd[i];
             }
@@ -48562,6 +48612,7 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
                     if (pipes_r[j] && pipes_r[j] != in)  file_close(pipes_r[j]);
                     if (pipes_w[j] && pipes_w[j] != out) file_close(pipes_w[j]);
                 }
+                shell_child_std_take();     /* (638) */
                 int crc = shell_run_pipeline_shell_stage(&pl->stage[i], in, out);
                 if (crc < 0) crc = 127;
                 _exit(crc & 0xff);
@@ -53603,6 +53654,7 @@ static bool shell_try_subshell_command(const char *src) {
         if (pid == 0) {
             forked_child = true;
             jobs_forget_all();
+            shell_child_std_take();     /* (638) */
         }
     }
 #endif
@@ -54752,6 +54804,9 @@ static bool shell_try_compound_pipeline(const char *src) {
              * reader that was itself. Closing it here is what the fds= dance
              * in a real shell is for. */
             if (r) file_close(r);
+#ifdef SHELL_HOSTED
+            shell_child_std_take();     /* its pipe ends its 0 and 1 (638) */
+#endif
             /* THE PARENT'S TRAPS ARE SHOWN HERE, NOT RUN: a stage is a
              * subshell, where `trap` lists them (Oils 1221: `trap | cat`)
              * but the EXIT trap that runs is only one the stage sets. A
@@ -55346,6 +55401,10 @@ static bool shell_try_coproc(const char *src) {
          * own fd 0 and read the console under the shparity runner --
          * "read: read error: 0: Is a directory" (shparity 245a). */
         g_shell_in = 0;
+        /* THE PIPES ARE ITS 0 AND 1, as bash's coprocess's are -- tsh's
+         * kept its parent's 0-2 and held the pipes at 4 and 5 (logs/b44
+         * rg7 p6, logs/b45 td12 k2 k3, td13 r8 r18; finding 638) */
+        shell_child_std_take();
         shell_trap_clear_caught();
         jobs_forget_all();
         g_subshell_depth++;
