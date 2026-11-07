@@ -11248,12 +11248,29 @@ static void cmd_local(int argc, char **argv) {
                          shell_local_of_caller(name, g_script_depth);
         if (shell_readonly_key(name, klen) && !ro_caller) {
             /* a compound value: bash's own declare of it reports first,
-             * under the command it last named (see cmd_declare) */
+             * under the command it last named (see cmd_declare) -- a
+             * WRITTEN one; a quoted list is the builtin's alone (630) */
             size_t vk = env_key_len(argv[i]);
-            if (argv[i][vk] == '=' && argv[i][vk + 1] == '(')
+            bool wlist = argv[i][vk] == '=' && argv[i][vk + 1] == '(' &&
+                         shell_kv_written_list(argv[i]);
+            if (wlist)
                 shell_readonly_print_error(name, klen,
                                            g_decl_cmd_name ? g_decl_cmd_name
                                                            : "shell");
+            /* ...and over the function's OWN readonly local that refusal
+             * drops the function and the line that called it -- set -e's
+             * end under set -e -- with no second message: `local -r x=(1);
+             * local x=(2) y=3` (logs/b44 rg10 s2; logs/b45 td4 r1 r26
+             * r27) -- 625 */
+            if (wlist && shell_local_declared_here(name, g_script_depth)) {
+                shell_set_status(1);
+                if (g_shell_flow == SHELL_FLOW_NONE) {
+                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                 : SHELL_FLOW_DISCARD;
+                    g_shell_flow_status = 1;
+                }
+                return;
+            }
             shell_readonly_print_error(name, klen, "local");
             shell_set_status(1);
             continue;
@@ -13347,8 +13364,17 @@ static void cmd_declare(int argc, char **argv) {
                 /* ...and so does one with -g in a function: bash makes
                  * no local there, and the assignment's failure discards
                  * the line as at top level (logs/b17 rodecl). */
+                /* ...and in a function too, over a readonly name of its own
+                 * scope -- `f() { local -r x=(1); local x=(2) y=3; }` drops
+                 * the function and the line that called it, set -e's end
+                 * under set -e; tsh went on with status 1 (logs/b44 rg9 r6,
+                 * rg10; logs/b45 td4 r1-r19) -- finding 625. A new local
+                 * over a readonly global (above) is the builtin's refusal,
+                 * and so is a QUOTED list, which the builtin makes itself:
+                 * "declare: x: readonly variable", status 1, at the top
+                 * level too (td4 r21-r25) -- 630. */
                 const char *v = argv[i] + env_key_len(argv[i]) + 1;
-                if (g_readonly_hit && *v == '(' && (g_fn_depth == 0 || set_global)) {
+                if (g_readonly_hit && *v == '(' && shell_kv_written_list(argv[i])) {
                     if (g_shell_flow == SHELL_FLOW_NONE) {
                         g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
                                                      : SHELL_FLOW_DISCARD;
