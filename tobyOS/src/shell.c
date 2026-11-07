@@ -23529,16 +23529,19 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
             last = g_last_status;
             break;
         }
-        /* eval's DISCARD and RETURN are not this reader's to settle -- see
-         * eval_mode above. */
-        if (eval_mode && (g_shell_flow == SHELL_FLOW_DISCARD ||
-                          g_shell_flow == SHELL_FLOW_RETURN)) {
+        /* eval's RETURN is not this reader's to settle -- see eval_mode
+         * above. */
+        if (eval_mode && g_shell_flow == SHELL_FLOW_RETURN) {
             last = g_last_status;
             break;
         }
         /* A DISCARD threw away the rest of THAT logical line and nothing
          * more: the script goes on, and the status it left is 1 -- or the
-         * one the discard asked for, 2 for a ${v:=w} that cannot assign */
+         * one the discard asked for, 2 for a ${v:=w} that cannot assign.
+         * So do eval's string and a trap's action, as bash's
+         * parse_and_execute does: the next line of either ran in bash and
+         * tsh ended the string there (`eval 'x=$((1+)); echo a<NL>echo
+         * b'` is "b", status 0 -- logs/b45 td5 m1 m3 m12) -- finding 627. */
         if (g_shell_flow == SHELL_FLOW_DISCARD) {
             int ds = g_shell_flow_status ? g_shell_flow_status : 1;
             g_shell_flow = SHELL_FLOW_NONE;
