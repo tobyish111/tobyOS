@@ -52131,11 +52131,20 @@ static bool shell_try_case_command(const char *src) {
     char *word_src = shell_dup_segment(s, in_at);
     SH_SB(wordb);
     const char *word = wordb.p;
-    if (!word_src ||
-        shell_expand_case_word(word_src, &wordb) < 0) {
-        kfree(word_src);
-        kprintf("case: word too long\n");
+    if (!word_src) {
+        kprintf("case: out of memory\n");
         shell_set_status(2);
+        return true;
+    }
+    /* THE WORD'S EXPANSION FAILED: it has said why, and it is the
+     * expansion's error, as in any word -- the line discarded with status
+     * 1, or set -e's end (not for an arithmetic one), or the end an
+     * expansion asked for itself (`${x:?}`). tsh said "case: word too long"
+     * as well, left status 2 and ran on (logs/b44 ev4 y9; logs/b45 td3
+     * w1-w14 e10) -- finding 622. */
+    if (shell_expand_case_word(word_src, &wordb) < 0) {
+        kfree(word_src);
+        shell_wordlist_failed();
         return true;
     }
     kfree(word_src);
