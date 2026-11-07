@@ -23515,10 +23515,13 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
         /* THE TOP LEVEL'S DISCARD (619) is settled by the top-level reader
          * alone -- the script's, the stdin script's, the prompt's: it goes
          * on out of eval's string, a sourced file and a trap's action, and
-         * a -c string ends with 1. */
-        if (g_shell_flow == SHELL_FLOW_DISCARD && shell_discard_top_now() &&
-            !counts_cmds) {
-            if (c_main) {
+         * a -c string ends with 1. A $( )'s text (and a <( )'s) is a
+         * subshell's, which ANY discard ends: the next line of it ran, so
+         * `x=$(echo $((1+)); echo a<NL>echo b)` was "b" where bash's is
+         * empty, status 1 (logs/b45 td5 m5 m11) -- finding 628. */
+        if (g_shell_flow == SHELL_FLOW_DISCARD &&
+            (comsub_lines || (shell_discard_top_now() && !counts_cmds))) {
+            if (c_main && shell_discard_top_now()) {
                 g_discard_top = false;
                 g_shell_flow = SHELL_FLOW_EXIT;
                 g_shell_flow_status = 1;
