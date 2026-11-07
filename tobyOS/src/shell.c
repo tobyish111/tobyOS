@@ -1025,6 +1025,18 @@ enum shell_flow {
 
 static enum shell_flow g_shell_flow;
 static int g_shell_flow_status;
+/* THE DISCARD IN FLIGHT GOES TO THE TOP LEVEL. An arithmetic error in an
+ * array subscript -- `a[1+]=x`, `( [1+]=x )`, `${a[1+]}`, `(( a[1+] ))`,
+ * `unset 'a[1+]'` -- or in an -i variable's value (`declare -i n=1+`) is
+ * bash's jump to the top level: eval, `.`, a trap's action and `command
+ * eval` do not stop it, so the line the top-level reader was running goes,
+ * every caller's with it, and the next line sees 1; a -c string ends with
+ * 1; a subshell, a $( ) or a pipeline's element it ends exits 1; no ERR
+ * trap, and set -e does not make it an exit. A $(( )) or bad substitution's
+ * DISCARD is the one those readers catch. tsh caught both kinds at eval
+ * and at `.` (logs/b44 ev1-ev3, logs/b45 td1 td2) -- finding 619. True only
+ * while g_shell_flow is SHELL_FLOW_DISCARD (shell_discard_top_now). */
+static bool g_discard_top;
 static int g_shell_loop_depth;
 /* Lists in progress -- bash's executing_list: one more while a list of two
  * commands or more (`;` or a newline, `&&`, `||`) runs, the body of a
@@ -1078,6 +1090,22 @@ static int g_errexit_negate;
 /* Set when a malformed expansion is the `${ command }` kind, which bash
  * reports with status 1 and continues from rather than aborting. */
 static bool g_bad_subst_soft;
+/* bash's jump to the top level (see g_discard_top): the error has been
+ * reported; status 1. A flow already in progress (an EXIT, a set -u end)
+ * stays what it was. */
+static void shell_discard_to_top(void) {
+    if (g_shell_flow == SHELL_FLOW_NONE) {
+        g_shell_flow = SHELL_FLOW_DISCARD;
+        g_shell_flow_status = 1;
+    }
+    if (g_shell_flow == SHELL_FLOW_DISCARD) g_discard_top = true;
+}
+
+/* Is the DISCARD in flight the top-level kind? Clears a stale mark. */
+static bool shell_discard_top_now(void) {
+    if (g_shell_flow != SHELL_FLOW_DISCARD) g_discard_top = false;
+    return g_discard_top;
+}
 
 /* True when the last non-zero status came from a command errexit is not
  * allowed to act on -- the left side of && or ||. It exists so the exemption
@@ -4712,12 +4740,9 @@ static int sh_array_assign_literal(const char *name, const char *paren,
              * ran on (bash's exp8.sub; logs/b42 in3) -- finding 494 */
             int sk = sh_subscript_value(e->key, &ix);
             if (sk == SARITH_ERROR) {
+                /* ...to the top level, set -e or not (619) */
                 shell_set_status(1);
-                if (g_shell_flow == SHELL_FLOW_NONE) {
-                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
-                                                 : SHELL_FLOW_DISCARD;
-                    g_shell_flow_status = 1;
-                }
+                shell_discard_to_top();
                 break;
             }
             if (sk != SARITH_OK) {
@@ -5100,18 +5125,25 @@ static unsigned shell_value_attrs(const char *name) {
 static bool shell_utf8(void);
 static size_t sh_case_put(struct shell_sb *out, const char *p, const char *end,
                           int op, bool u8, int *rc);
+/* Set while env_set_kv takes a SCALAR value through its attributes. */
+static bool g_attr_scalar;
 static int shell_attr_value(unsigned attrs, const char *val, struct shell_sb *out) {
     if (!(attrs & SHVAR_VALUE_ATTRS)) return 0;
     if (attrs & SHVAR_INTEGER) {
         long v = 0;
-        int k = shell_arith_eval(val ? val : "", 0, &v);
+        /* a declaration builtin's value is evaluated under its name:
+         * "declare: 1+: syntax error ..." (logs/b45 td2 k26, td5 n4) --
+         * a scalar's; an element's is the array code's, no name (td8 i3) */
+        const char *cn = g_attr_scalar ? g_this_cmd_name : 0;
+        if (cn && strcmp(cn, "declare") != 0 && strcmp(cn, "typeset") != 0 &&
+            strcmp(cn, "local") != 0 && strcmp(cn, "export") != 0 &&
+            strcmp(cn, "readonly") != 0)
+            cn = 0;
+        int k = shell_arith_eval(val ? val : "", cn, &v);
         if (k != SARITH_OK) {
             if (k != SARITH_UNBOUND) {
                 shell_set_status(1);
-                if (g_shell_flow == SHELL_FLOW_NONE) {
-                    g_shell_flow = SHELL_FLOW_DISCARD;
-                    g_shell_flow_status = 1;
-                }
+                shell_discard_to_top();         /* -i's error: 619 */
             }
             return -1;
         }
@@ -5161,10 +5193,7 @@ static int shell_attr_append(unsigned attrs, const char *old, const char *add,
     if (old && *old && shell_arith_eval(old, 0, &a) != SARITH_OK) return -1;
     if (shell_arith_eval(add ? add : "", 0, &b) != SARITH_OK) {
         shell_set_status(1);
-        if (g_shell_flow == SHELL_FLOW_NONE) {
-            g_shell_flow = SHELL_FLOW_DISCARD;
-            g_shell_flow_status = 1;
-        }
+        shell_discard_to_top();                 /* -i's error: 619 */
         return -1;
     }
     char nb[32];
@@ -5478,7 +5507,9 @@ static int env_set_kv(const char *kv_in) {
         unsigned at = ax >= 0 ? (g_env_flags[ax] & SHVAR_VALUE_ATTRS) : 0u;
         if (at) {
             SH_SB(tv);
+            g_attr_scalar = true;
             int ar = shell_attr_value(at, kv_in + klen + 1, &tv);
+            g_attr_scalar = false;
             if (ar < 0) return -1;
             if (ar > 0) {
                 if (sb_putmem(&attrkv, kv_in, klen) < 0 || sb_putc(&attrkv, '=') < 0 ||
@@ -6950,7 +6981,12 @@ static void shell_run_trap(int sig) {
     g_shell_lineno = saved_line;
     g_bash_lnum = bl_save;
 
-    if (g_shell_flow != SHELL_FLOW_EXIT) {
+    /* the top level's DISCARD goes on out into the line the trap ran in:
+     * `trap 'a=( [1+]=x )' USR1; kill -USR1 $$; echo after` says nothing
+     * more (logs/b44 ev3 x10) -- 619 */
+    if (shell_discard_top_now()) {
+        shell_set_status(1);
+    } else if (g_shell_flow != SHELL_FLOW_EXIT) {
         g_shell_flow = saved_flow;
         g_shell_flow_status = saved_flow_status;
         shell_set_status(saved_status);
@@ -9238,10 +9274,7 @@ static const char *sh_ar_key_for(void *ctx, const char *sub, struct shell_sb *kx
  * l4, p20) -- finding 571. */
 static int sh_ar_sub_failed(void) {
     shell_set_status(1);
-    if (g_shell_flow == SHELL_FLOW_NONE) {
-        g_shell_flow = SHELL_FLOW_DISCARD;
-        g_shell_flow_status = 1;
-    }
+    shell_discard_to_top();                     /* ...the top level's (619) */
     return SARITH_CB_FAIL;
 }
 
@@ -9394,7 +9427,17 @@ static bool sh_subscript_eval(const char *sub, const char *name,
                               bool for_write, long *out) {
     long v = 0;
     if (!sub || !*sub) return false;
-    if (sh_subscript_value(sub, &v) != SARITH_OK) return false;
+    int sk = sh_subscript_value(sub, &v);
+    if (sk != SARITH_OK) {
+        /* ...an arithmetic error the top level's discard, wherever the
+         * subscript is read: `[[ -v a[1+] ]]`, a nameref to `a[1+]`, `${!r}`
+         * (logs/b45 td2 k3 k20 k21) -- 619 */
+        if (sk == SARITH_ERROR) {
+            shell_set_status(1);
+            shell_discard_to_top();
+        }
+        return false;
+    }
     if (v < 0) {
         struct sh_array *arr = sh_array_find(name);
         long top = sh_array_max_idx(arr);
@@ -9446,10 +9489,7 @@ static int sh_subscript_assign_index(const char *name, const char *sub,
         g_assign_fail_hit = true;
         if (k != SARITH_UNBOUND) {          /* unbound has ended the shell */
             shell_set_status(1);
-            if (g_shell_flow == SHELL_FLOW_NONE) {
-                g_shell_flow = SHELL_FLOW_DISCARD;
-                g_shell_flow_status = 1;
-            }
+            shell_discard_to_top();         /* 619 */
         }
         return -1;
     }
@@ -9480,7 +9520,11 @@ static int sh_subscript_read_index(const char *nm, const char *sub, long *out) {
     long v = 0;
     int k = sh_subscript_value(sub, &v);
     if (k != SARITH_OK) {
-        if (k != SARITH_UNBOUND) g_bad_subst_soft = true;
+        if (k != SARITH_UNBOUND) {
+            g_bad_subst_soft = true;
+            shell_set_status(1);
+            shell_discard_to_top();             /* 619 */
+        }
         return -1;
     }
     if (v < 0) {
@@ -12029,7 +12073,9 @@ static void cmd_export(int argc, char **argv) {
             if (esrc < 0) {
                 /* a readonly name has said so in bash's words already --
                  * "PATH: readonly variable" -- and that is all bash says */
-                if (!g_readonly_hit)
+                /* (...and so has a value that discarded the line, -i's
+                 * arithmetic: td8 i5) */
+                if (!g_readonly_hit && g_shell_flow == SHELL_FLOW_NONE)
                     kprintf("export: failed to set '%s'\n", argv[i]);
                 shell_set_status(1);
                 /* A COMPOUND value refused ends the line, in a function
@@ -13983,7 +14029,16 @@ static void cmd_unset(int argc, char **argv) {
                  * status 1 (unbind_array_element; Oils 0266 0357). tsh
                  * unset nothing and said nothing. */
                 long ix = 0;
-                if (arr && sh_subscript_value(sub, &ix) == SARITH_OK) {
+                int uk = arr ? sh_subscript_value(sub, &ix) : SARITH_OK;
+                /* a subscript whose arithmetic fails is the top level's
+                 * discard: `unset 'a[1+]'` ran on, status 0 (logs/b45 td2
+                 * k4) -- 619 */
+                if (arr && uk == SARITH_ERROR) {
+                    shell_set_status(1);
+                    shell_discard_to_top();
+                    return;
+                }
+                if (arr && uk == SARITH_OK) {
                     if (ix < 0) ix = sh_count_back(sh_array_max_idx(arr), ix);
                     if (ix < 0) {
                         kprintf("unset: [%s]: bad array subscript\n", sub);
@@ -14006,6 +14061,10 @@ static void cmd_unset(int argc, char **argv) {
                         if (dk == SARITH_OK && di < 0) {
                             kprintf("unset: [%s]: bad array subscript\n", sub);
                             shell_set_status(1);
+                        } else if (dk == SARITH_ERROR) {
+                            shell_set_status(1);
+                            shell_discard_to_top();     /* 619 */
+                            return;
                         } else if (dk != SARITH_OK) {
                             shell_set_status(1);
                         }
@@ -14583,8 +14642,11 @@ static void cmd_shift(int argc, char **argv) {
      * (The build host's bash exits 2 for a non-numeric count; the guest's
      * is the one the gate compares against.) */
     if (argc > 2) {
+        /* ...which drops the line as no_args' refusals do: the top
+         * level's discard (logs/b45 td9 n10) -- 619 */
         kprintf("shift: too many arguments\n");
         shell_set_status(1);
+        shell_discard_to_top();
         return;
     }
     if (argc == 2) {
@@ -23391,6 +23453,23 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
         if (unit_checked) g_syn_checked--;
         g_shell_lineno = line_last;
         if (accum) { kfree(accum); accum = 0; line = 0; }
+        /* THE TOP LEVEL'S DISCARD (619) is settled by the top-level reader
+         * alone -- the script's, the stdin script's, the prompt's: it goes
+         * on out of eval's string, a sourced file and a trap's action, and
+         * a -c string ends with 1. */
+        if (g_shell_flow == SHELL_FLOW_DISCARD && shell_discard_top_now() &&
+            !counts_cmds) {
+            if (c_main) {
+                g_discard_top = false;
+                g_shell_flow = SHELL_FLOW_EXIT;
+                g_shell_flow_status = 1;
+                shell_set_status(1);
+                last = 1;
+                break;
+            }
+            last = g_last_status;
+            break;
+        }
         /* eval's DISCARD and RETURN are not this reader's to settle -- see
          * eval_mode above. */
         if (eval_mode && (g_shell_flow == SHELL_FLOW_DISCARD ||
@@ -23405,6 +23484,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
             int ds = g_shell_flow_status ? g_shell_flow_status : 1;
             g_shell_flow = SHELL_FLOW_NONE;
             g_shell_flow_status = 0;
+            g_discard_top = false;
             shell_set_status(ds);
         }
         last = g_last_status;
@@ -24110,10 +24190,7 @@ static void cmd_break(int argc, char **argv) {
         if (parse_int(argv[1], &nn) == 0 && nn > 0) {
             kprintf("break: too many arguments\n");
             shell_set_status(1);
-            if (g_shell_flow == SHELL_FLOW_NONE) {
-                g_shell_flow = SHELL_FLOW_DISCARD;
-                g_shell_flow_status = 1;
-            }
+            shell_discard_to_top();     /* no_args': the top level's (619) */
             return;
         }
         argc = 2;
@@ -24163,10 +24240,7 @@ static void cmd_continue(int argc, char **argv) {
         if (parse_int(argv[1], &nn) == 0 && nn > 0) {
             kprintf("continue: too many arguments\n");
             shell_set_status(1);
-            if (g_shell_flow == SHELL_FLOW_NONE) {
-                g_shell_flow = SHELL_FLOW_DISCARD;
-                g_shell_flow_status = 1;
-            }
+            shell_discard_to_top();     /* no_args': the top level's (619) */
             return;
         }
         argc = 2;
@@ -24219,10 +24293,7 @@ static void cmd_return(int argc, char **argv) {
     if (ok && argc > 2) {
         kprintf("return: too many arguments\n");
         shell_set_status(1);
-        if (g_shell_flow == SHELL_FLOW_NONE) {
-            g_shell_flow = SHELL_FLOW_DISCARD;
-            g_shell_flow_status = 1;
-        }
+        shell_discard_to_top();         /* no_args': the top level's (619) */
         return;
     }
     /* A FUNCTION OR A SOURCED FILE, not any script. This tested
@@ -24378,10 +24449,7 @@ static void cmd_exit(int argc, char **argv) {
     if (ok && argc > 2) {
         kprintf("exit: too many arguments\n");
         shell_set_status(1);
-        if (g_shell_flow == SHELL_FLOW_NONE) {
-            g_shell_flow = SHELL_FLOW_DISCARD;
-            g_shell_flow_status = 1;
-        }
+        shell_discard_to_top();         /* no_args': the top level's (619) */
         return;
     }
     shell_set_status(st);
@@ -24839,8 +24907,9 @@ eval_done:
      * raised here that was NOT absorbed. */
     g_parse_error = saved_parse_error || g_parse_error;
     /* eval CATCHES A DISCARD: the rest of its string is gone, the caller
-     * goes on, and eval's status is 1 (bash: parse_and_execute). */
-    if (g_shell_flow == SHELL_FLOW_DISCARD) {
+     * goes on, and eval's status is 1 (bash: parse_and_execute) -- not the
+     * top level's, which goes on out (619). */
+    if (g_shell_flow == SHELL_FLOW_DISCARD && !shell_discard_top_now()) {
         g_shell_flow = SHELL_FLOW_NONE;
         g_shell_flow_status = 0;
         shell_set_status(1);
@@ -29652,10 +29721,8 @@ static void cmd_history(int argc, char **argv) {
             if (nops > 1) {
                 /* bash's no_args(): the rest of the line is thrown away. */
                 kprintf("history: too many arguments\n");
-                g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
-                                             : SHELL_FLOW_DISCARD;
-                g_shell_flow_status = 1;
                 shell_set_status(1);
+                shell_discard_to_top();     /* ...set -e or not (619) */
                 return;
             }
             if (limit < 0) limit = -limit;
@@ -29830,10 +29897,7 @@ static void cmd_suspend(int argc, char **argv) {
     if (i < argc) {
         kprintf("suspend: too many arguments\n");
         shell_set_status(1);
-        if (g_shell_flow == SHELL_FLOW_NONE) {
-            g_shell_flow = SHELL_FLOW_DISCARD;
-            g_shell_flow_status = 1;
-        }
+        shell_discard_to_top();         /* no_args': the top level's (619) */
         return;
     }
     if (!force) {
@@ -31662,10 +31726,13 @@ static void shell_capture_body(const char *cmd, bool forked) {
          *
          *     shopt -s failglob
          *     x=$(echo *.ZZ; echo in); echo "[$x] $?"   bash: [] 1
-         *                                              tsh : nothing */
+         *                                              tsh : nothing
+         * -- the top level's kind too: the substitution is its own top
+         * level (619) */
         g_capture_last_status = 1;
         g_shell_flow = SHELL_FLOW_NONE;
         g_shell_flow_status = 0;
+        g_discard_top = false;
     }
 #ifdef SHELL_HOSTED
     if (forked) {
@@ -53262,6 +53329,16 @@ static bool shell_try_subshell_command(const char *src) {
     if (g_shell_flow == SHELL_FLOW_EXIT) {
         rc = g_shell_flow_status;
     }
+    /* ...and a DISCARD ends the subshell with 1 (or the status it asked
+     * for), whatever the last command had left: `( a=( [1+]=x ); echo in )`
+     * was 0 (logs/b44 ev3 x4) -- the top level's kind too, the ( ) being
+     * its own top level (619) */
+    if (g_shell_flow == SHELL_FLOW_DISCARD) {
+        rc = g_shell_flow_status ? g_shell_flow_status : 1;
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+        g_discard_top = false;
+    }
     rc = shell_run_exit_trap(rc);
 #ifdef SHELL_HOSTED
     if (forked_child) {
@@ -55076,6 +55153,9 @@ static void shell_time_report(bool posix_fmt, uint64_t real_us,
 }
 
 static void execute_line_text_inner(const char *src) {
+    /* no discard is in flight as a command starts: a top-level mark left by
+     * one a frame swallowed must not make the next DISCARD that kind */
+    if (g_shell_flow == SHELL_FLOW_NONE) g_discard_top = false;
     {
         unsigned long gen = ++g_line_gen;
         if (g_nofork_pending) {
