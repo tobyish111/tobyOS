@@ -31218,6 +31218,11 @@ static void shell_env_put_command_name(char **envp, int *envc,
 struct shell_fd_state;
 static struct shell_fd_state *g_spawn_release;
 static void shell_fd_state_release_owned(struct shell_fd_state *st);
+#ifdef SHELL_HOSTED
+static int shell_fd_state_owned_list(struct shell_fd_state *st,
+                                     struct file **out, int max);
+void host_spawn_move_set(struct file *const *v, int n);    /* host.c */
+#endif
 static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                                            char **argv, bool background,
                                            const char *profile,
@@ -31301,6 +31306,12 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         (void)proc_exec_in_place(&spec);
     }
 #endif
+#ifdef SHELL_HOSTED
+    /* the command's own descriptors, the child's alone as it starts: the
+     * spawn moves them (host.c host_spawn_move_set, finding 618) */
+    struct file *mvv[64];
+    host_spawn_move_set(mvv, rel ? shell_fd_state_owned_list(rel, mvv, 64) : 0);
+#endif
     int pid = proc_spawn(&spec);
     if (pid < 0) {
         /* 127 IS "NOT FOUND", 126 IS "FOUND BUT COULD NOT RUN". POSIX XCU
@@ -31325,12 +31336,18 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
             }
         }
         if (pid < 0) {
+#ifdef SHELL_HOSTED
+            host_spawn_move_set(0, 0);
+#endif
             if (why != 0) status = shell_report_unrunnable(report_as, status);
             g_shell_fd[2] = spawn_diag_saved;
             g_spawn_launch_failed = true;
             return status;
         }
     }
+#ifdef SHELL_HOSTED
+    host_spawn_move_set(0, 0);
+#endif
     g_shell_fd[2] = spawn_diag_saved;
     if (rel) shell_fd_state_release_owned(rel);         /* (618) */
 
@@ -45445,6 +45462,17 @@ static void shell_fd_state_release_owned(struct shell_fd_state *st) {
     (void)st;
 #endif
 }
+
+#ifdef SHELL_HOSTED
+/* ...the handles it owns, for the spawn to move (host_spawn_move_set) */
+static int shell_fd_state_owned_list(struct shell_fd_state *st,
+                                     struct file **out, int max) {
+    int n = 0;
+    for (int i = 0; st && i < st->n && n < max; i++)
+        if (st->owned[i] && st->fd[i]) out[n++] = st->fd[i];
+    return n;
+}
+#endif
 
 /* Make `fds` the shell's table, remembering the old one in `frame`. The
  * frame takes over what `fds` owned. */

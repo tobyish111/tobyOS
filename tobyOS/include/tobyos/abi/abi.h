@@ -2220,6 +2220,19 @@ struct abi_spawn_req {
  * shell had the CONSOLE's, so /dev/tty in the desktop's terminal window
  * opened the console, and `cmd | less` there waited on it for its keys. */
 #define ABI_SPAWN_F_SETSID     0x10u
+/* MOVE, NOT COPY: a caller descriptor named in fd0/fd1/fd2 or an extra's
+ * parent_fd with ABI_SPAWN_FD_MOVE or'd into its number is the child's
+ * alone -- the kernel clones it into the child and closes the caller's
+ * before the child can run (sys_spawn holds the big lock throughout, and
+ * the child's first system call waits for it), only when the spawn
+ * succeeds. A shell's own redirection of a command -- `ls /proc/$$/fd >
+ * f` -- is opened by the shell, which spawns rather than forks, and was
+ * the shell's until the spawn returned, so a child that looked at once
+ * saw it (finding 618). The bit means something only with this flag; a
+ * kernel without the flag refuses it, -EINVAL, and the caller can spawn
+ * as before. */
+#define ABI_SPAWN_F_MOVEFDS    0x20u
+#define ABI_SPAWN_FD_MOVE      0x40000000
 
 /* ============================================================
  *  Networking helpers (already exported in older syscall.h, but

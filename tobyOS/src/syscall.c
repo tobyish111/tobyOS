@@ -5600,8 +5600,13 @@ static long sys_spawn(const struct abi_spawn_req *req) {
     if (copy_from_user(&kreq, req, sizeof(kreq)) != 0) return -ABI_EFAULT;
     if (kreq.flags & ~(ABI_SPAWN_F_DFL_INT | ABI_SPAWN_F_DFL_QUIT |
                        ABI_SPAWN_F_IGN_INT | ABI_SPAWN_F_IGN_QUIT |
-                       ABI_SPAWN_F_SETSID))
+                       ABI_SPAWN_F_SETSID | ABI_SPAWN_F_MOVEFDS))
         return -ABI_EINVAL;
+    /* ABI_SPAWN_F_MOVEFDS (abi.h): the caller's descriptors marked
+     * ABI_SPAWN_FD_MOVE are closed once the child has its clones (below,
+     * from kreq's fd0..fd2 and the extras kept in uex_moves) */
+    const bool movefds = (kreq.flags & ABI_SPAWN_F_MOVEFDS) != 0;
+    struct abi_spawn_fd *uex_moves = 0;
 
     /* A RELATIVE PATH IS THE CALLER'S CWD's, as execve's is (sys_execve
      * resolves; this did not):
@@ -5657,6 +5662,7 @@ static long sys_spawn(const struct abi_spawn_req *req) {
         if (v == ABI_SPAWN_FD_INHERIT) {
             v = i;                   /* inherit parent's same-numbered fd */
         }
+        if (movefds && v >= 0) v &= ~ABI_SPAWN_FD_MOVE;
         if (v < 0 || v >= PROC_NFDS || !ptab || !ptab[v]) {
             failed = true; break;
         }
@@ -5706,6 +5712,7 @@ static long sys_spawn(const struct abi_spawn_req *req) {
         }
         for (uint32_t i = 0; i < kreq.nextra; i++) {
             int cfd = uex[i].child_fd, pfd = uex[i].parent_fd;
+            if (movefds && pfd >= 0) pfd &= ~ABI_SPAWN_FD_MOVE;
             if (cfd < 0 || cfd >= PROC_NFDS ||
                 pfd < 0 || pfd >= PROC_NFDS || !ptab || !ptab[pfd]) {
                 failed = true;
@@ -5717,7 +5724,9 @@ static long sys_spawn(const struct abi_spawn_req *req) {
             kextra[nextra].f  = cl;
             nextra++;
         }
-        kfree(uex);
+        /* (kept for the moves, when the spawn has succeeded) */
+        if (movefds && !failed) uex_moves = uex;
+        else kfree(uex);
         if (failed) {
             for (int i = 0; i < nextra; i++) file_close(kextra[i].f);
             kfree(kextra);
@@ -5787,6 +5796,25 @@ static long sys_spawn(const struct abi_spawn_req *req) {
     spawn_fd_put(f0);
     spawn_fd_put(f1);
     spawn_fd_put(f2);
+    /* ABI_SPAWN_F_MOVEFDS: the descriptors the caller gave the child for
+     * its own go now, before this call lets the big lock go and so before
+     * the child can ask about its parent's table (finding 618). A number
+     * named twice -- `>f 2>&1` -- is closed once. */
+    if (pid >= 0 && movefds) {
+        int fv[3] = { kreq.fd0, kreq.fd1, kreq.fd2 };
+        for (int i = 0; i < 3; i++)
+            if (fv[i] >= 0 && (fv[i] & ABI_SPAWN_FD_MOVE)) {
+                int n = fv[i] & ~ABI_SPAWN_FD_MOVE;
+                if (n < PROC_NFDS && ptab && ptab[n]) (void)sys_close(n);
+            }
+        for (uint32_t i = 0; uex_moves && i < kreq.nextra; i++)
+            if (uex_moves[i].parent_fd >= 0 &&
+                (uex_moves[i].parent_fd & ABI_SPAWN_FD_MOVE)) {
+                int n = uex_moves[i].parent_fd & ~ABI_SPAWN_FD_MOVE;
+                if (n < PROC_NFDS && ptab && ptab[n]) (void)sys_close(n);
+            }
+    }
+    kfree(uex_moves);
     if (pid < 0) return -ABI_ENOMEM;
     return pid;
 }

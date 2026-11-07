@@ -1053,6 +1053,36 @@ static int host_spawn_std(const struct file *f, int n) {
 
 void host_fd_sync(void);
 
+/* THE COMMAND'S OWN DESCRIPTORS ARE THE CHILD'S ALONE, from the moment it
+ * can run: bash opens a command's redirections in the child it forked, so
+ * the shell never holds them, and a child that lists /proc/$PPID/fd at
+ * once -- `ls /proc/$$/fd > f` -- never sees one. tsh opens them itself and
+ * spawns, and let them go once the spawn had returned: 2 runs in 40 the
+ * child saw the file (logs/b44 g1race.txt). The shell names the handles
+ * that are the command's own (host_spawn_move_set) and the spawn asks the
+ * kernel to MOVE each descriptor every handle of which is one of them
+ * (ABI_SPAWN_F_MOVEFDS): closed in the shell before the child runs. A
+ * kernel without it refuses the flag, and the spawn is made as before
+ * (finding 618). */
+static struct file *const *g_mv_files;
+static int g_mv_n;
+void host_spawn_move_set(struct file *const *v, int n) {
+    g_mv_files = v;
+    g_mv_n = v ? n : 0;
+}
+
+static struct hcell *host_move_cell(const struct file *f) {
+    if (!f || f->kind != FILE_KIND_VFS || g_mv_n <= 0) return 0;
+    struct hcell *c = (struct hcell *)f->vfs.priv;
+    if (!c || c == &g_dead_cell || c->fd <= 2) return 0;
+    int k = 0;
+    for (int i = 0; i < g_mv_n; i++) {
+        const struct file *m = g_mv_files[i];
+        if (m && m->kind == FILE_KIND_VFS && m->vfs.priv == c) k++;
+    }
+    return k > 0 && k == c->refs ? c : 0;
+}
+
 int proc_spawn(const struct proc_spec *spec) {
     if (!spec || !spec->path) return -1;
     host_fd_sync();             /* the shell's table, as the child sees it (618) */
@@ -1111,6 +1141,14 @@ int proc_spawn(const struct proc_spec *spec) {
         return -1;
     }
     unsigned nextra = 0;
+    /* (the cells the spawn moves, at most one a descriptor it passes) */
+    struct hcell **mvc = (struct hcell **)malloc((size_t)(nmax + 3) * sizeof *mvc);
+    if (!mvc) {
+        free(argv); free(envp); free(extra);
+        errno = ENOMEM;
+        return -1;
+    }
+    int nmvc = 0;
     for (int i = 0; i < spec->extra_nfds && nextra < ABI_SPAWN_EXTRA_MAX; i++) {
         struct file *f = spec->extra_fds[i].f;
         /* a slot the shell has closed (`exec 3>&-`) is not passed: the
@@ -1122,14 +1160,49 @@ int proc_spawn(const struct proc_spec *spec) {
         if (pfd < 0) continue;
         extra[nextra].child_fd  = spec->extra_fds[i].fd;
         extra[nextra].parent_fd = pfd;
+        struct hcell *mc = host_move_cell(f);
+        if (mc) {
+            extra[nextra].parent_fd |= ABI_SPAWN_FD_MOVE;
+            mvc[nmvc++] = mc;
+        }
         nextra++;
     }
+    /* ...and the standard three, the same way (618) */
+    const struct file *sf[3] = { spec->fd0, spec->fd1, spec->fd2 };
+    int *sfd[3] = { &fd0, &fd1, &fd2 };
+    for (int i = 0; i < 3; i++) {
+        struct hcell *mc = *sfd[i] >= 0 ? host_move_cell(sf[i]) : 0;
+        if (mc && mc->fd == *sfd[i]) {
+            *sfd[i] |= ABI_SPAWN_FD_MOVE;
+            mvc[nmvc++] = mc;
+        }
+    }
 
+    unsigned flags = host_spawn_sigflags(spec);
     int rc = (int)toby_spawn_flags(spec->path, argv, spec->envp ? envp : 0,
                                    fd0, fd1, fd2, nextra ? extra : 0, nextra,
-                                   host_spawn_sigflags(spec));
+                                   flags | (nmvc ? ABI_SPAWN_F_MOVEFDS : 0u));
+    if (rc < 0 && nmvc && errno == EINVAL) {
+        /* a kernel that has no moves: the spawn as it was, the shell
+         * letting them go after (host_file_release) */
+        for (int i = 0; i < 3; i++)                 /* (not a sentinel) */
+            if (*sfd[i] >= 0) *sfd[i] &= ~ABI_SPAWN_FD_MOVE;
+        for (unsigned i = 0; i < nextra; i++)
+            extra[i].parent_fd &= ~ABI_SPAWN_FD_MOVE;
+        nmvc = 0;
+        rc = (int)toby_spawn_flags(spec->path, argv, spec->envp ? envp : 0,
+                                   fd0, fd1, fd2, nextra ? extra : 0, nextra,
+                                   flags);
+    }
     int saved = errno;
-    free(argv); free(envp); free(extra);
+    /* the kernel closed the moved ones: their cells name no descriptor */
+    if (rc >= 0)
+        for (int i = 0; i < nmvc; i++)
+            if (mvc[i]->fd >= 0) {
+                hcell_unreg(mvc[i]);
+                mvc[i]->fd = -1;
+            }
+    free(argv); free(envp); free(extra); free(mvc);
     errno = saved;
     return rc;
 }
