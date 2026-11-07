@@ -11097,6 +11097,7 @@ static void cmd_local(int argc, char **argv) {
      * -x; any other word that started with `-` was skipped as if it were
      * not there (logs/b13 q16 q18). -g, -f and -F are declare's business. */
     bool l_array = false, l_assoc = false, l_nameref = false;
+    bool l_lower_a = false;                 /* -a itself, beside -A (631) */
     bool l_export = false, l_unexport = false, l_readonly = false;
     bool l_inherit = false;                 /* -I */
     unsigned l_attr_on = 0, l_attr_off = 0;
@@ -11111,7 +11112,7 @@ static void cmd_local(int argc, char **argv) {
         bool on = sign == '-';
         for (const char *f = argv[first] + 1; *f; f++) {
             switch (*f) {
-            case 'a': if (on) l_array = true; break;
+            case 'a': if (on) { l_array = true; l_lower_a = true; } break;
             case 'A': if (on) { l_array = true; l_assoc = true; } break;
             case 'n': if (on) l_nameref = true; break;
             case 'i': if (on) l_attr_on |= SHVAR_INTEGER; else l_attr_off |= SHVAR_INTEGER; break;
@@ -11337,6 +11338,12 @@ static void cmd_local(int argc, char **argv) {
             kprintf("local: %s: cannot convert associative to indexed array\n", name);
             shell_set_status(1);
             continue;
+        }
+        /* -a and -A both: -A's local, then -a's refusal (declare's, 631) */
+        if (l_lower_a && l_assoc && !l_nameref) {
+            kprintf("local: %s: cannot convert associative to indexed array\n", name);
+            shell_set_status(1);
+            if (has_value && !shell_kv_written_list(argv[i])) continue;
         }
         bool inherit = !already && !has_value && shell_local_inherits(name);
         /* a new local's written list is expanded first (shell_local_list_pre) */
@@ -12545,6 +12552,7 @@ static void cmd_declare(int argc, char **argv) {
     bool set_nameref = false, clear_nameref = false;
     bool set_array = false;
     bool set_assoc = false;
+    bool opt_lower_a = false;  /* -a itself, beside -A (631) */
     bool set_global = false;   /* -g: never a local, even in a function */
     bool set_inherit = false;  /* -I: a new local starts as what it hides */
     unsigned attr_on = 0, attr_off = 0;   /* -i -l -u (+i +l +u) */
@@ -12573,7 +12581,7 @@ static void cmd_declare(int argc, char **argv) {
             case 'x': if (on) set_export = true; else clear_export = true; break;
             case 'r': if (on) set_readonly = true; else clear_readonly = true; break;
             case 'n': if (on) set_nameref = true; else clear_nameref = true; break;
-            case 'a': if (on) set_array = true; else clear_array = true; break;
+            case 'a': if (on) { set_array = true; opt_lower_a = true; } else clear_array = true; break;
             /* -A is ASSOCIATIVE, and that is a different type from -a:
              * its subscripts are literal strings rather than arithmetic.
              * They shared a case while neither did anything. */
@@ -13305,6 +13313,19 @@ static void cmd_declare(int argc, char **argv) {
                                    ? g_decl_cmd_name : 0) < 0) {
             shell_set_status(1);
             continue;
+        }
+        /* -a AND -A BOTH: -A makes the name associative and -a then cannot
+         * convert it -- "declare: A: cannot convert associative to indexed
+         * array", status 1 -- after a written list is made (as -A's), and
+         * before a quoted one, which is not. tsh's flags held the two as
+         * one, -A's, and said nothing (logs/b44 rg12 w3; logs/b45 td4
+         * a1-a11) -- finding 631. (An indexed array was refused as -A's,
+         * above.) */
+        if (opt_lower_a && base_assoc && set_assoc && !nref) {
+            kprintf("%s: %.*s: cannot convert associative to indexed array\n",
+                    argv[0], (int)klen, name);
+            shell_set_status(1);
+            if (has_value && !shell_kv_written_list(argv[i])) continue;
         }
 
         /* `typeset -n ref=y` REBINDS; it does not write THROUGH.
