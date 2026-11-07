@@ -11906,6 +11906,61 @@ static void shell_print_exported_sorted(int kind) {
     for (int a = 0; a < n; a++) (void)shell_declare_print(names[a]);
 }
 
+/* IN A FUNCTION, readonly's and export's QUOTED LIST OVER A LOCAL IS THE
+ * GLOBAL'S: bash puts the attribute on the local the function sees -- a
+ * readonly one too, with no refusal -- and makes the list the global's, the
+ * attribute with it: `f() { local -r x=(1); readonly -a x="(3)"; }` is
+ * status 0, the local x=(1) as it was, and after f a global x=(3),
+ * readonly; export's local is -x too. tsh refused it, "readonly: x:
+ * readonly variable", or wrote the local (logs/b45 td5 d3 d7 d8, td6 q1 q2
+ * q4 q8 q11 q12) -- finding 630. KV is the word, NLEN its name's length;
+ * RO says readonly (else export), ASSOC its -A. 1 when done, 0 when the
+ * name has no local and the builtin goes on as before. */
+static int sh_decl_quoted_global(const char *kv, size_t nlen, bool assoc,
+                                 bool ro, const char *label) {
+    if (g_fn_depth <= 0) return 0;
+    SH_SB(nm);
+    if (sb_putmem(&nm, kv, nlen) < 0) return 0;
+    int si = shell_local_oldest(nm.p);
+    if (si < 0) return 0;
+    /* the attribute on the local first */
+    if (ro) {
+        (void)shell_readonly_mark(nm.p, nlen);
+    } else {
+        int lx = env_find(nm.p, nlen);
+        if (lx < 0 && env_set_attr_holder(nm.p) == 0) lx = env_find(nm.p, nlen);
+        if (lx >= 0) g_env_flags[lx] |= SHVAR_EXPORTED;
+    }
+    /* ...then the list, as the global's */
+    shell_global_exchange(si);
+    if (assoc && !shell_readonly_key(nm.p, nlen) && !sh_array_is_assoc(nm.p)) {
+        sh_array_unset(nm.p);
+        (void)sh_array_make_assoc(nm.p);
+    }
+    g_decl_paren_array = true;
+    g_readonly_label = label;
+    int rs = env_set_kv(kv);
+    g_decl_paren_array = false;
+    g_readonly_label = 0;
+    if (rs >= 0) {
+        if (ro) {
+            (void)shell_readonly_mark(nm.p, nlen);
+        } else {
+            int gx = env_find(nm.p, nlen);
+            if (gx < 0 && sh_array_find(nm.p) && env_set_attr_holder(nm.p) == 0) {
+                gx = env_find(nm.p, nlen);
+                if (gx >= 0)
+                    g_env_flags[gx] = (unsigned char)((g_env_flags[gx] | SHVAR_ARRAY) &
+                                                      ~SHVAR_NOVALUE);
+            }
+            if (gx >= 0) g_env_flags[gx] |= SHVAR_EXPORTED;
+        }
+    }
+    shell_global_exchange(si);
+    if (rs < 0) shell_set_status(1);
+    return 1;
+}
+
 static void cmd_export(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1 || (argc == 2 && strcmp(argv[1], "-p") == 0)) {
@@ -12076,6 +12131,9 @@ static void cmd_export(int argc, char **argv) {
                 }
             }
             bool qlist = (opt_a || opt_A) && !shell_kv_written_list(argv[i]);
+            if (qlist && sh_decl_quoted_global(argv[i], nlen, opt_A, false,
+                                               argv[0]))
+                continue;                               /* (630) */
             g_decl_paren_array = opt_a || opt_A || la;
             if (qlist) g_readonly_label = argv[0];
             SH_SB(enm);
@@ -12122,6 +12180,13 @@ static void cmd_export(int argc, char **argv) {
                         g_shell_flow_status = 1;
                     }
                     return;
+                }
+                /* ...and the value refused, the name is exported all the
+                 * same: `readonly x=1; export x=2` leaves `declare -rx x`
+                 * (logs/b45 td6 q6) -- 630 */
+                if (g_readonly_hit) {
+                    int rx = env_find(enm.p, nlen);
+                    if (rx >= 0) g_env_flags[rx] |= SHVAR_EXPORTED;
                 }
                 continue;
             }
@@ -13321,8 +13386,10 @@ static void cmd_declare(int argc, char **argv) {
                  !(g_env_flags[pax] & SHVAR_NAMEREF));
             /* a scalar value refused for a readonly name is reported under
              * the builtin, "declare: x: readonly variable" (bash; logs/b41
-             * v1) -- a compound one keeps its own two (logs/s35) */
-            if (argv[i][env_key_len(argv[i]) + 1] != '(') {
+             * v1) -- a compound one keeps its own two (logs/s35) -- and so
+             * is a quoted list, the builtin's own (630) */
+            if (argv[i][env_key_len(argv[i]) + 1] != '(' ||
+                !shell_kv_written_list(argv[i])) {
                 g_readonly_label = argv[0];
                 if (ras.slot) {
                     g_readonly_as_word = ras.orig;
@@ -13564,6 +13631,9 @@ static void cmd_readonly(int argc, char **argv) {
              * readonly variable" -- tsh set the string "(4)" (bash's
              * attr.tests; logs/b42 at1 a2, at2 b4 b6) -- finding 489 */
             bool qlist = (opt_a || opt_A) && !shell_kv_written_list(argv[i]);
+            if (qlist && sh_decl_quoted_global(argv[i], nlen, opt_A, true,
+                                               argv[0]))
+                continue;                               /* (630) */
             g_decl_paren_array = opt_a || opt_A || la;
             if (qlist) g_readonly_label = argv[0];
             SH_SB(rnm);
