@@ -1525,6 +1525,7 @@ static void prompt(void);
 static void execute_line_text(const char *src);
 static void shell_trap_text(const char *action, const char *name, bool resetline);
 static void execute_line_text_inner(const char *src);
+static void shell_wordlist_failed(void);
 struct shell_simple;
 static int shell_keyword_hoist(struct shell_simple *cmd);
 static void shell_parse_error(void);
@@ -38189,6 +38190,40 @@ static bool g_tok_word_assign_ctx;
  * emitted; the operator's token takes it (shell_emit_token_fd). */
 static const char *g_tok_fdvar;
 
+/* THE WORD BEING READ IS A REDIRECTION'S TARGET -- a file's or a
+ * here-string's, not a here-document's -- and the command it is for is the
+ * word g_tok_redir_cmd (its expanded text, in the line's word store; 0 when
+ * none came before it). A failed tokenize leaves its last word's answer in
+ * g_tokfail_redir / g_tokfail_cmd: bash expands an EXTERNAL command's
+ * redirections in the child it forked, so their error is the child's --
+ * status 1, the line goes on (finding 629). */
+static bool g_tok_redir_word;
+static const char *g_tok_redir_cmd;
+static bool g_tokfail_redir;
+static const char *g_tokfail_cmd;
+
+/* The command word of the simple command whose tokens end at v[last] (a
+ * redirection operator): its first word that is neither a prefix
+ * assignment nor a redirection's target. 0 when it has none yet, and in a
+ * pipeline's stage after the first -- each stage is its own child. */
+static const char *sh_tok_cmd_word(const struct shell_token *v, int last) {
+    int k = last;
+    while (k > 0 && v[k - 1].type != SH_TOK_SEMI && v[k - 1].type != SH_TOK_BG &&
+           v[k - 1].type != SH_TOK_PIPE && v[k - 1].type != SH_TOK_AND_IF &&
+           v[k - 1].type != SH_TOK_OR_IF)
+        k--;
+    if (k > 0 && v[k - 1].type == SH_TOK_PIPE) return 0;
+    for (int i = k; i < last; i++) {
+        if (v[i].type != SH_TOK_WORD) continue;
+        if (i > k && v[i - 1].type != SH_TOK_WORD &&
+            v[i - 1].type >= SH_TOK_REDIR_IN)
+            continue;                           /* a redirection's target */
+        if (v[i].assign_src) continue;          /* NAME=value before it */
+        return v[i].text;
+    }
+    return 0;
+}
+
 /* The tokens of one line, in the caller's word store beside their text.
  * There were 96 at most -- `echo` and 95 words -- and the 97th was "too many
  * tokens"; the vector grows now, and MOVES when it does, which is why only
@@ -38985,9 +39020,18 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     const char *saved_fdvar = g_tok_fdvar;
     const char *saved_bsub = g_bsub_unit;     /* points into this read */
     int saved_bsub_kind = g_bsub_unit_kind;
+    bool saved_redir_word = g_tok_redir_word;
+    const char *saved_redir_cmd = g_tok_redir_cmd;
+    g_tok_redir_word = false;
+    g_tok_redir_cmd = 0;
     g_tokpfx_base = g_tokpfx_n;
     struct sh_rdx *rdx_live0 = g_rdx_live;
     int rc_outer = shell_tokenize_outer(src, &tv, out_ntok, words);
+    /* (the word it stopped at, for the caller: see g_tok_redir_word) */
+    g_tokfail_redir = rc_outer < 0 && g_tok_redir_word;
+    g_tokfail_cmd = g_tokfail_redir ? g_tok_redir_cmd : 0;
+    g_tok_redir_word = saved_redir_word;
+    g_tok_redir_cmd = saved_redir_cmd;
     sh_rdx_unwind(rdx_live0);
     g_bsub_unit = saved_bsub;
     g_bsub_unit_kind = saved_bsub_kind;
@@ -39503,6 +39547,12 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
         int word_star_ov = g_star_ov;
         if (herestr_word) g_star_ov = SH_STAR_Q;
         herestr_word = false;
+        /* (a redirection's word, and whose: see g_tok_redir_word -- 629) */
+        g_tok_redir_word = ntok > 0 && tok->v[ntok - 1].type != SH_TOK_WORD &&
+                           tok->v[ntok - 1].type >= SH_TOK_REDIR_IN &&
+                           tok->v[ntok - 1].type != SH_TOK_HEREDOC &&
+                           tok->v[ntok - 1].type != SH_TOK_HEREDOC_TABS;
+        g_tok_redir_cmd = g_tok_redir_word ? sh_tok_cmd_word(tok->v, ntok - 1) : 0;
         /* (a redirection's word with a $( ) in it: see sh_rdx_enter) */
         struct sh_rdx *rdx = 0;
         if (ntok > 0 && tok->v[ntok - 1].type != SH_TOK_WORD &&
@@ -49016,8 +49066,15 @@ static int shell_parse_compound_redirs(const char *tail, struct shell_simple *ou
     }
     {
         int ntok = 0;
-        if (shell_tokenize(tail, &tok, &ntok, &words) < 0)
+        if (shell_tokenize(tail, &tok, &ntok, &words) < 0) {
+            /* A WORD THAT DID NOT EXPAND -- `{ cat; } <<< ${a[}` -- is the
+             * shell's expansion error, the compound's redirections being
+             * done in the shell itself: the line discarded, status 1 (set
+             * -e's end). It was status 2 and the line ran on (logs/b45 td5
+             * h9) -- with 629 */
+            shell_wordlist_failed();
             goto out;
+        }
         if (ntok == 0) { rc = 0; goto out; }
 
         int i = 0;
@@ -49061,7 +49118,8 @@ static bool shell_compound_tail_redirs(const char *src, const char *tail,
     struct shell_simple redirs;
     SH_WORDS(paths);
     if (shell_parse_compound_redirs(t, &redirs, &paths, label) < 0)
-        return false;
+        /* (a word that did not expand has discarded the line: done) */
+        return g_shell_flow != SHELL_FLOW_NONE;
     if (redirs.redir_count == 0) return false;
 
     size_t n = (size_t)(tail - src);
@@ -53265,7 +53323,22 @@ static bool shell_try_subshell_command(const char *src) {
     if (*tail) {
         int ntok = 0;
         if (shell_tokenize(tail, &tok, &ntok, &words) < 0) {
-            shell_set_status(2);
+            /* A WORD THAT DID NOT EXPAND is the subshell's: bash forks it
+             * first and does its redirections there, so `( cat ) <<<
+             * ${a[}` is the subshell failing, status 1, and the line goes
+             * on -- it was 2 (logs/b45 td8) -- with 629 */
+            if (g_bad_subst_soft || g_shell_flow == SHELL_FLOW_DISCARD) {
+                g_bad_subst_soft = false;
+                g_arith_expand_err = false;
+                if (g_shell_flow == SHELL_FLOW_DISCARD) {
+                    g_shell_flow = SHELL_FLOW_NONE;
+                    g_shell_flow_status = 0;
+                    g_discard_top = false;
+                }
+                shell_set_status(1);
+            } else {
+                shell_set_status(2);
+            }
             kfree(body);
             shell_pipeline_free(plp);
             return true;
@@ -53561,7 +53634,9 @@ static bool shell_try_group_command(const char *src) {
     if (*tail) {
         int ntok = 0;
         if (shell_tokenize(tail, &tok, &ntok, &words) < 0) {
-            shell_set_status(2);
+            /* ...the group's own redirection: the shell's expansion error,
+             * the line discarded (logs/b45 td5 h9) -- with 629 */
+            shell_wordlist_failed();
             kfree(body);
             shell_pipeline_free(plp);
             return true;
@@ -55229,6 +55304,19 @@ static void shell_time_report(bool posix_fmt, uint64_t real_us,
     kprintf_raw("%s\n", out.p ? out.p : "");
 }
 
+#ifdef SHELL_HOSTED
+/* Would the command word W -- as the tokenizer left it, marks and all --
+ * run in a child of its own: no function and no builtin of this shell? */
+static bool sh_cmd_word_is_child(const char *w) {
+    if (!w) return false;
+    SH_SB(n);
+    if (sb_puts(&n, w) < 0 || !n.p) return false;
+    shell_strip_nosplit_inplace(n.p);
+    if (!n.p[0]) return false;
+    return !shell_function_lookup(n.p) && !shell_cmd_lookup(n.p);
+}
+#endif
+
 static void execute_line_text_inner(const char *src) {
     /* no discard is in flight as a command starts: a top-level mark left by
      * one a frame swallowed must not make the next DISCARD that kind */
@@ -55725,6 +55813,34 @@ static void execute_line_text_inner(const char *src) {
         }
     }
     if (shell_tokenize(src, &tok, &ntok, &words) < 0) {
+#ifdef SHELL_HOSTED
+        /* AN EXTERNAL COMMAND'S REDIRECTION IS THE CHILD'S: bash forks
+         * first and expands the target there, so `cat <<< ${a[}`, `cat <
+         * f$((1+))` and `cat <<< ${x:?}` are cat failing, status 1, and
+         * the line goes on -- set -e and the ERR trap judge it as any
+         * failure. tsh threw the line away (or, for ${x:?}, the shell).
+         * A builtin's, a function's or a compound's redirection is the
+         * shell's own, the line discarded (logs/b45 td5 h1 h6 h10, td6 r1
+         * r2 r4, td3 w9) -- finding 629. */
+        if (g_tokfail_redir && sh_cmd_word_is_child(g_tokfail_cmd)) {
+            g_bad_subst_soft = false;
+            g_arith_expand_err = false;
+            if (g_shell_flow == SHELL_FLOW_DISCARD ||
+                g_shell_flow == SHELL_FLOW_EXIT) {
+                g_shell_flow = SHELL_FLOW_NONE;
+                g_shell_flow_status = 0;
+                g_discard_top = false;
+            }
+            shell_set_status(1);
+            if (g_errexit_suspend == 0 && g_errexit_negate == 0)
+                shell_run_err_trap(1);
+            if (shell_errexit_now() && g_shell_flow == SHELL_FLOW_NONE) {
+                g_shell_flow = SHELL_FLOW_EXIT;
+                g_shell_flow_status = 1;
+            }
+            return;
+        }
+#endif
         if (g_bad_subst_soft) {
             /* An EXPANSION error: bash's jump_to_top_level(DISCARD). The
              * command is skipped with status 1 and so is the rest of
