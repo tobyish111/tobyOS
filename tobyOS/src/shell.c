@@ -20551,7 +20551,12 @@ struct shell_scan {
     bool case_word;     /* between `case` and its `in` */
     bool case_pat;      /* a case PATTERN may start here, so `(` is legal */
     bool after_in;      /* the last token was the `in` of a for/case */
-    bool dbracket;      /* inside `[[ ... ]]`, where none of this applies */
+    /* Where the `in` of `for NAME in`, `select NAME in` and `case WORD in`
+     * may stand: 1, the keyword was the last token (its NAME or WORD
+     * comes next); 2, that NAME or WORD was, so an `in` now is the
+     * keyword; 0 anywhere else, where `in` is a word like any other. */
+    unsigned char in_owed;
+    bool dbracket;     /* inside `[[ ... ]]`, where none of this applies */
     bool for_head;      /* the last token was `for`: `((` opens an arithmetic head */
     /* The paren depth INSIDE a `(( ))` -- a command or a for head -- whose
      * `))` is on a later line; 0: none. Its lines are an expression's
@@ -20604,6 +20609,7 @@ static void shell_scan_init(struct shell_scan *st) {
     st->case_word = false;
     st->case_pat = false;
     st->after_in = false;
+    st->in_owed = 0;
     st->no_sep = true;
     st->dbracket = false;
     st->for_head = false;
@@ -20729,6 +20735,10 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     bool was_after_in = st->after_in;
     st->after_in = false;
     (void)was_after_in;
+    /* every token moves the `in` position on (see in_owed); the keyword
+     * branch for for/select/case and the NAME after it set it again */
+    unsigned char was_in_owed = st->in_owed;
+    st->in_owed = 0;
     /* Set by the arithmetic for head and cleared by every token except a
      * separator, so only a `{` that directly follows the head opens a body. */
     bool was_await_body = st->await_body;
@@ -21639,7 +21649,15 @@ procsub_word:;
         /* The `in` of `case WORD in` opens the PATTERN list, which is the one
          * place a `(` may appear where no command can start. */
         st->no_sep = false;
-        if (n == 2 && w[0] == 'i' && w[1] == 'n') {
+        /* ...and only THAT `in`: the third word of `for NAME in` or
+         * `case WORD in`. Any `in` was taken for it, so a body's line
+         * ending in one -- `{ echo a; echo in` -- joined the next line with
+         * no `;`, and `echo in2` became that echo's arguments. */
+        /* The NAME itself owes an `in` or a `do`, and either may be on the
+         * next line: joining `for x` and `in a b` with a `;` made the loop
+         * run over "$@" and `in a b` a command (bash takes both). */
+        if (was_in_owed == 1) { st->in_owed = 2; st->no_sep = true; }
+        if (n == 2 && w[0] == 'i' && w[1] == 'n' && was_in_owed == 2) {
             st->no_sep = true;
             /* `in` introduces a WORD LIST (for) or a PATTERN list (case).
              * Either way the next line continues it, so the accumulator must
@@ -21741,6 +21759,7 @@ procsub_word:;
         st->cmd_pos = false; st->prev_word_cmd = false;   /* a name or a word */
         st->no_sep = true;              /* `for` / `case` want a NAME next */
         st->for_head = shell_word_eq(w, n, "for");
+        st->in_owed = 1;
         return;
     }
     if (resv && (shell_word_eq(w, n, "fi")   || shell_word_eq(w, n, "done") ||
