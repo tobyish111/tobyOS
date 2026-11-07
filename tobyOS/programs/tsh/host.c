@@ -1600,6 +1600,7 @@ void host_fd_sync(void) {
 /* bash runs a script from its descriptor 255 (and its children have none
  * of it): /proc/$$/fd lists 255 for every script. The script's text is
  * read whole here; the descriptor is held for the listing (618). */
+static bool g_script_fd_held;
 void host_hold_script_fd(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return;
@@ -1608,6 +1609,18 @@ void host_hold_script_fd(const char *path) {
         close(fd);
     }
     (void)fcntl(255, F_SETFD, FD_CLOEXEC);
+    g_script_fd_held = true;
+}
+
+/* ...and a forked child has none of it: bash's subshells, async commands,
+ * pipeline elements, $( )s and coprocesses list no 255 -- `( ls
+ * /proc/$BASHPID/fd > f; : )` is 0 1 2 -- where every forked tsh kept its
+ * parent's (logs/b45 td13 r2, td14 q2 q3 q8; finding 637). The text was
+ * read whole; nothing reads the descriptor. */
+void host_child_drop_script_fd(void) {
+    if (!g_script_fd_held) return;
+    (void)close(255);
+    g_script_fd_held = false;
 }
 
 /* `read -t`: is there input on this descriptor, or would a read return EOF at

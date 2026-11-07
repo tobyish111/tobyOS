@@ -31750,11 +31750,13 @@ void shell_host_forked(void);                    /* host.c: the child's pid */
  * (ttyparity 18). With a TERM trap set the trap keeps its handler, and
  * what `trap - TERM` would go back to becomes the default. */
 void host_fd_sync(void);                         /* host.c (finding 618) */
+void host_child_drop_script_fd(void);           /* host.c (finding 637) */
 static int shell_fork(void) {
     host_fd_sync();             /* the table as the child's commands list it */
     int pid = fork();
     if (pid == 0) {
         shell_host_forked();
+        host_child_drop_script_fd();    /* bash's children have no 255 */
         g_replace_ok = true;
         g_async_payload = false;
         shell_child_signals();
