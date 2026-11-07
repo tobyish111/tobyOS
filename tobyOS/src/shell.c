@@ -5142,6 +5142,11 @@ static size_t sh_case_put(struct shell_sb *out, const char *p, const char *end,
                           int op, bool u8, int *rc);
 /* Set while env_set_kv takes a SCALAR value through its attributes. */
 static bool g_attr_scalar;
+/* Set while a builtin's or a function's PREFIX assignment is made: bash's
+ * temporary environment takes the value as written, -i -u -l or not --
+ * `declare -i n; n=1+ true` is no error and `n=3+4 eval 'echo $n'` says
+ * 3+4, where tsh evaluated it (logs/b45 td8 i4, iq) -- finding 632. */
+static bool g_env_prefix_plain;
 static int shell_attr_value(unsigned attrs, const char *val, struct shell_sb *out) {
     if (!(attrs & SHVAR_VALUE_ATTRS)) return 0;
     if (attrs & SHVAR_INTEGER) {
@@ -5520,7 +5525,7 @@ static int env_set_kv(const char *kv_in) {
     if (!g_env_attr_only) {
         int ax = env_find(kv_in, klen);
         unsigned at = ax >= 0 ? (g_env_flags[ax] & SHVAR_VALUE_ATTRS) : 0u;
-        if (at) {
+        if (at && !g_env_prefix_plain) {
             SH_SB(tv);
             g_attr_scalar = true;
             int ar = shell_attr_value(at, kv_in + klen + 1, &tv);
@@ -44867,7 +44872,11 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
                 continue;
             }
         }
-        if (env_set_kv(assignv[i]) < 0) {
+        /* (a prefix's plain `=` value is taken as written: 632) */
+        g_env_prefix_plain = exported;
+        int asrc = env_set_kv(assignv[i]);
+        g_env_prefix_plain = false;
+        if (asrc < 0) {
             /* A READONLY NAME (S4), measured against bash -- env_set_kv has
              * already said "NAME: readonly variable":
              *   a PREFIX (`x=3 true`): the assignment is skipped and the
