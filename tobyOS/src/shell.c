@@ -1090,6 +1090,21 @@ static int g_errexit_negate;
 /* Set when a malformed expansion is the `${ command }` kind, which bash
  * reports with status 1 and continues from rather than aborting. */
 static bool g_bad_subst_soft;
+/* ...and that failure was an arithmetic expansion's -- `$((1+))`, `$[1/0]`
+ * -- whose line set -e only discards: `set -e; echo $((1+)); echo x` goes
+ * on at the next line in bash, where a bad substitution or failglob ends
+ * the shell (logs/b44 ev3 x3, ev4 y1; logs/b45 td3 e1-e20) -- finding 620.
+ * Read and cleared by shell_xerr_flow. */
+static bool g_arith_expand_err;
+
+/* The flow an expansion error asks for: the line discarded, or under set
+ * -e the shell ended -- not for an arithmetic expansion's (620). */
+static enum shell_flow shell_xerr_flow(void) {
+    bool arith = g_arith_expand_err;
+    g_arith_expand_err = false;
+    return (g_opt_errexit && !arith) ? SHELL_FLOW_EXIT : SHELL_FLOW_DISCARD;
+}
+
 /* bash's jump to the top level (see g_discard_top): the error has been
  * reported; status 1. A flow already in progress (an EXIT, a set -u end)
  * stays what it was. */
@@ -3932,8 +3947,7 @@ static int sh_array_store_expanded(const char *name, const char *ex,
                     kprintf(SH_PFX_SHELL "no match: %s\n", field);
                     g_bad_subst_soft = true;
                     if (g_shell_flow == SHELL_FLOW_NONE) {
-                        g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
-                                                     : SHELL_FLOW_DISCARD;
+                        g_shell_flow = shell_xerr_flow();
                         g_shell_flow_status = 1;
                     }
                     return -1;
@@ -37298,6 +37312,7 @@ static int shell_arith_subst_eval(char *expr, struct shell_sb *b) {
             }
         } else if (k != SARITH_UNBOUND) {
             g_bad_subst_soft = true;
+            g_arith_expand_err = true;          /* set -e discards (620) */
         }
         return -1;
     }
@@ -42916,8 +42931,7 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
             if (g_shell_flow == SHELL_FLOW_NONE) {
                 /* set -e: an expansion error EXITS (bash: the failglob
                  * report is followed by the shell leaving, status 1). */
-                g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
-                                             : SHELL_FLOW_DISCARD;
+                g_shell_flow = shell_xerr_flow();
                 g_shell_flow_status = 1;
             }
             return -1;
@@ -44701,8 +44715,7 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
                 g_bad_subst_soft = false;
                 shell_set_status(1);
                 if (g_shell_flow == SHELL_FLOW_NONE) {
-                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
-                                                 : SHELL_FLOW_DISCARD;
+                    g_shell_flow = shell_xerr_flow();
                     g_shell_flow_status = 1;
                 }
                 return 1;
@@ -50226,8 +50239,7 @@ static bool shell_try_dbracket_command(const char *src) {
         g_bad_subst_soft = false;
         shell_set_status(1);
         if (g_shell_flow == SHELL_FLOW_NONE) {
-            g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
-                                         : SHELL_FLOW_DISCARD;
+            g_shell_flow = shell_xerr_flow();
             g_shell_flow_status = 1;
         }
         return true;
@@ -50251,7 +50263,7 @@ static bool shell_try_dbracket_command(const char *src) {
         g_bad_subst_soft = false;
         if (g_shell_flow == SHELL_FLOW_NONE) {
             shell_set_status(1);
-            g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT : SHELL_FLOW_DISCARD;
+            g_shell_flow = shell_xerr_flow();
             g_shell_flow_status = 1;
         }
         return true;
@@ -50538,7 +50550,7 @@ static void shell_wordlist_failed(void) {
         g_bad_subst_soft = false;
         shell_set_status(1);
         if (g_shell_flow == SHELL_FLOW_NONE) {
-            g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT : SHELL_FLOW_DISCARD;
+            g_shell_flow = shell_xerr_flow();
             g_shell_flow_status = 1;
         }
     } else if (g_shell_flow == SHELL_FLOW_NONE) {
@@ -50896,8 +50908,7 @@ static bool shell_try_for_command(const char *src) {
                     g_bad_subst_soft = false;
                     shell_set_status(1);
                     if (g_shell_flow == SHELL_FLOW_NONE) {
-                        g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
-                                                     : SHELL_FLOW_DISCARD;
+                        g_shell_flow = shell_xerr_flow();
                         g_shell_flow_status = 1;
                     }
                 } else {
@@ -52236,8 +52247,7 @@ static bool shell_try_case_command(const char *src) {
                 g_bad_subst_soft = false;
                 shell_set_status(1);
                 if (g_shell_flow == SHELL_FLOW_NONE) {
-                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
-                                                 : SHELL_FLOW_DISCARD;
+                    g_shell_flow = shell_xerr_flow();
                     g_shell_flow_status = 1;
                 }
                 return true;
@@ -55156,6 +55166,7 @@ static void execute_line_text_inner(const char *src) {
     /* no discard is in flight as a command starts: a top-level mark left by
      * one a frame swallowed must not make the next DISCARD that kind */
     if (g_shell_flow == SHELL_FLOW_NONE) g_discard_top = false;
+    g_arith_expand_err = false;
     {
         unsigned long gen = ++g_line_gen;
         if (g_nofork_pending) {
@@ -55656,8 +55667,7 @@ static void execute_line_text_inner(const char *src) {
             if (g_shell_flow == SHELL_FLOW_NONE) {
                 /* set -e: an expansion error EXITS (bash: the failglob
                  * report is followed by the shell leaving, status 1). */
-                g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
-                                             : SHELL_FLOW_DISCARD;
+                g_shell_flow = shell_xerr_flow();
                 g_shell_flow_status = 1;
             }
             return;
@@ -55737,8 +55747,7 @@ static void execute_line_text_inner(const char *src) {
                 g_bad_subst_soft = false;
                 shell_set_status(1);
                 if (g_shell_flow == SHELL_FLOW_NONE) {
-                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
-                                                 : SHELL_FLOW_DISCARD;
+                    g_shell_flow = shell_xerr_flow();
                     g_shell_flow_status = 1;
                 }
             } else {
