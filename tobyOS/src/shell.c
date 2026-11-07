@@ -53509,9 +53509,10 @@ static bool shell_text_is_one_subshell(const char *text) {
         }
     }
     if (!*p) return false;
-    for (const char *t = p + 1; *t; t++)
-        if (*t != ' ' && *t != '\t' && *t != '\n' && *t != '\r') return false;
-    return true;
+    /* ...its own redirections after it, too: `( sleep 2 ) >/dev/null &` is
+     * one process in bash, the ( ) with its redirections, which execs its
+     * one command (logs/b45 td15 e14; finding 640) -- no list after it */
+    return shell_text_one_command(p + 1);
 }
 
 /* The same text, give or take blanks and newlines at either end. */
@@ -53814,6 +53815,14 @@ static bool shell_try_subshell_command(const char *src) {
         bool saved_replace = g_replace_ok;
         if (!forked_child) g_replace_ok = false;
         g_nofork_pending = true;
+#ifdef SHELL_HOSTED
+        /* ...and a body that is ONE simple command execs it even with
+         * redirections of its own, as bash's does: `( sleep 2 >/dev/null )`
+         * is sleep, where a list's last command with one is forked (logs/b45
+         * td15 e1 e2 e9 e10; finding 640) */
+        if (forked_child && shell_bg_text_is_simple(body, body + strlen(body)))
+            g_bg_exec_ok = true;
+#endif
         g_paren_depth++;
         execute_line_text(body);
         g_paren_depth--;
@@ -55515,6 +55524,11 @@ static bool shell_try_coproc(const char *src) {
          * kept its parent's 0-2 and held the pipes at 4 and 5 (logs/b44
          * rg7 p6, logs/b45 td12 k2 k3, td13 r8 r18; finding 638) */
         shell_child_std_take();
+        /* ...and ONE simple command is the coprocess itself, exec'd:
+         * `coproc cat` is cat (td12 k8, td15 e6 e20; finding 640). Its own
+         * redirections are undone, as bash's are (td16 v5): no
+         * g_io_own_depth. */
+        g_bg_exec_ok = shell_bg_text_is_simple(cmd, cmd + strlen(cmd));
         shell_trap_clear_caught();
         jobs_forget_all();
         g_subshell_depth++;
