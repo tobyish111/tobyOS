@@ -22443,6 +22443,53 @@ static char *shell_print_comsub_body(const char *body) {
     return res;
 }
 
+/* A WORD AS BASH KEEPS IT, for a message that names it unexpanded: bash 5.2
+ * reads a `$( )`, `<( )` or `>( )` as a command and keeps its PRINTED form
+ * in the word -- the one parse_comsub runs (shell_print_comsub_body) -- so
+ *
+ *     arr[$(echo I >&2;echo 1)]=v echo w
+ *         bash: `arr[$(echo I 1>&2; echo 1)]': not a valid identifier
+ *
+ * and so too an ambiguous redirect's word, an unbound subscript, a bad
+ * substitution, a `for` name -- at any depth: in "", in ${ }, in $(( )), one
+ * inside another. Backquotes keep their text. tsh named the word as written
+ * (logs/b47 cs1, cs2) -- finding 645. W itself when nothing in it is a
+ * substitution or it does not parse as one word; else D's text, made from
+ * the word bsyn's tree holds. */
+static const char *sh_word_shown(const char *w, struct shell_sb *d) {
+    if (!w) return w;
+    bool any = false;
+    for (const char *q = w; *q; q++) {
+        if (*q == SHELL_HD_TAG) return w;    /* its body is held apart */
+        if ((*q == '$' || *q == '<' || *q == '>') && q[1] == '(') any = true;
+    }
+    if (!any) return w;
+    SH_SB(t);
+    /* as an assignment's value: a word there is read as one whatever it
+     * holds, never as a reserved word, an alias or a redirection */
+    if (sb_puts(&t, "x=") < 0 || sb_puts(&t, w) < 0 || sb_putc(&t, '\n') < 0)
+        return w;
+    struct bsyn_env env;
+    shell_syn_env(&env, true, false);
+    env.build = true;
+    env.expand_aliases = false;
+    env.ansi_u = shell_pr_ansi_u;
+    struct bsyn *h = bsyn_open(t.p, t.len, 0, 0, &env);
+    if (!h) return w;
+    const char *res = w;
+    struct bsyn_result r;
+    int k = bsyn_next(h, &r);
+    if (k == BSYN_OK && r.tree && r.tree->type == BN_SIMPLE && r.tree->words &&
+        !r.tree->words->next && r.tree->words->w &&
+        strncmp(r.tree->words->w, "x=", 2) == 0) {
+        sb_truncate(d, 0);
+        if (sb_puts(d, r.tree->words->w + 2) == 0 && d->p) res = d->p;
+    }
+    bsyn_result_free(&r);
+    bsyn_close(h);
+    return res;
+}
+
 /* $BASH_COMMAND. bash sets it to the printed form of each simple command
  * before running it -- and to a `for`/`select`/`case` head, a [[ ]], a
  * (( )), each of an arithmetic for's three expressions -- except while a
@@ -31806,9 +31853,11 @@ static int shell_capture_read_file(const char *word, struct shell_sb *out) {
     const char *rw = shell_redir_word(pl, &tok[1], &amb);
     int prc = rw ? sb_set(&path, rw) : -1;
     shell_pipeline_free(pl);
-    if (amb)
+    if (amb) {
+        SH_SB(wd);                       /* the word as bash keeps it (645) */
         kprintf(SH_PFX_SHELL "%s: ambiguous redirect\n",
-                tok[1].raw ? tok[1].raw : word);
+                sh_word_shown(tok[1].raw ? tok[1].raw : word, &wd));
+    }
     if (prc < 0) return -1;
     struct file *f = shell_open_vfs_file(path.p, false, false, "shell");
     if (!f) return -1;
@@ -35641,17 +35690,24 @@ static size_t sh_bsub_unit_len(const char *u, int kind) {
 }
 
 static void shell_bad_subst(bool fatal) {
+    /* (each with its $( )s as bash keeps them -- sh_word_shown, 645) */
     if (g_bsub_unit) {
         SH_SB(u);
         SH_SB(ud);
+        SH_SB(uw);
         if (sb_putmem(&u, g_bsub_unit,
                       sh_bsub_unit_len(g_bsub_unit, g_bsub_unit_kind)) == 0)
             kprintf("%s: bad substitution\n",
-                    sh_bsub_disp_text(u.p ? u.p : "", &ud) > 0 ? ud.p : u.p);
+                    sh_word_shown(sh_bsub_disp_text(u.p ? u.p : "", &ud) > 0
+                                      ? ud.p : u.p, &uw));
     } else if (g_bsub_text) {
         SH_SB(td);
-        kprintf("${%s}: bad substitution\n",
-                sh_brace_disp(g_bsub_text, &td) > 0 ? td.p : g_bsub_text);
+        SH_SB(tw);
+        SH_SB(tws);
+        if (sb_puts(&tw, "${") == 0 &&
+            sb_puts(&tw, sh_brace_disp(g_bsub_text, &td) > 0 ? td.p : g_bsub_text) == 0 &&
+            sb_putc(&tw, '}') == 0)
+            kprintf("%s: bad substitution\n", sh_word_shown(tw.p, &tws));
     } else {
         kprintf(SH_PFX_SHELL "bad substitution\n");
     }
@@ -35840,7 +35896,8 @@ static int shell_unbound_ref(const char *nm, const char *sub, size_t slen) {
     if (sub && (sb_putc(&m, '[') < 0 || sb_putmem(&m, sub, slen) < 0 ||
                 sb_putc(&m, ']') < 0))
         return -1;
-    shell_arith_unbound(m.p);
+    SH_SB(md);                           /* the subscript as bash keeps it (645) */
+    shell_arith_unbound(sh_word_shown(m.p, &md));
     return -1;
 }
 
@@ -45518,7 +45575,12 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
             for (size_t q = 0; q < ak; q++)
                 if (assignv[i][q] == '[') { lbk = assignv[i] + q; break; }
             if (lbk) {
-                kprintf("`%.*s': not a valid identifier\n", (int)ak, assignv[i]);
+                /* named as bash keeps the word: a $( ) in the subscript
+                 * printed (sh_word_shown, 645) */
+                SH_SB(nm);
+                SH_SB(nd);
+                if (sb_putmem(&nm, assignv[i], ak) < 0) continue;
+                kprintf("`%s': not a valid identifier\n", sh_word_shown(nm.p, &nd));
                 continue;
             }
         }
@@ -46401,7 +46463,9 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
 #endif
         struct shell_redir *r = &cmd->redir[i];
         if (r->op == SH_RD_AMBIG) {
-            kprintf("%s: ambiguous redirect\n", r->path ? r->path : "");
+            SH_SB(wd);                   /* the word as bash keeps it (645) */
+            kprintf("%s: ambiguous redirect\n",
+                    r->path ? sh_word_shown(r->path, &wd) : "");
             shell_set_status(1);
             return -1;
         }
