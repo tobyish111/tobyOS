@@ -1884,6 +1884,9 @@ struct job {
     int  owner;                /* the shell process that started it: in a
                                 * forked subshell the copy is not its child
                                 * -- see shell_job_foreign */
+    bool kill_fresh;           /* this shell's `kill` has just signalled it:
+                                * the next look does not see it die -- see
+                                * shell_jobs_learn (finding 636) */
 #else
     bool dying;                /* `kill` has signalled it to death: the next
                                 * look lets it finish dying -- see
@@ -2231,6 +2234,7 @@ static int jobs_add_procs(const int *pids, const char *const *cmds, int n,
         struct proc *me = current_proc();
         j->owner = me ? me->pid : 0;
     }
+    j->kill_fresh = false;
 #else
     j->dying = false;
 #endif
@@ -2712,15 +2716,44 @@ static bool shell_job_foreign(const struct job *j) {
  * wait %-`, is 143 there and 0 in QEMU (finding 44), and tsh said 0 on
  * both. A count read before the polls: a SIGCHLD during them is news for
  * the next look. */
+/* THE LOOK STRAIGHT AFTER THE SHELL'S OWN `kill` DOES NOT SEE ITS JOB DIE.
+ * A process a signal ends takes time to die and tell its parent -- 0.3 to
+ * 17 ms in QEMU (logs/b46 chldlat-qemu2.txt) -- and bash reaches the line
+ * after `kill` sooner, every time: `sleep 1 & kill -HUP $!` then `wait $!
+ * 2>err.txt` puts the Hangup in err.txt in 20 runs of 20 in the guest, and
+ * on the corpus's Linux (Oils 0488); one line more and it sees the death,
+ * 19 of 20 (logs/b46 hrate1.txt). tsh's look came as soon after the kill,
+ * but the child, killed while it was still starting, sometimes died first:
+ * the report went to the script's stderr, 2 runs in 20 -- finding 636. So
+ * a job the kill signalled is skipped by the next look alone (kill_fresh);
+ * that look's count consumed, the one after polls it whatever the count
+ * says (g_chld_force). A wait reaps all, as bash's does. */
+static bool g_kill_fresh;          /* some job's kill_fresh is set */
+static bool g_chld_force;          /* poll at the next look */
 extern volatile unsigned g_tsh_chld_seq;       /* host.c */
 static unsigned g_chld_seen;
+static void sh_kill_fresh(struct job *j) {
+    if (!j || !j->id || j->dead) return;
+    j->kill_fresh = true;
+    g_kill_fresh = true;
+}
 static void shell_jobs_learn(bool waited) {
     unsigned seq = g_tsh_chld_seq;
-    if (!waited && seq == g_chld_seen) return;
+    bool fresh = g_kill_fresh;
+    g_kill_fresh = false;
+    if (!waited && seq == g_chld_seen && !g_chld_force) {
+        if (fresh)
+            for (int i = 0; i < JOB_MAX; i++) g_jobs[i]->kill_fresh = false;
+        return;
+    }
     g_chld_seen = seq;
+    g_chld_force = false;
     for (int i = 0; i < JOB_MAX; i++) {
         struct job *j = g_jobs[i];
+        bool skip = !waited && j->kill_fresh;
+        j->kill_fresh = false;
         if (!j->id || j->dead || shell_job_foreign(j)) continue;
+        if (skip) { g_chld_force = true; continue; }
         /* reaped elsewhere: it is gone, as Done */
         if (shell_job_poll_now(j) < 0) shell_job_died(j, 0, 0);
     }
@@ -28053,6 +28086,8 @@ static void cmd_kill(int argc, char **argv) {
                 }
 #ifndef SHELL_HOSTED
                 jb->dying = ends;
+#else
+                if (sig > 0) sh_kill_fresh(jb);         /* 636 */
 #endif
                 continue;
             }
@@ -28064,6 +28099,8 @@ static void cmd_kill(int argc, char **argv) {
             }
 #ifndef SHELL_HOSTED
             jb->dying = ends;                      /* see shell_job_settle */
+#else
+            if (sig > 0) sh_kill_fresh(jb);         /* 636 */
 #endif
             if (cont) {
                 if (signal_send_to_pid_checked(-jb->pid, SIGCONT) != 0)
@@ -28128,7 +28165,15 @@ static void cmd_kill(int argc, char **argv) {
             kprintf("kill: (%d) - No such process\n", pid);
             shell_set_status(1);
         }
-#ifndef SHELL_HOSTED
+#ifdef SHELL_HOSTED
+        else if (sig > 0) {
+            /* the job it names, or whose group it names (636) */
+            int want = pid < 0 ? -pid : pid;
+            for (int k = 0; k < JOB_MAX; k++)
+                if (g_jobs[k]->id && job_has_pid(g_jobs[k], want))
+                    sh_kill_fresh(g_jobs[k]);
+        }
+#else
         else if (sig > 0) {
             /* a job it names, or whose group it names */
             for (int k = 0; k < JOB_MAX; k++)
