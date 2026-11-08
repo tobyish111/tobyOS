@@ -38392,12 +38392,42 @@ static bool g_tok_redir_word;
 static const char *g_tok_redir_cmd;
 static bool g_tokfail_redir;
 static const char *g_tokfail_cmd;
+/* ...the command reached through `command`, whose functions it does not
+ * look up (finding 642) */
+static bool g_tok_redir_via;
+static bool g_tokfail_via;
+
+/* A token's text with the reader's no-split and glob marks off, in BUF. */
+static const char *sh_tok_plain(const char *t, char *buf, size_t n) {
+    size_t o = 0;
+    for (; t && *t && o + 1 < n; t++)
+        if (*t != SHELL_NOSPLIT_MARK && *t != SHELL_GLOB_ESC) buf[o++] = *t;
+    buf[o] = '\0';
+    return buf;
+}
+
+/* The next word of the command after v[i], before v[last]: a redirection
+ * operator and its word skipped; -1 when there is none. */
+static int sh_tok_next_arg(const struct shell_token *v, int i, int last) {
+    for (int j = i + 1; j < last; j++) {
+        if (v[j].type != SH_TOK_WORD) { j++; continue; }
+        return j;
+    }
+    return -1;
+}
 
 /* The command word of the simple command whose tokens end at v[last] (a
  * redirection operator): its first word that is neither a prefix
  * assignment nor a redirection's target. 0 when it has none yet, and in a
- * pipeline's stage after the first -- each stage is its own child. */
-static const char *sh_tok_cmd_word(const struct shell_token *v, int last) {
+ * pipeline's stage after the first -- each stage is its own child.
+ * `command NAME` is NAME's, its functions not looked up (*VIA): bash runs
+ * `command cat <<< ${a[}` and `command f <<< ${a[}` for a function f as
+ * an external command -- the child's failure, status 1, the line going on
+ * -- where tsh took `command`, a builtin, and discarded the line (logs/b46
+ * ra2 b4 b5, ra3 d7) -- finding 642. `command -v` and `-V` are its own. */
+static const char *sh_tok_cmd_word(const struct shell_token *v, int last,
+                                   bool *via) {
+    *via = false;
     int k = last;
     while (k > 0 && v[k - 1].type != SH_TOK_SEMI && v[k - 1].type != SH_TOK_BG &&
            v[k - 1].type != SH_TOK_PIPE && v[k - 1].type != SH_TOK_AND_IF &&
@@ -38410,7 +38440,22 @@ static const char *sh_tok_cmd_word(const struct shell_token *v, int last) {
             v[i - 1].type >= SH_TOK_REDIR_IN)
             continue;                           /* a redirection's target */
         if (v[i].assign_src) continue;          /* NAME=value before it */
-        return v[i].text;
+        char b[16];
+        if (strcmp(sh_tok_plain(v[i].text, b, sizeof b), "command") != 0)
+            return v[i].text;
+        int j = sh_tok_next_arg(v, i, last);
+        while (j >= 0) {
+            char o[16];
+            sh_tok_plain(v[j].text, o, sizeof o);
+            if (o[0] != '-' || !o[1]) break;
+            if (strcmp(o, "--") == 0) { j = sh_tok_next_arg(v, j, last); break; }
+            for (const char *c = o; *c; c++)
+                if (*c == 'v' || *c == 'V') return v[i].text;
+            j = sh_tok_next_arg(v, j, last);
+        }
+        if (j < 0) return v[i].text;
+        *via = true;
+        return v[j].text;
     }
     return 0;
 }
@@ -39563,9 +39608,11 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     int saved_bsub_kind = g_bsub_unit_kind;
     bool saved_redir_word = g_tok_redir_word;
     const char *saved_redir_cmd = g_tok_redir_cmd;
+    bool saved_redir_via = g_tok_redir_via;
     bool saved_defer = g_tok_word_defer;
     g_tok_redir_word = false;
     g_tok_redir_cmd = 0;
+    g_tok_redir_via = false;
     g_tok_word_defer = false;
     g_tokpfx_base = g_tokpfx_n;
     struct sh_rdx *rdx_live0 = g_rdx_live;
@@ -39573,8 +39620,10 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     /* (the word it stopped at, for the caller: see g_tok_redir_word) */
     g_tokfail_redir = rc_outer < 0 && g_tok_redir_word;
     g_tokfail_cmd = g_tokfail_redir ? g_tok_redir_cmd : 0;
+    g_tokfail_via = g_tokfail_redir && g_tok_redir_via;
     g_tok_redir_word = saved_redir_word;
     g_tok_redir_cmd = saved_redir_cmd;
+    g_tok_redir_via = saved_redir_via;
     g_tok_word_defer = saved_defer;
     sh_rdx_unwind(rdx_live0);
     g_bsub_unit = saved_bsub;
@@ -40120,7 +40169,9 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                            tok->v[ntok - 1].type >= SH_TOK_REDIR_IN &&
                            tok->v[ntok - 1].type != SH_TOK_HEREDOC &&
                            tok->v[ntok - 1].type != SH_TOK_HEREDOC_TABS;
-        g_tok_redir_cmd = g_tok_redir_word ? sh_tok_cmd_word(tok->v, ntok - 1) : 0;
+        g_tok_redir_via = false;
+        g_tok_redir_cmd = g_tok_redir_word
+                              ? sh_tok_cmd_word(tok->v, ntok - 1, &g_tok_redir_via) : 0;
         /* (a redirection's word with a $( ) in it: see sh_rdx_enter) */
         struct sh_rdx *rdx = 0;
         if (ntok > 0 && tok->v[ntok - 1].type != SH_TOK_WORD &&
@@ -56110,14 +56161,15 @@ static void shell_time_report(bool posix_fmt, uint64_t real_us,
 
 #ifdef SHELL_HOSTED
 /* Would the command word W -- as the tokenizer left it, marks and all --
- * run in a child of its own: no function and no builtin of this shell? */
-static bool sh_cmd_word_is_child(const char *w) {
+ * run in a child of its own: no function and no builtin of this shell?
+ * VIA: reached through `command`, which looks up no function (642). */
+static bool sh_cmd_word_is_child(const char *w, bool via) {
     if (!w) return false;
     SH_SB(n);
     if (sb_puts(&n, w) < 0 || !n.p) return false;
     shell_strip_nosplit_inplace(n.p);
     if (!n.p[0]) return false;
-    return !shell_function_lookup(n.p) && !shell_cmd_lookup(n.p);
+    return (via || !shell_function_lookup(n.p)) && !shell_cmd_lookup(n.p);
 }
 #endif
 
@@ -56627,7 +56679,7 @@ static void execute_line_text_inner(const char *src) {
          * A builtin's, a function's or a compound's redirection is the
          * shell's own, the line discarded (logs/b45 td5 h1 h6 h10, td6 r1
          * r2 r4, td3 w9) -- finding 629. */
-        if (g_tokfail_redir && sh_cmd_word_is_child(g_tokfail_cmd)) {
+        if (g_tokfail_redir && sh_cmd_word_is_child(g_tokfail_cmd, g_tokfail_via)) {
             g_bad_subst_soft = false;
             g_arith_expand_err = false;
             if (g_shell_flow == SHELL_FLOW_DISCARD ||
