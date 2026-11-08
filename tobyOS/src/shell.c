@@ -30734,6 +30734,10 @@ struct shell_token {
      * part -- written as they are -- or -1 (see shell_add_one_arg's
      * tilde). */
     long qoff;
+    /* An assignment of the prefix read after the command's words, as bash
+     * expands them, and put back in front once the read is done (see
+     * sh_ord_text, finding 641). */
+    bool ord_defer;
 };
 
 struct shell_redir {
@@ -38424,6 +38428,7 @@ struct shell_tokv {
 
 static const char *g_tok_word_raw;      /* see shell_token.raw */
 static long g_tok_word_qoff = -1;       /* ...and shell_token.qoff */
+static bool g_tok_word_defer;           /* ...and shell_token.ord_defer */
 
 static int shell_emit_token_fd(struct shell_tokv *tok, int *ntok,
                                enum shell_tok_type type, char *text,
@@ -38450,6 +38455,8 @@ static int shell_emit_token_fd(struct shell_tokv *tok, int *ntok,
     g_tok_word_raw = 0;
     t->qoff = g_tok_word_qoff;
     g_tok_word_qoff = -1;
+    t->ord_defer = g_tok_word_defer;
+    g_tok_word_defer = false;
     (*ntok)++;
     return 0;
 }
@@ -39175,6 +39182,353 @@ static int shell_tokenize_outer(const char *src, struct shell_tokv *tok,
 /* *out_tok receives the array -- in `words`, as long-lived as the text. It
  * is never NULL on success, so an empty line can still be indexed as
  * before. */
+/* ---- THE ORDER OF A SIMPLE COMMAND'S EXPANSIONS -------------------------
+ *
+ * bash expands a simple command's WORDS first -- the command word and its
+ * arguments, in order -- then its ASSIGNMENTS, then each REDIRECTION as it
+ * applies it, in order, wherever each was written:
+ *
+ *     < $(echo R >&2) cat $(echo W >&2)      bash: W R    tsh: R W
+ *     x=$(echo X >&2) cat $(echo W >&2)      bash: W X    tsh: X W
+ *     x=$(exit 3) echo $?                    bash: 0      tsh: 3
+ *     <<< ${a[} cat                          bash: cat's failure, status 1,
+ *                                            the line going on
+ *
+ * The same in a builtin's, a function's, an eval's, a pipeline stage's
+ * and a background command's (logs/b46 ra1 o1-o12, ra2 c7-c20, ra3
+ * d8-d20). tsh expands as it reads, left to right, and the last was the
+ * line's discard: the command was not known yet when its redirection
+ * failed (629's STILL OPEN, logs/b45 td8 u7) -- finding 641. So a simple
+ * command whose order can matter is read REORDERED: its words, then its
+ * assignments, then its redirections, each list as written. An assignment
+ * read after the words is marked (g_ord_defer) and read as a prefix one;
+ * its token goes back to the front when the read is done (sh_ord_tokens).
+ * Only the reader of a simple command asks for it (g_tok_order), and a
+ * command whose text this scan is not sure of is read as it was written. */
+static bool g_tok_order;               /* the next shell_tokenize may reorder */
+#define SH_ORD_DEFER_MAX 32
+/* One reordered read: its text, and where its deferred assignments start.
+ * A read inside it -- an in-process $( )'s own commands -- has its own. */
+struct sh_ord {
+    const char *text;
+    int n;
+    size_t at[SH_ORD_DEFER_MAX];
+};
+static struct sh_ord *g_ord;
+static size_t shell_assign_prefix_len_raw(const char *w);
+
+/* Did the group the skipper went over from S end at E (its closer read)? */
+static bool sh_ord_closed(const char *s, const char *e) {
+    if (!e || e <= s + 1) return false;
+    if (*s == '`') return e > s + 1 && e[-1] == '`';
+    return e[-1] == (s[1] == '{' ? '}' : ')');
+}
+
+/* A group a `case` may be in: its `)` patterns would end it early here */
+static bool sh_ord_has_case(const char *s, const char *e) {
+    for (const char *q = s; q + 4 <= e; q++)
+        if (q[0] == 'c' && q[1] == 'a' && q[2] == 's' && q[3] == 'e') return true;
+    return false;
+}
+
+/* Past the group at P -- `$( )`, `${ }`, a backquote, `<( )`, `NAME=( )` --
+ * or 0 when this is not sure of it. */
+static const char *sh_ord_group(const char *p, const char *end) {
+    const char *e = shell_brace_skip_subst(p, end);
+    if (!sh_ord_closed(p, e) || sh_ord_has_case(p, e)) return 0;
+    return e;
+}
+
+/* The end of the word at P as the reader takes it, nothing expanded; 0
+ * when this is not sure. PREFIX: in the command's assignment prefix. */
+static const char *sh_ord_word_end(const char *p, const char *end, bool prefix) {
+    const char *s = p;
+    if (prefix) {
+        size_t an = shell_assign_prefix_len_raw(p);
+        if (an > 0) {
+            p += an;
+            if (*p == '(') {                 /* NAME=( ... ) */
+                p = sh_ord_group(p - 1, end);
+                if (!p) return 0;
+            }
+        } else {
+            /* `a[1 + 2]` in command position is one word over its blanks */
+            const char *q = p;
+            while ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
+                   (*q >= '0' && *q <= '9') || *q == '_')
+                q++;
+            if (q > p && *q == '[') return 0;
+        }
+    }
+    while (p < end) {
+        char c = *p;
+        if (c == ' ' || c == '\t') break;
+        if (c == '\n' || c == '\r') return 0;
+        if (c == '\\') {
+            if (p + 1 >= end) return 0;
+            p += 2;
+            continue;
+        }
+        if (c == '\'') {
+            const char *q = p + 1;
+            while (q < end && *q != '\'') q++;
+            if (q >= end) return 0;
+            p = q + 1;
+            continue;
+        }
+        if (c == '$' && p[1] == '\'') {
+            const char *q = p + 2;
+            while (q < end && *q != '\'') {
+                if (*q == '\\' && q + 1 < end) q++;
+                q++;
+            }
+            if (q >= end) return 0;
+            p = q + 1;
+            continue;
+        }
+        if (c == '"' || (c == '$' && p[1] == '"')) {
+            const char *q = p + (c == '$' ? 2 : 1);
+            while (q < end && *q != '"') {
+                if (*q == '\\' && q + 1 < end) { q += 2; continue; }
+                if (*q == '`' || (*q == '$' && (q[1] == '(' || q[1] == '{'))) {
+                    q = sh_ord_group(q, end);
+                    if (!q) return 0;
+                    continue;
+                }
+                q++;
+            }
+            if (q >= end) return 0;
+            p = q + 1;
+            continue;
+        }
+        if (c == '$' && p[1] == '[') return 0;
+        if (c == '`' || (c == '$' && (p[1] == '(' || p[1] == '{')) ||
+            ((c == '<' || c == '>' || c == '=') && p[1] == '(')) {
+            p = sh_ord_group(p, end);
+            if (!p) return 0;
+            continue;
+        }
+        if (c == '(' || c == ')') return 0;     /* an extglob, a stray paren */
+        if (c == ';' || c == '&' || c == '|' || c == '<' || c == '>') break;
+        p++;
+    }
+    return p > s ? p : 0;
+}
+
+/* Past the redirection operator at P -- its descriptor or {NAME} with it
+ * -- or 0 when P is no redirection (a `<( )` is a word). */
+static const char *sh_ord_redir_op(const char *p) {
+    const char *q = p;
+    if (*q >= '0' && *q <= '9') {
+        while (*q >= '0' && *q <= '9') q++;
+        if (*q != '<' && *q != '>') return 0;
+    } else if (*q == '{') {
+        q++;
+        if (!((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') || *q == '_'))
+            return 0;
+        while ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
+               (*q >= '0' && *q <= '9') || *q == '_')
+            q++;
+        if (*q != '}' || (q[1] != '<' && q[1] != '>')) return 0;
+        q++;
+    }
+    if (*q == '&' && q[1] == '>') return q + (q[2] == '>' ? 3 : 2);
+    if (*q == '<') {
+        if (q[1] == '(') return 0;
+        if (q[1] == '<') return q + ((q[2] == '<' || q[2] == '-') ? 3 : 2);
+        if (q[1] == '&' || q[1] == '>') return q + 2;
+        return q + 1;
+    }
+    if (*q == '>') {
+        if (q[1] == '(') return 0;
+        if (q[1] == '>' || q[1] == '|' || q[1] == '&') return q + 2;
+        return q + 1;
+    }
+    return 0;
+}
+
+/* Does the item hold something that expands -- whose order can show? */
+static bool sh_ord_expands(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (s[i] == '$' || s[i] == '`' ||
+            ((s[i] == '<' || s[i] == '>') && i + 1 < n && s[i + 1] == '('))
+            return true;
+    return false;
+}
+
+#define SH_ORD_ITEMS_MAX 128
+struct sh_ord_item { const char *s; size_t n; char kind; };   /* a w r */
+
+/* SRC reordered into OUT, its simple commands' words before their
+ * assignments before their redirections where that order can show, and
+ * the deferred assignments' offsets in ORD. False when nothing moves, or
+ * the scan is not sure of the text. */
+static bool sh_ord_text(const char *src, struct shell_sb *out, struct sh_ord *ord) {
+    const char *end = src + strlen(src);
+    const char *p = src;
+    bool moved = false;
+    ord->n = 0;
+    /* (no redirection and no assignment: nothing can move) */
+    {
+        const char *q = src;
+        while (q < end && *q != '<' && *q != '>' && *q != '=') q++;
+        if (q >= end) return false;
+    }
+    struct sh_ord_item it_small[24];
+    struct sh_ord_item *it = it_small;
+    int it_cap = (int)(sizeof it_small / sizeof it_small[0]);
+    sb_truncate(out, 0);
+    bool ok = true;
+    while (ok && p < end) {
+        const char *cs = p;
+        int n = 0, nw = 0;
+        bool prefix = true;
+        for (;;) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (p >= end) break;
+            if (*p == '\n' || *p == '\r' || *p == '#' || *p == '(' ||
+                *p == ')' || (*p == ';' && p[1] == ';')) { ok = false; break; }
+            if (*p == ';' || *p == '|' || (*p == '&' && p[1] != '>')) break;
+            if (*p == '{' && (p[1] == ' ' || p[1] == '\t' || !p[1])) { ok = false; break; }
+            if (n >= it_cap) {
+                if (it_cap >= SH_ORD_ITEMS_MAX) { ok = false; break; }
+                struct sh_ord_item *nit = (struct sh_ord_item *)
+                    kmalloc(SH_ORD_ITEMS_MAX * sizeof *nit);
+                if (!nit) { ok = false; break; }
+                memcpy(nit, it, (size_t)n * sizeof *nit);
+                it = nit;
+                it_cap = SH_ORD_ITEMS_MAX;
+            }
+            const char *op = sh_ord_redir_op(p);
+            if (op) {
+                const char *w = op;
+                while (*w == ' ' || *w == '\t') w++;
+                const char *we = sh_ord_word_end(w, end, false);
+                if (!we) { ok = false; break; }
+                it[n++] = (struct sh_ord_item){ p, (size_t)(we - p), 'r' };
+                p = we;
+                continue;
+            }
+            if (*p == '<' || *p == '>' || *p == '&') {
+                if (!((*p == '<' || *p == '>') && p[1] == '(')) { ok = false; break; }
+            }
+            const char *we = sh_ord_word_end(p, end, prefix);
+            if (!we) { ok = false; break; }
+            char kind = 'w';
+            if (prefix && shell_assign_prefix_len_raw(p) > 0) {
+                kind = 'a';
+            } else if (prefix) {
+                /* the command word: a reserved word is no simple command */
+                char kw[16];
+                size_t kl = (size_t)(we - p);
+                if (kl < sizeof kw) {
+                    memcpy(kw, p, kl);
+                    kw[kl] = '\0';
+                    if (shell_word_is_keyword(kw) || strcmp(kw, "[[") == 0 ||
+                        (kl >= 2 && p[0] == '(' && p[1] == '(')) {
+                        ok = false;
+                        break;
+                    }
+                }
+                prefix = false;
+            }
+            if (kind == 'w') nw++;
+            it[n++] = (struct sh_ord_item){ p, (size_t)(we - p), kind };
+            p = we;
+        }
+        if (!ok) break;
+        /* whether this command's order can show */
+        bool need = false, defer = false;
+        for (int i = 0; i < n && !need; i++) {
+            if (it[i].kind != 'r') continue;
+            for (int j = i + 1; j < n; j++) {
+                bool later = it[j].kind == 'w' || (nw == 0 && it[j].kind == 'a');
+                if (later && (sh_ord_expands(it[i].s, it[i].n) ||
+                              sh_ord_expands(it[j].s, it[j].n))) {
+                    need = true;
+                    break;
+                }
+            }
+        }
+        if (nw > 0) {
+            bool ax = false, wx = false;
+            for (int i = 0; i < n; i++) {
+                if (it[i].kind == 'a' && sh_ord_expands(it[i].s, it[i].n)) ax = true;
+                if (it[i].kind == 'w' && sh_ord_expands(it[i].s, it[i].n)) wx = true;
+            }
+            defer = ax && wx;
+        }
+        if (need || defer) {
+            static const char order_defer[] = "war", order_keep[] = "awr";
+            const char *seq = defer ? order_defer : order_keep;
+            bool first = true;
+            for (int k = 0; k < 3 && ok; k++)
+                for (int i = 0; i < n; i++) {
+                    if (it[i].kind != seq[k]) continue;
+                    if (!first && sb_putc(out, ' ') < 0) { ok = false; break; }
+                    first = false;
+                    if (defer && it[i].kind == 'a') {
+                        if (ord->n >= SH_ORD_DEFER_MAX) { ok = false; break; }
+                        ord->at[ord->n++] = out->len;
+                    }
+                    if (sb_putmem(out, it[i].s, it[i].n) < 0) { ok = false; break; }
+                }
+            moved = true;
+            if (!ok) break;
+            if (sb_putc(out, ' ') < 0) { ok = false; break; }
+        } else if (sb_putmem(out, cs, (size_t)(p - cs)) < 0) {
+            ok = false;
+            break;
+        }
+        /* the separator, as written */
+        if (p < end) {
+            size_t sl = 1;
+            if ((*p == '|' && (p[1] == '|' || p[1] == '&')) || (*p == '&' && p[1] == '&'))
+                sl = 2;
+            if (sb_putmem(out, p, sl) < 0) { ok = false; break; }
+            p += sl;
+        }
+    }
+    if (it != it_small) kfree(it);
+    if (!ok || !moved || !out->p) {
+        ord->n = 0;
+        return false;
+    }
+    ord->text = out->p;
+    return true;
+}
+
+/* Is P, in the text being read, a deferred assignment's start? */
+static bool sh_ord_at(const char *p) {
+    if (!g_ord || !g_ord->text) return false;
+    size_t off = (size_t)(p - g_ord->text);
+    for (int i = 0; i < g_ord->n; i++)
+        if (g_ord->at[i] == off) return true;
+    return false;
+}
+
+/* Each command's deferred assignments back in front of it, in order. */
+static void sh_ord_tokens(struct shell_token *v, int ntok) {
+    int k = 0;
+    while (k < ntok) {
+        int e = k;
+        while (e < ntok && v[e].type != SH_TOK_SEMI && v[e].type != SH_TOK_BG &&
+               v[e].type != SH_TOK_PIPE && v[e].type != SH_TOK_AND_IF &&
+               v[e].type != SH_TOK_OR_IF)
+            e++;
+        /* a stable rotation: each deferred token moves to the front, after
+         * those moved before it */
+        int dst = k;
+        for (int i = k; i < e; i++) {
+            if (!v[i].ord_defer) continue;
+            struct shell_token t = v[i];
+            for (int j = i; j > dst; j--) v[j] = v[j - 1];
+            v[dst++] = t;
+        }
+        k = e + 1;
+    }
+}
+
 struct sh_rdx;                           /* see sh_rdx_enter */
 static struct sh_rdx *g_rdx_live;
 static void sh_rdx_unwind(struct sh_rdx *live0);
@@ -39209,8 +39563,10 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     int saved_bsub_kind = g_bsub_unit_kind;
     bool saved_redir_word = g_tok_redir_word;
     const char *saved_redir_cmd = g_tok_redir_cmd;
+    bool saved_defer = g_tok_word_defer;
     g_tok_redir_word = false;
     g_tok_redir_cmd = 0;
+    g_tok_word_defer = false;
     g_tokpfx_base = g_tokpfx_n;
     struct sh_rdx *rdx_live0 = g_rdx_live;
     int rc_outer = shell_tokenize_outer(src, &tv, out_ntok, words);
@@ -39219,6 +39575,7 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     g_tokfail_cmd = g_tokfail_redir ? g_tok_redir_cmd : 0;
     g_tok_redir_word = saved_redir_word;
     g_tok_redir_cmd = saved_redir_cmd;
+    g_tok_word_defer = saved_defer;
     sh_rdx_unwind(rdx_live0);
     g_bsub_unit = saved_bsub;
     g_bsub_unit_kind = saved_bsub_kind;
@@ -39237,17 +39594,37 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
 
 static int shell_tokenize_outer(const char *src, struct shell_tokv *tok,
                                 int *out_ntok, struct shell_words *words) {
+    /* (a simple command read in bash's order -- 641; a read inside it is
+     * its own) */
+    bool order = g_tok_order;
+    g_tok_order = false;
+    struct sh_ord *ord_saved = g_ord;
+    g_ord = 0;
+    const char *text = src;
+    SH_SB(expanded);
     if (src && shell_has_brace(src)) {
         /* The expansion grows as far as it has to: `echo {1..20000}` is
          * 108 KB of words. A fixed buffer made a big one fail, and a failed
          * brace expansion fell back to the RAW text -- so tsh printed the
          * braces back where bash printed the numbers. */
-        SH_SB(expanded);
-        if (shell_expand_braces_line(src, &expanded) < 0)
+        if (shell_expand_braces_line(src, &expanded) < 0) {
+            g_ord = ord_saved;
             return -1;                  /* only memory can fail it now */
-        return shell_tokenize_inner(expanded.p, tok, out_ntok, words);
+        }
+        text = expanded.p;
     }
-    return shell_tokenize_inner(src, tok, out_ntok, words);
+    SH_SB(reord);
+    struct sh_ord ord;
+    ord.text = 0;
+    ord.n = 0;
+    if (order && text && sh_ord_text(text, &reord, &ord)) {
+        text = reord.p;
+        g_ord = &ord;
+    }
+    int rc = shell_tokenize_inner(text, tok, out_ntok, words);
+    if (rc >= 0 && g_ord) sh_ord_tokens(tok->v, *out_ntok);
+    g_ord = ord_saved;
+    return rc;
 }
 
 /* `<(cmd)` and `>(cmd)` are WORDS, and the word is the /dev/fd path the
@@ -39705,6 +40082,10 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
         }
         bool word_quoted = false;
         const char *raw_word_start = p;      /* shell_token.raw */
+        /* AN ASSIGNMENT READ AFTER THE COMMAND'S WORDS is still the
+         * prefix's, as bash expands it (see sh_ord_text, 641) */
+        bool ord_defer = sh_ord_at(p);
+        if (ord_defer) prefix_ok = true;
         g_tok_word_src = p;                  /* shell_bad_subst_noclose */
         /* an ASSIGNMENT's value is expanded on its own, and is what a bad
          * substitution in it names (`x=${a[]}` names `${a[]}`); a
@@ -40273,6 +40654,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
             g_tok_word_raw = words_store(words, raw_word_start,
                                          (size_t)(p - raw_word_start));
             g_tok_word_qoff = word_qoff;
+            g_tok_word_defer = ord_defer;
             if (shell_emit_token(tok, &ntok, SH_TOK_WORD, start, word_quoted) < 0) return -1;
             /* A PREFIX ASSIGNMENT IS IN FORCE FOR THE WORDS AFTER IT. See
              * g_tokpfx. `prefix_ok` is the same command-position rule the
@@ -40327,6 +40709,8 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 }
                 prefix_ok = false;
             }
+            /* (the words came before it: what follows is not the prefix) */
+            if (ord_defer) prefix_ok = false;
         }
     }
 
@@ -56232,6 +56616,7 @@ static void execute_line_text_inner(const char *src) {
             dbg_before = true;
         }
     }
+    g_tok_order = true;                         /* bash's order: 641 */
     if (shell_tokenize(src, &tok, &ntok, &words) < 0) {
 #ifdef SHELL_HOSTED
         /* AN EXTERNAL COMMAND'S REDIRECTION IS THE CHILD'S: bash forks
