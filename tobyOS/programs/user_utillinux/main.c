@@ -12,11 +12,12 @@
  * /proc/mounts, lsns reads /proc/<pid>/ns, wdctl asks the watchdog it
  * actually has.
  *
- * The last four have NO data source on this system, and each says exactly
- * which one is missing instead of printing an empty table that reads as
- * "nothing to report":
+ * The last four print no table, and each says exactly why instead of
+ * printing an empty one that reads as "nothing to report" -- three have NO
+ * data source on this system, and prlimit is not written:
  *
- *   prlimit   no getrlimit/setrlimit syscall exists
+ *   prlimit   not written yet: the limits are the kernel's now (batch 47,
+ *             getrlimit/setrlimit), and `ulimit` reads and sets them
  *   lslocks   no /proc/locks
  *   lsipc     the kernel has SysV IPC but exposes no listing interface
  *   zramctl   zram exists but nothing reports its devices (and
@@ -444,8 +445,8 @@ static int no_source(const char *what, const char *why) {
 static int cmd_prlimit(int argc, char **argv) {
     (void)argc; (void)argv;
     return no_source("prlimit",
-        "resource limits are not available: this kernel has no "
-        "getrlimit/setrlimit syscall, so there is nothing to read or set");
+        "this command is not written yet; the resource limits are the "
+        "kernel's, and the shell's `ulimit` reads and sets them");
 }
 static int cmd_lslocks(int argc, char **argv) {
     (void)argc; (void)argv;

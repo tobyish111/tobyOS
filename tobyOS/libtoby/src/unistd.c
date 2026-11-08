@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <sys/statfs.h>
+#include <sys/resource.h>
 #include <stdio.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -754,6 +755,36 @@ int setpriority(int which, int who, int prio) {
     long r = toby_sc3(ABI_SYS_SETNICE, which, who, prio);
     if (r < 0) { errno = (int)-r; return -1; }
     return 0;
+}
+
+/* ---- resource limits (batch 47): one call, prlimit64's --------------------
+ * struct rlimit is the kernel's { soft, hard } pair as it stands. getrlimit
+ * of a NULL pointer is EFAULT, not a quiet success: the kernel judges the
+ * resource first and then the pointer, as Linux's does, so this goes to
+ * the kernel with the pointer as it is. */
+int prlimit(int pid, int resource, const struct rlimit *new_limit,
+            struct rlimit *old_limit) {
+    long r = toby_sc4(ABI_SYS_PRLIMIT, pid, resource,
+                      (long)(uintptr_t)new_limit, (long)(uintptr_t)old_limit);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 0;
+}
+
+int getrlimit(int resource, struct rlimit *rlim) {
+    if (!rlim) {
+        /* the kernel would take a 0 OLD as "not wanted": judge the
+         * resource there, then fail the pointer */
+        struct rlimit tmp;
+        if (prlimit(0, resource, 0, &tmp) < 0) return -1;
+        errno = EFAULT;
+        return -1;
+    }
+    return prlimit(0, resource, 0, rlim);
+}
+
+int setrlimit(int resource, const struct rlimit *rlim) {
+    if (!rlim) { errno = EFAULT; return -1; }
+    return prlimit(0, resource, rlim, 0);
 }
 
 /* nice(3): add INC to the caller's niceness; the new one, or -1 with errno

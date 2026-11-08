@@ -487,6 +487,10 @@ long sys_fork(void) {
     /* Copy parent's proc struct as a starting point. */
     int child_pid = proc_pid_alloc(child);
     memcpy(child, parent, sizeof(*child));
+    /* the limits the parent USES: a thread's own table is not them, its
+     * leader's is (proc_rlim; include/tobyos/rlimit.h) */
+    { struct tobyos_rlim *rl = proc_rlim(parent);
+      if (rl) { memcpy(child->rlim, rl, sizeof child->rlim); child->rlim_set = true; } }
 
     child->pid       = child_pid;
     child->ppid      = parent->pid;
@@ -920,6 +924,10 @@ long sys_fork_share(void) {
 
     int child_pid = proc_pid_alloc(child);
     memcpy(child, parent, sizeof(*child));
+    /* the limits the parent USES: a thread's own table is not them, its
+     * leader's is (proc_rlim; include/tobyos/rlimit.h) */
+    { struct tobyos_rlim *rl = proc_rlim(parent);
+      if (rl) { memcpy(child->rlim, rl, sizeof child->rlim); child->rlim_set = true; } }
 
     child->pid       = child_pid;
     child->ppid      = parent->pid;
@@ -1153,6 +1161,10 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     int child_pid = proc_pid_alloc(child);
 
     memcpy(child, parent, sizeof(*child));
+    /* a thread reads its leader's limits (proc_rlim); its own copy is
+     * only what it falls back to should the leader be gone */
+    { struct tobyos_rlim *rl = proc_rlim(tg);
+      if (rl) { memcpy(child->rlim, rl, sizeof child->rlim); child->rlim_set = true; } }
     child->pid        = child_pid;
     child->ppid       = parent->ppid;
     child->tgid       = tg->pid;                /* same thread group */

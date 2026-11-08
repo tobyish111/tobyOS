@@ -399,16 +399,75 @@ int fd_cloexec_get(struct proc *p, int fd) {
     return m ? (m[fd >> 3] >> (fd & 7)) & 1 : 0;
 }
 
+/* RESOURCE LIMITS (include/tobyos/rlimit.h). A thread's are its leader's,
+ * as its descriptors are; a table never set reads as the defaults. */
+struct tobyos_rlim *proc_rlim(struct proc *p) {
+    if (!p) return 0;
+    if (p->is_thread) {
+        struct proc *ld = proc_lookup(p->tgid);
+        if (ld) p = ld;
+    }
+    if (!p->rlim_set) {
+        for (int r = 0; r < TOBYOS_RLIM_NLIMITS; r++)
+            tobyos_rlimit_default(r, &p->rlim[r].cur, &p->rlim[r].max);
+        p->rlim_set = true;
+    }
+    return p->rlim;
+}
+
+int proc_nofile(struct proc *p) {
+    struct tobyos_rlim *t = proc_rlim(p);
+    if (!t) return PROC_NFDS;
+    uint64_t c = t[TOBYOS_RLIMIT_NOFILE].cur;
+    return c < (uint64_t)PROC_NFDS ? (int)c : PROC_NFDS;
+}
+
+/* May CALLER read or set TARGET's limits? Its own thread group; root
+ * (Linux's CAP_SYS_RESOURCE); or a TARGET whose real, effective and saved
+ * ids are all the caller's real ones -- Linux's prlimit rule. */
+static bool proc_rlimit_may(struct proc *caller, struct proc *target) {
+    if (!caller || !target) return false;
+    if (caller == target) return true;
+    if (caller->tgid && caller->tgid == target->tgid) return true;
+    if (caller->uid == 0) return true;
+    return caller->ruid == target->ruid && caller->ruid == target->uid &&
+           caller->ruid == target->suid && caller->rgid == target->rgid &&
+           caller->rgid == target->gid && caller->rgid == target->sgid;
+}
+
+/* Linux's order: no process, then the permission, then the resource and
+ * the new values; the old values only once all of that has passed. */
+long proc_prlimit(struct proc *caller, struct proc *target, int resource,
+                  const struct tobyos_rlim *nw, struct tobyos_rlim *old) {
+    if (!target) return -ABI_ESRCH;
+    if (!proc_rlimit_may(caller, target)) return -ABI_EPERM;
+    if (resource < 0 || resource >= TOBYOS_RLIM_NLIMITS) return -ABI_EINVAL;
+    struct tobyos_rlim *t = proc_rlim(target);
+    if (!t) return -ABI_ESRCH;
+    struct tobyos_rlim was = t[resource];
+    if (nw) {
+        int e = tobyos_rlimit_check(resource, &was, nw,
+                                    caller && caller->uid == 0);
+        if (e) return e == 1 ? -ABI_EPERM : -ABI_EINVAL;
+        t[resource] = *nw;
+    }
+    if (old) *old = was;
+    return 0;
+}
+
 static struct file *fd_lookup(int fd) {
     if (fd < 0 || fd >= PROC_NFDS) return 0;
     struct file **t = proc_fds(current_proc());
     return t ? t[fd] : 0;
 }
 
+/* The lowest free descriptor BELOW P'S SOFT RLIMIT_NOFILE, holding F; -1
+ * when there is none, which every creator reports as EMFILE. */
 static int fd_alloc_into(struct proc *p, struct file *f) {
     struct file **t = proc_fds(p);
     if (!t) return -1;
-    for (int i = 0; i < PROC_NFDS; i++) {
+    int lim = proc_nofile(p);
+    for (int i = 0; i < lim; i++) {
         if (!t[i]) {
             t[i] = f;
             /* A fresh slot starts NOT close-on-exec; a stale bit left by a
@@ -710,10 +769,12 @@ static long sys_pipe(int *user_fds_out) {
 
     struct proc *p = current_proc();
     struct file **t = proc_fds(p);
+    /* no room for both ends: EMFILE, as Linux's (it was a bare -1, which
+     * reads as EPERM -- logs/b47/rl, "pipe when full") */
     int fd_r = fd_alloc_into(p, r);
-    if (fd_r < 0) { file_close(r); file_close(w); return -1; }
+    if (fd_r < 0) { file_close(r); file_close(w); return -ABI_EMFILE; }
     int fd_w = fd_alloc_into(p, w);
-    if (fd_w < 0) { t[fd_r] = 0; file_close(r); file_close(w); return -1; }
+    if (fd_w < 0) { t[fd_r] = 0; file_close(r); file_close(w); return -ABI_EMFILE; }
 
     int fds[2] = { fd_r, fd_w };
     if (copy_to_user(user_fds_out, fds, sizeof(fds)) != 0) {
@@ -2302,6 +2363,30 @@ static long nice_set(int which, int who, long niceval) {
         if (err == -ABI_ESRCH) err = 0;
     }
     return err;
+}
+
+/* prlimit64(2) for both personalities (LX_prlimit64, ABI_SYS_PRLIMIT):
+ * PID 0 is the caller, any other a pid as the caller sees it (slice 10's
+ * namespaces); NEWP and OLDP point at { cur, max } pairs, either 0. The new
+ * values are read before anything is judged, the old written back only
+ * when the call has succeeded -- Linux's order. */
+static long sys_prlimit(int pid, int resource, uint64_t newp, uint64_t oldp) {
+    struct tobyos_rlim nw, old;
+    if (newp && copy_from_user(&nw, (const void *)(uintptr_t)newp, sizeof nw) != 0)
+        return -ABI_EFAULT;
+    struct proc *me = current_proc();
+    struct proc *t = me;
+    if (pid < 0) {
+        t = 0;
+    } else if (pid > 0) {
+        int k = pid_knr(pid);
+        t = k ? proc_lookup(k) : 0;
+    }
+    long r = proc_prlimit(me, t, resource, newp ? &nw : 0, oldp ? &old : 0);
+    if (r == 0 && oldp &&
+        copy_to_user((void *)(uintptr_t)oldp, &old, sizeof old) != 0)
+        return -ABI_EFAULT;
+    return r;
 }
 
 /* Copy a user-provided path into the kernel and resolve it against the
@@ -4872,6 +4957,10 @@ static long sys_dup2(int oldfd, int newfd) {
     if (oldfd == newfd) {
         return fd_lookup(oldfd) ? newfd : -ABI_EBADF;
     }
+    /* a number at or past the soft RLIMIT_NOFILE is no descriptor to make
+     * (Linux's dup2/dup3) -- though one already open there stays, and
+     * dup2(n, n) of it answered above */
+    if (newfd >= proc_nofile(current_proc())) return -ABI_EBADF;
     struct file *f = fd_lookup(oldfd);
     if (!f) return -ABI_EBADF;
     struct file *cl = file_clone(f);
@@ -5713,6 +5802,11 @@ static long sys_spawn(const struct abi_spawn_req *req) {
         for (uint32_t i = 0; i < kreq.nextra; i++) {
             int cfd = uex[i].child_fd, pfd = uex[i].parent_fd;
             if (movefds && pfd >= 0) pfd &= ~ABI_SPAWN_FD_MOVE;
+            /* NOT judged by the soft RLIMIT_NOFILE: this is how a shell
+             * hands on what it holds, and a fork-and-exec child inherits a
+             * descriptor opened above a limit lowered later still open, as
+             * Linux's does. A shell refuses a NEW redirection there itself,
+             * as bash's dup2 does (batch 47). */
             if (cfd < 0 || cfd >= PROC_NFDS ||
                 pfd < 0 || pfd >= PROC_NFDS || !ptab || !ptab[pfd]) {
                 failed = true;
@@ -7658,6 +7752,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     }
     case ABI_SYS_GETNICE: return nice_get((int)a1, (int)a2);
     case ABI_SYS_SETNICE: return nice_set((int)a1, (int)a2, (long)(int)a3);
+    case ABI_SYS_PRLIMIT:           /* as Linux's prlimit64 (batch 47) */
+        return sys_prlimit((int)a1, (int)a2, (uint64_t)a3, (uint64_t)a4);
     case ABI_SYS_XSTAT:
         if (a1 == 2) return sys_fstat_sz((int)a2, (struct abi_stat *)a3, (size_t)a4);
         if (a1 != 0 && a1 != 1) return -ABI_EINVAL;
@@ -10313,9 +10409,28 @@ static int linux_fast_time_syscall(long num, long a1, long a2, long *out) {
     }
 }
 
+static long lx_do_poll_in(struct lx_pollfd *fds, uint64_t ufds,
+                          unsigned long nfds, long timeout_ms);
+
+/* poll(2) over NFDS entries: more than the soft RLIMIT_NOFILE is EINVAL,
+ * Linux's rule -- the cap was a fixed 256, a quarter of the descriptors a
+ * process can hold. Up to 256 the entries sit on the stack, as they did;
+ * more go on the heap. */
 static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
-    if (nfds > LX_POLL_MAXFDS) return -ABI_EINVAL;
-    struct lx_pollfd fds[LX_POLL_MAXFDS];
+    if (nfds > (unsigned long)proc_nofile(current_proc())) return -ABI_EINVAL;
+    if (nfds <= LX_POLL_MAXFDS) {
+        struct lx_pollfd fds[LX_POLL_MAXFDS];
+        return lx_do_poll_in(fds, ufds, nfds, timeout_ms);
+    }
+    struct lx_pollfd *fds = (struct lx_pollfd *)kmalloc(nfds * sizeof *fds);
+    if (!fds) return -ABI_ENOMEM;
+    long r = lx_do_poll_in(fds, ufds, nfds, timeout_ms);
+    kfree(fds);
+    return r;
+}
+
+static long lx_do_poll_in(struct lx_pollfd *fds, uint64_t ufds,
+                          unsigned long nfds, long timeout_ms) {
     if (nfds && copy_from_user(fds, (const void *)(uintptr_t)ufds,
                                nfds * sizeof(fds[0])) != 0)
         return -ABI_EFAULT;
@@ -10847,7 +10962,10 @@ static long lx_socketpair(int domain, int type, int proto, uint64_t usv) {
     int fd0 = lx_sock_install(a);
     if (fd0 < 0) { sock_close(a); sock_close(b); return -ABI_EMFILE; }
     int fd1 = lx_sock_install(b);
-    if (fd1 < 0) { sock_close(b); return -ABI_EMFILE; }    /* fd0/a leak on rare OOM */
+    /* one slot for two ends -- an ordinary EMFILE under RLIMIT_NOFILE, no
+     * longer only a rare OOM: the first end goes too, as on Linux, where
+     * socketpair gives both or neither */
+    if (fd1 < 0) { sock_close(b); (void)sys_close(fd0); return -ABI_EMFILE; }
 
     if (type & LX_O_CLOEXEC) {                  /* SOCK_CLOEXEC, both ends */
         fd_cloexec_set(current_proc(), fd0, 1);
@@ -16507,35 +16625,30 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_msgctl:
         return sysv_msgctl((int)a1, (int)a2, (uint64_t)a3);
 
-    /* prlimit64(pid, resource, *new, *old) and the legacy getrlimit/setrlimit.
-     * glibc reads RLIMIT_STACK at startup (to size the main+default thread
-     * stacks) and RLIMIT_NOFILE elsewhere. We don't enforce limits, so report
-     * sane values and accept any set as a no-op. */
-    case LX_prlimit64: {
-        int      resource = (int)a2;
-        uint64_t oldp     = (uint64_t)a4;
-        if (oldp) {
-            struct { uint64_t cur, max; } rl;
-            /* include/tobyos/rlimit.h: the one table /bin/tsh reads too */
-            tobyos_rlimit(resource, PROC_NFDS, &rl.cur, &rl.max);
-            if (copy_to_user((void *)(uintptr_t)oldp, &rl, sizeof rl) != 0)
-                return -ABI_EFAULT;
-        }
-        return 0;                            /* a3 (new limit) accepted as no-op */
-    }
+    /* prlimit64(pid, resource, *new, *old) and the legacy getrlimit and
+     * setrlimit, over each process's own table (include/tobyos/rlimit.h).
+     * They reported one fixed table and took any set as a no-op, so
+     * `ulimit -n 128` changed nothing a later `ulimit -n` printed. glibc
+     * reads RLIMIT_STACK at startup (the main and default thread stacks). */
+    case LX_prlimit64:
+        return sys_prlimit((int)a1, (int)a2, (uint64_t)a3, (uint64_t)a4);
     case LX_getrlimit: {                     /* (resource, *rlim) */
-        int      resource = (int)a1;
-        uint64_t out      = (uint64_t)a2;
-        if (out) {
-            struct { uint64_t cur, max; } rl;
-            tobyos_rlimit(resource, PROC_NFDS, &rl.cur, &rl.max);
-            if (copy_to_user((void *)(uintptr_t)out, &rl, sizeof rl) != 0)
-                return -ABI_EFAULT;
-        }
+        /* the resource is judged first, then the pointer -- even a NULL
+         * one, EFAULT (Linux's getrlimit) */
+        struct tobyos_rlim old;
+        long r = proc_prlimit(current_proc(), current_proc(), (int)a1, 0, &old);
+        if (r) return r;
+        if (copy_to_user((void *)(uintptr_t)a2, &old, sizeof old) != 0)
+            return -ABI_EFAULT;
         return 0;
     }
-    case LX_setrlimit:
-        return 0;
+    case LX_setrlimit: {                     /* (resource, *rlim) */
+        /* the pointer first: EFAULT before any EINVAL (Linux's setrlimit) */
+        struct tobyos_rlim nw;
+        if (copy_from_user(&nw, (const void *)(uintptr_t)a2, sizeof nw) != 0)
+            return -ABI_EFAULT;
+        return proc_prlimit(current_proc(), current_proc(), (int)a1, &nw, 0);
+    }
 
     /* clone3(*cl_args, size): the modern thread-spawn entry glibc 2.41 tries
      * FIRST for pthread_create (falling back to clone on -ENOSYS). Translate
@@ -17730,13 +17843,16 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             struct file *ff = fd_lookup((int)a1);
             if (!ff) return -ABI_EBADF;
             int minfd = (int)a3;
-            if (minfd < 0 || minfd >= PROC_NFDS) return -ABI_EINVAL;
             struct proc *p = current_proc();
             if (!p) return -ABI_EPERM;
+            /* from at or past the soft RLIMIT_NOFILE: EINVAL; none free
+             * between it and the limit: EMFILE (Linux's f_dupfd) */
+            int lim = proc_nofile(p);
+            if (minfd < 0 || minfd >= lim) return -ABI_EINVAL;
             struct file **tab = proc_fds(p);
             if (!tab) return -ABI_EPERM;
             int nfd = -1;
-            for (int i = minfd; i < PROC_NFDS; i++)
+            for (int i = minfd; i < lim; i++)
                 if (!tab[i]) { nfd = i; break; }
             if (nfd < 0) return -ABI_EMFILE;
             struct file *cl = file_clone(ff);

@@ -953,12 +953,12 @@ static int do_sort(int argc, char **argv) {
                 su_error(2, 0, "minimum --batch-size argument is %s", su_quote("2"));
             }
             /* GNU's limit: the open-file limit less three */
+            /* (the soft limit is the kernel's own since batch 47: `ulimit -n
+             * 64; sort --batch-size=62` is too large, as GNU's says) */
             uintmax_t max = 1021;                  /* tobyOS: 1024 descriptors */
-#ifdef SU_HOST
             struct rlimit rl;
             if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 3)
                 max = (uintmax_t)rl.rlim_cur - 3;
-#endif
             if (r == SU_NUM_OVERFLOW || v > max) {
                 su_error(0, 0, "--batch-size argument %s too large", su_quote(su_optarg));
                 su_error(2, 0, "maximum --batch-size argument with current rlimit is %ju", max);

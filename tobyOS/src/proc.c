@@ -1028,6 +1028,16 @@ static int spawn_body(const char *path, const char *name,
         /* niceness too, and the scheduling class that goes with it */
         p->nice       = parent ? parent->nice       : 0;
         if (p->nice) p->prio = p->nice > 0 ? PRIO_LOW : PRIO_HIGH;
+        /* the resource limits, as fork copies them -- a spawn is a fork and
+         * an exec in one, and exec keeps them; with no parent the wiped
+         * table reads as the defaults (include/tobyos/rlimit.h) */
+        {
+            struct tobyos_rlim *rl = parent ? proc_rlim(parent) : 0;
+            if (rl) {
+                memcpy(p->rlim, rl, sizeof p->rlim);
+                p->rlim_set = true;
+            }
+        }
         /* the session and its terminal, as fork copies them */
         p->sid        = parent ? parent->sid        : 0;
         p->ctty_kind  = parent ? parent->ctty_kind  : PROC_CTTY_CONSOLE;

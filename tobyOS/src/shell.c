@@ -28244,9 +28244,62 @@ static int ulim_factor(const struct shell_ulim *u) {
     return u->factor == ULIM_POSIXBLK ? (g_opt_posix ? 512 : 1024) : u->factor;
 }
 
+/* THE LIMITS ARE THE KERNEL'S (batch 47). /bin/tsh reads and sets its own
+ * process's table (getrlimit/setrlimit over ABI_SYS_PRLIMIT), which its
+ * children inherit and the kernel enforces -- RLIMIT_NOFILE above all. It
+ * was one fixed table, and a set was accepted and kept nowhere: `ulimit -n
+ * 128; ulimit -n` printed 1024. The kernel shell runs as pid 0, whose table
+ * every kernel spawn starts from, so its `ulimit` keeps a table of its
+ * own, judged by the same rules (include/tobyos/rlimit.h) -- as its umask
+ * is its own. */
+#ifdef SHELL_HOSTED
+/* programs/tsh/host.c: 0 or the errno, and the C library's words for one */
+extern int host_getrlimit(int res, uint64_t *cur, uint64_t *max);
+extern int host_setrlimit(int res, uint64_t cur, uint64_t max);
+extern const char *host_errtext(int e);
+#else
+static struct tobyos_rlim g_ks_rlim[TOBYOS_RLIM_NLIMITS];
+static bool g_ks_rlim_set;
+#endif
+
 static void ulim_get(const struct shell_ulim *u, uint64_t *soft, uint64_t *hard) {
     if (u->res < 0) { *soft = *hard = 4096; return; }   /* PIPE_BUF */
-    tobyos_rlimit(u->res, PROC_NFDS, soft, hard);
+#ifdef SHELL_HOSTED
+    if (host_getrlimit(u->res, soft, hard) != 0)
+        tobyos_rlimit_default(u->res, soft, hard);
+#else
+    if (!g_ks_rlim_set) {
+        for (int r = 0; r < TOBYOS_RLIM_NLIMITS; r++)
+            tobyos_rlimit_default(r, &g_ks_rlim[r].cur, &g_ks_rlim[r].max);
+        g_ks_rlim_set = true;
+    }
+    *soft = g_ks_rlim[u->res].cur;
+    *hard = g_ks_rlim[u->res].max;
+#endif
+}
+
+/* Set U's limits to SOFT and HARD: 0, or the errno (Linux's numbering)
+ * the kernel refused them with. */
+static int ulim_set(const struct shell_ulim *u, uint64_t soft, uint64_t hard) {
+#ifdef SHELL_HOSTED
+    return host_setrlimit(u->res, soft, hard);
+#else
+    struct tobyos_rlim nw = { soft, hard };
+    uint64_t s0, h0;
+    ulim_get(u, &s0, &h0);                       /* (fills the table) */
+    int e = tobyos_rlimit_check(u->res, &g_ks_rlim[u->res], &nw, 1);
+    if (e) return e;
+    g_ks_rlim[u->res] = nw;
+    return 0;
+#endif
+}
+
+static const char *ulim_errtext(int e) {
+#ifdef SHELL_HOSTED
+    return host_errtext(e);
+#else
+    return e == 1 ? "Operation not permitted" : "Invalid argument";
+#endif
 }
 
 static void ulim_printone(const struct shell_ulim *u, uint64_t v, bool desc) {
@@ -28281,7 +28334,14 @@ static int ulim_one(char opt, const char *arg, int mode, bool multiple) {
         ulim_printone(u, (mode & ULIM_SOFT) ? soft : hard, multiple);
         return 0;
     }
-    if (strcmp(arg, "hard") && strcmp(arg, "soft") && strcmp(arg, "unlimited")) {
+    uint64_t nv;
+    if (!strcmp(arg, "unlimited")) {
+        nv = TOBYOS_RLIM_INFINITY;
+    } else if (!strcmp(arg, "hard")) {
+        nv = hard;                               /* the limit as it stands */
+    } else if (!strcmp(arg, "soft")) {
+        nv = soft;
+    } else {
         bool digits = *arg != 0;
         for (const char *p = arg; *p; p++) if (*p < '0' || *p > '9') digits = false;
         if (!digits) {
@@ -28300,11 +28360,21 @@ static int ulim_one(char opt, const char *arg, int mode, bool multiple) {
             kprintf("ulimit: %s: limit out of range\n", arg);
             return 1;
         }
+        nv = v * f;
     }
-    /* the pipe size cannot be set; everything else is accepted and, on
-     * this kernel, changes nothing */
+    /* the pipe size cannot be set */
     if (u->res < 0) {
         kprintf("ulimit: %s: cannot modify limit: Invalid argument\n", u->desc);
+        return 1;
+    }
+    /* a bare value sets both limits, -S or -H the one (bash's; logs/b47
+     * rl ulim-wsl) -- and the kernel judges it: a soft limit over the hard
+     * one is EINVAL, raising a hard one without root EPERM */
+    int e = ulim_set(u, (mode & ULIM_SOFT) ? nv : soft,
+                     (mode & ULIM_HARD) ? nv : hard);
+    if (e) {
+        kprintf("ulimit: %s: cannot modify limit: %s\n", u->desc,
+                ulim_errtext(e));
         return 1;
     }
     return 0;

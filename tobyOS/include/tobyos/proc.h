@@ -47,6 +47,7 @@
 #include <tobyos/types.h>
 #include <tobyos/abi/abi.h>
 #include <tobyos/signal.h>
+#include <tobyos/rlimit.h>
 
 #define PROC_MAX        256           /* proc/thread slots. Chromium single-
                                        * process spawns ~30-50 threads (each a
@@ -67,7 +68,7 @@ struct file;
  * return: proc_kstack_free frees p's and clears kstack_base/kstack_top. */
 void *proc_kstack_alloc(void);
 void  proc_kstack_free(struct proc *p);
-#define PROC_NFDS       1024          /* per-proc file descriptor table size.
+#define PROC_NFDS       TOBYOS_NR_OPEN /* per-proc file descriptor table size (1024).
                                        * Must match the RLIMIT_NOFILE we report
                                        * (syscall.c) -- Chromium+Mojo+threads
                                        * share ONE table (CLONE_FILES) and open
@@ -540,6 +541,15 @@ struct proc {
      * existed every creator dropped O_CLOEXEC/SOCK_CLOEXEC on the floor
      * and every descriptor leaked across exec (2026-08-22 audit). */
     uint8_t         fd_cloexec[PROC_NFDS / 8];
+
+    /* Resource limits, soft and hard, Linux's sixteen (include/tobyos/
+     * rlimit.h). Reached only through proc_rlim(), which gives a thread its
+     * leader's table, as proc_fds() does, and fills a table never set with
+     * the defaults -- so no way of making a process can leave it a zero
+     * RLIMIT_NOFILE, which would refuse it every descriptor. fork's memcpy
+     * copies them, and so does spawn; exec keeps them. */
+    struct tobyos_rlim rlim[TOBYOS_RLIM_NLIMITS];
+    bool            rlim_set;
 
     /* Session tag (milestone 14). 0 means "no user session" (kernel
      * thread / pre-login boot procs). On every spawn we copy this
@@ -1163,6 +1173,18 @@ struct file **proc_fds(struct proc *p);
  * leader's bitmap exactly as proc_fds routes to the leader's table. */
 void fd_cloexec_set(struct proc *p, int fd, int on);
 int  fd_cloexec_get(struct proc *p, int fd);
+
+/* Resource limits (syscall.c; include/tobyos/rlimit.h). proc_rlim: the
+ * table P uses -- its leader's for a thread -- filled with the defaults the
+ * first time a table never set is read; 0 only for no P. proc_nofile: P's
+ * soft RLIMIT_NOFILE as a descriptor count, never above PROC_NFDS.
+ * proc_prlimit: Linux's prlimit64 by CALLER on TARGET (0: no such process,
+ * ESRCH): OLD gets the limit as it was and NW, when not 0, becomes it --
+ * 0 or -ABI_E*, OLD written only on success. */
+struct tobyos_rlim *proc_rlim(struct proc *p);
+int  proc_nofile(struct proc *p);
+long proc_prlimit(struct proc *caller, struct proc *target, int resource,
+                  const struct tobyos_rlim *nw, struct tobyos_rlim *old);
 
 /* Record argv for /proc/<pid>/cmdline (proc.c; spawn + execve call it). */
 void proc_record_cmdline(struct proc *p, int argc, char **argv);

@@ -1423,7 +1423,19 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         jump; ADJ_SETOFFSET steps.
                                         CAP_SYS_TIME to change anything
                                         (EPERM). (finding 280) */
-#define ABI_SYS_NR_MAX          244
+#define ABI_SYS_PRLIMIT         245  /* (pid, resource, const uint64_t
+                                        new[2], uint64_t old[2] -- each
+                                        { soft, hard }) -> 0|-E: prlimit64(2), the
+                                        Linux personality's own table and
+                                        rules (include/tobyos/rlimit.h):
+                                        pid 0 the caller; EINVAL for a soft
+                                        limit over its hard one or a
+                                        resource past 15, EPERM to raise a
+                                        hard limit without root or the
+                                        open-file one past 1024. OLD is
+                                        written only on success. libtoby's
+                                        getrlimit/setrlimit (batch 47) */
+#define ABI_SYS_NR_MAX          245
 
 #define ABI_SHADOW_GET     0  /* arg: struct abi_shadow *out; root, or the
                                  account's own user */

@@ -55,6 +55,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 
 /* NOT <signal.h>: this file straddles the kernel headers (tobyos/signal.h
  * arrives via the shell/proc includes) and libtoby's, whose sigaction/
@@ -684,6 +685,27 @@ int host_inherited_fds(int *out, int max) {
         out[w++] = out[i];
     }
     return w;
+}
+
+/* THE RESOURCE LIMITS, for `ulimit` (src/shell.c): this process's own, the
+ * kernel's (getrlimit/setrlimit, batch 47). 0, or the errno it answered. */
+int host_getrlimit(int res, uint64_t *cur, uint64_t *max) {
+    struct rlimit rl;
+    if (getrlimit(res, &rl) != 0) return errno ? errno : EINVAL;
+    *cur = rl.rlim_cur;
+    *max = rl.rlim_max;
+    return 0;
+}
+
+int host_setrlimit(int res, uint64_t cur, uint64_t max) {
+    struct rlimit rl = { cur, max };
+    if (setrlimit(res, &rl) != 0) return errno ? errno : EINVAL;
+    return 0;
+}
+
+/* the C library's words for errno E -- musl's, as the guest's bash prints */
+const char *host_errtext(int e) {
+    return strerror(e);
 }
 
 /* An inherited descriptor as a file. Unseekable, like the standard three:
