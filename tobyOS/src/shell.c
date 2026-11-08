@@ -39414,7 +39414,18 @@ struct sh_ord {
     const char *text;
     int n;
     size_t at[SH_ORD_DEFER_MAX];
+    /* EVERY assignment of a simple command, deferred or not: where it
+     * starts in TEXT, its length, its command (a count), and whether that
+     * command is a statement -- assignments and no word (647) */
+    int np;
+    size_t pat[SH_ORD_DEFER_MAX];
+    size_t plen[SH_ORD_DEFER_MAX];
+    int pcmd[SH_ORD_DEFER_MAX];
+    bool pstmt[SH_ORD_DEFER_MAX];
 };
+/* the command (pcmd + 1) whose statement met a readonly name: its later
+ * assignments are not expanded (sh_ord_pfx_skip; 0 for none) */
+static int g_ord_ro_stmt;
 static struct sh_ord *g_ord;
 static size_t shell_assign_prefix_len_raw(const char *w);
 
@@ -39568,7 +39579,9 @@ static bool sh_ord_text(const char *src, struct shell_sb *out, struct sh_ord *or
     const char *end = src + strlen(src);
     const char *p = src;
     bool moved = false;
+    int ncmd = 0;                       /* the simple command's count (647) */
     ord->n = 0;
+    ord->np = 0;
     /* (no redirection and no assignment: nothing can move) */
     {
         const char *q = src;
@@ -39672,15 +39685,32 @@ static bool sh_ord_text(const char *src, struct shell_sb *out, struct sh_ord *or
                         if (ord->n >= SH_ORD_DEFER_MAX) { ok = false; break; }
                         ord->at[ord->n++] = out->len;
                     }
+                    if (it[i].kind == 'a' && ord->np < SH_ORD_DEFER_MAX) {
+                        ord->plen[ord->np] = it[i].n;
+                        ord->pcmd[ord->np] = ncmd;
+                        ord->pstmt[ord->np] = nw == 0;
+                        ord->pat[ord->np++] = out->len;
+                    }
                     if (sb_putmem(out, it[i].s, it[i].n) < 0) { ok = false; break; }
                 }
             moved = true;
             if (!ok) break;
             if (sb_putc(out, ' ') < 0) { ok = false; break; }
-        } else if (sb_putmem(out, cs, (size_t)(p - cs)) < 0) {
-            ok = false;
-            break;
+        } else {
+            /* as written -- its assignments where they are */
+            for (int i = 0; i < n && ord->np < SH_ORD_DEFER_MAX; i++)
+                if (it[i].kind == 'a') {
+                    ord->plen[ord->np] = it[i].n;
+                    ord->pcmd[ord->np] = ncmd;
+                    ord->pstmt[ord->np] = nw == 0;
+                    ord->pat[ord->np++] = out->len + (size_t)(it[i].s - cs);
+                }
+            if (sb_putmem(out, cs, (size_t)(p - cs)) < 0) {
+                ok = false;
+                break;
+            }
         }
+        ncmd++;
         /* the separator, as written */
         if (p < end) {
             size_t sl = 1;
@@ -39691,8 +39721,11 @@ static bool sh_ord_text(const char *src, struct shell_sb *out, struct sh_ord *or
         }
     }
     if (it != it_small) kfree(it);
-    if (!ok || !moved || !out->p) {
+    /* nothing moved but a command has a prefix assignment: OUT is the text
+     * as written, and the reader takes it for its offsets (647) */
+    if (!ok || (!moved && ord->np == 0) || !out->p) {
         ord->n = 0;
+        ord->np = 0;
         return false;
     }
     ord->text = out->p;
@@ -39706,6 +39739,62 @@ static bool sh_ord_at(const char *p) {
     for (int i = 0; i < g_ord->n; i++)
         if (g_ord->at[i] == off) return true;
     return false;
+}
+
+/* The index of the simple command's assignment that starts at P, deferred
+ * or not; -1 for none. */
+static int sh_ord_pfx_ix(const char *p) {
+    if (!g_ord || !g_ord->text) return -1;
+    size_t off = (size_t)(p - g_ord->text);
+    for (int i = 0; i < g_ord->np; i++)
+        if (g_ord->pat[i] == off) return i;
+    return -1;
+}
+
+/* A COMMAND'S TEMPORARY ASSIGNMENT TO A READONLY NAME IS REFUSED BEFORE ITS
+ * VALUE IS EXPANDED: bash looks the name up first, so nothing in the value
+ * runs -- no $( ), no ${q:=v} -- and "NAME: readonly variable" comes where
+ * the assignment is, between the expansions of those before and after it.
+ * The command runs without it; under posix mode a non-interactive shell
+ * ends there, status 1, the command not run.
+ *
+ *     readonly ro=1; x=$(echo X >&2) ro=$(echo A >&2) y=$(echo Y >&2) cmd
+ *         bash: X, the message, Y       tsh: X, A, Y, the message
+ *
+ * A statement's assignment is not this: bash expands its value first
+ * (logs/b47 cs2 r1-r14) -- finding 647. P is a deferred assignment's start
+ * (sh_ord_at), so a command's prefix. A subscripted name is no
+ * identifier there, which the prefix's own check says (645). True when
+ * refused and said. */
+/* The length of the plain NAME that assignment P writes, when that name is
+ * readonly; 0 when it is not, or P is no plain NAME= or NAME+= (a subscript
+ * is the prefix check's, 645), or NAME is a reference -- resolving one here
+ * could warn of a loop the assignment itself warns of, so a reference keeps
+ * the old order. */
+static size_t sh_assign_ro_name(const char *p) {
+    const char *q = p;
+    if (!((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') || *q == '_'))
+        return 0;
+    while ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
+           (*q >= '0' && *q <= '9') || *q == '_')
+        q++;
+    if (!(*q == '=' || (*q == '+' && q[1] == '='))) return 0;
+    size_t nl = (size_t)(q - p);
+    SH_SB(nm);
+    if (sb_putmem(&nm, p, nl) < 0 || !nm.p) return 0;
+    if (shell_is_nameref(nm.p)) return 0;
+    return shell_readonly_key(nm.p, nl) ? nl : 0;
+}
+
+static bool sh_prefix_readonly(const char *p) {
+    size_t nl = sh_assign_ro_name(p);
+    if (!nl) return false;
+    shell_readonly_print_error(p, nl, "shell");
+    if (g_opt_posix && !g_interactive && g_shell_flow == SHELL_FLOW_NONE) {
+        g_shell_flow = SHELL_FLOW_EXIT;
+        g_shell_flow_status = shell_fatal_status();
+    }
+    return true;
 }
 
 /* Each command's deferred assignments back in front of it, in order. */
@@ -39822,13 +39911,17 @@ static int shell_tokenize_outer(const char *src, struct shell_tokv *tok,
     struct sh_ord ord;
     ord.text = 0;
     ord.n = 0;
+    ord.np = 0;
     if (order && text && sh_ord_text(text, &reord, &ord)) {
         text = reord.p;
         g_ord = &ord;
     }
+    int ro_saved = g_ord_ro_stmt;       /* (each read has its own, 647) */
+    g_ord_ro_stmt = 0;
     int rc = shell_tokenize_inner(text, tok, out_ntok, words);
     if (rc >= 0 && g_ord) sh_ord_tokens(tok->v, *out_ntok);
     g_ord = ord_saved;
+    g_ord_ro_stmt = ro_saved;
     return rc;
 }
 
@@ -40309,6 +40402,24 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
          * prefix's, as bash expands it (see sh_ord_text, 641) */
         bool ord_defer = sh_ord_at(p);
         if (ord_defer) prefix_ok = true;
+        /* A COMMAND'S PREFIX ASSIGNMENT to a readonly name is refused
+         * unexpanded, the word gone (sh_prefix_readonly). A STATEMENT's is
+         * expanded and then refused where it is assigned -- but bash stops
+         * there, so the assignments after it are never expanded (logs/b47
+         * cs2 r11) -- finding 647 */
+        {
+            int ix = sh_ord_pfx_ix(p);
+            if (ix >= 0 && g_ord->pstmt[ix]) {
+                if (g_ord_ro_stmt == g_ord->pcmd[ix] + 1) {
+                    p += g_ord->plen[ix];
+                    continue;
+                }
+                if (sh_assign_ro_name(p)) g_ord_ro_stmt = g_ord->pcmd[ix] + 1;
+            } else if (ix >= 0 && sh_prefix_readonly(p)) {
+                p += g_ord->plen[ix];
+                continue;
+            }
+        }
         g_tok_word_src = p;                  /* shell_bad_subst_noclose */
         /* an ASSIGNMENT's value is expanded on its own, and is what a bad
          * substitution in it names (`x=${a[]}` names `${a[]}`); a
