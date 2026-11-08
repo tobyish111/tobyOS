@@ -765,6 +765,7 @@ static int errno_to_vfs(void) {
         case ENAMETOOLONG: return VFS_ERR_NAMETOOLONG;
         case ENXIO:   return SHELL_HOSTED_ERR_NXIO;   /* /dev/tty, no terminal */
         case EINTR:   return SHELL_HOSTED_ERR_INTR;   /* host_open's ^C */
+        case EMFILE:  return SHELL_HOSTED_ERR_MFILE;  /* RLIMIT_NOFILE */
         default:      return VFS_ERR_IO;
     }
 }

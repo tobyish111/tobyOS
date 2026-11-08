@@ -28278,9 +28278,26 @@ static void ulim_get(const struct shell_ulim *u, uint64_t *soft, uint64_t *hard)
 #endif
 }
 
+/* THE SOFT RLIMIT_NOFILE, AS A DESCRIPTOR COUNT: no new descriptor is made
+ * at or past it -- bash's dup2 there is EBADF, its F_DUPFD EINVAL or EMFILE
+ * (logs/b47 ul1, ul2). Asked once and kept: only this shell's own `ulimit`
+ * changes it (ulim_set forgets it), and a subshell forked from here keeps
+ * its own copy, as its limit is its own. */
+static int g_fd_soft = -1;
+
+static int sh_fd_soft_limit(void) {
+    if (g_fd_soft < 0) {
+        uint64_t s, h;
+        ulim_get(&g_ulims[ulim_find('n')], &s, &h);
+        g_fd_soft = s < (uint64_t)SHELL_FD_LIMIT ? (int)s : SHELL_FD_LIMIT;
+    }
+    return g_fd_soft;
+}
+
 /* Set U's limits to SOFT and HARD: 0, or the errno (Linux's numbering)
  * the kernel refused them with. */
 static int ulim_set(const struct shell_ulim *u, uint64_t soft, uint64_t hard) {
+    if (u->res == TOBYOS_RLIMIT_NOFILE) g_fd_soft = -1;
 #ifdef SHELL_HOSTED
     return host_setrlimit(u->res, soft, hard);
 #else
@@ -28904,6 +28921,7 @@ static const char *shell_errno_text(int err) {
     case VFS_ERR_NOTPERM:     return "Operation not permitted";
     case SHELL_HOSTED_ERR_NXIO: return "No such device or address";
     case SHELL_HOSTED_ERR_INTR: return "Interrupted system call";
+    case SHELL_HOSTED_ERR_MFILE: return "No file descriptors available";
     default:                  return "No error information";
     }
 }
@@ -44391,20 +44409,27 @@ static int shell_default_redir_fd(enum shell_tok_type t, int explicit_fd) {
 
 static int shell_parse_fd_word(const char *word, int *out_fd) {
     if (!word || !*word || !out_fd) return -1;
-    int v = 0;
+    /* any number an int holds: one past the table is a descriptor not open
+     * (`>&2000` is "2000: Bad file descriptor", as bash's), not a word */
+    long v = 0;
     for (const char *p = word; *p; p++) {
         if (!shell_is_digit(*p)) return -1;
         v = v * 10 + (*p - '0');
-        if (v >= SHELL_FD_LIMIT) return -1;
+        if (v > 0x7fffffffL) return -1;
     }
-    *out_fd = v;
+    *out_fd = (int)v;
     return 0;
 }
 
 static int shell_add_redir(struct shell_simple *cur, enum shell_redir_op op,
                            int fd, const char *path, const char *text,
                            int target_fd) {
-    if (fd < 0 || fd >= SHELL_FD_LIMIT) {
+    /* A NUMBER PAST THE TABLE IS A REDIRECTION ALL THE SAME: bash makes its
+     * file and its dup2 fails, "2000: Bad file descriptor", status 1, the
+     * script going on (logs/b47 ul2 v1) -- tsh refused it here, in its own
+     * words, status 2. It is judged where the soft limit is
+     * (sh_rd_over_limit), which a number past the table is past too. */
+    if (fd < 0) {
         kprintf(SH_PFX_SHELL "%d: bad file descriptor\n", fd);
         return -1;
     }
@@ -46333,6 +46358,24 @@ static int shell_apply_redirs(struct shell_simple *cmd,
 #endif
 }
 
+/* A NEW DESCRIPTOR AT OR PAST THE SOFT RLIMIT_NOFILE: bash makes the file
+ * and then its dup2 to the number fails -- "N: Bad file descriptor",
+ * status 1, the command not run, the file there all the same (logs/b47 ul1
+ * u10-u15 u30, ul2 v1-v3 v17). A dup names its target, as its own failure
+ * does (`200>&1` is "1: Bad file descriptor"). True when refused, F closed. */
+static bool sh_rd_over_limit(const struct shell_redir *r, struct file *f) {
+    if (r->fd < sh_fd_soft_limit()) return false;
+    if (f) file_close(f);
+    if (r->op == SH_RD_DUP_IN || r->op == SH_RD_DUP_OUT) {
+        if (r->path) kprintf(SH_PFX_TSH "%s: Bad file descriptor\n", r->path);
+        else kprintf(SH_PFX_TSH "%d: Bad file descriptor\n", r->target_fd);
+    } else {
+        kprintf(SH_PFX_TSH "%d: Bad file descriptor\n", r->fd);
+    }
+    shell_set_status(1);
+    return true;
+}
+
 static int shell_apply_redirs_in(struct shell_simple *cmd,
                                  struct shell_fd_state *st,
                                  const char *label) {
@@ -46418,16 +46461,40 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
                 /* The lowest descriptor open in neither table. A slot that
                  * holds the CLOSED marker `N>&-` leaves is free: bash hands
                  * out 10 again after `exec {fd}>&-`. */
+                int lim = sh_fd_soft_limit();
                 int fd = SHELL_FD_BASE;
-                while (fd < SHELL_FD_LIMIT &&
+                while (fd < lim &&
                        ((fd < st->n && st->fd[fd] &&
                          st->fd[fd]->kind != FILE_KIND_NULL) ||
                         (fd < g_shell_fd_cap && g_shell_fd[fd] &&
                          g_shell_fd[fd]->kind != FILE_KIND_NULL)))
                     fd++;
-                if (fd >= SHELL_FD_LIMIT) {
-                    kprintf("%s: %s: no free file descriptor\n", label,
-                            r->fdvar);
+                /* NONE FREE FROM 10 UP TO THE SOFT LIMIT: bash makes the
+                 * file, asks for a number from 10 (F_DUPFD) and is told
+                 * EMFILE -- EINVAL when the limit is 10 or less -- which it
+                 * says twice, the second time naming the file or the
+                 * dup's target; the name is left as it was, status 1
+                 * (logs/b47 ul2 v9 v10 v18, ul1 u32). */
+                if (fd >= lim) {
+                    const char *why = lim <= SHELL_FD_BASE
+                                          ? "Invalid argument"
+                                          : "No file descriptors available";
+                    if (r->op == SH_RD_OPEN_IN || r->op == SH_RD_OPEN_OUT ||
+                        r->op == SH_RD_OPEN_APPEND || r->op == SH_RD_OPEN_RW) {
+                        struct file *mk = r->op == SH_RD_OPEN_RW
+                            ? shell_open_vfs_file_rw(r->path, label)
+                            : shell_open_vfs_file(r->path, r->op != SH_RD_OPEN_IN,
+                                                  r->op == SH_RD_OPEN_APPEND, label);
+                        if (!mk) return -1;
+                        file_close(mk);
+                    }
+                    kprintf_raw("%s: redirection error: cannot duplicate fd: %s\n",
+                                g_param0 ? g_param0 : "tsh", why);
+                    if (r->path)
+                        kprintf(SH_PFX_TSH "%s: %s\n", r->path, why);
+                    else
+                        kprintf(SH_PFX_TSH "%d: %s\n", r->target_fd, why);
+                    shell_set_status(1);
                     return -1;
                 }
                 /* bash opens the file before it gives the name its number:
@@ -46459,7 +46526,10 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
             }
         }
         pending_var = var_fd;
-        if (r->fd < 0 || r->fd >= SHELL_FD_LIMIT) {
+        /* (a number past the table is past the soft limit as well: it is
+         * judged, as bash's dup2 judges it, once its file is made --
+         * sh_rd_over_limit) */
+        if (r->fd < 0) {
             kprintf("%s: bad file descriptor %d\n", label, r->fd);
             if (pre) file_close(pre);
             return -1;
@@ -46468,6 +46538,7 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
         if (r->op == SH_RD_OPEN_IN) {
             struct file *f = pre ? pre : shell_open_vfs_file(r->path, false, false, label);
             if (!f) return -1;
+            if (sh_rd_over_limit(r, f)) return -1;
             if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
                 file_close(f);
                 return -1;
@@ -46477,6 +46548,7 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
         if (r->op == SH_RD_OPEN_RW) {
             struct file *f = pre ? pre : shell_open_vfs_file_rw(r->path, label);
             if (!f) return -1;
+            if (sh_rd_over_limit(r, f)) return -1;
             if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
                 file_close(f);
                 return -1;
@@ -46486,6 +46558,7 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
         if (r->op == SH_RD_HEREDOC) {
             struct file *f = shell_open_text_pipe(r->text, label);
             if (!f) return -1;
+            if (sh_rd_over_limit(r, f)) return -1;
             if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
                 file_close(f);
                 return -1;
@@ -46532,6 +46605,7 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
                                                  r->op == SH_RD_OPEN_APPEND,
                                                  label);
             if (!f) return -1;
+            if (sh_rd_over_limit(r, f)) return -1;
             if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
                 file_close(f);
                 return -1;
@@ -46549,10 +46623,12 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
             continue;
         }
         if (r->op == SH_RD_DUP_IN || r->op == SH_RD_DUP_OUT) {
-            if (r->target_fd < 0 || r->target_fd >= SHELL_FD_LIMIT) {
+            /* (a target past the table is one not open, below) */
+            if (r->target_fd < 0) {
                 kprintf("%s: bad file descriptor %d\n", label, r->target_fd);
                 return -1;
             }
+            if (sh_rd_over_limit(r, 0)) return -1;
             struct file *clone = 0;
             bool owned = false;
             /* A NULL slot means "the shell's own descriptor", not "no

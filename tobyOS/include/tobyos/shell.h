@@ -131,5 +131,9 @@ void shell_set_shell_name_hosted(const char *name);
 /* ...and EINTR: an open a ^C ended (host.c host_open), which the shell
  * reports no error for, as bash's redirections do not -- the line unwinds. */
 #define SHELL_HOSTED_ERR_INTR (-201)
+/* ...and EMFILE: no descriptor free below the soft RLIMIT_NOFILE, which the
+ * kernel enforces since batch 47 -- musl's "No file descriptors available",
+ * where tsh said "I/O error". */
+#define SHELL_HOSTED_ERR_MFILE (-202)
 
 #endif /* TOBYOS_SHELL_H */
