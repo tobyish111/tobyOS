@@ -51849,11 +51849,15 @@ static bool shell_try_for_command(const char *src) {
                    !(*e == ' ' || *e == '\t' || *e == '\n' || *e == ';' ||
                      *e == '\0');
         if (bad) {
-            const char *we = s;
-            while (*we && *we != ' ' && *we != '\t' && *we != '\n' &&
-                   *we != ';')
-                we++;
-            kprintf("`%.*s': not a valid identifier\n", (int)(we - s), s);
+            /* THE WORD, quotes and substitutions and all -- `for $(echo a)
+             * in` names `$(echo a)', where tsh stopped at the first blank,
+             * `$(echo' (finding 646) -- and as bash keeps it, its $( )s
+             * printed (645; logs/b47 cs1 c19, cs2 d7 d8) */
+            SH_SB(wn);
+            SH_SB(wd);
+            if (sb_putmem(&wn, s, sh_bsub_unit_len(s, SH_BSUB_WORD)) < 0)
+                return true;
+            kprintf("`%s': not a valid identifier\n", sh_word_shown(wn.p, &wd));
             shell_set_status(1);
             return true;
         }
