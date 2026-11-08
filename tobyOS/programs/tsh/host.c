@@ -1413,6 +1413,24 @@ extern bool shell_host_fd_frozen(void);
 extern int shell_host_fd_saved(struct file **set, struct file **old, int *std,
                                int max);
 
+/* The highest descriptor from TOP down, above 3, that nothing holds -- not
+ * this process, not a cell or a copy of ours, not a slot of the shell's
+ * table not yet put at its own number (that waits for the next child):
+ * where bash puts a process substitution's end (shell.c
+ * shell_procsub_fd_for; logs/b47 ul3). -1 when there is none. */
+int host_fd_high_free(int top) {
+    struct file **tab = 0;
+    int ns = shell_host_fd_slots(&tab);
+    for (int n = top; n > 3; n--) {
+        if (n < HOST_NREG && (g_reg[n] || g_mir[n])) continue;
+        if (tab && n < ns && tab[n] && tab[n]->kind != FILE_KIND_NULL) continue;
+        struct stat st;
+        if (fstat(n, &st) == 0 || errno != EBADF) continue;
+        return n;
+    }
+    return -1;
+}
+
 static struct hcell *host_slot_cell(struct file *f) {
     if (!f || f->kind != FILE_KIND_VFS) return 0;
     struct hcell *c = (struct hcell *)f->vfs.priv;

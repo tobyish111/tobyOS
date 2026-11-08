@@ -37861,10 +37861,21 @@ extern int  host_file_move_fd(struct file *f, int want);
 
 static int g_procsub_cap;            /* only a forking shell makes any */
 
-/* The number a new substitution's descriptor gets. See the note above. */
+extern int  host_fd_high_free(int top);            /* host.c */
+
+/* The number a new substitution's descriptor gets. See the note above.
+ * bash's, measured under each limit (logs/b47 ul3): the highest number
+ * from 63 down that nothing holds -- a 63 the script opened too, so
+ * `exec 63>f; cat <(...)` is /dev/fd/62 -- and with 63 at or past the soft
+ * RLIMIT_NOFILE, the pipe's own, the lowest free (`ulimit -n 50; echo
+ * <(true) <(true)` is /dev/fd/3 /dev/fd/4). tsh counted down from 63 by
+ * how many it had made, over whatever held the number, and under a limit
+ * of 63 or less failed: "no descriptor 63". */
 static int shell_procsub_fd_for(struct file *keep) {
-    int want = SHELL_PROCSUB_FD_TOP - g_procsub_n;
-    if (want >= SHELL_FD_BASE) return want;
+    if (SHELL_PROCSUB_FD_TOP < sh_fd_soft_limit()) {
+        int want = host_fd_high_free(SHELL_PROCSUB_FD_TOP);
+        if (want >= 0) return want;
+    }
     return host_file_fd(keep);
 }
 
