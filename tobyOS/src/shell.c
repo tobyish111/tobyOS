@@ -39763,26 +39763,32 @@ struct sh_rdx {
 static struct sh_rdx *g_rdx_live;
 static struct file *shell_closed_file_make(void);
 
-static bool sh_rdx_word_has_comsub(const char *p) {
+/* ...AND SO IS ANY WORD THAT EXPANDS, for what its expansion says when it
+ * FAILS: bash applies the command's redirections before it -- in the
+ * child it forked for an external command -- before it expands the word,
+ * so `cat 2>f <<< ${a[}` says "bad substitution" into f and nowhere else,
+ * a function's `f 2>e <<< ${a[}` into e, and `cat >out <<< ${a[}` and
+ * `cat 3>out <<< ${a[}` have made out, empty. tsh said it on its own
+ * stderr and made nothing (logs/b46 ra2 b1 b2 b7-b10, ra3 d1 d2 d4 d13) --
+ * finding 643. Any `$` or backquote outside single quotes. */
+static bool sh_rdx_word_expands(const char *p) {
     char q = 0;
     for (; *p; p++) {
         if (q) {
             if (*p == '\\' && q == '"' && p[1]) { p++; continue; }
             if (*p == q) q = 0;
-            else if (q == '"' && ((*p == '$' && p[1] == '(' && p[2] != '(') || *p == '`'))
-                return true;
+            else if (q == '"' && (*p == '$' || *p == '`')) return true;
             continue;
         }
         if (*p == '\\' && p[1]) { p++; continue; }
-        if (*p == '\'' || *p == '"') { q = *p; continue; }
-        if (*p == '`') return true;
-        if (*p == '$' && p[1] == '(') {
-            if (p[2] != '(') return true;
-            const char *g = shell_skip_dollar_group(p);
-            if (!g) return false;
-            p = g - 1;
+        if (*p == '$' && p[1] == '\'') {
+            for (p += 2; *p && *p != '\''; p++)
+                if (*p == '\\' && p[1]) p++;
+            if (!*p) return false;
             continue;
         }
+        if (*p == '\'' || *p == '"') { q = *p; continue; }
+        if (*p == '$' || *p == '`') return true;
         if (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';' || *p == '|' ||
             *p == '&' || *p == '<' || *p == '>' || *p == '(' || *p == ')')
             return false;
@@ -39831,8 +39837,20 @@ static void sh_rdx_enter(struct shell_token *v, int last, struct sh_rdx *x) {
             bool both = ty == SH_TOK_REDIR_BOTH || ty == SH_TOK_REDIR_BOTH_APPEND ||
                         ty == SH_TOK_DUP_OUT;
             if (fd < 0) fd = 1;
-            if (!both && fd != 1 && fd != 2) { i++; continue; }
             bool append = ty == SH_TOK_REDIR_APPEND || ty == SH_TOK_REDIR_BOTH_APPEND;
+            if (!both && fd != 1 && fd != 2) {
+                /* ANOTHER DESCRIPTOR'S FILE IS MADE TOO, as the redirection
+                 * before the word makes it: `cat 3>out <<< ${a[}` leaves out
+                 * empty (643); opened now, the redirection appends */
+                struct file *of = shell_open_vfs_file(word, true, append, "shell");
+                if (of) {
+                    file_close(of);
+                    if (ty == SH_TOK_REDIR_OUT || ty == SH_TOK_REDIR_CLOBBER)
+                        v[i].type = SH_TOK_REDIR_APPEND;
+                }
+                i++;
+                continue;
+            }
             struct file *f = shell_open_vfs_file(word, true, append, "shell");
             if (!f) { i++; continue; }
             /* opened now: the redirection itself appends to it */
@@ -40178,7 +40196,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
             tok->v[ntok - 1].type >= SH_TOK_REDIR_IN &&
             tok->v[ntok - 1].type != SH_TOK_HEREDOC &&
             tok->v[ntok - 1].type != SH_TOK_HEREDOC_TABS &&
-            sh_rdx_word_has_comsub(p) &&
+            sh_rdx_word_expands(p) &&
             (rdx = (struct sh_rdx *)kmalloc(sizeof *rdx)) != 0) {
             sh_rdx_enter(tok->v, ntok - 1, rdx);
             rdx->prev = g_rdx_live;
