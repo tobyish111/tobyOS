@@ -28412,19 +28412,24 @@ static int ulim_one(char opt, const char *arg, int mode, bool multiple) {
             kprintf("ulimit: %s: invalid number\n", arg);
             return 1;
         }
+        /* BASH'S RANGE, measured (logs/b47 ul4): the digits are read in
+         * the limit's own 64-bit unsigned type, wrapping -- 2^64 is 0,
+         * 2^64-1 is RLIM_INFINITY, "unlimited" -- and "limit out of range"
+         * is only the block size's product overflowing it: `ulimit -f
+         * $((1 << 53))` is 2^63 bytes, set. Everything else is the
+         * kernel's to refuse (`ulimit -n 2^63`: "Operation not permitted").
+         * tsh refused anything past 2^63 over the block size, which no one
+         * saw while the kernel kept no limit (Oils 1067) -- finding 651. */
         uint64_t v = 0;
-        bool over = false;
-        for (const char *p = arg; *p; p++) {
-            uint64_t d = (uint64_t)(*p - '0');
-            if (v > (~0ULL - d) / 10) over = true;
-            v = v * 10 + d;
-        }
+        for (const char *p = arg; *p; p++)
+            v = v * 10 + (uint64_t)(*p - '0');
         uint64_t f = (uint64_t)ulim_factor(u);
-        if (over || (f && v > (~0ULL >> 1) / f)) {
+        uint64_t real = v * f;
+        if (f && real / f != v) {
             kprintf("ulimit: %s: limit out of range\n", arg);
             return 1;
         }
-        nv = v * f;
+        nv = real;
     }
     /* the pipe size cannot be set */
     if (u->res < 0) {
