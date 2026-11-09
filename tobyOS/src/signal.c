@@ -21,6 +21,7 @@
 #include <tobyos/smp.h>
 #include <tobyos/percpu.h>
 #include <tobyos/apic.h>       /* apic_sched_wake: signal_kick */
+#include <tobyos/cpu.h>        /* fpu_save / fpu_restore: the frame's FPU state */
 
 static int g_foreground_pid = 0;
 
@@ -48,6 +49,7 @@ static int g_foreground_pid = 0;
  * uc_link, and the 24-byte uc_stack). gregs is greg_t[23] in this fixed
  * order; uc_sigmask follows the 256-byte mcontext_t at offset 296. */
 #define LXUC_GREGS   40
+#define LXUC_FPREGS  224        /* mcontext's fpregs pointer, after gregs[23] */
 #define LXUC_SIGMASK 296
 enum {
     LXREG_R8=0, LXREG_R9, LXREG_R10, LXREG_R11, LXREG_R12, LXREG_R13,
@@ -77,6 +79,18 @@ enum {
  * SYSRETQ handed the code rcx = its own RIP and r11 = RFLAGS. GNU bash
  * faulted on exactly that (ecx was the character being classified).
  * sys_sigreturn now returns through IRETQ with these restored. */
+/* THE FPU/SSE STATE IS SAVED TOO (finding 652). A handler is ordinary
+ * code: it may use any xmm register, and MXCSR, as its own, and the code
+ * it interrupted -- at any instruction, or across a syscall, which keeps
+ * every xmm register -- cannot have saved them. Linux puts the interrupted
+ * code's FPU state in the signal frame and back at rt_sigreturn, and starts
+ * the handler from a clean state; this frame kept the integer registers
+ * only, so whatever the handler left in xmm0-xmm15 and MXCSR was the
+ * interrupted code's on return. GNU bash 5.2 died on the EliteDesk in
+ * _print_word_list (exit 139, its word list's node {0, 0x10000}, a 16-byte
+ * SSE store's) just after its SIGCHLD handler -- logs/b47/sigfpu: every
+ * round changed there, none on Linux. `fx` is the FXSAVE image (no XSAVE:
+ * CR4.OSXSAVE is off, so FXSAVE is all of the user's state). */
 struct sig_context {
     uint64_t rax;        /* syscall return value at the interruption point */
     uint64_t rdi, rsi, rdx, r10, r8, r9;
@@ -87,7 +101,44 @@ struct sig_context {
     uint64_t rflags;     /* resume RFLAGS */
     uint64_t saved_mask; /* signal mask to restore */
     uint64_t magic;
+    uint8_t  fx[512] __attribute__((aligned(16)));  /* the FPU/SSE state */
 };
+
+/* The interrupted code's FPU/SSE state into the frame being built. The
+ * kernel is -mno-sse and the scheduler saves and restores a process's state
+ * around every switch, so on its way back to user mode the registers hold
+ * this process's own. The frame is zeroed first: FXSAVE leaves bytes
+ * 464-511 (and may leave 416-463) unwritten, and the frame goes to the
+ * user's stack. */
+static void sig_fpu_save(struct sig_context *ctx) {
+    memset(ctx, 0, sizeof *ctx);
+    fpu_save(ctx->fx);
+}
+
+/* The handler starts from the default state, as on Linux: x87 control word
+ * 0x037F, MXCSR 0x1F80, every register zero. Called once the frame is
+ * wholly written -- a frame that failed leaves the state as it was. */
+static void sig_fpu_handler_state(void) {
+    uint8_t clean[512] __attribute__((aligned(16)));
+    fpu_init_default(clean);
+    fpu_restore(clean);
+}
+
+/* rt_sigreturn: the saved state back. The frame is the user's memory and
+ * FXRSTOR faults on an MXCSR with a reserved bit set, so MXCSR is first
+ * masked with this CPU's MXCSR_MASK (FXSAVE's bytes 28-31; 0 there means
+ * the architectural default 0xFFBF). */
+static void sig_fpu_restore(struct sig_context *ctx) {
+    uint8_t cur[512] __attribute__((aligned(16)));
+    fpu_save(cur);
+    uint32_t mask, mx;
+    memcpy(&mask, cur + 28, 4);
+    if (mask == 0) mask = 0xFFBF;
+    memcpy(&mx, ctx->fx + 24, 4);
+    mx &= mask;
+    memcpy(ctx->fx + 24, &mx, 4);
+    fpu_restore(ctx->fx);
+}
 
 /* Locate the current process's saved syscall register block. Only valid on
  * the SYSCALL return path (where the block was just pushed by the asm
@@ -540,14 +591,15 @@ bool signal_take_pending_stop(void) {
 /* Write the siginfo_t + ucontext_t a 3-arg SA_SIGINFO handler reads, in either
  * native tobyOS layout or x86-64 Linux layout (B15), at info_addr/uctx_addr on
  * the user stack. `ctx` carries the saved registers of the interrupted context;
- * rcx/r11 (absent from sig_context) are supplied separately. Returns false on a
- * uaccess failure. */
+ * rcx/r11 (absent from sig_context) are supplied separately. `fx_addr` is
+ * the user address of the frame's saved FPU state, which Linux's
+ * uc_mcontext.fpregs points at. Returns false on a uaccess failure. */
 static bool sig_emit_info_uctx(struct proc *p, int sig, int si_code,
                                uint64_t fault_addr,
                                const struct sig_context *ctx,
                                uint64_t rcx, uint64_t r11,
                                uint64_t info_addr, uint64_t uctx_addr,
-                               bool linux_layout) {
+                               uint64_t fx_addr, bool linux_layout) {
     bool is_fault = (sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE ||
                      sig == SIGILL  || sig == SIGTRAP);
 
@@ -578,6 +630,7 @@ static bool sig_emit_info_uctx(struct proc *p, int sig, int si_code,
         g[LXREG_RSP]=ctx->rsp; g[LXREG_RIP]=ctx->rip; g[LXREG_EFL]=ctx->rflags;
         g[LXREG_CSGSFS]=LX_USER_CS; g[LXREG_ERR]=0; g[LXREG_TRAPNO]=0;
         g[LXREG_OLDMASK]=0; g[LXREG_CR2]=fault_addr;
+        *(uint64_t *)(ub + LXUC_FPREGS) = fx_addr;
         *(uint64_t *)(ub + LXUC_SIGMASK) = (uint64_t)p->sigstate.mask;
 
         if (copy_to_user((void *)info_addr, ib, sizeof ib) != 0 ||
@@ -674,6 +727,7 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     uint64_t sp = (top - sizeof(struct sig_context)) & ~(uint64_t)0xF;
     struct sig_context kctx;
     struct sig_context *ctx = &kctx;
+    sig_fpu_save(ctx);                 /* finding 652: the FPU state too */
 
     /* SA_RESTART: if this handler interrupted a blocking syscall (it bailed
      * with EINTR) and the action asks for restart, resume at the `syscall`
@@ -748,7 +802,9 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     if (siginfo) {
         if (!sig_emit_info_uctx(p, sig, p->sigstate.si_code[sig], 0, ctx,
                                 regs->rcx, regs->r11,
-                                info_addr, uctx_addr, linux_layout)) {
+                                info_addr, uctx_addr,
+                                sp + __builtin_offsetof(struct sig_context, fx),
+                                linux_layout)) {
             kprintf("[signal] pid=%d sig %d: cannot write siginfo/ucontext\n",
                     p->pid, sig);
             return false;
@@ -789,6 +845,7 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
         regs->rsi = info_addr;
         regs->rdx = uctx_addr;
     }
+    sig_fpu_handler_state();
     return true;
 }
 
@@ -1039,6 +1096,7 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
 
     struct sig_context kctx;
     struct sig_context *ctx = &kctx;
+    sig_fpu_save(ctx);                 /* finding 652: the FPU state too */
     ctx->rax = r->rax; ctx->rdi = r->rdi; ctx->rsi = r->rsi; ctx->rdx = r->rdx;
     ctx->r10 = r->r10; ctx->r8 = r->r8;   ctx->r9 = r->r9;
     ctx->rbx = r->rbx; ctx->rbp = r->rbp;
@@ -1057,7 +1115,9 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
     if (siginfo) {
         if (!sig_emit_info_uctx(p, sig, si_code, fault_addr, ctx,
                                 r->rcx, r->r11,
-                                info_addr, uctx_addr, linux_layout))
+                                info_addr, uctx_addr,
+                                sp + __builtin_offsetof(struct sig_context, fx),
+                                linux_layout))
             return false;
     }
 
@@ -1084,6 +1144,7 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
         r->rsi = info_addr;
         r->rdx = uctx_addr;
     }
+    sig_fpu_handler_state();
     return true;
 }
 
@@ -1204,6 +1265,7 @@ long sys_sigreturn(void) {
     regs->sig_rcx  = ctx->rcx;      /* the user's real rcx/r11 -- only an */
     regs->sig_r11  = ctx->r11;      /* IRETQ exit can put them back      */
     regs->pad      = 1;             /* ...so ask for one */
+    sig_fpu_restore(ctx);           /* and the FPU/SSE state (652) */
 
     p->sigstate.mask = (sigset_t)ctx->saved_mask;
 
