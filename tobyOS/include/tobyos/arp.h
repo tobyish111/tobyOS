@@ -59,3 +59,9 @@ void arp_gratuitous(void);
 void arp_dump(void);
 
 #endif /* TOBYOS_ARP_H */
+
+/* Cache entry i (0..ARP_CACHE_MAX-1) for /proc/net/arp and the native ARP
+ * syscall: false past the end or for an empty slot. */
+bool arp_cache_entry(int i, uint32_t *ip_be, uint8_t mac[ETH_ADDR_LEN]);
+int  arp_cache_capacity(void);
+bool arp_cache_delete(uint32_t ip_be);   /* false if absent */

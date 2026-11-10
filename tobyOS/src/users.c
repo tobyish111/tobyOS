@@ -75,6 +75,24 @@ static const struct {
     { 0, 0, 0 },
 };
 
+/* Today, in days since 1970, by the wall clock */
+int64_t users_today(void) {
+    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+    extern uint64_t perf_now_ns(void);
+    return (int64_t)(lx_realtime_ns(perf_now_ns()) / 1000000000ull / 86400ull);
+}
+
+/* A new account's aging, as shadow-utils' useradd gives one (finding 213):
+ * changed today, 0 99999 7, no inactive days, no expiry */
+static void age_defaults(struct user *u) {
+    u->lastchg = users_today();
+    u->minage = 0;
+    u->maxage = USER_AGE_MAX_DEFAULT;
+    u->warn = USER_AGE_WARN_DEFAULT;
+    u->inactive = -1;
+    u->expire = -1;
+}
+
 static void install_defaults(void) {
     g_count = 0;
     for (int i = 0; g_defaults[i].name; i++) {
@@ -83,8 +101,21 @@ static void install_defaults(void) {
         g_users[g_count].uid = g_defaults[i].uid;
         g_users[g_count].gid = g_defaults[i].gid;
         g_users[g_count].password_hash[0] = '\0';
+        age_defaults(&g_users[g_count]);
         g_count++;
     }
+}
+
+/* One aging field of a /data/users line, N bytes at S: empty is -1 */
+static int64_t parse_age(const char *s, size_t n) {
+    if (n == 0) return -1;
+    int64_t v = 0;
+    bool neg = s[0] == '-';
+    for (size_t i = neg ? 1 : 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return -1;
+        v = v * 10 + (s[i] - '0');
+    }
+    return neg ? -v : v;
 }
 
 /* ---- parser ---- */
@@ -158,15 +189,31 @@ static void parse_buffer(const char *text, size_t n) {
                         u->name[nlen] = '\0';
                         u->uid = uid;
                         u->gid = gid;
-                        /* Parse optional password_hash (4th field after 3rd colon) */
+                        /* Parse optional password_hash (4th field after 3rd
+                         * colon), to the next colon: the aging fields
+                         * follow it (finding 213) -- a line without them
+                         * has empty ones, as an /etc/shadow line can */
                         u->password_hash[0] = '\0';
+                        u->lastchg = u->minage = u->maxage = -1;
+                        u->warn = u->inactive = u->expire = -1;
                         if (c3 < j) {
                             size_t hstart = c3 + 1;
-                            size_t hlen = j - hstart;
+                            size_t he = hstart;
+                            while (he < j && text[he] != ':') he++;
+                            size_t hlen = he - hstart;
                             if (hlen > USER_PWHASH_MAX - 1) hlen = USER_PWHASH_MAX - 1;
                             if (hlen > 0) {
                                 memcpy(u->password_hash, &text[hstart], hlen);
                                 u->password_hash[hlen] = '\0';
+                            }
+                            int64_t *age[6] = { &u->lastchg, &u->minage, &u->maxage,
+                                                &u->warn, &u->inactive, &u->expire };
+                            size_t f = he;
+                            for (int k = 0; k < 6 && f < j; k++) {
+                                size_t fe = f + 1;
+                                while (fe < j && text[fe] != ':') fe++;
+                                *age[k] = parse_age(&text[f + 1], fe - (f + 1));
+                                f = fe;
                             }
                         }
                     }
@@ -179,21 +226,178 @@ static void parse_buffer(const char *text, size_t n) {
     }
 }
 
+/* /etc/passwd IS THE ACCOUNT DATABASE, as on Linux: a login takes its uid
+ * and gid from it. This cache (/data/users) and /etc/passwd were two
+ * stores that drifted -- usermod changes the second -- so a login could
+ * come up with gid 1000 while /etc/passwd said 100: `id -g` and
+ * `getent passwd $(id -un)` disagreed, and chown's "OWNER:" (the login
+ * group) took the file's group from one where id took it from the other
+ * (batch 31, finding 194). Each name this cache knows takes its uid and
+ * gid from /etc/passwd when /etc/passwd has the name; the cache keeps the
+ * password and the set of names that may log in. */
+void users_sync_passwd(void) {
+    void *buf = 0;
+    size_t sz = 0;
+    if (vfs_read_all("/etc/passwd", &buf, &sz) != VFS_OK || !buf) return;
+    const char *t = (const char *)buf, *end = t + sz;
+    while (t < end) {
+        const char *nl = t;
+        while (nl < end && *nl != '\n') nl++;
+        /* name:passwd:uid:gid:... */
+        const char *f[4];
+        size_t fl[4];
+        int nf = 0;
+        const char *p = t;
+        while (nf < 4 && p <= nl) {
+            const char *q = p;
+            while (q < nl && *q != ':') q++;
+            f[nf] = p;
+            fl[nf] = (size_t)(q - p);
+            nf++;
+            p = q + 1;
+            if (q >= nl) break;
+        }
+        int uid, gid;
+        if (nf == 4 && fl[0] && fl[0] < USER_NAME_MAX && t[0] != '#' &&
+            parse_int(f[2], fl[2], &uid) && parse_int(f[3], fl[3], &gid)) {
+            for (int i = 0; i < g_count; i++) {
+                if (strlen(g_users[i].name) == fl[0] &&
+                    memcmp(g_users[i].name, f[0], fl[0]) == 0) {
+                    g_users[i].uid = uid;
+                    g_users[i].gid = gid;
+                }
+            }
+        }
+        t = nl + 1;
+    }
+    kfree(buf);
+}
+
+/* /etc/passwd's record of NAME, or of UID when NAME is 0: its name, uid
+ * and gid into the out parameters. */
+static bool passwd_find(const char *name, int want_uid, char *oname,
+                        int *uid, int *gid) {
+    void *buf = 0;
+    size_t sz = 0;
+    if (vfs_read_all("/etc/passwd", &buf, &sz) != VFS_OK || !buf) return false;
+    const char *t = (const char *)buf, *end = t + sz;
+    bool found = false;
+    while (t < end && !found) {
+        const char *nl = t;
+        while (nl < end && *nl != '\n') nl++;
+        const char *f[4];
+        size_t fl[4];
+        int nf = 0;
+        const char *p = t;
+        while (nf < 4 && p <= nl) {
+            const char *q = p;
+            while (q < nl && *q != ':') q++;
+            f[nf] = p;
+            fl[nf] = (size_t)(q - p);
+            nf++;
+            p = q + 1;
+            if (q >= nl) break;
+        }
+        int u, g;
+        if (nf == 4 && fl[0] && fl[0] < USER_NAME_MAX && t[0] != '#' &&
+            parse_int(f[2], fl[2], &u) && parse_int(f[3], fl[3], &g)) {
+            bool hit = name ? (strlen(name) == fl[0] && memcmp(name, f[0], fl[0]) == 0)
+                            : (u == want_uid);
+            if (hit) {
+                memcpy(oname, f[0], fl[0]);
+                oname[fl[0]] = '\0';
+                *uid = u;
+                *gid = g;
+                found = true;
+            }
+        }
+        t = nl + 1;
+    }
+    kfree(buf);
+    return found;
+}
+
+/* The login cache's own entry for NAME. */
+static struct user *cache_find(const char *name) {
+    for (int i = 0; i < g_count; i++)
+        if (strcmp(g_users[i].name, name) == 0) return &g_users[i];
+    return 0;
+}
+
+/* A NAME ONLY /etc/passwd HAS (finding 194): an account a Linux tool or an
+ * edit of /etc/passwd made, which the login cache (/data/users) never
+ * heard of. As on Linux it is an account -- `id NAME`, chown NAME, a
+ * login's lookup all know it -- and LOCKED until `passwd NAME` gives it a
+ * password, as a Linux account made without one is ("!" in /etc/shadow):
+ * its hash here matches nothing. It was simply unknown to every login. */
+static struct user g_etc_user, g_etc_uid_user;
+
+static const struct user *etc_user(struct user *slot, const char *name, int uid) {
+    char nm[USER_NAME_MAX];
+    int u, g;
+    if (!passwd_find(name, uid, nm, &u, &g)) return 0;
+    memset(slot, 0, sizeof *slot);
+    copy_capped(slot->name, nm, USER_NAME_MAX);
+    slot->uid = u;
+    slot->gid = g;
+    copy_capped(slot->password_hash, "!", USER_PWHASH_MAX);   /* locked */
+    slot->lastchg = slot->minage = slot->maxage = -1;          /* no aging */
+    slot->warn = slot->inactive = slot->expire = -1;
+    return slot;
+}
+
 /* ---- public API ---- */
 
 const struct user *users_lookup_by_name(const char *name) {
     if (!name || !name[0]) return 0;
-    for (int i = 0; i < g_count; i++) {
-        if (strcmp(g_users[i].name, name) == 0) return &g_users[i];
+    users_sync_passwd();            /* a usermod since boot counts */
+    struct user *c = cache_find(name);
+    if (c) return c;
+    return etc_user(&g_etc_user, name, 0);
+}
+
+int users_initgroups(const char *name, int gid, int *out, int max) {
+    int n = 0;
+    if (!out || max <= 0) return 0;
+    out[n++] = gid;
+    if (!name || !name[0]) return n;
+    void *buf = 0; size_t sz = 0;
+    if (vfs_read_all("/etc/group", &buf, &sz) != VFS_OK || !buf) return n;
+    const char *s = (const char *)buf, *end = s + sz;
+    size_t nl = strlen(name);
+    while (s < end && n < max) {
+        const char *e = s;
+        while (e < end && *e != '\n') e++;
+        /* NAME:PASSWORD:GID:MEMBER,MEMBER... */
+        const char *c[3];
+        int k = 0;
+        for (const char *p = s; p < e && k < 3; p++) if (*p == ':') c[k++] = p;
+        int g;
+        if (k == 3 && parse_int(c[1] + 1, (size_t)(c[2] - c[1] - 1), &g)) {
+            const char *m = c[2] + 1;
+            while (m < e) {
+                const char *me = m;
+                while (me < e && *me != ',' && *me != '\r') me++;
+                if ((size_t)(me - m) == nl && strncmp(m, name, nl) == 0) {
+                    bool have = false;
+                    for (int i = 0; i < n; i++) if (out[i] == g) have = true;
+                    if (!have) out[n++] = g;
+                    break;
+                }
+                m = me + 1;
+            }
+        }
+        s = e + 1;
     }
-    return 0;
+    kfree(buf);
+    return n;
 }
 
 const struct user *users_lookup_by_uid(int uid) {
     for (int i = 0; i < g_count; i++) {
         if (g_users[i].uid == uid) return &g_users[i];
     }
-    return 0;
+    return etc_user(&g_etc_uid_user, 0, uid);       /* finding 194 */
 }
 
 int users_add(const char *name, int uid, int gid) {
@@ -205,11 +409,13 @@ int users_add(const char *name, int uid, int gid) {
         kprintf("[users] cannot add '%s': cache full\n", name);
         return -1;
     }
-    if (users_lookup_by_name(name)) {
+    if (cache_find(name)) {
         kprintf("[users] cannot add '%s': name already taken\n", name);
         return -1;
     }
-    if (users_lookup_by_uid(uid)) {
+    bool uid_taken = false;
+    for (int i = 0; i < g_count; i++) if (g_users[i].uid == uid) uid_taken = true;
+    if (uid_taken) {
         kprintf("[users] cannot add '%s': uid %d already taken\n", name, uid);
         return -1;
     }
@@ -218,7 +424,20 @@ int users_add(const char *name, int uid, int gid) {
     u->uid = uid;
     u->gid = gid;
     u->password_hash[0] = '\0';
+    age_defaults(u);                     /* finding 213 */
     return 0;
+}
+
+int users_del(const char *username) {
+    if (!username || !username[0]) return -1;
+    for (int i = 0; i < g_count; i++) {
+        if (strcmp(g_users[i].name, username) != 0) continue;
+        if (g_users[i].uid == 0) return -1;
+        for (int k = i + 1; k < g_count; k++) g_users[k - 1] = g_users[k];
+        g_count--;
+        return 0;
+    }
+    return -1;
 }
 
 void users_visit(users_visit_fn cb, void *ctx) {
@@ -227,30 +446,38 @@ void users_visit(users_visit_fn cb, void *ctx) {
 }
 
 int users_save(void) {
-    /* Worst case: header + USER_MAX * (name + 3x":" + 2x10-digit + hash + "\n"). */
-    size_t cap = 128 + (size_t)USER_MAX * (USER_NAME_MAX + 32 + USER_PWHASH_MAX);
+    /* Worst case: header + USER_MAX * (name + 9x":" + 8x11-digit + hash + "\n"). */
+    size_t cap = 160 + (size_t)USER_MAX * (USER_NAME_MAX + 112 + USER_PWHASH_MAX);
     char *buf = (char *)kmalloc(cap);
     if (!buf) return -1;
 
     size_t n = 0;
     const char *header =
-        "# tobyOS users (milestone 15) -- name:uid:gid\n";
+        "# tobyOS users (milestone 15) -- "
+        "name:uid:gid:hash:lastchg:min:max:warn:inactive:expire\n";
     size_t hl = strlen(header);
     if (n + hl < cap) { memcpy(&buf[n], header, hl); n += hl; }
 
     for (int i = 0; i < g_count; i++) {
         size_t nl = strlen(g_users[i].name);
-        if (n + nl + 32 + USER_PWHASH_MAX >= cap) break;
+        if (n + nl + 112 + USER_PWHASH_MAX >= cap) break;
         memcpy(&buf[n], g_users[i].name, nl); n += nl;
         buf[n++] = ':';
         append_int(buf, &n, cap, g_users[i].uid);
         buf[n++] = ':';
         append_int(buf, &n, cap, g_users[i].gid);
-        if (g_users[i].password_hash[0]) {
+        /* the hash, then the aging fields, empty for -1 (finding 213):
+         * name:uid:gid:hash:lastchg:min:max:warn:inactive:expire */
+        buf[n++] = ':';
+        size_t hl = strlen(g_users[i].password_hash);
+        memcpy(&buf[n], g_users[i].password_hash, hl);
+        n += hl;
+        const int64_t age[6] = { g_users[i].lastchg, g_users[i].minage,
+                                 g_users[i].maxage, g_users[i].warn,
+                                 g_users[i].inactive, g_users[i].expire };
+        for (int k = 0; k < 6; k++) {
             buf[n++] = ':';
-            size_t hl = strlen(g_users[i].password_hash);
-            memcpy(&buf[n], g_users[i].password_hash, hl);
-            n += hl;
+            if (age[k] >= 0) append_int(buf, &n, cap, (int)age[k]);
         }
         buf[n++] = '\n';
     }
@@ -420,10 +647,19 @@ static bool pw_verify_legacy_djb2(const char *stored, const char *password) {
 bool users_check_password(const char *username, const char *password) {
     const struct user *u = users_lookup_by_name(username);
     if (!u) return false;
+    if (u->password_hash[0] == '!') return false;   /* locked (finding 194) */
     if (u->password_hash[0] == '\0') return true;   /* no password set */
 
-    if (u->password_hash[0] == '$')
+    if (strncmp(u->password_hash, "$argon2id$", 10) == 0)
         return pw_verify_argon2(u->password_hash, password);
+    /* SHA-crypt, as Linux's crypt makes it: what chpasswd -e brings
+     * from elsewhere (finding 213) */
+    if (strncmp(u->password_hash, "$5$", 3) == 0 ||
+        strncmp(u->password_hash, "$6$", 3) == 0) {
+        extern bool shacrypt_check(const char *password, const char *stored);
+        return shacrypt_check(password ? password : "", u->password_hash);
+    }
+    if (u->password_hash[0] == '$') return false;   /* a method not kept */
 
     /* Legacy djb2 digest. Verify, and on success transparently upgrade the
      * stored credential to salted Argon2id so the weak hash goes away. */
@@ -443,8 +679,17 @@ bool users_check_password(const char *username, const char *password) {
 }
 
 int users_set_password(const char *username, const char *password) {
+    /* a name only /etc/passwd has gets its login here, with its ids from
+     * there (finding 194) -- what `passwd NAME` does for a Linux account */
+    if (username && !cache_find(username)) {
+        char nm[USER_NAME_MAX];
+        int u, g;
+        if (passwd_find(username, 0, nm, &u, &g) && users_add(nm, u, g) != 0)
+            return -1;
+    }
     for (int i = 0; i < g_count; i++) {
         if (strcmp(g_users[i].name, username) == 0) {
+            g_users[i].lastchg = users_today();     /* finding 213 */
             if (!password || !password[0]) {
                 g_users[i].password_hash[0] = '\0';
                 users_save();
@@ -460,6 +705,80 @@ int users_set_password(const char *username, const char *password) {
         }
     }
     return -1;
+}
+
+/* ---- the shadow operations (finding 213) ----
+ *
+ * What passwd -l -u -d -e -n -x -w -i -S and chpasswd -e do to an account,
+ * as shadow-utils does them to /etc/shadow: a lock puts one '!' before the
+ * hash (once), an unlock takes it off -- not when that would leave no
+ * password -- a delete empties the hash, an expiry sets the last change to
+ * 0, a hash made elsewhere is kept as it is and is a change today. A name
+ * only /etc/passwd has gets its entry here first, as users_set_password's
+ * does. */
+static struct user *shadow_entry(const char *username) {
+    if (!username || !username[0]) return 0;
+    struct user *c = cache_find(username);
+    if (c) return c;
+    char nm[USER_NAME_MAX];
+    int u, g;
+    if (!passwd_find(username, 0, nm, &u, &g) || users_add(nm, u, g) != 0) return 0;
+    c = cache_find(nm);
+    if (c) copy_capped(c->password_hash, "!", USER_PWHASH_MAX);   /* locked */
+    return c;
+}
+
+int users_shadow_op(const char *username, int op, const char *arg) {
+    struct user *u = shadow_entry(username);
+    if (!u) return -1;
+    char *h = u->password_hash;
+    switch (op) {
+    case USERS_SH_LOCK:
+        if (h[0] != '!') {
+            size_t l = strlen(h);
+            if (l + 2 > USER_PWHASH_MAX) l = USER_PWHASH_MAX - 2;
+            memmove(h + 1, h, l);
+            h[0] = '!';
+            h[l + 1] = '\0';
+        }
+        break;
+    case USERS_SH_UNLOCK:
+        if (h[0] == '!') {
+            if (!h[1]) return -2;
+            memmove(h, h + 1, strlen(h));
+        }
+        break;
+    case USERS_SH_DELETE: h[0] = '\0'; break;
+    case USERS_SH_EXPIRE: u->lastchg = 0; break;
+    case USERS_SH_SETHASH:
+        copy_capped(h, arg ? arg : "", USER_PWHASH_MAX);
+        u->lastchg = users_today();
+        break;
+    default: return -1;
+    }
+    users_save();
+    return 0;
+}
+
+int users_shadow_age(const char *username, int64_t minage, int64_t maxage,
+                     int64_t warn, int64_t inactive) {
+    struct user *u = shadow_entry(username);
+    if (!u) return -1;
+    if (minage != -2) u->minage = minage;
+    if (maxage != -2) u->maxage = maxage;
+    if (warn != -2) u->warn = warn;
+    if (inactive != -2) u->inactive = inactive;
+    users_save();
+    return 0;
+}
+
+int users_shadow_get(const char *username, struct user *out, int *state) {
+    const struct user *u = users_lookup_by_name(username);
+    if (!u) return -1;
+    *out = *u;
+    const char *h = u->password_hash;
+    *state = h[0] == '!' ? 2 : h[0] ? 1 : 0;
+    return 0;
 }
 
 void users_dump(void) {

@@ -268,6 +268,49 @@ static bool ipv6_dst_is_for_us(const struct ipv6_addr *dst) {
     return false;
 }
 
+/* The source address ipv6_send will stamp for `dst` -- exported so an
+ * L4 checksum can be computed over the SAME pseudo-header the packet
+ * will actually carry (2026-08-23; the udp6 path needs it). Mirrors the
+ * selection in ipv6_send and its loopback branch exactly. */
+const struct ipv6_addr *ipv6_src_for(const struct ipv6_addr *dst) {
+    if (!ipv6_addr_is_multicast(dst) &&
+        (ipv6_addr_equal(dst, &ipv6_addr_loopback) ||
+         ipv6_dst_is_for_us(dst)))
+        return dst;                       /* loopback: src == dst */
+    if (g_have_global && !ipv6_addr_is_linklocal(dst) &&
+        !ipv6_addr_is_multicast(dst))
+        return &g_global;
+    return &g_linklocal;
+}
+
+/* Shared L4 pseudo-header checksum (RFC 8200 §8.1). Mandatory for UDP
+ * over v6 (unlike v4, a zero checksum is INVALID). icmpv6.c grew its own
+ * copy first; this export exists so the socket layer's UDP path cannot
+ * drift from it. */
+uint16_t ipv6_l4_checksum(const struct ipv6_addr *src,
+                          const struct ipv6_addr *dst,
+                          uint8_t next_header,
+                          const void *payload, size_t len) {
+    uint32_t sum = 0;
+    const uint16_t *s = (const uint16_t *)src->bytes;
+    const uint16_t *d = (const uint16_t *)dst->bytes;
+    for (int i = 0; i < 8; i++) {
+        sum += ntohs(s[i]);
+        sum += ntohs(d[i]);
+    }
+    sum += (uint32_t)len;
+    sum += next_header;
+    const uint8_t *p = (const uint8_t *)payload;
+    for (size_t i = 0; i + 1 < len; i += 2)
+        sum += ((uint32_t)p[i] << 8) | p[i + 1];
+    if (len & 1)
+        sum += (uint32_t)p[len - 1] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    uint16_t cs = htons(~(uint16_t)sum);
+    return cs ? cs : 0xFFFF;   /* UDP: all-ones stands in for zero */
+}
+
 void ipv6_recv(const void *frame, size_t len) {
     if (!g_ipv6_up) return;
     if (len < IPV6_HDR_LEN) return;
@@ -291,18 +334,46 @@ void ipv6_recv(const void *frame, size_t len) {
         icmpv6_recv(&h->src, &h->dst, payload, plen);
         break;
     case IPV6_NH_UDP: {
-        /* Minimal UDP-over-IPv6 demux: only the DHCPv6 client port (546)
-         * is consumed in-kernel today. Header = src(2) dst(2) len(2) cks(2). */
+        /* UDP-over-IPv6 demux. The DHCPv6 client port (546) stays an
+         * in-kernel consumer; everything else goes to the AF_INET6
+         * socket layer (2026-08-23 -- before this, every v6 datagram
+         * that wasn't DHCPv6 was silently dropped, because no v6
+         * sockets existed to want it). Header = src(2) dst(2) len(2)
+         * cks(2). */
         if (plen < 8) break;
+        uint16_t sport = ((uint16_t)payload[0] << 8) | payload[1];
         uint16_t dport = ((uint16_t)payload[2] << 8) | payload[3];
         uint16_t ulen  = ((uint16_t)payload[4] << 8) | payload[5];
-        if (dport == 546 && ulen >= 8 && (size_t)ulen <= plen)
+        {   /* capped trace while the wire path is young */
+            static int seen;
+            if (seen < 8) { seen++;
+                kprintf("[ipv6] udp in sport=%u dport=%u ulen=%u plen=%u\n",
+                        (unsigned)sport, (unsigned)dport, (unsigned)ulen,
+                        (unsigned)plen);
+            } }
+        if (ulen < 8 || (size_t)ulen > plen) break;
+        if (dport == 546) {
             dhcpv6_recv(&h->src, payload + 8, (size_t)ulen - 8);
+            break;
+        }
+        {
+            extern void sock_udp6_deliver(const struct ipv6_addr *src,
+                                          uint16_t sport, uint16_t dport,
+                                          const void *data, size_t len);
+            sock_udp6_deliver(&h->src, sport, dport,
+                              payload + 8, (size_t)ulen - 8);
+        }
         break;
     }
-    case IPV6_NH_TCP:
-        /* Future: TCP-over-IPv6 */
+    case IPV6_NH_TCP: {
+        /* TCP6 (2026-08-23): the same engine as v4, demuxed by v6 peer.
+         * Extern to keep tcp.h out of this file's include set. */
+        extern void tcp_recv_packet6(const struct ipv6_addr *src,
+                                     const struct ipv6_addr *dst,
+                                     const void *tcp_packet, size_t len);
+        tcp_recv_packet6(&h->src, &h->dst, payload, plen);
         break;
+    }
     default:
         break;
     }
@@ -310,10 +381,31 @@ void ipv6_recv(const void *frame, size_t len) {
 
 /* ---- send -------------------------------------------------------- */
 
-int ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
-              const void *payload, size_t payload_len) {
+int ipv6_send_hl(const struct ipv6_addr *dst, uint8_t next_header,
+                 const void *payload, size_t payload_len, uint8_t hop_limit) {
     if (!g_ipv6_up) return -1;
     if (payload_len > ETH_MTU - IPV6_HDR_LEN) return -1;
+
+    /* Loopback (2026-08-23): ::1 and our own unicast addresses deliver
+     * INLINE through ipv6_recv, mirroring the 127/8 design ip.c adopted
+     * in the fidelity arc -- no device, no neighbor resolution, and the
+     * caller's send IS the peer's receive. Multicast stays on the wire. */
+    if (!ipv6_addr_is_multicast(dst) &&
+        (ipv6_addr_equal(dst, &ipv6_addr_loopback) ||
+         ipv6_dst_is_for_us(dst))) {
+        uint8_t frame[ETH_MTU];
+        struct ipv6_hdr *h = (struct ipv6_hdr *)frame;
+        memset(h, 0, IPV6_HDR_LEN);
+        ((uint8_t *)&h->ver_tc_fl)[0] = 0x60;
+        h->payload_len = htons((uint16_t)payload_len);
+        h->next_header = next_header;
+        h->hop_limit   = hop_limit;
+        h->src = *dst;               /* self-addressed: src == dst */
+        h->dst = *dst;
+        memcpy(frame + IPV6_HDR_LEN, payload, payload_len);
+        ipv6_recv(frame, IPV6_HDR_LEN + payload_len);
+        return 0;
+    }
 
     uint8_t dst_mac[6];
 
@@ -346,7 +438,7 @@ int ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
 
     h->payload_len = htons((uint16_t)payload_len);
     h->next_header = next_header;
-    h->hop_limit   = 64;
+    h->hop_limit   = hop_limit;
     /* Source selection: a link-local/multicast destination uses our
      * link-local; a global destination uses our SLAAC global if we have one
      * (a global source is required for the reply to be routable back). */
@@ -364,4 +456,9 @@ int ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
         return -1;
 
     return 0;
+}
+
+int ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
+              const void *payload, size_t payload_len) {
+    return ipv6_send_hl(dst, next_header, payload, payload_len, 64);
 }

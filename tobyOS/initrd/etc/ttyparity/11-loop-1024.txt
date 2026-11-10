@@ -1,0 +1,12 @@
+# A LOOP MUST NOT STOP EARLY AND SAY NOTHING.
+#
+# tsh capped every while/until loop at 1024 iterations while the check that
+# was supposed to announce the cap tested a different (unreachable) number,
+# so a script looping past 1k simply got the wrong answer with no error --
+# the loop reported its body's last status as though it had finished.
+#
+# 5000 iterations: comfortably past the old cap, quick for both shells.
+i=0
+while [ $i -lt 5000 ]; do i=$((i+1)); done
+echo "i=$i rc=$?"
+exit 0

@@ -9,9 +9,15 @@
  * fcntl.h's open() lives here (rather than in a separate fcntl.c)
  * because there's no good reason to split it out. */
 
+#include <sys/sysmacros.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
+#include <sys/statfs.h>
+#include <sys/resource.h>
+#include <stdio.h>
 #include <errno.h>
 #include <stdarg.h>
 #include "libtoby_internal.h"
@@ -110,19 +116,25 @@ int unlink(const char *path) {
  *   - sbrk(0)       -> current break.
  *   - sbrk(inc)     -> previous break, or (void*)-1 + errno=ENOMEM. */
 
+/* MEMORY IS NOT AN EFFECT: the break moves without flushing stdio first
+ * (K5, syscall.c, writes pending output before every other syscall). A
+ * program's output has nothing to be ordered against here, and flushing
+ * made WHERE a buffered line broke depend on whether malloc happened to
+ * grow the heap: /bin/tsh's printf put half a line out ahead of its own
+ * warning, where bash's stdio holds the line (logs/b13 q53). */
 int brk(void *addr) {
-    long r = toby_sc1(ABI_SYS_BRK, (long)(uintptr_t)addr);
+    long r = toby_sc_raw3(ABI_SYS_BRK, (long)(uintptr_t)addr, 0, 0);
     if (r == 0 && addr != 0) { errno = ENOMEM; return -1; }
     return 0;
 }
 
 void *sbrk(long inc) {
     /* Read current. */
-    long cur = toby_sc1(ABI_SYS_BRK, 0);
+    long cur = toby_sc_raw3(ABI_SYS_BRK, 0, 0, 0);
     if (cur == 0) { errno = ENOMEM; return (void *)-1; }
     if (inc == 0) return (void *)(uintptr_t)cur;
     long want = cur + inc;
-    long got  = toby_sc1(ABI_SYS_BRK, want);
+    long got  = toby_sc_raw3(ABI_SYS_BRK, want, 0, 0);
     if (got != want) { errno = ENOMEM; return (void *)-1; }
     return (void *)(uintptr_t)cur;     /* POSIX: return PREVIOUS break */
 }
@@ -131,38 +143,34 @@ void *sbrk(long inc) {
  *
  * Bypasses atexit handlers (see exit() in stdlib.c for the full path). */
 
-/* DEBUG (M25C): trace each _exit() call with caller RIP + code so we
- * can pin down a mystery exit(2) coming out of the env test program.
- * Uses raw write() so no stdio buffering can swallow the line. */
-static void __toby_exit_trace(int code, void *caller) {
-    char buf[80];
-    static const char hex[] = "0123456789abcdef";
-    int  i = 0;
-    buf[i++] = '[';  buf[i++] = '_';  buf[i++] = 'e'; buf[i++] = 'x';
-    buf[i++] = 'i';  buf[i++] = 't';  buf[i++] = ']';
-    buf[i++] = ' ';  buf[i++] = 'c';  buf[i++] = 'o'; buf[i++] = 'd';
-    buf[i++] = 'e';  buf[i++] = '=';
-    /* Decimal code (handles negative). */
-    int c = code;
-    if (c < 0) { buf[i++] = '-'; c = -c; }
-    char tmp[12]; int ti = 0;
-    if (c == 0) { tmp[ti++] = '0'; }
-    while (c) { tmp[ti++] = (char)('0' + (c % 10)); c /= 10; }
-    while (ti) buf[i++] = tmp[--ti];
-    buf[i++] = ' '; buf[i++] = 'c'; buf[i++] = 'a'; buf[i++] = 'l';
-    buf[i++] = 'l'; buf[i++] = 'e'; buf[i++] = 'r'; buf[i++] = '=';
-    buf[i++] = '0'; buf[i++] = 'x';
-    unsigned long p = (unsigned long)(uintptr_t)caller;
-    for (int s = 60; s >= 0; s -= 4) {
-        buf[i++] = hex[(p >> s) & 0xf];
-    }
-    buf[i++] = '\n';
-    /* Direct write to fd=2 (stderr); ignore failures. */
-    (void)toby_sc3(ABI_SYS_WRITE, 2, (long)(uintptr_t)buf, (long)i);
-}
-
+/* THE M25C EXIT TRACE IS GONE (2026-09-13).
+ *
+ * It wrote "[_exit] code=<n> caller=0x<rip>" to fd 2 on every _exit(), to
+ * pin down one mystery exit(2) coming out of the env test program. That
+ * question was answered long ago; the line outlived it and became a tax on
+ * every harness in the tree.
+ *
+ * It fired precisely when stderr was NOT a tty -- which is the definition
+ * of a captured stream, so it polluted exactly the transcripts that get
+ * compared and never the screen where a human might have noticed it. Its
+ * own comment claimed it stayed "for captured streams (harnesses read
+ * it)", and no harness ever read it: programs/oilspec/main.c skips the
+ * line in two places, and logs/kernstrip.sh strips it for both distro
+ * gates. Three filters, zero consumers.
+ *
+ * It also cost a real verdict. On the real EliteDesk the shred section
+ * graded FAIL with
+ *
+ *     ...|/tmp/shr: removed|[_exit] code=0 caller=0x4070a4|gone|
+ *
+ * against an expectation identical but for that middle field. A diagnostic
+ * that no one reads, which corrupts the streams that ARE read, is not a
+ * diagnostic -- it is noise with a build dependency. Filtering it in three
+ * places was the wrong repair; not emitting it is the right one.
+ *
+ * (oilspec's two filters are left alone: they cost nothing and still guard
+ * against a stale binary built before this commit.) */
 void _exit(int code) {
-    __toby_exit_trace(code, __builtin_return_address(0));
     toby_sc1(ABI_SYS_EXIT, code);
     for (;;) { __asm__ volatile ("hlt"); }   /* unreachable */
 }
@@ -183,13 +191,21 @@ int usleep(unsigned int usecs) {
 
 /* ---- isatty ------------------------------------------------------ *
  *
- * The kernel exposes no "is this fd a tty?" syscall yet (M25A scope).
- * We approximate by treating stdin/stdout/stderr as ttys and everything
- * else as not. Good enough for the M25E-era ports of cat/ls which only
- * use isatty to decide whether to colourise output. */
+ * ASK THE KERNEL. This used to return 1 for any of fd 0/1/2 whatever they
+ * were pointing at, under a comment saying no syscall could tell -- while
+ * _exit() twenty lines above was already using the right probe: TCGETS
+ * succeeds on a console or a pty and returns ENOTTY on anything else.
+ *
+ * The stub was not harmless. Every tool that changes behaviour for a
+ * terminal was taking the terminal branch when redirected: `ls` printed
+ * COLUMNS into a pipe instead of one name per line, `more` paged instead
+ * of copying its input through, `nohup` always redirected to nohup.out,
+ * and `watch` would have looped forever in a script. */
 int isatty(int fd) {
-    if (fd >= 0 && fd <= 2) return 1;
-    return 0;
+    if (fd < 0) return 0;
+    char tio_probe[64];
+    return toby_sc3(ABI_SYS_IOCTL, fd, 0x5401 /* TCGETS */,
+                    (long)(uintptr_t)tio_probe) >= 0;
 }
 
 /* ---- open ------------------------------------------------------- *
@@ -220,23 +236,238 @@ static int abi_stat_to_user(const struct abi_stat *k, struct stat *u) {
     u->st_mode = (mode_t)k->mode;
     u->st_uid  = (uid_t)k->uid;
     u->st_gid  = (gid_t)k->gid;
+    u->st_mtim.tv_sec = (time_t)k->mtime; u->st_mtim.tv_nsec = (long)k->mtime_ns;
+    u->st_atim.tv_sec = (time_t)k->atime; u->st_atim.tv_nsec = (long)k->atime_ns;
+    u->st_nlink = (nlink_t)k->nlink;
+    u->st_ino   = (ino_t)k->ino;
+    /* the mount's number split as the Linux personality splits it, 12 bits
+     * of major over 20 of minor, so a native `stat -c %d` and a Linux one
+     * agree; 0 stays 0, "no answer" */
+    u->st_dev   = k->dev ? (dev_t)makedev((unsigned)(k->dev >> 20) & 0xfffu,
+                                          (unsigned)k->dev & 0xfffffu) : 0;
+    u->st_ctim.tv_sec = (time_t)k->ctime; u->st_ctim.tv_nsec = (long)k->ctime_ns;
+    u->st_blocks  = (blkcnt_t)k->blocks;
+    u->st_blksize = (blksize_t)k->blksize;
+    u->st_rdev    = (k->rdev_major || k->rdev_minor)
+                  ? (dev_t)makedev(k->rdev_major, k->rdev_minor) : 0;
     return 0;
 }
 
-int stat(const char *path, struct stat *out) {
+/* stat, lstat and fstat ask through ABI_SYS_XSTAT, which writes the whole
+ * struct abi_stat this libtoby was built with (batch 25); the old calls
+ * write only its first ABI_STAT_V1_SIZE bytes. KIND 0 stat, 1 lstat, 2
+ * fstat. */
+static int xstat(int kind, long what, struct stat *out) {
     if (!out) { errno = EFAULT; return -1; }
     struct abi_stat k;
-    long r = toby_sc2(ABI_SYS_STAT, (long)(uintptr_t)path, (long)(uintptr_t)&k);
+    memset(&k, 0, sizeof k);
+    long r = toby_sc4(ABI_SYS_XSTAT, kind, what, (long)(uintptr_t)&k, (long)sizeof k);
     if (__toby_check(r) < 0) return -1;
     return abi_stat_to_user(&k, out);
 }
 
+int stat(const char *path, struct stat *out) {
+    return xstat(0, (long)(uintptr_t)path, out);
+}
+
 int fstat(int fd, struct stat *out) {
-    if (!out) { errno = EFAULT; return -1; }
-    struct abi_stat k;
-    long r = toby_sc2(ABI_SYS_FSTAT, fd, (long)(uintptr_t)&k);
-    if (__toby_check(r) < 0) return -1;
-    return abi_stat_to_user(&k, out);
+    return xstat(2, fd, out);
+}
+
+/* A FIFO at PATH, MODE less the umask (ABI_SYS_MKFIFO). */
+int mkfifo(const char *path, mode_t mode) {
+    return (int)__toby_check(toby_sc2(ABI_SYS_MKFIFO, (long)(uintptr_t)path,
+                                      (long)mode));
+}
+
+/* mknod(2) and mknodat(2), the kernel's in Linux's order of answers: a
+ * device node for root alone, as on Linux (finding 214; there was none) */
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
+    return (int)__toby_check(toby_sc4(ABI_SYS_MKNOD, dirfd, (long)(uintptr_t)path,
+                                      (long)mode, (long)dev));
+}
+int mknod(const char *path, mode_t mode, dev_t dev) {
+    return mknodat(-100, path, mode, dev);           /* AT_FDCWD */
+}
+
+/* chroot(2), the kernel's (finding 214; there was none) */
+int chroot(const char *path) {
+    return (int)__toby_check(toby_sc1(ABI_SYS_CHROOT, (long)(uintptr_t)path));
+}
+
+/* statfs(2) and fstatfs(2) in Linux's struct statfs, the Linux arms'
+ * answers (finding 215; there were none) */
+int statfs(const char *path, struct statfs *buf) {
+    return (int)__toby_check(toby_sc3(ABI_SYS_LXSTATFS, 0, (long)(uintptr_t)path,
+                                      (long)(uintptr_t)buf));
+}
+int fstatfs(int fd, struct statfs *buf) {
+    return (int)__toby_check(toby_sc3(ABI_SYS_LXSTATFS, 1, fd, (long)(uintptr_t)buf));
+}
+
+/* fsync(2) and fdatasync(2), the kernel's (finding 215: shred synced the
+ * whole cache, there being no fsync) */
+int fsync(int fd) {
+    return (int)__toby_check(toby_sc2(ABI_SYS_FSYNC, fd, 0));
+}
+int fdatasync(int fd) {
+    return (int)__toby_check(toby_sc2(ABI_SYS_FSYNC, fd, 1));
+}
+
+/* ---- pathconf, fpathconf (finding 215) -----------------------------------
+ *
+ * glibc's answers, measured (logs/b33/pathconfprobe-wsl.out): the
+ * terminal and path limits are constants that never look at the file
+ * (MAX_CANON and MAX_INPUT 255, PATH_MAX and PIPE_BUF 4096, NO_TRUNC 1,
+ * VDISABLE 0; SYNC_IO, PRIO_IO, SOCK_MAXBUF, the two REC_ sizes with no
+ * minimum and SYMLINK_MAX -1, errno untouched). CHOWN_RESTRICTED and
+ * 2_SYMLINKS are 1 for a file that exists, ASYNC_IO 1 for a regular file
+ * or a block device and -1 otherwise. The rest are the filesystem's:
+ * NAME_MAX its longest name, REC_MIN_XFER_SIZE, REC_XFER_ALIGN and
+ * ALLOC_SIZE_MIN its block size, and by its type -- ext2 and ext3 32000
+ * links, ext4 65000, both 64 bits of file size; anything else 127 links
+ * and 32 bits (tmpfs, proc, sysfs, 9p measured; glibc's table names a
+ * few more types, none of them a filesystem tobyOS has). A file that
+ * cannot be looked at is its errno (ENOENT, EBADF); an unknown NAME is
+ * EINVAL. */
+
+struct pc_target { const char *path; int fd; };
+
+static int pc_statfs(const struct pc_target *t, struct statfs *sf) {
+    return t->path ? statfs(t->path, sf) : fstatfs(t->fd, sf);
+}
+static int pc_stat(const struct pc_target *t, struct stat *st) {
+    return t->path ? stat(t->path, st) : fstat(t->fd, st);
+}
+
+/* ext2 and ext3 share ext4's magic: the type in /proc/self/mounts of the
+ * mount the file is on says which (its mount point's device is the
+ * file's), as glibc tells them apart */
+static long pc_ext_link_max(const struct pc_target *t) {
+    struct stat me, ms;
+    if (pc_stat(t, &me) != 0) return 32000;
+    FILE *m = fopen("/proc/self/mounts", "r");
+    if (!m) return 32000;
+    long r = 32000;
+    char line[1024];
+    while (fgets(line, sizeof line, m)) {
+        char *f[3] = { 0, 0, 0 };
+        char *p = line;
+        for (int i = 0; i < 3; i++) {
+            while (*p == ' ') p++;
+            f[i] = p;
+            while (*p && *p != ' ' && *p != '\n') p++;
+            if (*p) *p++ = 0;
+        }
+        if (!f[2] || strncmp(f[2], "ext", 3) != 0) continue;
+        if (stat(f[1], &ms) == 0 && ms.st_dev == me.st_dev)
+            r = strcmp(f[2], "ext4") == 0 ? 65000 : 32000;
+    }
+    fclose(m);
+    return r;
+}
+
+static long pc_query(const struct pc_target *t, int name) {
+    struct statfs sf;
+    struct stat st;
+    switch (name) {
+    case _PC_MAX_CANON: case _PC_MAX_INPUT: return 255;
+    case _PC_PATH_MAX: case _PC_PIPE_BUF:   return 4096;
+    case _PC_NO_TRUNC:                      return 1;
+    case _PC_VDISABLE:                      return 0;
+    case _PC_SYNC_IO: case _PC_PRIO_IO: case _PC_SOCK_MAXBUF:
+    case _PC_REC_INCR_XFER_SIZE: case _PC_REC_MAX_XFER_SIZE:
+    case _PC_SYMLINK_MAX:
+        return -1;
+    case _PC_CHOWN_RESTRICTED: case _PC_2_SYMLINKS:
+        return pc_stat(t, &st) == 0 ? 1 : -1;
+    case _PC_ASYNC_IO:
+        if (pc_stat(t, &st) != 0) return -1;
+        return (S_ISREG(st.st_mode) || S_ISBLK(st.st_mode)) ? 1 : -1;
+    case _PC_LINK_MAX: case _PC_NAME_MAX: case _PC_FILESIZEBITS:
+    case _PC_REC_MIN_XFER_SIZE: case _PC_REC_XFER_ALIGN: case _PC_ALLOC_SIZE_MIN:
+        if (pc_statfs(t, &sf) != 0) return -1;
+        if (name == _PC_NAME_MAX) return sf.f_namelen;
+        if (name == _PC_FILESIZEBITS) return sf.f_type == 0xEF53 ? 64 : 32;
+        if (name == _PC_LINK_MAX)
+            return sf.f_type == 0xEF53 ? pc_ext_link_max(t) : 127;
+        return sf.f_bsize;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+long pathconf(const char *path, int name) {
+    struct pc_target t = { path, -1 };
+    if (!path) { errno = EFAULT; return -1; }
+    return pc_query(&t, name);
+}
+
+long fpathconf(int fd, int name) {
+    struct pc_target t = { 0, fd };
+    return pc_query(&t, name);
+}
+
+/* unshare(2), the kernel's (finding 241; there was none): <sched.h> */
+int unshare(int flags) {
+    return (int)__toby_check(toby_sc1(ABI_SYS_UNSHARE, (long)(unsigned)flags));
+}
+
+/* The twelve extended-attribute calls (finding 225; there were none):
+ * ABI_SYS_XATTR carries Linux's number for each -- 188 setxattr, then
+ * lsetxattr, fsetxattr, getxattr (191), lgetxattr, fgetxattr, listxattr
+ * (194), llistxattr, flistxattr, removexattr (197), lremovexattr,
+ * fremovexattr -- and a set's flags above its size. */
+static long xa_call(long nr, long a, long b, long c, long d) {
+    return __toby_check(toby_sc5(ABI_SYS_XATTR, nr, a, b, c, d));
+}
+static long xa_set(long nr, long target, const char *name, const void *value,
+                   size_t size, int flags) {
+    return xa_call(nr, target, (long)(uintptr_t)name, (long)(uintptr_t)value,
+                   (long)((uint64_t)size | (uint64_t)(uint32_t)flags << 32));
+}
+int setxattr(const char *path, const char *name, const void *value, size_t size, int flags) {
+    return (int)xa_set(188, (long)(uintptr_t)path, name, value, size, flags);
+}
+int lsetxattr(const char *path, const char *name, const void *value, size_t size, int flags) {
+    return (int)xa_set(189, (long)(uintptr_t)path, name, value, size, flags);
+}
+int fsetxattr(int fd, const char *name, const void *value, size_t size, int flags) {
+    return (int)xa_set(190, fd, name, value, size, flags);
+}
+ssize_t getxattr(const char *path, const char *name, void *value, size_t size) {
+    return xa_call(191, (long)(uintptr_t)path, (long)(uintptr_t)name, (long)(uintptr_t)value, (long)size);
+}
+ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size) {
+    return xa_call(192, (long)(uintptr_t)path, (long)(uintptr_t)name, (long)(uintptr_t)value, (long)size);
+}
+ssize_t fgetxattr(int fd, const char *name, void *value, size_t size) {
+    return xa_call(193, fd, (long)(uintptr_t)name, (long)(uintptr_t)value, (long)size);
+}
+ssize_t listxattr(const char *path, char *list, size_t size) {
+    return xa_call(194, (long)(uintptr_t)path, (long)(uintptr_t)list, (long)size, 0);
+}
+ssize_t llistxattr(const char *path, char *list, size_t size) {
+    return xa_call(195, (long)(uintptr_t)path, (long)(uintptr_t)list, (long)size, 0);
+}
+ssize_t flistxattr(int fd, char *list, size_t size) {
+    return xa_call(196, fd, (long)(uintptr_t)list, (long)size, 0);
+}
+int removexattr(const char *path, const char *name) {
+    return (int)xa_call(197, (long)(uintptr_t)path, (long)(uintptr_t)name, 0, 0);
+}
+int lremovexattr(const char *path, const char *name) {
+    return (int)xa_call(198, (long)(uintptr_t)path, (long)(uintptr_t)name, 0, 0);
+}
+int fremovexattr(int fd, const char *name) {
+    return (int)xa_call(199, fd, (long)(uintptr_t)name, 0, 0);
+}
+
+/* The link itself, S_IFLNK; stat() follows it. There was no lstat, and
+ * stat called a link a regular file, so nothing native could see one. */
+int lstat(const char *path, struct stat *out) {
+    return xstat(1, (long)(uintptr_t)path, out);
 }
 
 int mkdir(const char *path, mode_t mode) {
@@ -256,27 +487,32 @@ int pipe(int fds[2]) {
 
 /* ---- truncate / ftruncate --------------------------------------- *
  *
- * The kernel doesn't expose these yet -- stub with ENOSYS so linkers
- * resolve the symbol and callers get a clean error. */
+ * 2026-08-24: real syscalls. These were ENOSYS stubs with the comment
+ * "the kernel doesn't expose these yet" -- which stopped being true when
+ * the Linux personality got truncate(2)/ftruncate(2) against the same
+ * VFS, so busybox could shorten a file and a native tobyOS program could
+ * not. ABI_SYS_TRUNCATE/FTRUNCATE close that. */
 
 int truncate(const char *path, off_t length) {
-    (void)path; (void)length;
-    errno = ENOSYS;
-    return -1;
+    if (length < 0) { errno = EINVAL; return -1; }
+    return (int)__toby_check(
+        toby_sc2(ABI_SYS_TRUNCATE, (long)(uintptr_t)path, (long)length));
 }
 
 int ftruncate(int fd, off_t length) {
-    (void)fd; (void)length;
-    errno = ENOSYS;
-    return -1;
+    if (length < 0) { errno = EINVAL; return -1; }
+    return (int)__toby_check(toby_sc2(ABI_SYS_FTRUNCATE, (long)fd, (long)length));
 }
 
 /* ---- rmdir ------------------------------------------------------ *
  *
- * Maps to unlink for now (tobyfs doesn't distinguish dir removal). */
+ * 2026-08-24: a real rmdir. This used to be `return unlink(path)`, so
+ * `rmdir somefile` DELETED THE FILE rather than reporting ENOTDIR --
+ * every script that probes with rmdir before falling back to unlink was
+ * quietly destroying data. The kernel does the type check. */
 
 int rmdir(const char *path) {
-    return (int)__toby_check(toby_sc1(ABI_SYS_UNLINK, (long)(uintptr_t)path));
+    return (int)__toby_check(toby_sc1(ABI_SYS_RMDIR, (long)(uintptr_t)path));
 }
 
 /* ---- access ----------------------------------------------------- *
@@ -305,43 +541,100 @@ int chown(const char *path, uid_t owner, gid_t group) {
         toby_sc3(ABI_SYS_CHOWN, (long)(uintptr_t)path, (long)owner, (long)group));
 }
 
+/* getgroups(2): the supplementary groups, as a login set them */
+int getgroups(int size, gid_t list[]) {
+    return (int)__toby_check(
+        toby_sc2(ABI_SYS_GETGROUPS, (long)size, (long)(uintptr_t)list));
+}
+
+/* setgroups(2): privileged, as Linux's (finding 203) */
+int setgroups(size_t size, const gid_t *list) {
+    return (int)__toby_check(
+        toby_sc2(ABI_SYS_SETGROUPS, (long)size, (long)(uintptr_t)list));
+}
+
+/* initgroups(3): GROUP and every /etc/group entry that names USER, as
+ * glibc's -- what a login and su give the account (finding 203) */
+int initgroups(const char *user, gid_t group) {
+    gid_t g[64];
+    size_t n = 0;
+    g[n++] = group;
+    int fd = open("/etc/group", O_RDONLY);
+    if (fd >= 0) {
+        static char buf[16384];
+        ssize_t r, len = 0;
+        while (len < (ssize_t)sizeof buf - 1 &&
+               (r = read(fd, buf + len, sizeof buf - 1 - (size_t)len)) > 0)
+            len += r;
+        close(fd);
+        buf[len > 0 ? len : 0] = '\0';
+        size_t ul = user ? strlen(user) : 0;
+        for (char *s = buf; ul && *s && n < 64; ) {
+            char *e = strchr(s, '\n');
+            if (e) *e = '\0';
+            /* NAME:PASSWORD:GID:MEMBER,MEMBER... */
+            char *c1 = strchr(s, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : 0;
+            char *c3 = c2 ? strchr(c2 + 1, ':') : 0;
+            if (c3 && c2[1] >= '0' && c2[1] <= '9') {
+                gid_t gid = 0;
+                for (char *q = c2 + 1; q < c3 && *q >= '0' && *q <= '9'; q++)
+                    gid = gid * 10 + (gid_t)(*q - '0');
+                for (char *m = c3 + 1; *m; ) {
+                    size_t ml = strcspn(m, ",\r");
+                    if (ml == ul && !strncmp(m, user, ul)) {
+                        size_t k = 0;
+                        while (k < n && g[k] != gid) k++;
+                        if (k == n) g[n++] = gid;
+                        break;
+                    }
+                    m += ml;
+                    if (*m) m++;
+                }
+            }
+            if (!e) break;
+            s = e + 1;
+        }
+    }
+    return setgroups(n, g);
+}
+
+/* lchown(2): a symbolic link itself, where chown follows one */
+int lchown(const char *path, uid_t owner, gid_t group) {
+    return (int)__toby_check(
+        toby_sc3(ABI_SYS_LCHOWN, (long)(uintptr_t)path, (long)owner, (long)group));
+}
+
+/* Always succeeds; the kernel answers with the previous mask. */
+mode_t umask(mode_t mask) {
+    return (mode_t)toby_sc1(ABI_SYS_UMASK, (long)mask);
+}
+
 /* ---- rename ----------------------------------------------------- *
  *
- * No kernel rename syscall. Emulate with read-copy-write-unlink.
- * Only works for regular files that fit in memory (64KB limit). */
+ * 2026-08-24: the real thing. This was a read-copy-write-unlink
+ * emulation, which is not a rename: it could not move a DIRECTORY (it
+ * returned EISDIR), it was not atomic, it doubled the file's storage
+ * mid-flight, and a failure part-way left both names present with
+ * different contents. The kernel had vfs_rename all along -- renameat(2)
+ * in the Linux personality already used it. */
 
 int rename(const char *oldpath, const char *newpath) {
-    struct stat st;
-    if (stat(oldpath, &st) < 0) return -1;
-    if ((st.st_mode & S_IFMT) == S_IFDIR) { errno = EISDIR; return -1; }
-
-    int src = open(oldpath, O_RDONLY);
-    if (src < 0) return -1;
-
-    int dst = open(newpath, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
-    if (dst < 0) { close(src); return -1; }
-
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(src, buf, sizeof(buf))) > 0) {
-        ssize_t w = write(dst, buf, (size_t)n);
-        if (w != n) { close(src); close(dst); return -1; }
-    }
-    close(src);
-    close(dst);
-    if (n < 0) return -1;
-    return unlink(oldpath);
+    return (int)__toby_check(toby_sc2(ABI_SYS_RENAME,
+                                      (long)(uintptr_t)oldpath,
+                                      (long)(uintptr_t)newpath));
 }
 
 /* ---- link / symlink / readlink ---------------------------------- *
  *
- * link() still stubs (hard links not implemented in tobyfs).
+ * link() reaches ABI_SYS_LINK (native-parity batch, 2026-09-04).
  * symlink/readlink use the kernel's SYS_SYMLINK/SYS_READLINK. */
 
 int link(const char *oldpath, const char *newpath) {
-    (void)oldpath; (void)newpath;
-    errno = ENOSYS;
-    return -1;
+    /* ABI_SYS_LINK (2026-09-04): a real hard link where the filesystem has
+     * inode indirection (tobyfs, tmpfs); -EPERM where it cannot, which is
+     * exactly Linux's answer on FAT. This stubbed ENOSYS for years. */
+    return (int)__toby_check(
+        toby_sc2(ABI_SYS_LINK, (long)(uintptr_t)oldpath, (long)(uintptr_t)newpath));
 }
 
 int symlink(const char *target, const char *linkpath) {
@@ -356,9 +649,13 @@ ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
 
 /* ---- getuid / geteuid / getgid / getegid ------------------------ */
 
-uid_t getuid(void)  { return (uid_t)toby_sc0(ABI_SYS_GETUID); }
+/* THE REAL IDS for getuid/getgid, the effective for geteuid/getegid
+ * (finding 206): all four said the effective ones, so a setuid-root
+ * program could not tell who ran it -- sudo, asking getuid(), let anyone
+ * be root. */
+uid_t getuid(void)  { return (uid_t)toby_sc0(ABI_SYS_GETRUID); }
 uid_t geteuid(void) { return (uid_t)toby_sc0(ABI_SYS_GETUID); }
-gid_t getgid(void)  { return (gid_t)toby_sc0(ABI_SYS_GETGID); }
+gid_t getgid(void)  { return (gid_t)toby_sc0(ABI_SYS_GETRGID); }
 gid_t getegid(void) { return (gid_t)toby_sc0(ABI_SYS_GETGID); }
 
 /* Slice 14: the native ABI could READ identity but never change it, which is why
@@ -376,10 +673,42 @@ int setgid(gid_t gid) {
     return 0;
 }
 
+/* Job control: real process groups (the shell's `set -m`). */
+int setpgid(pid_t pid, pid_t pgid) {
+    long r = toby_sc2(ABI_SYS_SETPGID, (long)pid, (long)pgid);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 0;
+}
+pid_t getpgid(pid_t pid) {
+    long r = toby_sc1(ABI_SYS_GETPGID, (long)pid);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return (pid_t)r;
+}
+pid_t getpgrp(void) { return getpgid(0); }
+
+/* setsid(2): a new session and group led by the caller, with no
+ * controlling terminal; EPERM for a process-group leader (fork first). */
+pid_t setsid(void) {
+    long r = toby_sc0(ABI_SYS_SETSID);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return (pid_t)r;
+}
+
+int ioctl(int fd, unsigned long req, void *argp) {
+    long r = toby_sc3(ABI_SYS_IOCTL, fd, (long)req, (long)argp);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return (int)r;
+}
+
 /* ---- socket API ------------------------------------------------- */
 
 int socket(int domain, int type, int protocol) {
-    (void)protocol;
+    /* The kernel's socket() takes only (domain, type), so a raw socket's
+     * protocol rides in the top 16 bits of `type` -- see SOCK_RAW_PROTO_SHIFT
+     * in tobyos/socket.h. Discarding it (which this did) meant every raw
+     * socket asked for protocol 0 and got every packet on the machine. */
+    if ((type & 0xFFFF) == 3 /* SOCK_RAW */ && protocol > 0)
+        type |= (protocol & 0xFF) << 16;
     return (int)__toby_check(toby_sc2(ABI_SYS_SOCKET, domain, type));
 }
 
@@ -398,4 +727,75 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, void *src_out) {
     return (ssize_t)__toby_check(
         toby_sc4(ABI_SYS_RECVFROM, sockfd, (long)(uintptr_t)buf,
                  (long)len, (long)(uintptr_t)src_out));
+}
+
+int toby_sockopt(int fd, int opt, long val) {
+    return (int)__toby_check(toby_sc3(ABI_SYS_SOCKOPT, (long)fd, (long)opt, val));
+}
+
+int toby_arp_resolve(unsigned int ip_be, unsigned char mac[6]) {
+    return (int)__toby_check(toby_sc3(ABI_SYS_ARP, 0, (long)ip_be,
+                                      (long)(uintptr_t)mac));
+}
+
+int toby_arp_request(unsigned int ip_be) {
+    return (int)__toby_check(toby_sc3(ABI_SYS_ARP, 1, (long)ip_be, 0));
+}
+
+/* ---- niceness (batch 25): getpriority/setpriority/nice -------------------
+ * The raw call answers 20 less the niceness, as Linux's does, so a
+ * niceness of -1 is never mistaken for an error there. */
+int getpriority(int which, int who) {
+    long r = toby_sc2(ABI_SYS_GETNICE, which, who);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 20 - (int)r;
+}
+
+int setpriority(int which, int who, int prio) {
+    long r = toby_sc3(ABI_SYS_SETNICE, which, who, prio);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 0;
+}
+
+/* ---- resource limits (batch 47): one call, prlimit64's --------------------
+ * struct rlimit is the kernel's { soft, hard } pair as it stands. getrlimit
+ * of a NULL pointer is EFAULT, not a quiet success: the kernel judges the
+ * resource first and then the pointer, as Linux's does, so this goes to
+ * the kernel with the pointer as it is. */
+int prlimit(int pid, int resource, const struct rlimit *new_limit,
+            struct rlimit *old_limit) {
+    long r = toby_sc4(ABI_SYS_PRLIMIT, pid, resource,
+                      (long)(uintptr_t)new_limit, (long)(uintptr_t)old_limit);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 0;
+}
+
+int getrlimit(int resource, struct rlimit *rlim) {
+    if (!rlim) {
+        /* the kernel would take a 0 OLD as "not wanted": judge the
+         * resource there, then fail the pointer */
+        struct rlimit tmp;
+        if (prlimit(0, resource, 0, &tmp) < 0) return -1;
+        errno = EFAULT;
+        return -1;
+    }
+    return prlimit(0, resource, 0, rlim);
+}
+
+int setrlimit(int resource, const struct rlimit *rlim) {
+    if (!rlim) { errno = EFAULT; return -1; }
+    return prlimit(0, resource, rlim, 0);
+}
+
+/* nice(3): add INC to the caller's niceness; the new one, or -1 with errno
+ * (EPERM for a lower one without the privilege -- POSIX's word for it). */
+int nice(int inc) {
+    errno = 0;
+    int cur = getpriority(0, 0);
+    if (cur == -1 && errno) return -1;
+    if (setpriority(0, 0, cur + inc) != 0) {
+        if (errno == EACCES) errno = EPERM;
+        return -1;
+    }
+    return getpriority(0, 0);
 }

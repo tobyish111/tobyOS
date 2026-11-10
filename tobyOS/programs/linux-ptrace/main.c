@@ -38,10 +38,18 @@
  * bit6 PTRACE_CONT runs the child to exit, and waitpid then reports the
  *      child's real exit code -- so the tracer sees a normal exit after a
  *      trace, not a process left parked.
- * bit7 the refusals are real: an unimplemented request (SINGLESTEP) returns
- *      EINVAL, and SETOPTIONS with an unimplemented option is refused rather
- *      than accepted. A tracer told "yes" for an event stop that never fires
- *      waits forever; an honest EINVAL it can fall back from.
+ * bit7 options are honest, and SINGLESTEP really steps: SETOPTIONS with an
+ *      unimplemented option is refused rather than accepted (a tracer told
+ *      "yes" for an event stop that never fires waits forever; an honest
+ *      EINVAL it can fall back from). SINGLESTEP returns 0 and the tracee
+ *      comes back as a SIGTRAP stop after one instruction.
+ *
+ *      This bit used to REQUIRE that SINGLESTEP be refused -- written when
+ *      it was unimplemented. 4178bbb implemented it (for gdb), and the stale
+ *      check then did worse than fail: it resumed the child without waiting
+ *      for the step's stop, so the next request raced the trap and got
+ *      ESRCH whenever the child had not stopped yet -- bits 2-4 failed or
+ *      passed by timing (rc 127 / 113 / 87 on one boot).
  *
  * exit status is the bitmask; 255 = all eight.
  * ===========================================================================
@@ -153,6 +161,14 @@ int main(void)
         errno = 0;
         long ss = ptrace(PTRACE_SINGLESTEP, kid, 0, 0);
         int ss_errno = errno;
+        /* The step runs ONE instruction and stops the tracee again with
+         * SIGTRAP. Wait for that stop HERE: until it arrives the tracee is
+         * running, and any request -- the PTRACE_SYSCALL below -- is
+         * rightly refused with ESRCH. */
+        int ss_trap = 0, ss_st = 0;
+        if (ss == 0 && waitpid(kid, &ss_st, 0) == kid &&
+            WIFSTOPPED(ss_st) && WSTOPSIG(ss_st) == SIGTRAP)
+            ss_trap = 1;
         if (!opt_ok)
             no("SETOPTIONS(TRACESYSGOOD) was refused, and it is implemented");
         else if (bad_opt == 0)
@@ -161,9 +177,12 @@ int main(void)
         else if (bad_errno != EINVAL)
             no("the unimplemented option was refused with errno=%d, want "
                "EINVAL", bad_errno);
-        else if (ss == 0 || ss_errno != EINVAL)
-            no("SINGLESTEP returned %ld errno=%d -- an unimplemented request "
-               "must refuse with EINVAL, not pretend", ss, ss_errno);
+        else if (ss != 0)
+            no("SINGLESTEP returned %ld errno=%d -- it is implemented and "
+               "must step", ss, ss_errno);
+        else if (!ss_trap)
+            no("SINGLESTEP returned 0 but no SIGTRAP stop followed "
+               "(status=0x%x) -- the step did not trap", ss_st);
         else
             refusals_ok = 1;
     }
@@ -283,14 +302,33 @@ int main(void)
         if (got == 0x5A5A5A5A)
             ok(32, "POKEDATA landed: the child read back %ld from a variable "
                    "only the tracer wrote", got);
-        else
-            no("the child reported %ld, want %ld -- POKEDATA did not reach "
-               "the other address space", got, (long)0x5A5A5A5A);
+        else {
+            /* `got` defaults to 0 AND is 0 when the child genuinely reports 0,
+             * so the bare number cannot say which failed: the poke, or the
+             * pipe readback this assertion rides on. Print the evidence.
+             * Note the child inherited g_poked = 0x1111 across fork, so a
+             * report of 0 is not even the pre-poke value -- that would point
+             * at the readback or at the child's page, not at POKEDATA. */
+            no("the child reported %ld (0x%lx), want %ld -- POKEDATA did not "
+               "reach the other address space", got, got, (long)0x5A5A5A5A);
+            no("  evidence: total=%ld pattern_match=%d num='%.*s'",
+               (long)total,
+               (total >= (ssize_t)PATLEN && memcmp(out, PATTERN, PATLEN) == 0),
+               (int)(total > (ssize_t)PATLEN ? total - (ssize_t)PATLEN : 0),
+               num);
+            {
+                char hex[3 * 24 + 1]; int hn = 0;
+                for (int i = 0; i < total && i < 24; i++)
+                    hn += snprintf(hex + hn, sizeof hex - (size_t)hn, "%02x ",
+                                   (unsigned char)out[i]);
+                no("  first bytes: %s", hex);
+            }
+        }
     }
 
     if (refusals_ok)
-        ok(128, "unimplemented requests refuse with EINVAL (SINGLESTEP, and "
-                "an unsupported SETOPTIONS bit)");
+        ok(128, "an unsupported SETOPTIONS bit refuses with EINVAL, and "
+                "SINGLESTEP steps: 0, then a SIGTRAP stop");
 
     printf("ptrace: BITS=0x%x (want 0xff)\n", g_bits);
     return g_bits;

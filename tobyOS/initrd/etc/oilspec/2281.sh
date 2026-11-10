@@ -1,0 +1,1 @@
+NAME=foo echo >>filename

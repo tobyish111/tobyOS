@@ -110,6 +110,34 @@ struct blk_dev *blk_offset_wrap(struct blk_dev *parent,
     return wrap_internal(parent, offset_lba, size_lba, name, BLK_CLASS_WRAPPER);
 }
 
+/* A partition entry that went with its disk, given the geometry of the
+ * table the disk has now (a stick written elsewhere and plugged back):
+ * where it starts, how long, its number, type and label. Its parent is
+ * the same disk entry, revived. The caller clears `gone` after. */
+int blk_partition_rewrap(struct blk_dev *d, uint64_t offset_lba,
+                         uint64_t size_lba, uint32_t partition_index,
+                         const uint8_t type_guid[BLK_GUID_BYTES],
+                         const char *label) {
+    if (!d || d->class != BLK_CLASS_PARTITION || !d->parent) return -1;
+    struct blk_offset_priv *p = (struct blk_offset_priv *)d->priv;
+    struct blk_dev *parent = d->parent;
+    if (!p || offset_lba >= parent->sector_count) return -1;
+    uint64_t avail = parent->sector_count - offset_lba;
+    if (size_lba == 0 || size_lba > avail) size_lba = avail;
+    p->offset_lba = offset_lba;
+    d->offset_lba = offset_lba;
+    d->sector_count = size_lba;
+    d->partition_index = partition_index;
+    for (size_t i = 0; i < BLK_GUID_BYTES; i++)
+        d->type_guid[i] = type_guid ? type_guid[i] : 0;
+    size_t i = 0;
+    if (label)
+        for (; label[i] && i < BLK_PART_LABEL_MAX - 1; i++)
+            d->partition_label[i] = label[i];
+    d->partition_label[i] = 0;
+    return 0;
+}
+
 struct blk_dev *blk_partition_wrap(struct blk_dev *parent,
                                    uint64_t offset_lba,
                                    uint64_t size_lba,

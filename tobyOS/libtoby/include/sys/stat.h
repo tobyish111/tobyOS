@@ -11,6 +11,7 @@
 
 #include <sys/types.h>
 #include <stdint.h>
+#include <time.h>   /* struct timespec, as POSIX has sys/stat.h give it */
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,6 +20,16 @@ extern "C" {
 #define S_IFMT      0xF000
 #define S_IFREG     0x8000
 #define S_IFDIR     0x4000
+/* The other POSIX file types. The kernel reports S_IFCHR for the /dev nodes
+ * (and passes st_mode through unchanged -- see unistd.c), but with only the
+ * two macros below defined, every native tool that asked "what is this?"
+ * got neither answer: `ls -l /dev/null` printed `?rw-rw-rw-` and `stat`
+ * said "unknown". Values are the POSIX/Linux ones. */
+#define S_IFIFO     0x1000
+#define S_IFCHR     0x2000
+#define S_IFBLK     0x6000
+#define S_IFLNK     0xA000
+#define S_IFSOCK    0xC000
 
 #define S_IRUSR     0400
 #define S_IWUSR     0200
@@ -29,20 +40,79 @@ extern "C" {
 #define S_IROTH     0004
 #define S_IWOTH     0002
 #define S_IXOTH     0001
+/* The rest of POSIX's mode bits (batch 30: ls is GNU's now, and asks for
+ * them by name; programs spelled out 04000). */
+#define S_ISUID     04000
+#define S_ISGID     02000
+#define S_ISVTX     01000
+#define S_IRWXU     0700
+#define S_IRWXG     0070
+#define S_IRWXO     0007
 
 #define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
 #define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
+#define S_ISCHR(m)  (((m) & S_IFMT) == S_IFCHR)
+#define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
+#define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
+#define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)
+#define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 
 struct stat {
     off_t  st_size;
     mode_t st_mode;
     uid_t  st_uid;
     gid_t  st_gid;
+    /* 2026-08-24: timestamps, in UNIX EPOCH SECONDS. The kernel had them
+     * in struct vfs_stat all along and struct abi_stat had nowhere to put
+     * them, so no native program could read a file's date -- which is why
+     * `touch -m` had no existing atime to preserve. 0 means the filesystem
+     * has no answer (fstat on a pipe, say), not 1970.
+     * Finding 239: to the nanosecond, POSIX's timespecs, where the
+     * filesystem keeps them (tmpfs); st_mtime and the rest are their
+     * seconds, as glibc spells them. */
+    struct timespec st_mtim;
+    struct timespec st_atim;
+    /* 2026-09-08. st_nlink was absent, so `ls -l` printed a synthetic
+     * count; st_ino/st_dev were absent, so `test -ef` compared paths and
+     * answered "different" for two hard links to one file. 0 for ino/dev
+     * means the filesystem has no answer -- compare paths instead. */
+    nlink_t st_nlink;
+    ino_t   st_ino;
+    dev_t   st_dev;
+    /* 2026-10-12 (batch 25): what GNU stat, du and truncate -o ask -- the
+     * inode-change time, 512-byte blocks, the I/O block size, and a device
+     * node's numbers (major() and minor(), <sys/sysmacros.h>). The
+     * kernel's answers through ABI_SYS_XSTAT, the Linux personality's
+     * numbers. */
+    struct timespec st_ctim;
+    blkcnt_t  st_blocks;
+    blksize_t st_blksize;
+    dev_t     st_rdev;
 };
+#define st_mtime st_mtim.tv_sec
+#define st_atime st_atim.tv_sec
+#define st_ctime st_ctim.tv_sec
 
 int stat (const char *path, struct stat *out);
 int fstat(int fd,           struct stat *out);
+int lstat(const char *path, struct stat *out);   /* the link itself */
+int mkfifo(const char *path, mode_t mode);        /* a named pipe */
+/* finding 214: a file, a FIFO, a socket or (root only) a device node */
+int mknod(const char *path, mode_t mode, dev_t dev);
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev);
 int mkdir(const char *path, mode_t mode);
+mode_t umask(mode_t mask);
+
+/* utimensat(2) (batch 26): at AT_FDCWD only; Linux's values. */
+#ifndef AT_FDCWD
+#define AT_FDCWD            (-100)
+#endif
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 0x100
+#endif
+#define UTIME_NOW           ((1L << 30) - 1L)
+#define UTIME_OMIT          ((1L << 30) - 2L)
+int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags);
 
 #ifdef __cplusplus
 }

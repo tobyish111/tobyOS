@@ -624,6 +624,7 @@ static int cgfs_close(struct vfs_file *f) { kfree(f->priv); f->priv = 0; return 
 static long cgfs_read(struct vfs_file *f, void *buf, size_t n) {
     struct cgfs_handle *h = f->priv;
     if (!h) return VFS_ERR_INVAL;
+    h->pos = f->pos;                 /* the file's, which lseek moves (220) */
     if (h->pos >= h->len) return 0;
     size_t avail = h->len - h->pos;
     if (n > avail) n = avail;
@@ -846,6 +847,7 @@ static int cgfs_readdir(struct vfs_dir *dd, struct vfs_dirent *out) {
 }
 
 static const struct vfs_ops cgroupfs_ops = {
+    .fsname   = "cgroup2",          /* batch 31: /proc/mounts */
     .open = cgfs_open, .close = cgfs_close, .read = cgfs_read,
     .write = cgfs_write, .create = 0, .unlink = cgfs_unlink,
     .mkdir = cgfs_mkdir, .opendir = cgfs_opendir, .closedir = cgfs_closedir,

@@ -24,19 +24,67 @@
 #include <tobyos/vfs.h>
 #include <tobyos/proc.h>
 #include <tobyos/file.h>
+#include <tobyos/pty.h>       /* pty_file_index: /proc/PID/fd's /dev/pts/N */
+#include <tobyos/signal.h>    /* signal_get_foreground: stat tpgid on the console */
 #include <tobyos/heap.h>
+#include "../build/kbuild_id.h"   /* TOBYOS_BUILD_ID -- see the Makefile */
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/pit.h>
 #include <tobyos/pmm.h>
 #include <tobyos/smp.h>
 #include <tobyos/nsproxy.h>   /* the /proc/PID/ns tree (slice 8) */
+#include <tobyos/net.h>       /* /proc/net tables (2026-08-22) */
+#include <tobyos/hwinfo.h>    /* real CPUID vendor/brand for cpuinfo */
+#include <tobyos/perf.h>      /* boot_id derivation */
+#include <tobyos/percpu.h>    /* MAX_CPUS: the per-CPU jiffy table */
+#include <tobyos/rtc.h>       /* btime */
+#include <tobyos/module.h>    /* /proc/modules */
+#include <tobyos/arp.h>       /* /proc/net/arp */
+#include <tobyos/net.h>       /* /proc/net/route */
 
 /* Describe an open file for /proc/<pid>/fd/<n> readlink: a real path where we
  * have one, else the Linux-style synthetic target (pipe:[..], socket:[..],
  * /dev/console, /dev/pts, anon_inode:...). */
 static void describe_fd_target(struct file *f, char *out, size_t cap) {
     const char *s = "anon_inode:[unknown]";
+    /* The stamped opening path wins for every kind that has one (2026-08-22).
+     * Before open_path existed the VFS arm answered "/", which broke every
+     * consumer that round-trips a descriptor through its /proc link -- most
+     * importantly glibc's fexecve fallback, execve("/proc/self/fd/N"). */
+    if (f->open_path) {
+        size_t sl = strlen(f->open_path);
+        if (sl >= cap) sl = cap - 1;
+        memcpy(out, f->open_path, sl);
+        out[sl] = '\0';
+        return;
+    }
+    /* A pipe or socket by its inode, as Linux names one -- the number
+     * fstat gives (file_object_ino) -- and a pty slave by its own number.
+     * They were pipe:[r], socket:[0] and /dev/pts/0 whatever the file. */
+    {
+        extern uint64_t file_object_ino(struct file *f);
+        char num[48];
+        if (f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W ||
+            f->kind == FILE_KIND_PIPE_RW || f->kind == FILE_KIND_SOCKET) {
+            ksnprintf(num, sizeof num, "%s:[%lu]",
+                      f->kind == FILE_KIND_SOCKET ? "socket" : "pipe",
+                      (unsigned long)file_object_ino(f));
+            size_t nl = strlen(num);
+            if (nl >= cap) nl = cap - 1;
+            memcpy(out, num, nl);
+            out[nl] = '\0';
+            return;
+        }
+        if (f->kind == FILE_KIND_PTY_SLAVE && pty_file_index(f) >= 0) {
+            ksnprintf(num, sizeof num, "/dev/pts/%d", pty_file_index(f));
+            size_t nl = strlen(num);
+            if (nl >= cap) nl = cap - 1;
+            memcpy(out, num, nl);
+            out[nl] = '\0';
+            return;
+        }
+    }
     switch (f->kind) {
     case FILE_KIND_CONSOLE:     s = "/dev/console";          break;
     case FILE_KIND_PTY_MASTER:  s = "/dev/ptmx";             break;
@@ -169,10 +217,16 @@ static int procfs_kpid(const char *s) {
  * the second field mirrors the first (tools like busybox `uptime` parse the
  * first field only). */
 static int gen_uptime(char *buf, size_t cap) {
-    uint64_t ticks = pit_ticks();
-    uint32_t hz    = pit_hz();
-    uint64_t secs  = (hz > 0) ? ticks / hz : 0;
-    uint64_t frac  = (hz > 0) ? ((ticks % hz) * 100) / hz : 0;
+    /* perf_now_ns(), NOT pit_ticks() (2026-09-03). The PIT tick count loses
+     * ticks under emulation -- measured: 42 s of ticks in 123 s of wall
+     * clock -- while every other clock here runs off the TSC: CLOCK_MONOTONIC,
+     * /proc/<pid>/stat's starttime, the anchor CLOCK_REALTIME hangs off.
+     * ps computes ELAPSED as uptime minus starttime, and with two clocks a
+     * two-second-old child read 0. One clock for everything. */
+    extern uint64_t perf_now_ns(void);
+    uint64_t ns    = perf_now_ns();
+    uint64_t secs  = ns / 1000000000ull;
+    uint64_t frac  = (ns % 1000000000ull) / 10000000ull;
     int off = 0;
     char tmp[24];
     #define APPEND_STR(s) do { size_t sl = strlen(s); \
@@ -216,6 +270,24 @@ static int gen_meminfo(char *buf, size_t cap) {
     APPEND_STR("Cached:       "); APPEND_KB(0);     APPEND_STR("\n");
     APPEND_STR("SwapTotal:    "); APPEND_KB(0);     APPEND_STR("\n");
     APPEND_STR("SwapFree:     "); APPEND_KB(0);     APPEND_STR("\n");
+
+    /* Kernel heap, which Linux does not report here and we do.
+     *
+     * MemFree alone cannot tell a LEAK from FRAGMENTATION, and those need
+     * opposite fixes. HeapUsed climbing means unbalanced kmalloc/kfree;
+     * HeapUsed flat while HeapTotal climbs means the allocator is holding
+     * arenas it cannot reuse. The shell conformance gate loses ~620 KiB per
+     * process spawn and reading MemFree for an hour could not distinguish
+     * the two. Allocs/Frees make an imbalance countable directly. */
+    {
+        struct heap_stats hs;
+        heap_stats(&hs);
+        APPEND_STR("HeapTotal:    "); APPEND_KB(hs.total_bytes / 1024); APPEND_STR("\n");
+        APPEND_STR("HeapUsed:     "); APPEND_KB(hs.used_bytes  / 1024); APPEND_STR("\n");
+        APPEND_STR("HeapArenas:   "); APPEND_KB(hs.arenas);             APPEND_STR("\n");
+        APPEND_STR("HeapAllocs:   "); APPEND_KB(hs.alloc_count);        APPEND_STR("\n");
+        APPEND_STR("HeapFrees:    "); APPEND_KB(hs.free_count);         APPEND_STR("\n");
+    }
     buf[off] = '\0';
     return off;
 
@@ -234,29 +306,54 @@ static int live_proc_count(void) {
 
 /* /proc/loadavg -- "0.00 0.00 0.00 <running>/<total> <lastpid>". We don't
  * compute real load averages; the running/total + lastpid fields are real. */
+/* The scheduler's counters (src/sched.c) and the ISR dispatcher's
+ * (src/isr.c). Declared here, at the one consumer, the way poll_tick is. */
+extern uint64_t g_cpu_jiffies[MAX_CPUS][3];
+extern uint64_t g_ctxt_switches;
+extern uint64_t g_loadavg_fixed[3];
+extern uint32_t sched_nr_runnable(void);
+extern uint64_t g_intr_total;
+extern uint64_t g_intr_vec[256];
+
+/* /proc/loadavg -- three real moving averages (sampled every 5 s on the BSP,
+ * decayed as Linux's calc_load), "running/total" and the last pid. Each
+ * average is rounded to two places, as Linux prints it (half a hundredth
+ * added first, FIXED_1/200); it was truncated, so 0.909 read 0.90 (finding
+ * 192). The running count is the moment's, the reader among it. */
 static int gen_loadavg(char *buf, size_t cap) {
     int total = live_proc_count();
-    int lastpid = 0;
-    for (int i = 0; i < PROC_MAX; i++)
-        if (g_proc[i].state != PROC_UNUSED &&
-            g_proc[i].state != PROC_EMBRYO && g_proc[i].pid > lastpid)
-            lastpid = g_proc[i].pid;
+    int lastpid = proc_last_pid();         /* the last one handed out, as Linux's */
     int off = 0;
     char tmp[24];
     #define APPEND_STR(s) do { size_t sl = strlen(s); \
         if ((size_t)off + sl >= cap) return off; \
         memcpy(buf + off, s, sl); off += (int)sl; } while (0)
     #define APPEND_INT(v) do { int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); } while (0)
-    APPEND_STR("0.00 0.00 0.00 1/");
+    #define APPEND_FRAC2(v) do { char f[3]; f[0] = (char)('0' + (int)(((v)/10)%10)); \
+        f[1] = (char)('0' + (int)((v)%10)); f[2] = 0; APPEND_STR(f); } while (0)
+    for (int i = 0; i < 3; i++) {
+        uint64_t lv = g_loadavg_fixed[i] + 2048u / 200u;
+        APPEND_INT(lv >> 11); APPEND_STR(".");
+        APPEND_FRAC2(((lv & 2047u) * 100u) >> 11); APPEND_STR(" ");
+    }
+    APPEND_INT(sched_nr_runnable()); APPEND_STR("/");
     APPEND_INT(total); APPEND_STR(" "); APPEND_INT(lastpid); APPEND_STR("\n");
     buf[off] = '\0';
     return off;
     #undef APPEND_STR
     #undef APPEND_INT
+    #undef APPEND_FRAC2
 }
 
-/* /proc/stat -- the aggregate "cpu" line + per-cpu lines + a few counters
- * tools parse (btime, processes, procs_running). Jiffy counters are zero. */
+/* /proc/stat -- real counters (2026-09-01). The cpu lines are user / nice /
+ * system / idle / iowait / irq / softirq / steal / guest / guest_nice in
+ * USER_HZ jiffies, from the 100 Hz tick; "intr" is the ISR dispatcher's
+ * total followed by the sixteen legacy IRQ vectors; "ctxt" is the
+ * scheduler's switch count; "btime" is the RTC minus uptime; "processes"
+ * is every spawn and fork since boot; "procs_running" is the load
+ * sampler's last count. procs_blocked is Linux's nr_iowait, and there is
+ * no uninterruptible-I/O state here to count, so it is 0 rather than a
+ * guess -- the one column that stays synthetic. */
 static int gen_stat(char *buf, size_t cap) {
     int off = 0;
     char tmp[24];
@@ -264,42 +361,211 @@ static int gen_stat(char *buf, size_t cap) {
         if ((size_t)off + sl >= cap) return off; \
         memcpy(buf + off, s, sl); off += (int)sl; } while (0)
     #define APPEND_INT(v) do { int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); } while (0)
+    #define APPEND_U64(v) do { uint_to_str(tmp, sizeof(tmp), (uint64_t)(v)); APPEND_STR(tmp); } while (0)
+    #define APPEND_CPU(u, s, i) do { \
+        APPEND_U64(u); APPEND_STR(" 0 "); APPEND_U64(s); APPEND_STR(" "); \
+        APPEND_U64(i); APPEND_STR(" 0 0 0 0 0 0\n"); } while (0)
     uint32_t ncpu = smp_cpu_count();
     if (ncpu == 0) ncpu = 1;
-    APPEND_STR("cpu  0 0 0 0 0 0 0 0 0 0\n");
+    if (ncpu > MAX_CPUS) ncpu = MAX_CPUS;
+    uint64_t tu = 0, ts = 0, ti = 0;
     for (uint32_t i = 0; i < ncpu; i++) {
-        APPEND_STR("cpu"); APPEND_INT(i);
-        APPEND_STR(" 0 0 0 0 0 0 0 0 0 0\n");
+        tu += g_cpu_jiffies[i][0];
+        ts += g_cpu_jiffies[i][1];
+        ti += g_cpu_jiffies[i][2];
     }
-    APPEND_STR("intr 0\n");
-    APPEND_STR("ctxt 0\n");
-    APPEND_STR("btime 0\n");
-    APPEND_STR("processes "); APPEND_INT(live_proc_count()); APPEND_STR("\n");
-    APPEND_STR("procs_running 1\n");
+    APPEND_STR("cpu  "); APPEND_CPU(tu, ts, ti);
+    for (uint32_t i = 0; i < ncpu; i++) {
+        APPEND_STR("cpu"); APPEND_INT(i); APPEND_STR(" ");
+        APPEND_CPU(g_cpu_jiffies[i][0], g_cpu_jiffies[i][1],
+                   g_cpu_jiffies[i][2]);
+    }
+    APPEND_STR("intr "); APPEND_U64(g_intr_total);
+    for (int v = 32; v < 48; v++) { APPEND_STR(" "); APPEND_U64(g_intr_vec[v]); }
+    APPEND_STR("\n");
+    APPEND_STR("ctxt "); APPEND_U64(g_ctxt_switches); APPEND_STR("\n");
+    {
+        /* COMPUTED ONCE. btime is the wall-clock instant the machine booted,
+         * which by definition never changes -- recomputing it on every read
+         * was pointless even before it was dangerous.
+         *
+         * And it was dangerous: rtc_unix_time() drives the CMOS, so reading
+         * /proc/stat put that on a path any process could take from any core
+         * at any time. On real 4-core hardware `head -1 /proc/stat` wedged
+         * the machine outright, every time. src/rtc.c now locks and bounds
+         * its side of it; caching here keeps the common path away from the
+         * hardware altogether. */
+        /* NOT CACHED any more: btime moves when the clock is set, as
+         * Linux's (getboottime64) does -- timesyncd's first step at boot
+         * would otherwise leave every ps start time and `uptime -s` as far
+         * off as the RTC was (finding 157). The clock read is cheap and
+         * touches no hardware now that lx_realtime_ns is anchored. */
+        uint64_t s_btime = 0;
+        {
+            /* The same anchored clock CLOCK_REALTIME reports, minus the same
+             * uptime /proc/uptime reports, so btime + starttime/HZ is a
+             * process's real start instant the way ps computes it. The CMOS
+             * stays off this path: lx_realtime_ns latches the RTC once, for
+             * whichever caller comes first. */
+            extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+            extern uint64_t perf_now_ns(void);
+            uint64_t mono = perf_now_ns();
+            uint64_t now  = lx_realtime_ns(mono) / 1000000000ull;
+            uint64_t up   = mono / 1000000000ull;
+            s_btime = (now > up) ? now - up : 0;
+        }
+        APPEND_STR("btime "); APPEND_U64(s_btime); APPEND_STR("\n");
+    }
+    {
+        struct perf_sys ps;
+        perf_sys_snapshot(&ps);
+        APPEND_STR("processes "); APPEND_U64(ps.proc_spawns); APPEND_STR("\n");
+    }
+    APPEND_STR("procs_running "); APPEND_INT(sched_nr_runnable()); APPEND_STR("\n");
     APPEND_STR("procs_blocked 0\n");
     buf[off] = '\0';
     return off;
     #undef APPEND_STR
     #undef APPEND_INT
+    #undef APPEND_U64
+    #undef APPEND_CPU
 }
 
-/* /proc/mounts -- one line per VFS mount: "<dev> <point> <type> <opts> 0 0".
- * Built by walking the mount table. */
-struct mounts_ctx { char *buf; int off; size_t cap; };
-static bool mounts_cb(const char *point, const struct vfs_ops *ops,
-                      void *mnt, void *cookie) {
-    (void)ops; (void)mnt;
-    struct mounts_ctx *c = (struct mounts_ctx *)cookie;
-    #define MAPP(s) do { size_t sl = strlen(s); \
-        if ((size_t)c->off + sl >= c->cap) return false; \
-        memcpy(c->buf + c->off, s, sl); c->off += (int)sl; } while (0)
-    MAPP("none "); MAPP(point); MAPP(" tobyos rw,relatime 0 0\n");
-    #undef MAPP
+/* /proc/mounts -- one line per mount, as Linux writes it: "SOURCE POINT
+ * TYPE OPTIONS 0 0", the options from the mount's flags (rw or ro, nosuid,
+ * nodev, noexec, relatime), a blank, tab, newline or backslash in a path
+ * as \NNN octal. Every line said "none POINT tobyos rw,relatime": mount(8)
+ * could list mount points and nothing else, `mount -t proc` found none
+ * (batch 31). /proc/PID/mountinfo has the rest. */
+struct mounts_ctx { char *buf; int off; size_t cap; bool full; };
+
+static bool mounts_put(struct mounts_ctx *c, const char *s) {
+    size_t sl = strlen(s);
+    if ((size_t)c->off + sl >= c->cap) return false;
+    memcpy(c->buf + c->off, s, sl);
+    c->off += (int)sl;
     return true;
 }
+
+static bool mounts_put_path(struct mounts_ctx *c, const char *s) {
+    char t[8];
+    for (; *s; s++) {
+        if (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\\') {
+            t[0] = '\\';
+            t[1] = (char)('0' + ((*s >> 6) & 7));
+            t[2] = (char)('0' + ((*s >> 3) & 7));
+            t[3] = (char)('0' + (*s & 7));
+            t[4] = 0;
+        } else {
+            t[0] = *s; t[1] = 0;
+        }
+        if (!mounts_put(c, t)) return false;
+    }
+    return true;
+}
+
+static bool mounts_put_opts(struct mounts_ctx *c, uint32_t flags) {
+    return mounts_put(c, (flags & VFS_MNT_RDONLY) ? "ro" : "rw") &&
+           ((flags & VFS_MNT_NOSUID) ? mounts_put(c, ",nosuid") : true) &&
+           ((flags & VFS_MNT_NODEV)  ? mounts_put(c, ",nodev")  : true) &&
+           ((flags & VFS_MNT_NOEXEC) ? mounts_put(c, ",noexec") : true) &&
+           /* the atime rule, in Linux's words and order (finding 266):
+            * noatime, nodiratime, then relatime -- the default -- unless
+            * noatime or strictatime */
+           ((flags & VFS_MNT_NOATIME) ? mounts_put(c, ",noatime") : true) &&
+           ((flags & VFS_MNT_NODIRATIME) ? mounts_put(c, ",nodiratime") : true) &&
+           ((flags & (VFS_MNT_NOATIME | VFS_MNT_STRICTATIME)) ? true
+                                                             : mounts_put(c, ",relatime"));
+}
+
+static const char *mounts_type(const struct vfs_mount_info *mi) {
+    return (mi->ops && mi->ops->fsname) ? mi->ops->fsname : "tobyos";
+}
+
+static bool mounts_cb(const struct vfs_mount_info *mi, void *cookie) {
+    struct mounts_ctx *c = (struct mounts_ctx *)cookie;
+    return mounts_put_path(c, mi->source) && mounts_put(c, " ") &&
+           mounts_put_path(c, mi->point) && mounts_put(c, " ") &&
+           mounts_put(c, mounts_type(mi)) && mounts_put(c, " ") &&
+           mounts_put_opts(c, mi->flags) && mounts_put(c, " 0 0\n");
+}
+
 static int gen_mounts(char *buf, size_t cap) {
-    struct mounts_ctx c = { buf, 0, cap };
-    vfs_iter_mounts(mounts_cb, &c);
+    struct mounts_ctx c = { buf, 0, cap, false };
+    vfs_iter_mounts_info(mounts_cb, &c);
+    buf[c.off] = '\0';
+    return c.off;
+}
+
+/* /proc/PID/mountinfo, as Linux's: "ID PARENT MAJOR:MINOR ROOT POINT
+ * OPTIONS [shared:N|master:N] - TYPE SOURCE SUPER-OPTIONS". The id is the
+ * mount's slot (+21, as Linux's ids start past its internal mounts); the
+ * parent the mount whose point is the longest proper prefix of this one's
+ * (the root's is itself); the device what stat of the point says, as
+ * st_dev splits it; the root "/" (no bind of a subtree here). libmount --
+ * util-linux's mount, findmnt -- reads this before /proc/mounts. */
+struct minfo_ent { char point[VFS_PATH_MAX]; };
+static struct minfo_ent g_minfo[VFS_MAX_MOUNTS];
+static int g_minfo_n;
+
+static bool minfo_collect(const struct vfs_mount_info *mi, void *cookie) {
+    (void)cookie;
+    if (g_minfo_n >= VFS_MAX_MOUNTS) return false;
+    size_t l = strlen(mi->point);
+    if (l >= VFS_PATH_MAX) l = VFS_PATH_MAX - 1;
+    memcpy(g_minfo[g_minfo_n].point, mi->point, l);
+    g_minfo[g_minfo_n].point[l] = '\0';
+    g_minfo_n++;
+    return true;
+}
+
+static int minfo_parent(int self) {
+    const char *p = g_minfo[self].point;
+    size_t pl = strlen(p);
+    int best = self;
+    size_t bl = 0;
+    for (int i = 0; i < g_minfo_n; i++) {
+        if (i == self) continue;
+        const char *q = g_minfo[i].point;
+        size_t ql = strlen(q);
+        bool under = (ql == 1 && q[0] == '/' && pl > 1) ||
+                     (ql < pl && strncmp(p, q, ql) == 0 && p[ql] == '/');
+        if (under && ql >= bl) { best = i; bl = ql; }
+    }
+    return best;
+}
+
+static bool minfo_cb(const struct vfs_mount_info *mi, void *cookie) {
+    struct mounts_ctx *c = (struct mounts_ctx *)cookie;
+    char t[64];
+    struct vfs_stat st;
+    uint32_t maj = 0, min = 1;              /* stat's st_dev when there is none */
+    if (vfs_stat(mi->point, &st) == VFS_OK && st.dev) {
+        maj = ((uint32_t)st.dev >> 20) & 0xfffu;
+        min = (uint32_t)st.dev & 0xfffffu;
+    }
+    ksnprintf(t, sizeof t, "%d %d %u:%u / ", mi->index + 21,
+              minfo_parent(mi->index) + 21, (unsigned)maj, (unsigned)min);
+    if (!mounts_put(c, t) || !mounts_put_path(c, mi->point) ||
+        !mounts_put(c, " ") || !mounts_put_opts(c, mi->flags)) return false;
+    if (mi->prop == VFS_PROP_SHARED && mi->peer_id) {
+        ksnprintf(t, sizeof t, " shared:%u", (unsigned)mi->peer_id);
+        if (!mounts_put(c, t)) return false;
+    }
+    if (mi->master_id) {
+        ksnprintf(t, sizeof t, " master:%u", (unsigned)mi->master_id);
+        if (!mounts_put(c, t)) return false;
+    }
+    return mounts_put(c, " - ") && mounts_put(c, mounts_type(mi)) &&
+           mounts_put(c, " ") && mounts_put_path(c, mi->source) &&
+           mounts_put(c, (mi->flags & VFS_MNT_RDONLY) ? " ro\n" : " rw\n");
+}
+
+static int gen_mountinfo(char *buf, size_t cap) {
+    g_minfo_n = 0;
+    vfs_iter_mounts_info(minfo_collect, 0);
+    struct mounts_ctx c = { buf, 0, cap, false };
+    vfs_iter_mounts_info(minfo_cb, &c);
     buf[c.off] = '\0';
     return c.off;
 }
@@ -348,6 +614,7 @@ static int gen_devices(char *buf, size_t cap) {
         " 13 input\n"
         " 29 fb\n"
         "116 alsa\n"
+        "136 pts\n"
         "226 drm\n"
         "\nBlock devices:\n"
         "  8 sd\n"
@@ -372,6 +639,28 @@ static int gen_devices(char *buf, size_t cap) {
  * honest ENOENT; a present but empty one would read as "this process has no
  * environment", which is false. */
 
+/* Linux's comm: the executable's basename, at most 15 bytes (TASK_COMM_LEN
+ * less the NUL). p->name is the label the SPAWNER chose -- "distro-test",
+ * "tsh-ssh", "c_envtest-boot" -- which is right for the kernel log and wrong
+ * for `ps -C tsh`, `pkill tsh` or anything else that matches on comm the way
+ * it does on Linux. A proc with no image (pid 0, kernel workers) keeps its
+ * name. */
+static const char *proc_comm(const struct proc *p, char *buf, size_t cap) {
+    const char *src = p->name;
+    if (p->exe_path[0]) {
+        const char *b = p->exe_path;
+        for (const char *s = p->exe_path; *s; s++)
+            if (*s == '/' && s[1]) b = s + 1;
+        src = b;
+    }
+    size_t n = strlen(src);
+    if (n > 15) n = 15;
+    if (n >= cap) n = cap - 1;
+    memcpy(buf, src, n);
+    buf[n] = '\0';
+    return buf;
+}
+
 static int gen_pid_status(int pid, char *buf, size_t cap) {
     struct proc *p = proc_lookup(pid);
     if (!p) return -1;
@@ -389,16 +678,81 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
         APPEND_STR(tmp); \
     } while (0)
 
-    APPEND_STR("Name:   "); APPEND_STR(p->name);     APPEND_STR("\n");
-    APPEND_STR("State:  "); APPEND_STR(proc_state_name(p->state)); APPEND_STR("\n");
+    { char cm[16]; APPEND_STR("Name:\t"); APPEND_STR(proc_comm(p, cm, sizeof cm)); APPEND_STR("\n"); }
+    /* Linux's words, as its /proc/PID/status gives them: "T (stopped)",
+     * not the scheduler's "STOPPED" -- a script reading the state letter
+     * read S for stopped and B for asleep (logs/b15 stopw). */
+    {
+        const char *sn = "R (running)";
+        switch (p->state) {
+        case PROC_BLOCKED:    sn = "S (sleeping)"; break;
+        case PROC_STOPPED:    sn = p->ptrace_stopped ? "t (tracing stop)"
+                                                     : "T (stopped)"; break;
+        case PROC_TERMINATED: sn = "Z (zombie)"; break;
+        default: break;
+        }
+        APPEND_STR("State:\t"); APPEND_STR(sn); APPEND_STR("\n");
+    }
     /* Slice 10: report pids as the READER numbers them, not as the kernel
      * stores them. A process inside a pid namespace reading /proc must see its
      * own numbering, or `ps` shows pids that kill(2) then rejects. Identity in
      * the initial namespace. PPid falls to 0 when the parent is outside the
      * reader's namespace, which is what Linux reports and is also the right
      * answer -- the alternative leaks a host pid across the boundary. */
-    APPEND_STR("Pid:    "); APPEND_INT(pid_vnr(p));            APPEND_STR("\n");
-    APPEND_STR("PPid:   "); APPEND_INT(pid_vnr_of_kpid(p->ppid)); APPEND_STR("\n");
+    /* Tgid (2026-08-22): what ps/pgrep/debuggers group threads by --
+     * absent until now. For a thread it is the leader's (translated) pid. */
+    {   int tg = p->is_thread ? p->tgid : p->pid;
+        struct proc *ld = proc_lookup(tg);
+        APPEND_STR("Tgid:\t"); APPEND_INT(ld ? pid_vnr(ld) : tg);
+        APPEND_STR("\n");
+    }
+    APPEND_STR("Pid:\t"); APPEND_INT(pid_vnr(p));            APPEND_STR("\n");
+    /* An orphan (PROC_PPID_ORPHAN) reads as a child of 1, as in Linux. */
+    APPEND_STR("PPid:\t");
+    APPEND_INT(p->ppid < 0 ? 1 : pid_vnr_of_kpid(p->ppid));
+    APPEND_STR("\n");
+    /* VmSize/VmRSS in kB from the maintained user-page counter (real since
+     * the slice-16 fix; before that it was a spawn-time constant). */
+    APPEND_STR("VmSize:\t"); APPEND_INT((int64_t)p->user_pages * 4); APPEND_STR(" kB\n");
+    APPEND_STR("VmRSS:\t");  APPEND_INT((int64_t)p->user_pages * 4); APPEND_STR(" kB\n");
+    /* Threads: live group members incl. the leader. */
+    {   extern struct proc g_proc[];
+        int tg = p->is_thread ? p->tgid : p->pid, nth = 0;
+        for (int ti = 0; ti < PROC_MAX; ti++) {
+            struct proc *q = &g_proc[ti];
+            if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+                q->state == PROC_TERMINATED) continue;
+            if (q->pid == tg || (q->is_thread && q->tgid == tg)) nth++;
+        }
+        APPEND_STR("Threads:\t"); APPEND_INT(nth); APPEND_STR("\n");
+    }
+    /* tobyOS extension (2026-08-23): the process's kernel-counted syscall
+     * total. Exists so userspace can PROVE a code path stopped syscalling
+     * -- the vDSO gate hammers clock_gettime and asserts this barely
+     * moves. Linux has no equivalent line; the Toby prefix keeps parsers
+     * of standard fields honest. */
+    APPEND_STR("TobySyscalls:\t");
+    APPEND_INT((int64_t)p->syscall_count);
+    APPEND_STR("\n");
+    /* Signal masks, 16-digit hex in LINUX numbering (>>1 off the tobyOS
+     * bit-per-signal convention). SigIgn/SigCgt are derived by scanning
+     * the thread-group action table. */
+    {   uint64_t ign = 0, cgt = 0;
+        struct sigaction *acts = sig_actions_of(p);
+        for (int si = 1; si < SIG_MAX; si++) {
+            if (!acts) break;
+            if (acts[si].sa_handler == SIG_IGN) ign |= SIGMASK(si);
+            else if (acts[si].sa_handler != SIG_DFL) cgt |= SIGMASK(si);
+        }
+        #define APPEND_SIGHEX(name, v) do { \
+            char hx[20]; hex_to_str(hx, sizeof hx, sig_mask_to_linux((uint64_t)(v))); \
+            APPEND_STR(name); APPEND_STR(hx); APPEND_STR("\n"); } while (0)
+        APPEND_SIGHEX("SigPnd:\t", p->pending_signals);
+        APPEND_SIGHEX("SigBlk:\t", p->sigstate.mask);
+        APPEND_SIGHEX("SigIgn:\t", ign);
+        APPEND_SIGHEX("SigCgt:\t", cgt);
+        #undef APPEND_SIGHEX
+    }
     /* Linux slice 2: report the full credential set. Linux's format is four
      * TAB-separated columns -- real, effective, saved-set, filesystem -- and
      * `ps`, `id` and every sandbox probe parse exactly that shape. We had a
@@ -437,12 +791,22 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
 static int gen_pid_cmdline(int pid, char *buf, size_t cap) {
     struct proc *p = proc_lookup(pid);
     if (!p) return -1;
+    /* 2026-08-22: the REAL argv, NUL-separated, exactly as Linux emits it
+     * -- the old name+'\n' fabrication is not the format ps/pgrep/argv
+     * readers parse (they split on NULs and got one token plus a stray
+     * newline). Kernel procs have no recorded argv; fall back to the name
+     * with a terminating NUL, which is at least the right SHAPE. */
+    if (p->cmdline_len) {
+        size_t nl = p->cmdline_len;
+        if (nl > cap) nl = cap;
+        memcpy(buf, p->cmdline, nl);
+        return (int)nl;
+    }
     size_t nl = strlen(p->name);
     if (nl >= cap) nl = cap - 1;
     memcpy(buf, p->name, nl);
-    buf[nl] = '\n'; nl++;
     buf[nl] = '\0';
-    return (int)nl;
+    return (int)(nl + 1);
 }
 
 /* /proc/<pid>/fdinfo/<n>.
@@ -468,11 +832,14 @@ static int gen_pid_fdinfo(int pid, int fd, char *buf, size_t cap) {
     if (!tab || fd < 0 || fd >= PROC_NFDS || !tab[fd]) return -1;
     struct file *f = tab[fd];
 
-    uint64_t pos = (f->kind == FILE_KIND_VFS) ? (uint64_t)f->vfs.pos : 0;
-    /* Linux prints the open flags in OCTAL with a leading 0. We keep only the
-     * access mode on the descriptor, so that is what goes out -- the value is
+    /* a file's, and a disk's (finding 279: 0 where Linux's says 12288) */
+    uint64_t pos = (f->kind == FILE_KIND_VFS || f->kind == FILE_KIND_BLKDEV)
+                 ? (uint64_t)file_pos_get(f) : 0;
+    /* Linux prints the open flags in OCTAL with a leading 0. We keep the
+     * access mode and O_APPEND on the descriptor, so that is what goes out -- the value is
      * right as far as it goes, and no bit is invented to pad it. */
     unsigned flags = (unsigned)f->o_accmode;
+    if (f->kind == FILE_KIND_VFS && f->vfs.append) flags |= 02000;   /* O_APPEND */
 
     int off = 0;
     char tmp[24];
@@ -510,14 +877,33 @@ static int gen_cpuinfo(char *buf, size_t cap) {
         int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); \
     } while (0)
 
+    /* Report the REAL CPU (2026-08-23). This used to answer
+     * "GenuineTobyOS" / "tobyOS virtual x86-64 CPU" for every core --
+     * invented strings, while hwinfo had the genuine CPUID vendor and
+     * brand cached since boot. Anything that identifies the machine from
+     * /proc/cpuinfo (lscpu, build scripts, JIT feature probes) was being
+     * told a fiction it could not act on. */
+    const struct abi_hwinfo_summary *hw = hwinfo_current();
+    const char *vendor = (hw && hw->cpu_vendor[0]) ? hw->cpu_vendor
+                                                   : "Unknown";
+    const char *brand  = (hw && hw->cpu_brand[0])  ? hw->cpu_brand
+                                                   : "x86-64";
+
     uint32_t ncpu = smp_cpu_count();
     if (ncpu == 0) ncpu = 1;
     for (uint32_t i = 0; i < ncpu; i++) {
         APPEND_STR("processor\t: "); APPEND_INT(i); APPEND_STR("\n");
-        APPEND_STR("vendor_id\t: GenuineTobyOS\n");
-        APPEND_STR("cpu family\t: 6\n");
-        APPEND_STR("model\t\t: 1\n");
-        APPEND_STR("model name\t: tobyOS virtual x86-64 CPU\n");
+        APPEND_STR("vendor_id\t: "); APPEND_STR(vendor); APPEND_STR("\n");
+        APPEND_STR("cpu family\t: "); APPEND_INT(hw ? hw->cpu_family : 6);
+        APPEND_STR("\n");
+        APPEND_STR("model\t\t: "); APPEND_INT(hw ? hw->cpu_model : 0);
+        APPEND_STR("\n");
+        APPEND_STR("model name\t: "); APPEND_STR(brand); APPEND_STR("\n");
+        APPEND_STR("stepping\t: "); APPEND_INT(hw ? hw->cpu_stepping : 0);
+        APPEND_STR("\n");
+        APPEND_STR("siblings\t: "); APPEND_INT(ncpu); APPEND_STR("\n");
+        APPEND_STR("core id\t\t: "); APPEND_INT(i); APPEND_STR("\n");
+        APPEND_STR("cpu cores\t: "); APPEND_INT(ncpu); APPEND_STR("\n");
         APPEND_STR("flags\t\t: fpu tsc msr sse sse2 syscall\n");
         APPEND_STR("\n");
     }
@@ -527,51 +913,275 @@ static int gen_cpuinfo(char *buf, size_t cap) {
     #undef APPEND_INT
 }
 
-/* /proc/<pid>/maps -- a best-effort memory map synthesised from the few
- * regions the kernel tracks explicitly: the executable image (around the
- * entry point), the brk heap, and the user stack. Real software reads this
- * to discover its own [heap]/[stack] ranges and exe mapping. */
+/* Fixed-width uppercase hex, the /proc/net table format. */
+static void net_hex32(char *out, uint32_t v) {
+    static const char *h = "0123456789ABCDEF";
+    for (int i = 7; i >= 0; i--) { out[i] = h[v & 0xF]; v >>= 4; }
+    out[8] = 0;
+}
+static void net_hex16(char *out, uint16_t v) {
+    static const char *h = "0123456789ABCDEF";
+    for (int i = 3; i >= 0; i--) { out[i] = h[v & 0xF]; v >>= 4; }
+    out[4] = 0;
+}
+
+/* /proc/sys -- the sysctls real software actually reads (2026-08-22;
+ * there was NO /proc/sys at all). Values are REAL or the file is absent:
+ * a sysctl that reads back a number nothing enforces is the
+ * accept-and-ignore lie in file form. */
+static int gen_sys(const char *rest, char *buf, size_t cap) {
+    #define SYS_OUT(s) do { \
+        size_t sl = strlen(s); if (sl >= cap) sl = cap - 1; \
+        memcpy(buf, s, sl); buf[sl] = 0; return (int)sl; } while (0)
+    if (strcmp(rest, "kernel/ostype") == 0)    SYS_OUT("Linux\n");
+    if (strcmp(rest, "kernel/osrelease") == 0) SYS_OUT("6.1.0-tobyos\n");
+    /* uname -v: Linux's "#1 SMP" and the build's date (finding 253; the
+     * file was missing, and uname's version field empty) */
+    if (strcmp(rest, "kernel/version") == 0) SYS_OUT("#1 SMP " TOBYOS_BUILD_DATE "\n");
+    if (strcmp(rest, "kernel/hostname") == 0) {
+        const char *hn = uts_nodename();
+        char t[80]; size_t l = strlen(hn); if (l > 76) l = 76;
+        memcpy(t, hn, l); t[l] = '\n'; t[l + 1] = 0;
+        SYS_OUT(t);
+    }
+    if (strcmp(rest, "kernel/domainname") == 0) {
+        /* uts_ns has carried this since the namespace slice; nothing was
+         * reading it, which is why no file named it. */
+        const char *dn = uts_domainname();
+        char t[80]; size_t l = strlen(dn); if (l > 76) l = 76;
+        memcpy(t, dn, l); t[l] = '\n'; t[l + 1] = 0;
+        SYS_OUT(t);
+    }
+    if (strcmp(rest, "kernel/pid_max") == 0)   SYS_OUT("32768\n");   /* PID_MAX */
+    if (strcmp(rest, "kernel/ns_last_pid") == 0) {
+        /* the last pid handed out in the reader's pid namespace; root in the
+         * initial one may write it (procfs_write), as CRIU does on Linux */
+        struct proc *me = current_proc();
+        char t[16];
+        int_to_str(t, sizeof t - 1, pid_ns_last_pid(me ? me->pid_ns : 0));
+        size_t l = strlen(t); t[l] = '\n'; t[l + 1] = 0;
+        SYS_OUT(t);
+    }
+    /* Which kernel is this? The commit it was built from (Makefile). Its own
+     * file, not /proc/version: uname -v and -a print that file's first line
+     * and gates compare uname across implementations. */
+    if (strcmp(rest, "kernel/tobyos_build") == 0) SYS_OUT(TOBYOS_BUILD_ID "\n");
+    if (strcmp(rest, "fs/file-max") == 0)      SYS_OUT("1024\n");
+    if (strcmp(rest, "vm/overcommit_memory") == 0) SYS_OUT("0\n");
+    if (strcmp(rest, "kernel/random/boot_id") == 0) {
+        /* Unique per boot (the contract); derived once from the clock. */
+        static char uuid[40];
+        if (!uuid[0]) {
+            uint64_t a = perf_now_ns() * 0x9E3779B97F4A7C15ull;
+            uint64_t b = (a ^ (a >> 29)) * 0xBF58476D1CE4E5B9ull;
+            static const char *h = "0123456789abcdef";
+            int gi = 0;
+            for (int i = 0; i < 36; i++) {
+                if (i == 8 || i == 13 || i == 18 || i == 23) { uuid[i] = '-'; continue; }
+                uint64_t src = (gi < 16) ? a : b;
+                uuid[i] = h[(src >> ((gi % 16) * 4)) & 0xF];
+                gi++;
+            }
+            uuid[36] = '\n'; uuid[37] = 0;
+        }
+        SYS_OUT(uuid);
+    }
+    return -1;
+    #undef SYS_OUT
+}
+
+/* /proc/net -- the tables ifconfig/netstat/ss read (2026-08-22; there was
+ * NO /proc/net at all, so every one of them was blind). Rows come from
+ * the REAL conn/socket pools via read-only snapshots. */
+/* defined below, after the per-file generators */
+static int gen_net_route(char *buf, size_t cap);
+static int gen_net_arp(char *buf, size_t cap);
+
+static int gen_net(const char *rest, char *buf, size_t cap) {
+    int off = 0;
+    char h32[9], h16[5];
+    #define NET_STR(s) do { \
+        size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) { buf[off] = 0; return off; } \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+
+    if (strcmp(rest, "route") == 0) return gen_net_route(buf, cap);
+    if (strcmp(rest, "arp") == 0)   return gen_net_arp(buf, cap);
+    if (strcmp(rest, "dev") == 0) {
+        NET_STR("Inter-|   Receive                            "
+                "                    |  Transmit\n");
+        NET_STR(" face |bytes    packets errs drop fifo frame "
+                "compressed multicast|bytes    packets errs "
+                "drop fifo colls carrier compressed\n");
+        NET_STR("    lo:       0       0    0    0    0     0          0 "
+                "        0        0       0    0    0    0     0       0          0\n");
+        NET_STR("  eth0:       0       0    0    0    0     0          0 "
+                "        0        0       0    0    0    0     0       0          0\n");
+        buf[off] = 0; return off;
+    }
+    if (strcmp(rest, "tcp") == 0) {
+        extern int tcp_conn_snapshot(int, uint32_t *, uint16_t *,
+                                     uint32_t *, uint16_t *, int *);
+        NET_STR("  sl  local_address rem_address   st tx_queue rx_queue "
+                "tr tm->when retrnsmt   uid  timeout inode\n");
+        for (int i = 0; ; i++) {
+            uint32_t lip, rip; uint16_t lp, rp; int st;
+            int rc = tcp_conn_snapshot(i, &lip, &lp, &rip, &rp, &st);
+            if (rc == -2) break;
+            if (rc != 0) continue;
+            char row[128]; int ro = 0;
+            #define ROW(s) do { size_t l2 = strlen(s); \
+                memcpy(row + ro, s, l2); ro += (int)l2; } while (0)
+            ROW("   "); { char ix[8]; int_to_str(ix, sizeof ix, i); ROW(ix); }
+            ROW(": ");
+            net_hex32(h32, lip); ROW(h32); ROW(":");
+            net_hex16(h16, ntohs(lp)); ROW(h16); ROW(" ");
+            net_hex32(h32, rip); ROW(h32); ROW(":");
+            net_hex16(h16, ntohs(rp)); ROW(h16); ROW(" ");
+            { char stx[3]; static const char *hx = "0123456789ABCDEF";
+              stx[0] = hx[(st >> 4) & 0xF]; stx[1] = hx[st & 0xF]; stx[2] = 0;
+              ROW(stx); }
+            ROW(" 00000000:00000000 00:00000000 00000000     0        0 0\n");
+            row[ro] = 0;
+            NET_STR(row);
+            #undef ROW
+        }
+        buf[off] = 0; return off;
+    }
+    if (strcmp(rest, "udp") == 0 || strcmp(rest, "unix") == 0) {
+        extern int sock_snapshot(int, int *, uint16_t *, uint32_t *,
+                                 uint16_t *, const char **);
+        bool want_udp = (rest[1] == 'd');
+        NET_STR(want_udp
+            ? "  sl  local_address rem_address   st tx_queue rx_queue "
+              "tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"
+            : "Num       RefCount Protocol Flags    Type St Inode Path\n");
+        for (int i = 0; ; i++) {
+            int kind; uint16_t lp, pp; uint32_t pip; const char *ux;
+            int rc = sock_snapshot(i, &kind, &lp, &pip, &pp, &ux);
+            if (rc == -2) break;
+            if (rc != 0) continue;
+            char row[160]; int ro = 0;
+            #define ROW(s) do { size_t l2 = strlen(s); \
+                memcpy(row + ro, s, l2); ro += (int)l2; } while (0)
+            if (want_udp && kind == 1 /* SOCK_KIND_UDP */ && lp) {
+                ROW("   "); { char ix[8]; int_to_str(ix, sizeof ix, i); ROW(ix); }
+                ROW(": ");
+                net_hex32(h32, 0); ROW(h32); ROW(":");
+                net_hex16(h16, ntohs(lp)); ROW(h16); ROW(" ");
+                net_hex32(h32, pip); ROW(h32); ROW(":");
+                net_hex16(h16, ntohs(pp)); ROW(h16);
+                ROW(" 07 00000000:00000000 00:00000000 00000000     0        0 0 0 0 0\n");
+            } else if (!want_udp && kind == 3 /* SOCK_KIND_UNIX */ && ux) {
+                { char ix[20]; hex_to_str(ix, sizeof ix, (uint64_t)i); ROW(ix); }
+                ROW(": 00000002 00000000 00000000 0001 01     0 ");
+                ROW(ux); ROW("\n");
+            } else { continue; }
+            row[ro] = 0;
+            NET_STR(row);
+            #undef ROW
+        }
+        buf[off] = 0; return off;
+    }
+    if (strcmp(rest, "route") == 0) {
+        NET_STR("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\t"
+                "Mask\t\tMTU\tWindow\tIRTT\n");
+        NET_STR("eth0\t00000000\t");
+        net_hex32(h32, net_my_gateway()); NET_STR(h32);
+        NET_STR("\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
+        buf[off] = 0; return off;
+    }
+    return -1;
+    #undef NET_STR
+}
+
+/* /proc/<pid>/maps -- the REAL region table (2026-08-22). The previous
+ * version synthesised exactly three lines (one exe page, heap, stack) and
+ * listed no mmap regions at all -- anything that walked its own address
+ * space (crash handlers, sanitizers, JIT probes) read fiction. Now: every
+ * entry in mmap.c's per-process VMA table, plus the exe page, the
+ * Linux-personality brk heap and the stack, sorted ascending as the format
+ * requires. The 2048-byte procfs generation buffer bounds the output; a
+ * table that does not fit ends with an explicit truncation line rather
+ * than pretending to be complete. */
+#define PMAPS_MAX 96
+struct pmaps_ent { uint64_t lo, hi; char perms[5]; const char *tag; };
+
 static int gen_pid_maps(int pid, char *buf, size_t cap) {
     struct proc *p = proc_lookup(pid);
     if (!p) return -1;
+    extern int  mmap_vma_snapshot(struct proc *, int, uint64_t *, uint64_t *,
+                                  uint32_t *, uint32_t *);
+    extern void mmap_brk_range(struct proc *, uint64_t *, uint64_t *);
+
+    struct pmaps_ent e[PMAPS_MAX];
+    int n = 0, dropped = 0;
+
+    if (p->user_entry) {
+        uint64_t lo = p->user_entry & ~0xfffULL;
+        e[n++] = (struct pmaps_ent){ lo, lo + 0x1000ULL, "r-xp",
+                                     p->exe_path[0] ? p->exe_path : p->name };
+    }
+    {   uint64_t bb = 0, bc = 0;
+        mmap_brk_range(p, &bb, &bc);
+        if (bc <= bb) { bb = p->brk_base; bc = p->brk_cur; } /* native brk */
+        if (bc > bb && n < PMAPS_MAX)
+            e[n++] = (struct pmaps_ent){ bb, bc, "rw-p", "[heap]" };
+    }
+    if (p->user_stack_base && p->user_stack_pages && n < PMAPS_MAX) {
+        uint64_t slo = p->user_stack_base;
+        e[n++] = (struct pmaps_ent){ slo,
+            slo + (uint64_t)p->user_stack_pages * 4096ULL, "rw-p", "[stack]" };
+    }
+    {   int cnt = mmap_vma_snapshot(p, -1, 0, 0, 0, 0);
+        for (int i = 0; i < cnt; i++) {
+            uint64_t lo, hi; uint32_t prot, fl;
+            if (mmap_vma_snapshot(p, i, &lo, &hi, &prot, &fl) != 0) continue;
+            if (n >= PMAPS_MAX) { dropped++; continue; }
+            struct pmaps_ent *x = &e[n++];
+            x->lo = lo; x->hi = hi;
+            x->perms[0] = (prot & 0x1) ? 'r' : '-';
+            x->perms[1] = (prot & 0x2) ? 'w' : '-';
+            x->perms[2] = (prot & 0x4) ? 'x' : '-';
+            x->perms[3] = (fl & 0x2 /* VMA_FLAG_SHARED */) ? 's' : 'p';
+            x->perms[4] = 0;
+            x->tag = "";
+        }
+    }
+    /* Sort ascending (insertion; n <= 96 and reads are rare). */
+    for (int i = 1; i < n; i++) {
+        struct pmaps_ent k = e[i];
+        int j = i - 1;
+        while (j >= 0 && e[j].lo > k.lo) { e[j + 1] = e[j]; j--; }
+        e[j + 1] = k;
+    }
+
     int off = 0;
     char tmp[24];
     #define APPEND_STR(s) do { \
         size_t sl = strlen(s); \
-        if ((size_t)off + sl >= cap) return off; \
+        if ((size_t)off + sl >= cap) goto full; \
         memcpy(buf + off, s, sl); off += (int)sl; \
     } while (0)
     #define APPEND_HEX(v) do { hex_to_str(tmp, sizeof(tmp), (uint64_t)(v)); APPEND_STR(tmp); } while (0)
-
-    /* one map line: lo-hi perms 00000000 00:00 0    path */
-    #define MAP_LINE(lo, hi, perms, path) do { \
-        APPEND_HEX(lo); APPEND_STR("-"); APPEND_HEX(hi); \
-        APPEND_STR(" "); APPEND_STR(perms); \
-        APPEND_STR(" 00000000 00:00 0 \t"); APPEND_STR(path); APPEND_STR("\n"); \
-    } while (0)
-
-    /* executable image: round the entry down to a page; present one r-xp
-     * page mapped to the exe path (span is approximate). */
-    if (p->user_entry) {
-        uint64_t lo = p->user_entry & ~0xfffULL;
-        uint64_t hi = lo + 0x1000ULL;
-        MAP_LINE(lo, hi, "r-xp", (p->exe_path[0] ? p->exe_path : p->name));
+    for (int i = 0; i < n; i++) {
+        APPEND_HEX(e[i].lo); APPEND_STR("-"); APPEND_HEX(e[i].hi);
+        APPEND_STR(" "); APPEND_STR(e[i].perms);
+        APPEND_STR(" 00000000 00:00 0 \t"); APPEND_STR(e[i].tag);
+        APPEND_STR("\n");
     }
-    /* heap */
-    if (p->brk_cur > p->brk_base) {
-        MAP_LINE(p->brk_base, p->brk_cur, "rw-p", "[heap]");
+    if (dropped) {
+        APPEND_STR("# [truncated: more regions than fit]\n");
     }
-    /* stack */
-    if (p->user_stack_base && p->user_stack_pages) {
-        uint64_t slo = p->user_stack_base;
-        uint64_t shi = p->user_stack_base + (uint64_t)p->user_stack_pages * 4096ULL;
-        MAP_LINE(slo, shi, "rw-p", "[stack]");
-    }
+    buf[off] = '\0';
+    return off;
+full:
+    /* The buffer filled mid-line: end at the last complete line. */
+    while (off > 0 && buf[off - 1] != '\n') off--;
     buf[off] = '\0';
     return off;
     #undef APPEND_STR
     #undef APPEND_HEX
-    #undef MAP_LINE
 }
 
 /* /proc/<pid>/stat -- the single-line numeric form. We emit the leading
@@ -585,6 +1195,7 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
         case PROC_RUNNING: case PROC_READY: st = 'R'; break;
         case PROC_BLOCKED: st = 'S'; break;
         case PROC_TERMINATED: st = 'Z'; break;
+        case PROC_STOPPED: st = 'T'; break;     /* ptrace / SIGSTOP: procps shows T */
         default: st = 'R'; break;
     }
     int off = 0;
@@ -595,14 +1206,26 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
         memcpy(buf + off, s, sl); off += (int)sl; \
     } while (0)
     #define APPEND_INT(v) do { int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); } while (0)
+    /* Threads in the group, the same count /proc/<pid>/status reports. */
+    int nthreads = 0;
+    {   int tg = p->is_thread ? p->tgid : p->pid;
+        for (int ti = 0; ti < PROC_MAX; ti++) {
+            struct proc *q = &g_proc[ti];
+            if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+                q->state == PROC_TERMINATED) continue;
+            if (q->pid == tg || (q->is_thread && q->tgid == tg)) nthreads++;
+        }
+        if (nthreads < 1) nthreads = 1;
+    }
 
     /* Slice 10: fields 1 and 4 are pid and ppid -- namespace-translated for the
      * same reason as /proc/<pid>/status. busybox `ps` reads field 1 and then
      * offers it to kill(1). */
     APPEND_INT(pid_vnr(p)); APPEND_STR(" (");
-    APPEND_STR(p->name); APPEND_STR(") ");
+    { char cm[16]; APPEND_STR(proc_comm(p, cm, sizeof cm)); }
+    APPEND_STR(") ");
     { char ss[2] = { st, 0 }; APPEND_STR(ss); }
-    APPEND_STR(" "); APPEND_INT(pid_vnr_of_kpid(p->ppid));
+    APPEND_STR(" "); APPEND_INT(p->ppid < 0 ? 1 : pid_vnr_of_kpid(p->ppid));
 
     /* Linux /proc/<pid>/stat has FIFTY-TWO fields. We used to stop at 22,
      * which crashed real programs -- not by returning an error, but by
@@ -624,28 +1247,79 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
      * So: emit all 52, with honest values where we have them and 0 elsewhere.
      * Field numbers below are 1-based and match proc(5). */
     {
-        uint64_t hz100 = p->cpu_ns / 10000000ull;   /* ns -> USER_HZ (100/s) */
+        /* utime/stime: this thread's split (Linux reports the thread for
+         * task/<tid>/stat and the group for <pid>/stat; the group here,
+         * as for a single-threaded process they are the same); cutime and
+         * cstime the reaped children's. ns -> USER_HZ (100/s). */
+        uint64_t ut_ns, st_ns;
+        if (p->is_thread) proc_cputimes(p, &ut_ns, &st_ns);
+        else proc_group_cputimes(p, &ut_ns, &st_ns);
+        uint64_t hz100 = ut_ns / 10000000ull;
+        uint64_t st100 = st_ns / 10000000ull;
+        uint64_t cut100 = p->cutime_ns / 10000000ull;
+        uint64_t cst100 = p->cstime_ns / 10000000ull;
         uint64_t rss_pages = p->user_pages;
         uint64_t vsize = rss_pages * 4096ull;
 
-        APPEND_STR(" 0");                    /*  5 pgrp        */
-        APPEND_STR(" 0");                    /*  6 session     */
-        APPEND_STR(" 0");                    /*  7 tty_nr      */
-        APPEND_STR(" -1");                   /*  8 tpgid       */
+        /* 2026-09-03: pgrp, session and starttime were literal zeros, so a
+         * procps-style ps had no PGID, no SID, no ELAPSED/START and no
+         * %CPU -- every one of them is a function of these fields. The
+         * process group is a pid and is namespace-translated like ppid;
+         * the session is the login session id (there is no setsid(2)
+         * session distinct from it here), which is also what a bare `ps`
+         * uses in place of "the invoker's terminal". */
+        /* Batch 30: fields 5-8 are what the system calls say, as on Linux
+         * (logs/b30/pidprobe-*.out). pgrp is getpgrp()'s answer -- a pgid
+         * of 0 reads as the process's own pid everywhere else, so it does
+         * here (sshd's said 0); session is getsid()'s, the POSIX session
+         * setsid(2) makes -- it was session_id, the GUI login session, so
+         * every process said 0 beside getsid's 7; tty_nr and tpgid are the
+         * controlling terminal's device (Linux's encoding: a pty is 136,N;
+         * the console 5,1, as /dev has them) and foreground group, 0 and
+         * -1 with no terminal -- they were 0 and -1 always, under script(1)'s
+         * pty too. */
+        {
+            int pg = p->pgid > 0 ? p->pgid : p->pid;
+            APPEND_STR(" "); APPEND_INT(pid_vnr_of_kpid(pg));           /*  5 pgrp */
+            APPEND_STR(" "); APPEND_INT(p->sid > 0 ? pid_vnr_of_kpid(p->sid) : 0); /* 6 session */
+            int tty_nr = 0, tpgid = -1;
+            if (p->ctty_kind == PROC_CTTY_PTY &&
+                pty_ctty_live(p->ctty_index, p->ctty_gen)) {
+                uint32_t mn = (uint32_t)p->ctty_index;
+                tty_nr = (int)((mn & 0xffu) | (136u << 8) | ((mn & ~0xffu) << 12));
+                int fg = pty_fg_pgrp(p->ctty_index);
+                if (fg > 0) tpgid = pid_vnr_of_kpid(fg);
+            } else if (p->ctty_kind == PROC_CTTY_CONSOLE) {
+                tty_nr = (int)(1u | (5u << 8));
+                int fg = signal_get_foreground();
+                if (fg > 0) tpgid = pid_vnr_of_kpid(fg);
+            }
+            APPEND_STR(" "); APPEND_INT(tty_nr);                         /*  7 tty_nr */
+            APPEND_STR(" "); APPEND_INT(tpgid);                          /*  8 tpgid */
+        }
         APPEND_STR(" 0");                    /*  9 flags       */
-        APPEND_STR(" 0");                    /* 10 minflt      */
-        APPEND_STR(" 0");                    /* 11 cminflt     */
-        APPEND_STR(" 0");                    /* 12 majflt      */
-        APPEND_STR(" 0");                    /* 13 cmajflt     */
+        {   /* the thread's own for a task, else the group's (finding 205) */
+            uint64_t mnf, mjf;
+            if (p->is_thread) { mnf = p->min_flt; mjf = p->maj_flt; }
+            else proc_group_faults(p, &mnf, &mjf);
+            APPEND_STR(" "); APPEND_INT((int64_t)mnf);         /* 10 minflt  */
+            APPEND_STR(" "); APPEND_INT((int64_t)p->cmin_flt); /* 11 cminflt */
+            APPEND_STR(" "); APPEND_INT((int64_t)mjf);         /* 12 majflt  */
+            APPEND_STR(" "); APPEND_INT((int64_t)p->cmaj_flt); /* 13 cmajflt */
+        }
         APPEND_STR(" "); APPEND_INT(hz100);  /* 14 utime       */
-        APPEND_STR(" 0");                    /* 15 stime       */
-        APPEND_STR(" 0");                    /* 16 cutime      */
-        APPEND_STR(" 0");                    /* 17 cstime      */
-        APPEND_STR(" 20");                   /* 18 priority    */
-        APPEND_STR(" 0");                    /* 19 nice        */
-        APPEND_STR(" 1");                    /* 20 num_threads */
+        APPEND_STR(" "); APPEND_INT(st100);  /* 15 stime       */
+        APPEND_STR(" "); APPEND_INT(cut100); /* 16 cutime      */
+        APPEND_STR(" "); APPEND_INT(cst100); /* 17 cstime      */
+        /* 18 priority, 19 nice: 20 + niceness and the niceness, as Linux
+         * gives them for a normal process (batch 25; they were 20 and 0) */
+        APPEND_STR(" "); APPEND_INT(20 + p->nice);
+        APPEND_STR(" "); APPEND_INT(p->nice);
+        APPEND_STR(" "); APPEND_INT(nthreads);   /* 20 num_threads */
         APPEND_STR(" 0");                    /* 21 itrealvalue */
-        APPEND_STR(" 0");                    /* 22 starttime   */
+        /* 22 starttime: clock ticks (USER_HZ = 100) after boot, from the
+         * creation stamp every spawn/fork/clone site already records. */
+        APPEND_STR(" "); APPEND_INT(p->created_ns / 10000000ull);
         APPEND_STR(" "); APPEND_INT(vsize);      /* 23 vsize   */
         APPEND_STR(" "); APPEND_INT(rss_pages);  /* 24 rss (in PAGES) */
         /* 25 rsslim: Linux reports RLIM_INFINITY here. */
@@ -664,12 +1338,158 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
     #undef APPEND_INT
 }
 
+/* /proc/modules -- Linux's format: name size refcount deps state address.
+ * The module loader has been real since it was written; this is the first
+ * thing that reads its table from userspace (lsmod). */
+static int gen_modules(char *buf, size_t cap) {
+    int off = 0;
+    char tmp[24];
+    #define APPEND_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+    #define APPEND_U64(v) do { uint_to_str(tmp, sizeof(tmp), (uint64_t)(v)); APPEND_STR(tmp); } while (0)
+    for (int i = 0; i < MODULE_MAX; i++) {
+        const struct loaded_module *m = module_slot(i);
+        if (!m || !m->in_use) continue;
+        APPEND_STR(m->name); APPEND_STR(" ");
+        APPEND_U64(m->size); APPEND_STR(" 0 - ");
+        APPEND_STR(m->initialized ? "Live" : "Loading");
+        APPEND_STR(" 0x");
+        { char hx[20]; hex_to_str(hx, sizeof hx, (uint64_t)(uintptr_t)m->base); APPEND_STR(hx); }
+        APPEND_STR("\n");
+    }
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+    #undef APPEND_U64
+}
+
+/* /proc/vmstat -- the handful of counters procps's vmstat -s and free read.
+ * Page-fault totals come from the #PF handler; swap-ins from the reclaim
+ * path (swap-OUT has no production caller, so pswpout is honestly 0). */
+static int gen_vmstat(char *buf, size_t cap) {
+    extern uint64_t page_fault_total(void);
+    extern uint64_t reclaim_stat_faulted_back(void);
+    int off = 0;
+    char tmp[24];
+    #define APPEND_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+    #define APPEND_U64(v) do { uint_to_str(tmp, sizeof(tmp), (uint64_t)(v)); APPEND_STR(tmp); } while (0)
+    APPEND_STR("nr_free_pages "); APPEND_U64(pmm_free_pages()); APPEND_STR("\n");
+    APPEND_STR("nr_pages_total "); APPEND_U64(pmm_total_pages()); APPEND_STR("\n");
+    APPEND_STR("pgfault "); APPEND_U64(page_fault_total()); APPEND_STR("\n");
+    APPEND_STR("pgmajfault "); APPEND_U64(reclaim_stat_faulted_back()); APPEND_STR("\n");
+    APPEND_STR("pswpin "); APPEND_U64(reclaim_stat_faulted_back()); APPEND_STR("\n");
+    APPEND_STR("pswpout 0\n");
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+    #undef APPEND_U64
+}
+
+/* One IPv4 address as eight little-endian hex digits, the way Linux prints
+ * them in /proc/net/route (the address is stored in network order and the
+ * kernel dumps its bytes as a host-order word). */
+static void route_hex(uint32_t ip_be, char *out) {
+    static const char *hx = "0123456789ABCDEF";
+    /* Linux prints the 32-bit word in host byte order; on x86 that reverses
+     * the bytes of the network-order address: 10.0.2.2 -> 0202000A. */
+    uint32_t v = ip_be;
+    for (int i = 7; i >= 0; i--) { out[i] = hx[v & 0xF]; v >>= 4; }
+    out[8] = '\0';
+}
+
+static int gen_net_route(char *buf, size_t cap) {
+    int off = 0;
+    char h[9];
+    #define APPEND_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+    APPEND_STR("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
+    uint32_t ip = net_my_ip(), mask = net_my_netmask(), gw = net_my_gateway();
+    if (gw) {
+        /* default route: destination 0, gateway set, flags UG (0003) */
+        APPEND_STR("eth0\t00000000\t"); route_hex(gw, h); APPEND_STR(h);
+        APPEND_STR("\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
+    }
+    if (ip && mask) {
+        APPEND_STR("eth0\t"); route_hex(ip & mask, h); APPEND_STR(h);
+        APPEND_STR("\t00000000\t0001\t0\t0\t0\t"); route_hex(mask, h); APPEND_STR(h);
+        APPEND_STR("\t0\t0\t0\n");
+    }
+    /* routes added to the initial namespace's table (ip route add, route
+     * add): skip the two synthesized above so nothing prints twice */
+    {
+        struct proc *me = current_proc();
+        void *ns = me ? me->net_ns : NULL;
+        for (size_t i = 0; ; i++) {
+            uint32_t rd, rm, rg; struct net_dev *dev;
+            if (!net_ns_route_at(ns, i, &rd, &rm, &rg, &dev)) break;
+            if (rd == 0 && rm == 0 && gw && rg == gw) continue;
+            if (mask && rm == mask && rd == (ip & mask) && rg == 0) continue;
+            APPEND_STR("eth0\t"); route_hex(rd, h); APPEND_STR(h); APPEND_STR("\t");
+            route_hex(rg, h); APPEND_STR(h);
+            APPEND_STR(rg ? "\t0003\t0\t0\t0\t" : "\t0001\t0\t0\t0\t");
+            route_hex(rm, h); APPEND_STR(h);
+            APPEND_STR("\t0\t0\t0\n");
+        }
+    }
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+}
+
+static int gen_net_arp(char *buf, size_t cap) {
+    int off = 0;
+    #define APPEND_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+    APPEND_STR("IP address       HW type     Flags       HW address            Mask     Device\n");
+    for (int i = 0; i < arp_cache_capacity(); i++) {
+        uint32_t ip; uint8_t mac[6];
+        if (!arp_cache_entry(i, &ip, mac)) continue;
+        char line[96];
+        char ipd[16];
+        {   /* dotted quad, padded to the 17-column field Linux uses */
+            unsigned b0 = ip & 0xFF, b1 = (ip >> 8) & 0xFF, b2 = (ip >> 16) & 0xFF, b3 = (ip >> 24) & 0xFF;
+            int n = 0;
+            unsigned parts[4] = { b0, b1, b2, b3 };
+            for (int k = 0; k < 4; k++) {
+                char d[4]; int dn = 0; unsigned v = parts[k];
+                do { d[dn++] = (char)('0' + v % 10); v /= 10; } while (v);
+                while (dn) ipd[n++] = d[--dn];
+                if (k < 3) ipd[n++] = '.';
+            }
+            ipd[n] = '\0';
+        }
+        static const char *hx = "0123456789abcdef";
+        int n = 0;
+        for (const char *p = ipd; *p; p++) line[n++] = *p;
+        while (n < 17) line[n++] = ' ';
+        const char *mid = "0x1         0x2         ";
+        for (const char *p = mid; *p; p++) line[n++] = *p;
+        for (int k = 0; k < 6; k++) {
+            line[n++] = hx[mac[k] >> 4]; line[n++] = hx[mac[k] & 0xF];
+            if (k < 5) line[n++] = ':';
+        }
+        const char *tail = "     *        eth0\n";
+        for (const char *p = tail; *p; p++) line[n++] = *p;
+        line[n] = '\0';
+        APPEND_STR(line);
+    }
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+}
+
 /* ---- VFS driver ---- */
 
 /* Slice 11: which writable procfs file a handle refers to (PW_NONE for the
  * read-only majority). Recorded at open because procfs_write() only receives
  * the handle, not the path. */
-enum procfs_wkind { PW_NONE = 0, PW_UID_MAP, PW_GID_MAP, PW_SETGROUPS };
+enum procfs_wkind { PW_NONE = 0, PW_UID_MAP, PW_GID_MAP, PW_SETGROUPS,
+                    PW_NS_LAST_PID, PW_HOSTNAME, PW_DOMAINNAME };
 
 struct procfs_handle {
     char *data;
@@ -692,8 +1512,22 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
     int wpid = 0;                          /* slice 11: writable-file target */
     enum procfs_wkind wkind = PW_NONE;
 
-    if (strcmp(rel, "uptime") == 0)  { len = gen_uptime(buf, sizeof(buf));  }
+    if (strncmp(rel, "sys/", 4) == 0) { len = gen_sys(rel + 4, buf, sizeof(buf));
+                                        if (len < 0) return VFS_ERR_NOENT;
+                                        if (strcmp(rel, "sys/kernel/ns_last_pid") == 0)
+                                            wkind = PW_NS_LAST_PID;
+                                        /* batch 31: writable, as Linux's -- how
+                                         * hostname(1) sets the name here */
+                                        if (strcmp(rel, "sys/kernel/hostname") == 0)
+                                            wkind = PW_HOSTNAME;
+                                        if (strcmp(rel, "sys/kernel/domainname") == 0)
+                                            wkind = PW_DOMAINNAME; }
+    else if (strncmp(rel, "net/", 4) == 0) { len = gen_net(rel + 4, buf, sizeof(buf));
+                                        if (len < 0) return VFS_ERR_NOENT; }
+    else if (strcmp(rel, "uptime") == 0)  { len = gen_uptime(buf, sizeof(buf));  }
     else if (strcmp(rel, "meminfo") == 0) { len = gen_meminfo(buf, sizeof(buf)); }
+    else if (strcmp(rel, "modules") == 0) { len = gen_modules(buf, sizeof(buf)); }
+    else if (strcmp(rel, "vmstat") == 0)  { len = gen_vmstat(buf, sizeof(buf)); }
     else if (strcmp(rel, "version") == 0) { len = gen_version(buf, sizeof(buf)); }
     else if (strcmp(rel, "cpuinfo") == 0) { len = gen_cpuinfo(buf, sizeof(buf)); }
     else if (strcmp(rel, "loadavg") == 0) { len = gen_loadavg(buf, sizeof(buf)); }
@@ -701,6 +1535,10 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
     else if (strcmp(rel, "mounts") == 0)  { len = gen_mounts(buf, sizeof(buf)); }
     else if (strcmp(rel, "filesystems") == 0) { len = gen_filesystems(buf, sizeof(buf)); }
     else if (strcmp(rel, "devices") == 0) { len = gen_devices(buf, sizeof(buf)); }
+    else if (strcmp(rel, "partitions") == 0) {     /* finding 198 */
+        extern size_t devfs_partitions(char *buf, size_t cap);
+        len = (int)devfs_partitions(buf, sizeof(buf));
+    }
     else {
         /* Try /proc/<pid>/<file> */
         if (rel[0] >= '0' && rel[0] <= '9') {
@@ -728,6 +1566,29 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
                 }
                 else if (strcmp(sub, "stat") == 0)
                     len = gen_pid_stat(pid, buf, sizeof(buf));
+                else if (strcmp(sub, "comm") == 0) {         /* finding 208 */
+                    /* the executable's name, cut to TASK_COMM_LEN - 1 bytes,
+                     * as stat and status say it (proc_comm): this file
+                     * said the spawner's label -- an SSH session's shell
+                     * was "tsh-ssh" where Linux's is "bash" (finding 213) */
+                    struct proc *cp = proc_lookup(pid);
+                    if (!cp) return VFS_ERR_NOENT;
+                    char cb[16];
+                    const char *cn = proc_comm(cp, cb, sizeof cb);
+                    size_t cl = strlen(cn);
+                    memcpy(buf, cn, cl);
+                    buf[cl] = '\n';
+                    len = (int)cl + 1;
+                }
+                /* 2026-08-22: /proc/self/mounts is what libmount, findmnt,
+                 * systemd and Go's mountinfo actually read -- /proc/mounts
+                 * worked while the per-pid dispatch had no arm, so exactly
+                 * the common consumers got ENOENT. Same generator (it
+                 * already renders the READER's mount namespace). */
+                else if (strcmp(sub, "mounts") == 0)
+                    len = gen_mounts(buf, sizeof(buf));
+                else if (strcmp(sub, "mountinfo") == 0)      /* batch 31 */
+                    len = gen_mountinfo(buf, sizeof(buf));
                 /* Slice 11: the user-namespace id maps. These are the first
                  * WRITABLE files in /proc -- see procfs_write(). The pid is
                  * stashed on the handle because a write has to know which
@@ -794,6 +1655,10 @@ static int procfs_close(struct vfs_file *f) {
 static long procfs_read(struct vfs_file *f, void *buf, size_t n) {
     struct procfs_handle *h = f->priv;
     if (!h) return VFS_ERR_INVAL;
+    /* at the FILE's position, which lseek moves (finding 220): the handle's
+     * own cursor did not follow a seek, so bash's `read` -- a chunk, then a
+     * seek back past the line -- saw the first line of a file only */
+    h->pos = f->pos;
     if (h->pos >= h->len) return 0;
     size_t avail = h->len - h->pos;
     if (n > avail) n = avail;
@@ -813,6 +1678,38 @@ static long procfs_read(struct vfs_file *f, void *buf, size_t n) {
 static long procfs_write(struct vfs_file *f, const void *buf, size_t n) {
     struct procfs_handle *h = f->priv;
     if (!h || h->wkind == PW_NONE) return VFS_ERR_ROFS;
+    if (h->wkind == PW_NS_LAST_PID) {
+        /* Linux: a number 0..pid_max-1, EINVAL else; root (CAP_SYS_ADMIN /
+         * CAP_CHECKPOINT_RESTORE) only, EPERM else. Writable in the initial
+         * pid namespace only here. The next pid is the number + 1. */
+        struct proc *me = current_proc();
+        if (!me || me->uid != 0 || me->pid_ns) return VFS_ERR_NOTPERM;   /* uid: effective */
+        const char *c = (const char *)buf;
+        size_t i = 0;
+        long v = 0;
+        while (i < n && (c[i] == ' ' || c[i] == '\t')) i++;
+        size_t d0 = i;
+        while (i < n && c[i] >= '0' && c[i] <= '9' && v < PID_MAX) v = v * 10 + (c[i++] - '0');
+        while (i < n && (c[i] == ' ' || c[i] == '\t' || c[i] == '\n')) i++;
+        if (i == d0 || i != n || v >= PID_MAX) return VFS_ERR_INVAL;
+        proc_set_last_pid((int)v);
+        return (long)n;
+    }
+    if (h->wkind == PW_HOSTNAME || h->wkind == PW_DOMAINNAME) {
+        /* THE HOST AND DOMAIN NAME, AS LINUX'S /proc/sys/kernel FILES SET
+         * THEM: what is written, less one trailing newline, through the
+         * same rule sethostname(2) has (uts_set_*: CAP_SYS_ADMIN in the
+         * UTS namespace's owner, under 65 bytes). There was no way for a
+         * native program to set either (batch 31: hostname, domainname). */
+        size_t len = n;
+        const char *c = (const char *)buf;
+        if (len && c[len - 1] == '\n') len--;
+        long r = (h->wkind == PW_HOSTNAME) ? uts_set_nodename(c, len)
+                                           : uts_set_domainname(c, len);
+        if (r == -ABI_EPERM) return VFS_ERR_NOTPERM;
+        if (r < 0) return VFS_ERR_INVAL;
+        return (long)n;
+    }
     struct proc *target = proc_lookup(h->wpid);
     if (!target) return VFS_ERR_NOENT;
 
@@ -838,9 +1735,42 @@ static long procfs_write(struct vfs_file *f, const void *buf, size_t n) {
     return rc;
 }
 
+/* A /proc/PID/fd link's permissions, as Linux's: read-x for a descriptor
+ * open for reading, write-x for writing, both for both (finding 270). The
+ * kind says it where the open recorded no access mode: a pipe's end, a
+ * socket, the console, and the event objects Linux opens O_RDWR. */
+static uint32_t fd_link_mode(const struct file *f) {
+    int acc;
+    switch (f->kind) {
+    case FILE_KIND_PIPE_R:   acc = 0; break;
+    case FILE_KIND_PIPE_W:   acc = 1; break;
+    case FILE_KIND_PIPE_RW:
+    case FILE_KIND_SOCKET:
+    case FILE_KIND_CONSOLE:
+    case FILE_KIND_EVENTFD:
+    case FILE_KIND_TIMERFD:
+    case FILE_KIND_SIGNALFD:
+    case FILE_KIND_EPOLL:    acc = 2; break;
+    case FILE_KIND_INOTIFY:  acc = 0; break;
+    default:                 acc = f->o_accmode & 3; break;
+    }
+    return acc == 0 ? 0500u : acc == 1 ? 0300u : 0700u;
+}
+
 static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     (void)mnt;
     if (!path || path[0] != '/') return VFS_ERR_NOENT;
+
+    /* /proc/self itself is a link to the reader's pid, as procfs_readlink
+     * and readdir say (finding 254: stat took it through subst_self and
+     * called it the directory, so lstat, `readlink /proc/self` and `ls -l`
+     * saw no link); what is under it is substituted below */
+    if (strcmp(path, "/self") == 0) {
+        out->type = VFS_TYPE_SYMLINK;
+        out->size = 0;
+        out->uid = 0; out->gid = 0; out->mode = 0777u | VFS_MODE_VALID;
+        return VFS_OK;
+    }
 
     char normbuf[ABI_PATH_MAX];
     subst_self(path, normbuf, sizeof(normbuf));
@@ -848,6 +1778,18 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
 
     /* Root /proc directory */
     if (rel[0] == '\0') {
+        out->type = VFS_TYPE_DIR;
+        out->size = 0;
+        out->uid = 0; out->gid = 0; out->mode = 0;
+        return VFS_OK;
+    }
+
+    /* The /proc/sys and /proc/net directory skeleton (2026-08-22). The
+     * FILES stat through the generic open-and-measure fallthrough below;
+     * only the directories need explicit arms so `test -d` works. */
+    if (strcmp(rel, "sys") == 0 || strcmp(rel, "sys/kernel") == 0 ||
+        strcmp(rel, "sys/kernel/random") == 0 || strcmp(rel, "sys/fs") == 0 ||
+        strcmp(rel, "sys/vm") == 0 || strcmp(rel, "net") == 0) {
         out->type = VFS_TYPE_DIR;
         out->size = 0;
         out->uid = 0; out->gid = 0; out->mode = 0;
@@ -868,7 +1810,9 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
             }
             return VFS_ERR_NOENT;
         }
-        if (*s == '/' && strcmp(s + 1, "exe") == 0) {
+        if (*s == '/' && (strcmp(s + 1, "exe") == 0 ||
+                          strcmp(s + 1, "cwd") == 0 ||      /* finding 208 */
+                          strcmp(s + 1, "root") == 0)) {
             int pid = procfs_kpid(rel);   /* slice 10 */
             if (proc_lookup(pid)) {
                 out->type = VFS_TYPE_SYMLINK;
@@ -962,15 +1906,31 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
             int pid = procfs_kpid(rel);   /* slice 10 */
             struct proc *p = proc_lookup(pid);
             if (!p) return VFS_ERR_NOENT;
+            /* the process's, dr-x------ and l?wx------, as Linux's: they
+             * were root's, the link lrwxrwxrwx, 0 bytes, 1970 (270) */
+            out->uid = (uint32_t)p->uid;
+            out->gid = (uint32_t)p->gid;
             if (strcmp(s + 1, "fd") == 0) {        /* the fd directory */
                 out->type = VFS_TYPE_DIR;
-                out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+                out->size = 0;
+                out->mode = 0500u | VFS_MODE_VALID;
                 return VFS_OK;
             }
             int fd = parse_int(s + 4);             /* fd/<n> */
-            if (fd >= 0 && fd < PROC_NFDS && p->fds[fd]) {
+            struct file **tab = proc_fds(p);
+            if (fd >= 0 && fd < PROC_NFDS && tab && tab[fd]) {
+                struct file *f = tab[fd];
                 out->type = VFS_TYPE_SYMLINK;
-                out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+                out->size = 64;                    /* Linux's, whatever the target */
+                out->mode = fd_link_mode(f) | VFS_MODE_VALID;
+                /* dated when first looked at, and kept: Linux's inode's */
+                if (!f->proc_seen_ns) {
+                    extern uint64_t file_time_ns(void);
+                    f->proc_seen_ns = file_time_ns();
+                }
+                out->atime = out->mtime = out->ctime = f->proc_seen_ns / 1000000000ull;
+                out->atime_ns = out->mtime_ns = out->ctime_ns =
+                    (uint32_t)(f->proc_seen_ns % 1000000000ull);
                 return VFS_OK;
             }
             return VFS_ERR_NOENT;
@@ -1129,23 +2089,37 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
                                          "cpuinfo", "loadavg", "stat",
                                          "mounts", "self",
                                          /* slice 6 */
-                                         "filesystems", "devices" };
-        const int nglobals = 10;
+                                         "filesystems", "devices",
+                                         /* native-parity batch */
+                                         "modules", "vmstat",
+                                         /* batch 32 (finding 198) */
+                                         "partitions" };
+        const int nglobals = 13;
         if (dh->index < nglobals) {
             memset(out->name, 0, VFS_NAME_MAX);
             size_t nl = strlen(globals[dh->index]);
             memcpy(out->name, globals[dh->index], nl);
-            /* the last entry ("self") is a symlink, the rest are files */
-            out->type = (dh->index == nglobals - 1) ? VFS_TYPE_SYMLINK
-                                                     : VFS_TYPE_FILE;
+            /* "self" is a symlink, the rest are files. This tested for the
+             * LAST entry, which "self" stopped being when the list grew:
+             * vmstat listed as the link and self as a file -- harmless
+             * until readdir's types reached programs (batch 32) */
+            out->type = (strcmp(globals[dh->index], "self") == 0)
+                        ? VFS_TYPE_SYMLINK : VFS_TYPE_FILE;
             out->size = 0;
             out->uid = 0; out->gid = 0; out->mode = 0;
             dh->index++;
             return VFS_OK;
         }
-        int pidx = dh->index - nglobals;
+        /* In ascending pid order, as Linux lists /proc: the cursor is the
+         * smallest number not listed yet, and each call takes the smallest
+         * visible pid at or above it. It was the slot index, which was the
+         * pid until batch 26 (finding 146); slot order is not pid order now,
+         * and a cursor by number does not skip or repeat a process when a
+         * slot changes hands between two calls. */
+        int want = dh->index - nglobals;
+        int best = -1;
         struct proc *me = current_proc();
-        for (int i = pidx; i < PROC_MAX; i++) {
+        for (int i = 0; i < PROC_MAX; i++) {
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].state != PROC_EMBRYO) {
                 /* Slice 10: list only what the READER's pid namespace can see,
@@ -1153,50 +2127,82 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
                  * filters, not just the per-pid lookup, or a container's `ps`
                  * enumerates host processes and then fails to stat them.
                  *
-                 * A reader in the initial namespace is left EXACTLY as before,
-                 * pid 0 included -- pid_vnr_in reports 0 as "not visible", so
-                 * routing the initial namespace through it would have silently
-                 * dropped /proc/0 from the listing. Same reasoning as
-                 * procfs_kpid(). */
+                 * A reader in the initial namespace gets the identity mapping,
+                 * EXCEPT that pid 0 is not listed. Slice 10 left it in
+                 * deliberately, calling its removal "an unrelated behaviour
+                 * change that a pid-namespace slice has no business making".
+                 * This is that change, made on its own.
+                 *
+                 * LINUX HAS NO /proc/0, so `ls /proc` and everything that
+                 * enumerates /proc/[0-9]* omits the scheduler. Ours listed it,
+                 * and busybox `ps` -- which enumerates the directory -- duly
+                 * reported a pid 0 that native `ps -e` already filtered out.
+                 * Neither tool was wrong: both were faithful, and the
+                 * DIRECTORY was the thing diverging from Linux.
+                 *
+                 * Caught on the real EliteDesk. The distro gate's "busybox ps
+                 * sees the same set" check compares the two listings and
+                 * tolerates 3 differing pids for the snapshots' own
+                 * transients; on hardware the transients reached 3 and this
+                 * constant pushed it to 4. In QEMU the count had been sitting
+                 * at exactly 1 -- pid 0 and nothing else -- for the life of
+                 * the check, green throughout. etc/distro_test.sh has stated
+                 * the intended behaviour since it was written: "pid 0 is
+                 * deliberately NOT here: Linux `ps -e` omits the scheduler
+                 * (pid 0) and busybox ps agrees."
+                 *
+                 * ONLY THE LISTING CHANGES. A direct /proc/0/... lookup still
+                 * resolves as before: that path is procfs_kpid() and its
+                 * thirteen call sites, nothing in the tree reads it, and it is
+                 * already half-formed (there is no /proc/0/stat). Whether to
+                 * remove it outright is a separate question from the
+                 * enumeration parity this fixes. */
                 int vp;
                 if (!me || !me->pid_ns) {
                     vp = g_proc[i].pid;
+                    if (vp == 0) continue;
                 } else {
                     vp = pid_vnr_in(me->pid_ns, g_proc[i].pid);
                     if (!vp) continue;
                 }
-                memset(out->name, 0, VFS_NAME_MAX);
-                char tmp[16];
-                int_to_str(tmp, sizeof(tmp), vp);
-                size_t tl = strlen(tmp);
-                memcpy(out->name, tmp, tl);
-                out->type = VFS_TYPE_DIR;
-                out->size = 0;
-                out->uid = 0; out->gid = 0; out->mode = 0;
-                dh->index = nglobals + i + 1;
-                return VFS_OK;
+                if (vp >= want && (best < 0 || vp < best)) best = vp;
             }
         }
-        return VFS_ERR_NOENT;
+        if (best < 0) return VFS_ERR_NOENT;
+        memset(out->name, 0, VFS_NAME_MAX);
+        char tmp[16];
+        int_to_str(tmp, sizeof(tmp), best);
+        size_t tl = strlen(tmp);
+        memcpy(out->name, tmp, tl);
+        out->type = VFS_TYPE_DIR;
+        out->size = 0;
+        out->uid = 0; out->gid = 0; out->mode = 0;
+        dh->index = nglobals + best + 1;
+        return VFS_OK;
     }
 
-    /* Per-pid directory listing. "exe" is a symlink, "fd" and "ns" are
-     * directories, the rest are files. */
-    static const char *entries[] = { "status", "cmdline", "maps", "stat",
-                                     "exe", "fd", "ns",
-                                     /* slice 11 */
-                                     "uid_map", "gid_map", "setgroups",
-                                     "fdinfo" };
-    const int nentries = 11;
+    /* Per-pid directory listing, each name with its type. It was thirteen
+     * names counted as twelve -- fdinfo was never listed -- and the types
+     * went by positions that had moved: mounts came out a link, mountinfo
+     * and gid_map directories, exe a directory (finding 208). */
+    static const struct { const char *name; int type; } entries[] = {
+        { "status", VFS_TYPE_FILE }, { "cmdline", VFS_TYPE_FILE },
+        { "comm", VFS_TYPE_FILE },   { "maps", VFS_TYPE_FILE },
+        { "stat", VFS_TYPE_FILE },   { "mounts", VFS_TYPE_FILE },
+        { "mountinfo", VFS_TYPE_FILE },
+        { "exe", VFS_TYPE_SYMLINK }, { "cwd", VFS_TYPE_SYMLINK },
+        { "root", VFS_TYPE_SYMLINK },
+        { "fd", VFS_TYPE_DIR },      { "fdinfo", VFS_TYPE_DIR },
+        { "ns", VFS_TYPE_DIR },                          /* slice 8 */
+        { "uid_map", VFS_TYPE_FILE }, { "gid_map", VFS_TYPE_FILE },
+        { "setgroups", VFS_TYPE_FILE },                  /* slice 11 */
+    };
+    const int nentries = (int)(sizeof entries / sizeof entries[0]);
     if (dh->index >= nentries) return VFS_ERR_NOENT;
     memset(out->name, 0, VFS_NAME_MAX);
-    size_t nl = strlen(entries[dh->index]);
-    memcpy(out->name, entries[dh->index], nl);
-    if (dh->index == 4)      out->type = VFS_TYPE_SYMLINK;   /* exe */
-    else if (dh->index == 5) out->type = VFS_TYPE_DIR;       /* fd  */
-    else if (dh->index == 6) out->type = VFS_TYPE_DIR;       /* ns (slice 8) */
-    else if (dh->index == 10) out->type = VFS_TYPE_DIR;      /* fdinfo */
-    else                     out->type = VFS_TYPE_FILE;
+    size_t nl = strlen(entries[dh->index].name);
+    memcpy(out->name, entries[dh->index].name, nl);
+    out->type = entries[dh->index].type;
     out->size = 0;
     out->uid = 0; out->gid = 0; out->mode = 0;
     dh->index++;
@@ -1212,18 +2218,20 @@ static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
     (void)mnt;
     if (!path || path[0] != '/' || !buf || bufsz == 0) return VFS_ERR_INVAL;
 
-    /* Bare /proc/self -> /proc/<pid> */
+    /* Bare /proc/self -> <pid> -- the pid in the READER's namespace
+     * (2026-08-22: this was the one site still writing the HOST pid,
+     * against slice 10's rule; inside a pid namespace the link then named
+     * a process the reader cannot even see). Relative, as Linux's: the
+     * link says "1234", not "/proc/1234" (batch 30, logs/b30/pidprobe-
+     * wsl.out) -- a program that reads it for its own pid got a path. The
+     * VFS resolves a relative target against the link's directory. */
     if (strcmp(path, "/self") == 0) {
         struct proc *p = current_proc();
         char pidstr[16];
-        int pl = int_to_str(pidstr, sizeof(pidstr), p ? p->pid : 0);
-        int n = 0;
-        const char *pre = "/proc/";
-        size_t prelen = strlen(pre);
-        if (prelen + (size_t)pl + 1 > bufsz) return VFS_ERR_INVAL;
-        memcpy(buf, pre, prelen); n = (int)prelen;
-        memcpy(buf + n, pidstr, (size_t)pl); n += pl;
-        buf[n] = '\0';
+        int pl = int_to_str(pidstr, sizeof(pidstr), p ? pid_vnr(p) : 0);
+        if ((size_t)pl + 1 > bufsz) return VFS_ERR_INVAL;
+        memcpy(buf, pidstr, (size_t)pl);
+        buf[pl] = '\0';
         return VFS_OK;
     }
 
@@ -1234,6 +2242,19 @@ static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
     if (rel[0] >= '0' && rel[0] <= '9') {
         const char *s = rel;
         while (*s >= '0' && *s <= '9') s++;
+        /* finding 208: the working directory and the root, as Linux's links */
+        if (*s == '/' && (strcmp(s + 1, "cwd") == 0 || strcmp(s + 1, "root") == 0)) {
+            int pid = procfs_kpid(rel);
+            struct proc *p = proc_lookup(pid);
+            if (!p) return VFS_ERR_NOENT;
+            const char *tgt = (s[1] == 'c') ? (p->cwd[0] ? p->cwd : "/")
+                                            : (p->fs_root[0] ? p->fs_root : "/");
+            size_t tl = strlen(tgt);
+            if (tl >= bufsz) tl = bufsz - 1;
+            memcpy(buf, tgt, tl);
+            buf[tl] = '\0';
+            return VFS_OK;
+        }
         if (*s == '/' && strcmp(s + 1, "exe") == 0) {
             int pid = procfs_kpid(rel);   /* slice 10 */
             struct proc *p = proc_lookup(pid);
@@ -1301,6 +2322,7 @@ static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
 }
 
 static const struct vfs_ops procfs_ops = {
+    .fsname   = "proc",          /* batch 31: /proc/mounts */
     .open     = procfs_open,
     .close    = procfs_close,
     .read     = procfs_read,

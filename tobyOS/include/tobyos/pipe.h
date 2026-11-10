@@ -34,7 +34,32 @@
 struct file;
 struct proc;
 
-#define PIPE_BUF_SZ 4096
+/* SLICE 129 -- SIZED FOR THE MESSAGE THAT ACTUALLY CROSSES IT.
+ *
+ * 4096 was a milestone-7 default and it stayed while this pipe became the
+ * browser's frame transport. chromewin drives chrome-headless-shell over
+ * --remote-debugging-pipe, so every screencast frame arrives as ONE CDP
+ * message: a base64 JPEG plus JSON. MEASURED on a Bing SERP, 800x600:
+ * jpeg 22-40 KiB -> 29-54 KiB of base64, i.e. 8-14 fills of a 4 KiB ring.
+ * Each fill is a full producer->consumer handoff -- the writer blocks in
+ * wq_write, the reader is woken, both re-acquire the BKL (91% contended
+ * under chrome) -- so one frame paid up to fourteen scheduling round trips
+ * to move one image.
+ *
+ * The evidence that named this: [lx-top] read counts scale with payload
+ * size, not frame count. anim.html (6.7 KiB jpeg = 2.2 chunks) costs 7.4
+ * reads/frame; the Bing SERP (39 KiB jpeg = 12.8 chunks) costs 18.4 --
+ * delta 11.0 reads for delta 10.6 chunks. A near-perfect fit to "one
+ * syscall + one handoff per 4096 bytes", and the direct sighting is
+ * `[devpipe] pid=33 write(fd=4, 27888)`: one 27 KiB write, seven round
+ * trips.
+ *
+ * 64 KiB clears the largest measured frame (40568-byte jpeg -> ~54 KiB) in
+ * a SINGLE handoff. The ring is heap-allocated per pipe and the kernel heap
+ * grows from the PMM on demand, so this costs memory only for pipes that
+ * exist. Power of two: the copy paths mask instead of dividing. */
+#define PIPE_BUF_SZ   65536u
+#define PIPE_BUF_MASK (PIPE_BUF_SZ - 1u)
 
 struct pipe {
     uint8_t   buf[PIPE_BUF_SZ];
@@ -47,6 +72,7 @@ struct pipe {
 
     struct proc *wq_read;   /* head of read-side block queue (proc.next_wait) */
     struct proc *wq_write;  /* head of write-side block queue */
+    void        *fifo;      /* the named FIFO this pipe is, or NULL (fifo_open) */
 };
 
 /* Allocate a pipe + the two file aliases. On success returns 0 and
@@ -61,5 +87,24 @@ long pipe_tryread(struct pipe *p, void *buf, size_t n);   /* non-blocking (slice
 long pipe_write(struct pipe *p, const void *buf, size_t n);
 void pipe_close_reader(struct pipe *p);
 void pipe_close_writer(struct pipe *p);
+/* As much as there is room for, never blocking: the bytes written, -11
+ * (-ABI_EAGAIN) when full, -3 (EPIPE) with no reader. */
+long pipe_trywrite(struct pipe *p, const void *buf, size_t n);
+
+/* OPEN A NAMED FIFO (mkfifo): attach to the pipe that is the FIFO KPATH
+ * -- one per FIFO, made at its first open and gone, with its data, when
+ * the last end closes, as Linux keeps one. DEV and INO name it when the
+ * filesystem has them (else KPATH does). ACCMODE is O_RDONLY, O_WRONLY or
+ * O_RDWR. A reader waits for a writer and a writer for a reader -- unless
+ * NONBLOCK: the reader goes on, the writer is ENXIO; O_RDWR never waits.
+ * 0 and *OUT, or a negative errno (EINTR_RET when a signal ended the
+ * wait). */
+long fifo_open(const char *kpath, uint32_t dev, uint64_t ino, int accmode,
+               bool nonblock, struct file **out);
+
+/* The named FIFO pipe P is: the DEV and INO it was opened by (0 when its
+ * filesystem has no inode) and its PATH. false for an unnamed pipe. */
+bool pipe_fifo_identity(struct pipe *p, uint32_t *dev, uint64_t *ino,
+                        const char **path);
 
 #endif /* TOBYOS_PIPE_H */

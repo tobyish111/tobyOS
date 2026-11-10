@@ -9,6 +9,7 @@
  */
 
 #include <tobyos/signal.h>
+#include <tobyos/shell.h>
 #include <tobyos/proc.h>
 #include <tobyos/sched.h>
 #include <tobyos/printk.h>
@@ -17,6 +18,10 @@
 #include <tobyos/isr.h>
 #include <tobyos/nsproxy.h>   /* pid_knr / pid_vnr_in / pid_ns_can_see (slice 10) */
 #include <tobyos/abi/abi.h>
+#include <tobyos/smp.h>
+#include <tobyos/percpu.h>
+#include <tobyos/apic.h>       /* apic_sched_wake: signal_kick */
+#include <tobyos/cpu.h>        /* fpu_save / fpu_restore: the frame's FPU state */
 
 static int g_foreground_pid = 0;
 
@@ -37,12 +42,14 @@ static int g_foreground_pid = 0;
 #define LXSI_CODE    8          /* int  si_code                              */
 #define LXSI_PID    16          /* _kill: pid_t si_pid (kill/raise origin)   */
 #define LXSI_UID    20          /* _kill: uid_t si_uid                       */
+#define LXSI_VALUE  24          /* _rt: union sigval si_value (finding 215)  */
 #define LXSI_ADDR   16          /* _sigfault: void *si_addr (fault address)  */
 
 /* ucontext_t: uc_mcontext.gregs[] starts at offset 40 (after uc_flags,
  * uc_link, and the 24-byte uc_stack). gregs is greg_t[23] in this fixed
  * order; uc_sigmask follows the 256-byte mcontext_t at offset 296. */
 #define LXUC_GREGS   40
+#define LXUC_FPREGS  224        /* mcontext's fpregs pointer, after gregs[23] */
 #define LXUC_SIGMASK 296
 enum {
     LXREG_R8=0, LXREG_R9, LXREG_R10, LXREG_R11, LXREG_R12, LXREG_R13,
@@ -61,19 +68,77 @@ enum {
 
 /* Saved user context pushed onto the user stack for a caught signal and read
  * back by sys_sigreturn. It sits ABOVE the 8-byte handler return address so
- * the handler's own stack growth (downward) never clobbers it. rcx/r11 are
- * intentionally absent: the `syscall` instruction clobbers them by ABI, so
- * the interrupted user code already treats them as dead. */
+ * the handler's own stack growth (downward) never clobbers it.
+ *
+ * rcx AND r11 ARE SAVED (2026-09-20). They used to be "intentionally
+ * absent: the syscall instruction clobbers them by ABI, so the interrupted
+ * user code already treats them as dead" -- true of a context interrupted
+ * by a syscall, and false of one interrupted by the TIMER IRQ, which is how
+ * a caught signal reaches a process that is running user code
+ * (signal_deliver_irq). There rcx/r11 are live, and resuming through
+ * SYSRETQ handed the code rcx = its own RIP and r11 = RFLAGS. GNU bash
+ * faulted on exactly that (ecx was the character being classified).
+ * sys_sigreturn now returns through IRETQ with these restored. */
+/* THE FPU/SSE STATE IS SAVED TOO (finding 652). A handler is ordinary
+ * code: it may use any xmm register, and MXCSR, as its own, and the code
+ * it interrupted -- at any instruction, or across a syscall, which keeps
+ * every xmm register -- cannot have saved them. Linux puts the interrupted
+ * code's FPU state in the signal frame and back at rt_sigreturn, and starts
+ * the handler from a clean state; this frame kept the integer registers
+ * only, so whatever the handler left in xmm0-xmm15 and MXCSR was the
+ * interrupted code's on return. GNU bash 5.2 died on the EliteDesk in
+ * _print_word_list (exit 139, its word list's node {0, 0x10000}, a 16-byte
+ * SSE store's) just after its SIGCHLD handler -- logs/b47/sigfpu: every
+ * round changed there, none on Linux. `fx` is the FXSAVE image (no XSAVE:
+ * CR4.OSXSAVE is off, so FXSAVE is all of the user's state). */
 struct sig_context {
     uint64_t rax;        /* syscall return value at the interruption point */
     uint64_t rdi, rsi, rdx, r10, r8, r9;
     uint64_t rbx, rbp, r12, r13, r14, r15;
+    uint64_t rcx, r11;   /* live across an IRQ; RIP/RFLAGS on a syscall */
     uint64_t rip;        /* resume RIP    */
     uint64_t rsp;        /* resume RSP    */
     uint64_t rflags;     /* resume RFLAGS */
     uint64_t saved_mask; /* signal mask to restore */
     uint64_t magic;
+    uint8_t  fx[512] __attribute__((aligned(16)));  /* the FPU/SSE state */
 };
+
+/* The interrupted code's FPU/SSE state into the frame being built. The
+ * kernel is -mno-sse and the scheduler saves and restores a process's state
+ * around every switch, so on its way back to user mode the registers hold
+ * this process's own. The frame is zeroed first: FXSAVE leaves bytes
+ * 464-511 (and may leave 416-463) unwritten, and the frame goes to the
+ * user's stack. */
+static void sig_fpu_save(struct sig_context *ctx) {
+    memset(ctx, 0, sizeof *ctx);
+    fpu_save(ctx->fx);
+}
+
+/* The handler starts from the default state, as on Linux: x87 control word
+ * 0x037F, MXCSR 0x1F80, every register zero. Called once the frame is
+ * wholly written -- a frame that failed leaves the state as it was. */
+static void sig_fpu_handler_state(void) {
+    uint8_t clean[512] __attribute__((aligned(16)));
+    fpu_init_default(clean);
+    fpu_restore(clean);
+}
+
+/* rt_sigreturn: the saved state back. The frame is the user's memory and
+ * FXRSTOR faults on an MXCSR with a reserved bit set, so MXCSR is first
+ * masked with this CPU's MXCSR_MASK (FXSAVE's bytes 28-31; 0 there means
+ * the architectural default 0xFFBF). */
+static void sig_fpu_restore(struct sig_context *ctx) {
+    uint8_t cur[512] __attribute__((aligned(16)));
+    fpu_save(cur);
+    uint32_t mask, mx;
+    memcpy(&mask, cur + 28, 4);
+    if (mask == 0) mask = 0xFFBF;
+    memcpy(&mx, ctx->fx + 24, 4);
+    mx &= mask;
+    memcpy(ctx->fx + 24, &mx, 4);
+    fpu_restore(ctx->fx);
+}
 
 /* Locate the current process's saved syscall register block. Only valid on
  * the SYSCALL return path (where the block was just pushed by the asm
@@ -97,9 +162,36 @@ void signal_init_proc(struct signal_state *ss) {
         ss->actions[i].sa_flags   = 0;
         ss->si_pid[i] = 0;
         ss->si_uid[i] = 0;
+        ss->si_code[i] = 0;
+        ss->si_value[i] = 0;
     }
     ss->mask     = 0;
     ss->pending  = 0;
+    ss->restorer = 0;
+}
+
+/* What execve does to the signal state -- POSIX's rule, and Linux's:
+ * a CAUGHT signal goes back to its default (the handler was in the old
+ * image), an IGNORED one stays ignored, and the blocked mask and every
+ * PENDING signal carry over into the new program.
+ *
+ * execve used signal_init_proc, which also emptied the pending set. A
+ * signal sent between fork and the new image's first instruction was
+ * therefore thrown away:
+ *
+ *     sleep 5 & kill -TERM $!; wait $!     wants 143; 1-2 in 100 gave 0,
+ *                                          after sleeping the full 5 s
+ *
+ * under bash and tsh alike -- the "flaky" kill cases (Oils 0929/0930/0932,
+ * shparity 91) were this. Only the handler table and restorer reset; the
+ * pending bits in struct proc are the caller's to keep. */
+void signal_exec_reset(struct signal_state *ss) {
+    for (int i = 0; i < SIG_MAX; i++) {
+        if (ss->actions[i].sa_handler != SIG_IGN)
+            ss->actions[i].sa_handler = SIG_DFL;
+        ss->actions[i].sa_mask  = 0;
+        ss->actions[i].sa_flags = 0;
+    }
     ss->restorer = 0;
 }
 
@@ -123,6 +215,31 @@ static void wait_queue_unlink(struct proc *p) {
 
 #define SIGMASK_STOPS (SIGMASK(SIGSTOP) | SIGMASK(SIGTSTP) | \
                        SIGMASK(SIGTTIN) | SIGMASK(SIGTTOU))
+
+/* A TARGET RUNNING ON ANOTHER CPU IS INTERRUPTED, so it takes the signal
+ * now (finding 165). A pending signal reaches ring 3 when a system call or
+ * an interrupt returns there -- and a process busy in user code on another
+ * CPU takes no interrupt before its next timer tick. On the EliteDesk a
+ * SIGCHLD reached a parent spinning in user code a median 9903 us after the
+ * kill, one tick; a parent making system calls had it in 30
+ * (logs/hw-2a5fa1b/sigdelay-hw-2a5fa1b.out). tsh between `kill %%` and
+ * `wait %%` makes almost none, so it met `wait` with its job still "alive"
+ * (Oils 0944: 143 in 30 of 30, bash 127 in 30). Linux kicks the target's
+ * CPU (signal_wake_up -> kick_process); so does this, with the wake IPI,
+ * whose handler delivers to a ring-3 process it interrupts (apic.c). A
+ * stale `current` read only costs a spare interrupt. */
+static void signal_kick(struct proc *p) {
+    uint32_t n = smp_cpu_count(), me = smp_current_cpu_idx();
+    for (uint32_t i = 0; i < n && i < MAX_CPUS; i++) {
+        if (i == me) continue;
+        struct percpu *c = smp_cpu_mut(i);
+        if (!c || !c->online) continue;
+        if (__atomic_load_n(&c->current, __ATOMIC_ACQUIRE) == p) {
+            apic_sched_wake((uint8_t)c->apic_id);
+            return;
+        }
+    }
+}
 
 void signal_send(struct proc *p, int sig) {
     if (!p) return;
@@ -166,9 +283,16 @@ void signal_send(struct proc *p, int sig) {
     if (sig == SIGCONT) {
         p->pending_signals  &= ~SIGMASK_STOPS;
         p->sigstate.pending &= ~SIGMASK_STOPS;
+        p->stop_sig = 0;
+        p->stop_reported = false;
         if (p->state == PROC_STOPPED) {
+            p->cont_pending = true;        /* WCONTINUED: report once */
             p->state = PROC_READY;
             sched_enqueue(p);
+            if (p->ppid > 0) {             /* Linux: SIGCHLD on continue */
+                struct proc *par = proc_lookup(p->ppid);
+                if (par) signal_send(par, SIGCHLD);
+            }
         }
     } else if (SIGMASK(sig) & SIGMASK_STOPS) {
         p->pending_signals  &= ~SIGMASK(SIGCONT);
@@ -177,7 +301,7 @@ void signal_send(struct proc *p, int sig) {
 
     /* Check if signal is ignored (SIG_IGN) and not SIGKILL/SIGSTOP */
     if (sig != SIGKILL && sig != SIGSTOP) {
-        struct sigaction *sa = &p->sigstate.actions[sig];
+        struct sigaction *sa = &sig_actions_of(p)[sig];
         if (sa->sa_handler == SIG_IGN) return;
     }
 
@@ -193,6 +317,7 @@ void signal_send(struct proc *p, int sig) {
         bool from_user = snd && snd != p && snd->pid > 0;
         p->sigstate.si_pid[sig] = from_user ? snd->pid : 0;
         p->sigstate.si_uid[sig] = from_user ? snd->uid : 0;
+        p->sigstate.si_code[sig] = SI_USER;   /* tgkill overrides after */
     }
 
     /* Unblock if asleep */
@@ -208,26 +333,145 @@ void signal_send(struct proc *p, int sig) {
         p->state = PROC_READY;
         sched_enqueue(p);
     }
+
+    signal_kick(p);
+}
+
+int signal_send_to_pid_checked(int pid, int sig) {
+    /* The shell runs as a kernel thread and never returns to user mode, so
+     * the normal delivery point -- the return-to-user path -- never runs for
+     * it and a `trap ... USR1` handler would never fire. shell_deliver_signal
+     * existed for exactly this and had no callers at all. Hand it the signal;
+     * the shell dispatches pending traps at the next command boundary, which
+     * is where POSIX says a trap action runs. */
+    if (shell_owns_pid(pid)) { shell_deliver_signal(sig); return 0; }
+    /* A PID BELOW -1 IS A PROCESS GROUP, as kill(2)'s is: every process
+     * in it, and -1 when there is none. It was looked up as a process,
+     * found nothing and failed, so the kernel shell's `kill %N` and `kill
+     * -- -PGID` reached only the job's leader: `{ sleep 30; } &` then
+     * `kill %1` killed the /bin/tsh running the group and left the sleep
+     * (finding 63, logs/b14 k63). The hosted shell sends through kill(2). */
+    if (pid < -1) {
+        extern struct proc g_proc[];
+        int hits = 0;
+        for (int i = 1; i < PROC_MAX; i++) {
+            if (g_proc[i].state == PROC_UNUSED ||
+                g_proc[i].state == PROC_EMBRYO) continue;
+            int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
+            if (gp != -pid) continue;
+            if (shell_owns_pid(g_proc[i].pid)) shell_deliver_signal(sig);
+            else signal_send(&g_proc[i], sig);
+            hits++;
+        }
+        return hits ? 0 : -1;
+    }
+    struct proc *p = proc_lookup(pid);
+    if (!p) return -1;
+    signal_send(p, sig);
+    return 0;
 }
 
 void signal_send_to_pid(int pid, int sig) {
-    signal_send(proc_lookup(pid), sig);
+    (void)signal_send_to_pid_checked(pid, sig);
+}
+
+/* Kernel-internal group send (tty/pty line discipline: ^C/^Z to the
+ * foreground group). No caller-permission model -- the tty IS the
+ * authority on who its foreground group is. */
+void signal_send_to_pgrp(int pgrp, int sig) {
+    if (pgrp <= 0) return;
+    extern struct proc g_proc[];
+    int hits = 0;
+    for (int i = 1; i < PROC_MAX; i++) {
+        if (g_proc[i].state == PROC_UNUSED ||
+            g_proc[i].state == PROC_EMBRYO) continue;
+        int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
+        if (gp == pgrp) {
+            signal_send(&g_proc[i], sig);
+            hits++;
+        }
+    }
+    (void)hits;
 }
 
 void signal_send_to_foreground(int sig) {
-    if (g_foreground_pid > 0) {
+    if (g_foreground_pid <= 0) return;
+    /* A tty signal goes to the foreground JOB, not one pid: ^C must reach
+     * every stage of a foreground pipeline. The single-fg-pid model stays
+     * (nothing else changes who is foreground); delivery just follows the
+     * fg proc's process group when it has one. */
+    struct proc *fg = proc_lookup(g_foreground_pid);
+    int pg = (fg && fg->pgid > 0) ? fg->pgid : 0;
+    if (pg <= 0) {
         signal_send_to_pid(g_foreground_pid, sig);
+        return;
     }
+    extern struct proc g_proc[];
+    for (int i = 1; i < PROC_MAX; i++) {
+        if (g_proc[i].state == PROC_UNUSED ||
+            g_proc[i].state == PROC_EMBRYO) continue;
+        int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
+        if (gp == pg) signal_send_to_pid(g_proc[i].pid, sig);
+    }
+}
+
+/* Would any signal pending on `p` actually be ACTED ON? See signal.h.
+ *
+ * Mirrors signal_pending_self()'s notion of "deliverable" (unblocked, plus the
+ * two that cannot be blocked) and then asks the extra question a blocking
+ * primitive needs: of what IS deliverable, would anything actually happen?
+ * A pending SIGCHLD with no handler is not a reason to fail a read with
+ * EINTR; the same SIGCHLD with a handler installed absolutely is. */
+bool sig_should_eintr(struct proc *p) {
+    if (!p) return false;
+    uint64_t pend = p->pending_signals & ~p->sigstate.mask;
+    pend |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
+    if (!pend) return false;
+    /* Anything outside the default-ignore set acts: it has a handler, or its
+     * default action terminates or stops the process. */
+    if (pend & ~SIG_DEFAULT_IGNORE_MASK) return true;
+    /* Only default-ignore signals are pending. They interrupt ONLY if this
+     * thread group installed a real handler for one of them. */
+    struct sigaction *act = sig_actions_of(p);
+    if (!act) return false;
+    /* Only the SIG_DEFAULT_IGNORE_MASK bits can still be set here, so scan
+     * exactly those four -- never all 64.
+     *
+     * The 64-wide loop this replaces was measurably expensive, and ttyparity
+     * caught it: case 11-loop-1024 (a 5000-iteration shell loop) went from
+     * cpu=6205 ms PASS to 7476 ms and a harness SIGKILL. A shell with jobs has
+     * SIGCHLD pending almost continuously and no handler for it, which is
+     * precisely the path that falls through to here -- so the scan ran on
+     * essentially every blocking call rather than in some rare corner. */
+    static const int ignorable[] = { SIGCHLD, SIGURG, SIGWINCH, SIGCONT };
+    for (unsigned i = 0; i < sizeof ignorable / sizeof ignorable[0]; i++) {
+        const int s = ignorable[i];
+        if (!(pend & SIGMASK(s))) continue;
+        void (*h)(int) = act[s].sa_handler;
+        if (h != SIG_DFL && h != SIG_IGN) return true;   /* handler: must act */
+    }
+    return false;
 }
 
 bool signal_pending_self(void) {
     struct proc *p = current_proc();
     if (!p) return false;
     /* Pending signals not blocked by the mask */
-    uint32_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    uint64_t deliverable = p->pending_signals & ~p->sigstate.mask;
     /* SIGKILL and SIGSTOP cannot be blocked */
     deliverable |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
     return deliverable != 0;
+}
+
+/* See signal.h: the handler table is a THREAD-GROUP property; a thread
+ * reads and writes its leader's copy. Falls back to the proc's own table
+ * when the leader is gone mid-teardown -- a stale snapshot beats a NULL. */
+struct sigaction *sig_actions_of(struct proc *p) {
+    if (p && p->is_thread) {
+        struct proc *ld = proc_lookup(p->tgid);
+        if (ld) return ld->sigstate.actions;
+    }
+    return p ? p->sigstate.actions : 0;
 }
 
 /* Determine default action for a signal */
@@ -257,7 +501,16 @@ static void signal_apply_default(struct proc *p, int sig) {
         if (g_foreground_pid == p->pid) g_foreground_pid = 0;
         kprintf("[signal] pid=%d '%s' killed by signal %d\n",
                 p->pid, p->name, sig);
-        proc_exit(128 + sig);
+        /* GROUP-fatal, as POSIX requires: an uncaught fatal signal kills
+         * the PROCESS. proc_exit killed only the receiving thread -- a
+         * SIGSEGV in a worker left the rest of the process limping, which
+         * no crash handler, supervisor, or shell $? logic expects.
+         * proc_exit_group degenerates to proc_exit for the single-threaded
+         * case and for a leader (whose proc_exit already reaps threads).
+         * K3: record the signal itself, so wait4/waitid can report a
+         * signal death as one -- 128 + sig alone reads as exit(128 + sig). */
+        p->term_sig = sig;
+        proc_exit_group(128 + sig);
     }
 
     /* action == 2: job-control stop. We are running as `p` (delivery happens
@@ -285,10 +538,49 @@ static void signal_apply_default(struct proc *p, int sig) {
         p->ptrace_stopped = 1;
         proc_wake_waiters(p->pid);
     }
+    /* Job control: record the stop so a WUNTRACED wait can report it
+     * exactly once. SIGCONT clears both fields. The parent gets SIGCHLD
+     * for the transition, as Linux sends it. */
+    p->stop_sig = sig;
+    p->stop_reported = false;
+    if (p->ppid > 0) {
+        struct proc *par = proc_lookup(p->ppid);
+        if (par) signal_send(par, SIGCHLD);
+    }
     p->state = PROC_STOPPED;
     sched_yield();
     /* Resumed: by SIGCONT, or by the tracer's PTRACE_CONT/PTRACE_SYSCALL. */
     p->ptrace_stopped = 0;
+}
+
+/* Cooperative stop point for long-held syscall loops (nanosleep). The IRQ
+ * tick cannot stop a proc that is parked inside a syscall loop -- measured
+ * on the interactive gate, not assumed -- so such loops must offer the stop
+ * themselves. Consumes and applies ONE pending default-disposition stop
+ * signal; returns true if the proc stopped (and has since been continued).
+ * False means the stop signal is CAUGHT -- the caller should EINTR so the
+ * handler can run at syscall exit. */
+bool signal_take_pending_stop(void) {
+    struct proc *p = current_proc();
+    /* never a kernel context: there is no user to stop, and the scheduler's
+     * own procs must not park */
+    if (!p || p->pid == 0 || p->is_kernel || p->is_idle) return false;
+    /* A BLOCKED stop signal stops nothing (SIGSTOP cannot be blocked): it
+     * waits for the mask to open, as signal_deliver's does. */
+    uint64_t stops = p->pending_signals & SIGMASK_STOPS &
+                     (~p->sigstate.mask | SIGMASK(SIGSTOP));
+    if (!stops) return false;
+    int sig = 0;
+    for (int i = 1; i < SIG_MAX; i++)
+        if (stops & SIGMASK(i)) { sig = i; break; }
+    if (sig != SIGSTOP) {
+        struct sigaction *sa = &sig_actions_of(p)[sig];
+        if (sa->sa_handler != SIG_DFL) return false;
+    }
+    p->pending_signals  &= ~SIGMASK(sig);
+    p->sigstate.pending &= ~SIGMASK(sig);
+    signal_apply_default(p, sig);          /* parks here until SIGCONT */
+    return true;
 }
 
 /* Build a signal frame on the user stack and redirect the saved syscall
@@ -299,14 +591,15 @@ static void signal_apply_default(struct proc *p, int sig) {
 /* Write the siginfo_t + ucontext_t a 3-arg SA_SIGINFO handler reads, in either
  * native tobyOS layout or x86-64 Linux layout (B15), at info_addr/uctx_addr on
  * the user stack. `ctx` carries the saved registers of the interrupted context;
- * rcx/r11 (absent from sig_context) are supplied separately. Returns false on a
- * uaccess failure. */
+ * rcx/r11 (absent from sig_context) are supplied separately. `fx_addr` is
+ * the user address of the frame's saved FPU state, which Linux's
+ * uc_mcontext.fpregs points at. Returns false on a uaccess failure. */
 static bool sig_emit_info_uctx(struct proc *p, int sig, int si_code,
                                uint64_t fault_addr,
                                const struct sig_context *ctx,
                                uint64_t rcx, uint64_t r11,
                                uint64_t info_addr, uint64_t uctx_addr,
-                               bool linux_layout) {
+                               uint64_t fx_addr, bool linux_layout) {
     bool is_fault = (sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE ||
                      sig == SIGILL  || sig == SIGTRAP);
 
@@ -324,6 +617,8 @@ static bool sig_emit_info_uctx(struct proc *p, int sig, int si_code,
         } else {
             *(int32_t  *)(ib + LXSI_PID) = p->sigstate.si_pid[sig];
             *(uint32_t *)(ib + LXSI_UID) = p->sigstate.si_uid[sig];
+            if (si_code < 0 && si_code != SI_TKILL)     /* a queued one */
+                *(uint64_t *)(ib + LXSI_VALUE) = p->sigstate.si_value[sig];
         }
 
         uint64_t *g = (uint64_t *)(ub + LXUC_GREGS);
@@ -335,6 +630,7 @@ static bool sig_emit_info_uctx(struct proc *p, int sig, int si_code,
         g[LXREG_RSP]=ctx->rsp; g[LXREG_RIP]=ctx->rip; g[LXREG_EFL]=ctx->rflags;
         g[LXREG_CSGSFS]=LX_USER_CS; g[LXREG_ERR]=0; g[LXREG_TRAPNO]=0;
         g[LXREG_OLDMASK]=0; g[LXREG_CR2]=fault_addr;
+        *(uint64_t *)(ub + LXUC_FPREGS) = fx_addr;
         *(uint64_t *)(ub + LXUC_SIGMASK) = (uint64_t)p->sigstate.mask;
 
         if (copy_to_user((void *)info_addr, ib, sizeof ib) != 0 ||
@@ -353,6 +649,8 @@ static bool sig_emit_info_uctx(struct proc *p, int sig, int si_code,
         .si_status = 0,
         ._pad      = 0,
     };
+    if (!is_fault && si_code < 0 && si_code != SI_TKILL)   /* queued (215) */
+        info.si_value = p->sigstate.si_value[sig];
     ucontext_t uctx;
     memset(&uctx, 0, sizeof(uctx));
     uctx.uc_sigmask = p->sigstate.mask;
@@ -395,6 +693,20 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
 
     bool siginfo = (sa->sa_flags & SA_SIGINFO) != 0;
     bool linux_layout = (p->personality == ABI_PERS_LINUX);
+    /* A TRAPFRAME rt_sigreturn HAS JUST RESTORED IS NOT A SYSCALL'S (M1,
+     * finding 21). A second signal held pending by the first handler's mask
+     * is delivered on the way out of that handler's rt_sigreturn -- two
+     * SIGCHLDs for two children -- and the context in `regs` is then the
+     * one sigreturn restored: possibly cut by the timer IRQ, with rcx/r11
+     * as live as any register (sys_sigreturn parks them in sig_rcx/sig_r11
+     * and sets `pad` for the IRETQ exit; `pad` is zero on every syscall
+     * entry), and with rax whatever that code held. This frame saved
+     * rcx=RIP and r11=RFLAGS anyway, so when the second handler returned
+     * the interrupted code had lost both -- GNU bash 5.2 died with exit 139
+     * in shparity 146, its last two syscalls rt_sigreturn -- and a restored
+     * rax that happened to read -EINTR was taken for an interrupted
+     * syscall and "restarted" at RIP-2 with rax = rt_sigreturn's number. */
+    bool restored = regs->pad != 0;
 
     /* Carve the frame out of the user stack, below the SysV red zone. Build
      * each piece in a kernel local and copy out (per-copy uaccess). Layout,
@@ -415,6 +727,7 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     uint64_t sp = (top - sizeof(struct sig_context)) & ~(uint64_t)0xF;
     struct sig_context kctx;
     struct sig_context *ctx = &kctx;
+    sig_fpu_save(ctx);                 /* finding 652: the FPU state too */
 
     /* SA_RESTART: if this handler interrupted a blocking syscall (it bailed
      * with EINTR) and the action asks for restart, resume at the `syscall`
@@ -448,9 +761,11 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
             never_restart = true; break;
         default: break;
         }
+    } else if (num == ABI_SYS_POLL) {
+        never_restart = true;          /* the native poll(2), same reason */
     }
-    if (rv == EINTR_RET && num >= 0 && (sa->sa_flags & SA_RESTART) &&
-        !never_restart) {
+    if (!restored && rv == EINTR_RET && num >= 0 &&
+        (sa->sa_flags & SA_RESTART) && !never_restart) {
         ctx->rax = (uint64_t)num;
         ctx->rip = regs->rcx - 2;
     } else {
@@ -464,6 +779,11 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     ctx->r14 = regs->r14; ctx->r15 = regs->r15;
     ctx->rsp       = regs->user_rsp;   /* original user RSP    */
     ctx->rflags    = regs->r11;        /* original user RFLAGS */
+    /* A syscall clobbered the user's rcx/r11; what SYSRETQ would have left
+     * in them is RIP/RFLAGS, so the IRETQ resume leaves exactly that. A
+     * context rt_sigreturn restored keeps its own. */
+    ctx->rcx       = restored ? regs->sig_rcx : ctx->rip;
+    ctx->r11       = restored ? regs->sig_r11 : ctx->rflags;
     ctx->saved_mask = p->sigstate.mask;
     ctx->magic     = SIG_FRAME_MAGIC;
 
@@ -480,9 +800,11 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
      * expects (native or Linux ABI layout), and pass their addresses in
      * RSI/RDX. regs->rcx/r11 hold the user's RIP/RFLAGS on the sysret frame. */
     if (siginfo) {
-        if (!sig_emit_info_uctx(p, sig, SI_USER, 0, ctx,
+        if (!sig_emit_info_uctx(p, sig, p->sigstate.si_code[sig], 0, ctx,
                                 regs->rcx, regs->r11,
-                                info_addr, uctx_addr, linux_layout)) {
+                                info_addr, uctx_addr,
+                                sp + __builtin_offsetof(struct sig_context, fx),
+                                linux_layout)) {
             kprintf("[signal] pid=%d sig %d: cannot write siginfo/ucontext\n",
                     p->pid, sig);
             return false;
@@ -523,6 +845,7 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
         regs->rsi = info_addr;
         regs->rdx = uctx_addr;
     }
+    sig_fpu_handler_state();
     return true;
 }
 
@@ -530,57 +853,82 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
  * path, or NULL when called from an IRQ (PIT) where no such frame exists.
  * `rv` is the syscall return value and `num` the syscall number (only
  * meaningful when regs != NULL; pass num = -1 on the IRQ path). */
-static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
+/* True when the interrupted call is to be RESTARTED (see the SIG_DFL arm). */
+static bool signal_deliver(struct syscall_regs *regs, long rv, long num) {
     struct proc *p = current_proc();
-    if (!p || p->pending_signals == 0) return;
+    if (!p || p->pending_signals == 0) return false;
     if (p->pid == 0) {
         p->pending_signals = 0;
         p->sigstate.pending = 0;
-        return;
+        return false;
     }
 
     /* Lowest-numbered deliverable signal (unblocked, plus the two that can
      * never be blocked). */
-    uint32_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    uint64_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    /* RT-signal trace, delivery side (capped). */
+    if (p->pending_signals >> 32) {
+        static int rtd = 0;
+        if (rtd < 16) { rtd++;
+            kprintf("[rtdlv] pid=%d pend=0x%llx mask=0x%llx deliv=0x%llx regs=%d\n",
+                    p->pid, (unsigned long long)p->pending_signals,
+                    (unsigned long long)p->sigstate.mask,
+                    (unsigned long long)deliverable, regs ? 1 : 0);
+        }
+    }
     deliverable |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
-    if (deliverable == 0) return;
+    if (deliverable == 0) return false;
 
     int sig = 0;
     for (int i = 1; i < SIG_MAX; i++) {
         if (deliverable & SIGMASK(i)) { sig = i; break; }
     }
-    if (sig == 0) return;
+    if (sig == 0) return false;
 
-    struct sigaction *sa = &p->sigstate.actions[sig];
+    struct sigaction *sa = &sig_actions_of(p)[sig];
 
     /* A caught (user-handler) signal can only be delivered when we have a
      * trapframe to rewrite. On the IRQ path we leave it pending so the next
      * syscall return delivers it -- do NOT consume it here. */
     bool caught = (sig != SIGKILL &&
                    sa->sa_handler != SIG_DFL && sa->sa_handler != SIG_IGN);
-    if (caught && !regs) return;
+    if (caught && !regs) return false;
 
     /* Committed to acting on this signal -- consume it. */
     p->pending_signals  &= ~SIGMASK(sig);
     p->sigstate.pending &= ~SIGMASK(sig);
 
-    /* SIGKILL is always fatal and can never be caught. */
+    /* SIGKILL is always fatal, can never be caught, and kills the GROUP. */
     if (sig == SIGKILL) {
         if (g_foreground_pid == p->pid) g_foreground_pid = 0;
         kprintf("[signal] pid=%d killed by SIGKILL\n", p->pid);
-        proc_exit(128 + sig);
+        p->term_sig = sig;                 /* K3: see signal_apply_default */
+        proc_exit_group(128 + sig);
     }
 
-    if (sa->sa_handler == SIG_IGN) return;
+    if (sa->sa_handler == SIG_IGN) return false;
 
     if (sa->sa_handler == SIG_DFL) {
         signal_apply_default(p, sig);
-        return;
+        if (!regs || signal_default_action(sig) != 2) return false;
+        /* RESUMED FROM A STOP: what came meanwhile is taken now, as Linux's
+         * get_signal goes round again -- a SIGKILL that ended the stop
+         * above all. Taken one per return, `kill -9` of a stopped `cat &`
+         * let it see EINTR and exit 1 before the kill landed: "Exit 1",
+         * where bash says "Killed" (logs/b15 ttin). */
+        if (sig_should_eintr(p)) return signal_deliver(regs, rv, num);
+        /* A STOP THAT INTERRUPTED A BLOCKING CALL: once continued, the call
+         * goes on, as Linux restarts it when no handler ran (ERESTARTSYS,
+         * ERESTARTNOHAND). It returned EINTR to a program that had asked
+         * for no signal at all: `cat` reading a pipe, stopped by ^Z and
+         * continued by `fg`, failed with "Interrupted system call". */
+        return rv == EINTR_RET && num >= 0 && !regs->pad;
     }
 
     /* User handler: set up the frame; fall back to default if we can't. */
     if (!signal_setup_user_frame(p, sig, sa, regs, rv, num))
         signal_apply_default(p, sig);
+    return false;
 }
 
 /* IRQ-context entry (PIT). Handles fatal/default dispositions; caught
@@ -626,16 +974,84 @@ void signal_tick_alarms(void) {
         p->alarm_deadline_ns = 0;         /* clear BEFORE raising: one-shot */
         signal_send(p, SIGALRM);          /* full send: also WAKES a blocked proc */
     }
+    /* POSIX interval timers ride the same sweep + clock (ptimer.c). */
+    { extern void ptimer_tick(void); ptimer_tick(); }
+    /* vDSO time-constant republish (2026-08-23): compare-and-skip when
+     * nothing changed, so TSC recalibration and the first RTC latch
+     * reach userspace within one ~10 ms tick. */
+    { extern void vdso_refresh(void); vdso_refresh(); }
 }
 
 void signal_deliver_if_pending(void) {
-    signal_deliver(0, 0, -1);
+    (void)signal_deliver(0, 0, -1);
+}
+
+/* CAUGHT signals, delivered from the TIMER IRQ.
+ *
+ * 2026-08-25. signal_deliver() refuses a caught signal when it has no
+ * trapframe to rewrite ("on the IRQ path we leave it pending so the next
+ * syscall return delivers it"), and the PIT calls it with regs = NULL. That
+ * reasoning has a hole: A PROCESS SPINNING IN USERSPACE MAKES NO SYSCALLS,
+ * so "the next syscall return" never comes and the signal stays pending
+ * forever. pit.c's comment claims this path is "what makes a CPU-bound user
+ * loop killable by Ctrl+C" -- true only while the process takes the DEFAULT
+ * action. Install a handler, as every shell must, and the same loop becomes
+ * uninterruptible.
+ *
+ * Found via /bin/tsh: `while :; do :; done` runs entirely in builtins, so
+ * there is no child for the tty to signal AND no syscall for the shell's
+ * own SIGINT to ride home on. ^C did nothing at all.
+ *
+ * The frame-building is signal_deliver_fault()'s, unchanged -- it already
+ * turns a `struct regs` into a handler entry, and an IRQ trapframe has the
+ * same shape as the exception one. si_code is SI_USER (a tty/kill-generated
+ * signal, not a fault) and there is no fault address.
+ *
+ * Returns true if a handler was entered; false leaves everything pending so
+ * the caller's default-disposition path runs exactly as before. Takes NO
+ * locks: signal_send() must never be called from here (see the deadlock
+ * recorded above signal_tick_alarms) and this does not. */
+bool signal_deliver_irq(struct regs *r) {
+    struct proc *p = current_proc();
+    if (!r || !p || p->pid == 0 || p->pending_signals == 0) return false;
+
+    uint64_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    deliverable |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
+    if (deliverable == 0) return false;
+
+    int sig = 0;
+    for (int i = 1; i < SIG_MAX; i++) {
+        if (deliverable & SIGMASK(i)) { sig = i; break; }
+    }
+    if (sig == 0) return false;
+
+    /* SIGKILL/SIGSTOP and the default/ignore dispositions are the existing
+     * path's business -- it can already act on them without a trapframe. */
+    struct sigaction *sa = &sig_actions_of(p)[sig];
+    if (sig == SIGKILL || sig == SIGSTOP ||
+        sa->sa_handler == SIG_DFL || sa->sa_handler == SIG_IGN) return false;
+
+    if (!signal_deliver_fault(r, sig, SI_USER, 0)) return false;
+
+    /* Consumed only once the frame is really built: a failed setup must
+     * leave the signal pending rather than swallow it. */
+    p->pending_signals  &= ~SIGMASK(sig);
+    p->sigstate.pending &= ~SIGMASK(sig);
+    return true;
 }
 
 /* SYSCALL-return entry. Has access to the saved trapframe, so it can deliver
  * caught handlers by pushing a signal frame and redirecting the return. */
-void signal_deliver_syscall(long rv, long num) {
-    signal_deliver(current_syscall_regs(), rv, num);
+long signal_deliver_syscall(long rv, long num) {
+    struct syscall_regs *r = current_syscall_regs();
+    /* a restart: back to the `syscall` instruction (0F 05), RAX the call's
+     * number again; the argument registers are the entry's, restored by
+     * the unwind */
+    if (signal_deliver(r, rv, num) && r) {
+        r->rcx -= 2;
+        return num;
+    }
+    return rv;
 }
 
 /* SYNCHRONOUS CPU-fault delivery (B15). Called from the exception dispatcher
@@ -659,7 +1075,7 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
     if (!p || p->pid == 0) return false;
     if (sig <= 0 || sig >= SIG_MAX) return false;
 
-    struct sigaction *sa = &p->sigstate.actions[sig];
+    struct sigaction *sa = &sig_actions_of(p)[sig];
     if (sa->sa_handler == SIG_DFL || sa->sa_handler == SIG_IGN) return false;
     if (p->sigstate.restorer == 0) return false;
     /* A fault arriving while its own signal is blocked is undefined in POSIX
@@ -680,6 +1096,7 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
 
     struct sig_context kctx;
     struct sig_context *ctx = &kctx;
+    sig_fpu_save(ctx);                 /* finding 652: the FPU state too */
     ctx->rax = r->rax; ctx->rdi = r->rdi; ctx->rsi = r->rsi; ctx->rdx = r->rdx;
     ctx->r10 = r->r10; ctx->r8 = r->r8;   ctx->r9 = r->r9;
     ctx->rbx = r->rbx; ctx->rbp = r->rbp;
@@ -687,6 +1104,8 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
     ctx->rip = r->rip;                 /* resume at the faulting instruction */
     ctx->rsp = r->rsp;
     ctx->rflags = r->rflags;
+    ctx->rcx = r->rcx;                 /* LIVE here -- an IRQ/fault frame */
+    ctx->r11 = r->r11;
     ctx->saved_mask = p->sigstate.mask;
     ctx->magic = SIG_FRAME_MAGIC;
 
@@ -696,7 +1115,9 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
     if (siginfo) {
         if (!sig_emit_info_uctx(p, sig, si_code, fault_addr, ctx,
                                 r->rcx, r->r11,
-                                info_addr, uctx_addr, linux_layout))
+                                info_addr, uctx_addr,
+                                sp + __builtin_offsetof(struct sig_context, fx),
+                                linux_layout))
             return false;
     }
 
@@ -723,6 +1144,7 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
         r->rsi = info_addr;
         r->rdx = uctx_addr;
     }
+    sig_fpu_handler_state();
     return true;
 }
 
@@ -748,7 +1170,7 @@ int sys_sigaction(int sig, const void *uact, void *uoldact) {
     if (sig <= 0 || sig >= SIG_MAX) return -22; /* EINVAL */
     if (sig == SIGKILL || sig == SIGSTOP) return -22; /* can't change */
 
-    struct sigaction *cur = &p->sigstate.actions[sig];
+    struct sigaction *cur = &sig_actions_of(p)[sig];
 
     if (uoldact) {
         struct abi_sigaction old = {
@@ -805,9 +1227,10 @@ void sys_sigrestorer(uint64_t addr) {
 /* Restore the interrupted context saved by signal_setup_user_frame. The
  * handler has returned to the restorer trampoline, which issued SYS_SIGRETURN
  * with RSP pointing at the saved sig_context. We copy that context back into
- * the syscall trapframe so the SYSRETQ at the end of this very syscall
- * resumes the originally-interrupted instruction. Returns the value to leave
- * in the user's RAX. */
+ * the syscall trapframe and mark it for the IRETQ exit (syscall_entry.S,
+ * .Lsigreturn_iret): the interrupted context may have been cut by the timer
+ * IRQ where rcx/r11 are live, and SYSRETQ cannot restore those two. Returns
+ * the value to leave in the user's RAX. */
 long sys_sigreturn(void) {
     struct proc *p = current_proc();
     struct syscall_regs *regs = current_syscall_regs();
@@ -839,13 +1262,95 @@ long sys_sigreturn(void) {
     regs->rcx      = ctx->rip;      /* resume RIP    */
     regs->r11      = ctx->rflags;   /* resume RFLAGS */
     regs->user_rsp = ctx->rsp;      /* resume RSP    */
+    regs->sig_rcx  = ctx->rcx;      /* the user's real rcx/r11 -- only an */
+    regs->sig_r11  = ctx->r11;      /* IRETQ exit can put them back      */
+    regs->pad      = 1;             /* ...so ask for one */
+    sig_fpu_restore(ctx);           /* and the FPU/SSE state (652) */
 
     p->sigstate.mask = (sigset_t)ctx->saved_mask;
 
     return (long)ctx->rax;          /* becomes user RAX after SYSRETQ */
 }
 
+/* tkill/tgkill: THREAD-directed, so the process-directed retarget in
+ * sys_kill must NOT apply -- glibc's pthread_kill aims at one specific
+ * thread (the NPTL setxid/cancel broadcasts depend on exactly that), and
+ * rerouting it would deliver a cancellation to the wrong sibling. tgid > 0
+ * is verified against the target's real group (ESRCH on mismatch); pass
+ * tgid <= 0 for tkill's unchecked form. */
+int sys_tgkill(int tgid, int tid, int sig) {
+    if (sig < 0 || sig >= SIG_MAX) return -22;
+    struct proc *p = current_proc();
+    if (!p) return -1;
+    int ktid = pid_knr(tid);
+    if (!ktid) return -3;                              /* ESRCH */
+    struct proc *t = proc_lookup(ktid);
+    if (!t) return -3;
+    if (tgid > 0) {
+        int kgid = t->is_thread ? t->tgid : t->pid;
+        struct proc *ld = proc_lookup(kgid);
+        int vgid = ld ? pid_vnr(ld) : kgid;
+        if (vgid != tgid) return -3;                   /* tid not in tgid */
+    }
+    /* RT-signal trace (NPTL setxid/cancel debugging): name each link of
+     * the chain, capped. */
+    if (sig >= 32) {
+        static int tgk = 0;
+        if (tgk < 16) { tgk++;
+            struct sigaction *sa = &sig_actions_of(t)[sig];
+            kprintf("[tgk] %d->tid %d sig=%d tstate=%d hnd=%p mask=0x%llx "
+                    "pend(pre)=0x%llx\n",
+                    p->pid, t->pid, sig, (int)t->state,
+                    (void *)sa->sa_handler,
+                    (unsigned long long)t->sigstate.mask,
+                    (unsigned long long)t->pending_signals);
+        }
+    }
+    signal_send(t, sig);
+    if (sig > 0) {
+        /* Linux stamps the sender's TGID (glibc's handlers compare si_pid
+         * against their getpid(), which is the tgid) -- a thread's own tid
+         * here would make the anti-spoof check reject a legitimate
+         * broadcast sent from any non-main thread. */
+        int spid = p->is_thread ? p->tgid : p->pid;
+        struct proc *sld = proc_lookup(spid);
+        t->sigstate.si_pid[sig] = pid_vnr_in(t->pid_ns, sld ? sld->pid : spid);
+        t->sigstate.si_uid[sig] = p->uid;
+        t->sigstate.si_code[sig] = SI_TKILL;   /* the NPTL anti-spoof check */
+    }
+    return 0;
+}
+
+/* A PID NAMESPACE'S INIT TAKES ONLY WHAT IT CATCHES (pid_namespaces(7)):
+ * from inside its namespace a signal it has no handler for is dropped --
+ * SIGKILL too -- and from an ancestor's (which it cannot see) SIGKILL and
+ * SIGSTOP still act. `kill 1` inside `unshare -pf` ended the namespace
+ * (finding 237). The initial namespace's pid 1 is not covered. */
+static bool ns_init_drops(struct proc *sender, struct proc *target, int sig) {
+    if (sig <= 0 || !target || !pid_ns_is_init(target)) return false;
+    struct sigaction *a = sig_actions_of(target);
+    if (a && a[sig].sa_handler != SIG_DFL) return false;
+    bool inside = pid_vnr_in(target->pid_ns, sender->pid) != 0;
+    if (!inside && (sig == SIGKILL || sig == SIGSTOP)) return false;
+    return true;
+}
+
+static int kill_as(int pid, int sig, bool queued, int qcode, uint64_t qvalue);
+
 int sys_kill(int pid, int sig) {
+    return kill_as(pid, sig, false, 0, 0);
+}
+
+/* sigqueue(3) and rt_sigqueueinfo(2): kill(PID, SIG) to one process, with
+ * CODE (SI_QUEUE, or the caller's own negative code) and VALUE in the
+ * siginfo it is delivered with (finding 215: the value went, and the code
+ * said SI_USER) */
+int signal_queue(int pid, int sig, int code, uint64_t value) {
+    if (pid <= 0) return -3;                         /* one process: ESRCH */
+    return kill_as(pid, sig, true, code, value);
+}
+
+static int kill_as(int pid, int sig, bool queued, int qcode, uint64_t qvalue) {
     if (sig < 0 || sig >= SIG_MAX) return -22;
 
     struct proc *p = current_proc();
@@ -865,23 +1370,53 @@ int sys_kill(int pid, int sig) {
         if (!kpid) return -3;                        /* not visible => ESRCH */
         struct proc *target = proc_lookup(kpid);
         if (!target) return -3; /* ESRCH */
+        if (ns_init_drops(p, target, sig)) return 0;   /* finding 237 */
+        /* PROCESS-directed delivery (2026-08-22): kill(pid) targets the
+         * PROCESS, and POSIX says any thread with the signal unblocked may
+         * take it. This used to land on the leader's slot unconditionally,
+         * so a leader that blocked the signal pinned it pending forever
+         * while a sibling sat ready to handle it. SIGKILL/SIGSTOP skip the
+         * scan -- they act regardless of masks. */
+        if (!target->is_thread && sig > 0 &&
+            sig != SIGKILL && sig != SIGSTOP &&
+            (target->sigstate.mask & SIGMASK(sig))) {
+            extern struct proc g_proc[];
+            for (int i = 1; i < PROC_MAX; i++) {
+                struct proc *q = &g_proc[i];
+                if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO)
+                    continue;
+                if (!q->is_thread || q->tgid != target->pid) continue;
+                if (q->sigstate.mask & SIGMASK(sig)) continue;
+                target = q;                          /* it can take it now */
+                break;
+            }
+        }
         signal_send(target, sig);
         if (sig > 0) {
             target->sigstate.si_pid[sig] = pid_vnr_in(target->pid_ns, p->pid);
             target->sigstate.si_uid[sig] = p->uid;
+            target->sigstate.si_value[sig] = queued ? qvalue : 0;
+            if (queued) target->sigstate.si_code[sig] = (int8_t)qcode;
         }
     } else if (pid == 0) {
-        /* Send to all processes in the same process group (simplified:
-         * send to all in same session) */
+        /* kill(0, sig): the CALLER'S PROCESS GROUP. The old "simplified:
+         * whole session" reading was harmless while pgids were lies, and
+         * became a live bug the moment they weren't: interactive bash's
+         * job-control init does kill(0, SIGTTIN) when it is not foreground,
+         * and the session broadcast stopped login and the gate runner
+         * along with bash itself. */
         extern struct proc g_proc[];
+        int mypg = p->pgid > 0 ? p->pgid : p->pid;
         for (int i = 1; i < PROC_MAX; i++) {
+            int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].state != PROC_EMBRYO &&
-                g_proc[i].session_id == p->session_id) {
+                gp == mypg) {
                 /* A broadcast must not escape the caller's pid namespace: a
                  * container that can signal the host is not a container. The
                  * visibility map is the whole check. */
                 if (!pid_ns_can_see(p, &g_proc[i])) continue;
+                if (ns_init_drops(p, &g_proc[i], sig)) continue;   /* 237 */
                 signal_send(&g_proc[i], sig);
                 if (sig > 0) {
                     g_proc[i].sigstate.si_pid[sig] =
@@ -891,12 +1426,27 @@ int sys_kill(int pid, int sig) {
             }
         }
     } else if (pid == -1) {
-        /* Send to all processes (except pid 0) */
+        /* Every process the caller can see -- EXCEPT pid 1 and the CALLER
+         * ITSELF (its whole thread group), as Linux's kill_something_info
+         * has it ("on Linux the call kill(-1,sig) does not signal the
+         * calling process", kill(2)). This one sent the signal to the
+         * caller as well: `kill -- -1` from bash killed that bash
+         * (logs/s12a/pid1-killall-excerpt.txt). */
         extern struct proc g_proc[];
+        int mytg = p->is_thread ? p->tgid : p->pid;
         for (int i = 1; i < PROC_MAX; i++) {
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].state != PROC_EMBRYO) {
+                /* pid 1 AS THE CALLER'S NAMESPACE NUMBERS IT -- the
+                 * namespace's init, as Linux's kill_something_info skips
+                 * (task_pid_vnr > 1). Kernel pid 1 was skipped, so inside
+                 * `unshare -pf` kill -9 -- -1 killed the namespace's init
+                 * and with it the namespace (finding 237). */
+                if (pid_vnr_in(p->pid_ns, g_proc[i].pid) <= 1) continue;
+                if (g_proc[i].pid == mytg ||
+                    (g_proc[i].is_thread && g_proc[i].tgid == mytg)) continue;
                 if (!pid_ns_can_see(p, &g_proc[i])) continue;   /* slice 10 */
+                if (ns_init_drops(p, &g_proc[i], sig)) continue;  /* 237 */
                 signal_send(&g_proc[i], sig);
                 if (sig > 0) {
                     g_proc[i].sigstate.si_pid[sig] =
@@ -905,6 +1455,35 @@ int sys_kill(int pid, int sig) {
                 }
             }
         }
+    } else {
+        /* kill(-pgid): the whole process group. This branch DID NOT EXIST
+         * -- a negative pid fell through every arm and returned 0, so
+         * `kill -- -$!` reported success while signalling nobody. ESRCH
+         * when the group has no member the caller can see, like Linux.
+         * THE GROUP BY THE CALLER'S NUMBER for it (finding 226): pgids are
+         * kernel pids underneath, which /proc and getpgid translate -- an
+         * untranslated -PGID inside a pid namespace named some OTHER group
+         * (unshare's own took kill's fixture's SIGUSR1). */
+        int pg = pid_knr(-pid);
+        if (!pg) return -3;                         /* not visible: ESRCH */
+        extern struct proc g_proc[];
+        bool any = false;
+        for (int i = 1; i < PROC_MAX; i++) {
+            if (g_proc[i].state == PROC_UNUSED ||
+                g_proc[i].state == PROC_EMBRYO) continue;
+            int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
+            if (gp != pg) continue;
+            if (!pid_ns_can_see(p, &g_proc[i])) continue;
+            if (ns_init_drops(p, &g_proc[i], sig)) { any = true; continue; }  /* 237 */
+            if (sig > 0) {
+                signal_send(&g_proc[i], sig);
+                g_proc[i].sigstate.si_pid[sig] =
+                    pid_vnr_in(g_proc[i].pid_ns, p->pid);
+                g_proc[i].sigstate.si_uid[sig] = p->uid;
+            }
+            any = true;
+        }
+        if (!any) return -3;                        /* ESRCH */
     }
     return 0;
 }

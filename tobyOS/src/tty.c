@@ -3,6 +3,7 @@
  * input source is the shared keyboard ring (kbd_trygetc), its echo sink is
  * kputc (console + serial). */
 
+#include <tobyos/nsproxy.h>   /* pid_knr, pid_vnr_of_kpid (226) */
 #include <tobyos/tty.h>
 #include <tobyos/keyboard.h>
 #include <tobyos/console.h>
@@ -103,21 +104,37 @@ bool tty_handle_isig(char c) {
     else if (c == (char)g_tio.c_cc[TTY_VQUIT]) sig = SIGQUIT;
     else if (c == (char)g_tio.c_cc[TTY_VSUSP]) sig = SIGTSTP;
     if (!sig) return false;
-    int fg = signal_get_foreground();
-    if (fg > 0) signal_send_to_pid(fg, sig);
+    /* Deliver to the foreground GROUP: ^C/^Z must reach every stage of a
+     * foreground pipeline, and a ^Z'd job's WHOLE group must stop. */
+    signal_send_to_foreground(sig);
+    /* ...and the kernel shell at the console hears its ^C: a line it runs
+     * is interrupted, or the line being typed is thrown away (shell.c
+     * shell_console_isig -- flags only, safe from the keyboard's IRQ). */
+    if (sig == SIGINT) {
+        extern void shell_console_isig(void);
+        shell_console_isig();
+    }
     /* Consume the control char either way: a tty never delivers ^C as data
      * while ISIG is on, and we don't want it lingering in the input ring. */
     return true;
 }
 
 /* ---- blocking single-char fetch from the keyboard ring ---------------- */
+/* THE WAIT FOR A KEY PUTS THE BKL DOWN. It was `sti(); hlt();` in a loop,
+ * inside the read syscall, holding the big kernel lock: every other CPU's
+ * syscalls, and pid 0 with the network, waited behind a process reading
+ * the console. One `cat /dev/tty` from an SSH command -- whose terminal was
+ * the console -- stopped the guest for good (logs/b16 qd4-wedge.log: the
+ * watchdog's idle_stall, cpu1 holding the lock in `cat`'s read). The ring
+ * has no wait queue, so the reader naps a few milliseconds at a time
+ * (proc_nap_ns) and looks again. */
+#define TTY_KEY_NAP_NS 5000000ull
 /* Returns 0..255, or <0 to mean "interrupted by a signal" (EINTR). */
 static int getc_block(void) {
     int c = tty_input_next();
     while (c < 0) {
         if (signal_pending_self()) return -1;
-        sti();
-        hlt();
+        (void)proc_nap_ns(TTY_KEY_NAP_NS);
         c = tty_input_next();
     }
     return c;
@@ -205,8 +222,7 @@ static long raw_read(char *buf, size_t n) {
         if (c < 0) {
             if (got >= vmin) break;   /* VMIN satisfied */
             if (signal_pending_self()) return got ? (long)got : EINTR_RET;
-            sti();
-            hlt();
+            (void)proc_nap_ns(TTY_KEY_NAP_NS);    /* see getc_block */
             continue;
         }
         buf[got++] = (char)c;
@@ -286,7 +302,15 @@ long tty_console_ioctl(unsigned long cmd, unsigned long arg) {
     case TTY_TIOCGPGRP: {
         if (!arg) return -ABI_EFAULT;
         int pg = signal_get_foreground();
-        if (pg <= 0) { struct proc *p = current_proc(); pg = p ? p->pid : 1; }
+        /* No foreground group set: the caller's own GROUP, so a shell's
+         * job-control start (bash's, /bin/tsh's: wait until tcgetpgrp is
+         * getpgrp) sees itself in front. It answered the caller's PID, and
+         * a shell that was not a group leader would SIGTTIN itself. */
+        if (pg <= 0) {
+            struct proc *p = current_proc();
+            pg = p ? (p->pgid > 0 ? p->pgid : p->pid) : 1;
+        }
+        pg = pid_vnr_of_kpid(pg);         /* the caller's number (226) */
         if (copy_to_user((void *)arg, &pg, sizeof(pg)) != 0)
             return -ABI_EFAULT;
         return 0;
@@ -297,7 +321,11 @@ long tty_console_ioctl(unsigned long cmd, unsigned long arg) {
         int pg = 0;
         if (copy_from_user(&pg, (const void *)arg, sizeof(pg)) != 0)
             return -ABI_EFAULT;
-        if (pg > 0) signal_set_foreground(pg);
+        if (pg > 0) {                     /* the caller's number (226) */
+            int kp = pid_knr(pg);
+            if (!kp) return -ABI_EPERM;
+            signal_set_foreground(kp);
+        }
         return 0;
     }
 
@@ -308,6 +336,18 @@ long tty_console_ioctl(unsigned long cmd, unsigned long arg) {
         int navail = (int)(g_line_len - g_line_pos);
         if (copy_to_user((void *)arg, &navail, sizeof(navail)) != 0)
             return -ABI_EFAULT;
+        return 0;
+    }
+
+    case 0x540Eu: {                         /* TIOCSCTTY */
+        /* The console as the controlling terminal of a session leader that
+         * has none (Linux's rule); the one it already has is no change. */
+        struct proc *me = current_proc();
+        if (!me) return -ABI_EPERM;
+        if (me->ctty_kind == PROC_CTTY_CONSOLE) return 0;
+        if (me->sid != me->pid || me->ctty_kind != PROC_CTTY_NONE)
+            return -ABI_EPERM;
+        me->ctty_kind = PROC_CTTY_CONSOLE;
         return 0;
     }
 

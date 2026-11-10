@@ -21,6 +21,8 @@
 #include <tobyos/proc.h>
 #include <tobyos/xhci.h>
 #include <tobyos/perf.h>
+#include <tobyos/percpu.h>   /* finding 169: the BSP queue, need_resched */
+#include <tobyos/smp.h>      /* smp_this_cpu */
 
 #define PIT_CH0_DATA  0x40
 #define PIT_CMD       0x43
@@ -64,7 +66,14 @@ static void pit_irq(struct regs *r) {
      * gets freed when the parent reaps. EOI was already sent above so
      * future PIT IRQs can fire on the new running proc. */
     if ((r->cs & 3) == 3) {
-        signal_deliver_if_pending();
+        /* CAUGHT handlers first, using the ring-3 trapframe we interrupted.
+         * signal_deliver_if_pending() below can only take DEFAULT actions
+         * (it has no frame to rewrite), so on its own it left a process
+         * that catches SIGINT and spins in userspace permanently
+         * uninterruptible -- the loop makes no syscalls, and the deferral
+         * to "the next syscall return" never comes due. */
+        if (!signal_deliver_irq(r))
+            signal_deliver_if_pending();
 
         /* Timer preemption: if we interrupted a user-mode process that
          * is NOT pid 0, force a yield so the kernel idle loop (pid 0)
@@ -80,6 +89,23 @@ static void pit_irq(struct regs *r) {
         if (cur && cur->pid != 0) {
             sched_yield();
         }
+    } else {
+        /* FINDING 169: the same for a proc this tick caught in the kernel.
+         * It cannot be switched here (it may hold the BKL or a lock), so it
+         * is marked to yield -- when anything is waiting on this CPU's
+         * queue, pid 0 above all -- and does on its system call's way out:
+         * a plain sched_yield, as above, not the end-of-slice rotation (a
+         * rotation every tick also took work from other CPUs' queues, a
+         * thousand times a second; SCHEDPRIO lost its weighting once in two
+         * runs). Without it a proc living in system calls on the BSP kept
+         * pid 0, its sweeps and everything queued there waiting for its
+         * whole slice: on the EliteDesk three raw clock_gettime loops left
+         * spawns at 12-17 ms in one run of four, 2 ms in the others. */
+        struct proc *cur = current_proc();
+        struct percpu *me = smp_this_cpu();
+        if (cur && cur->pid != 0 && !cur->is_idle && me && !cur->need_resched &&
+            __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE))
+            cur->need_resched = NEED_RESCHED_YIELD;
     }
 }
 

@@ -1,0 +1,8 @@
+# set -o ignoreeof: ^D at the prompt must NOT exit -- the shell says to use
+# `exit` and prompts again. With the option off, ^D ends the shell (that is
+# the last line, so the runner just waits for the child).
+set -o ignoreeof
+%EOF%
+echo survived
+set +o ignoreeof
+%EOF%

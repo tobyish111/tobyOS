@@ -35,8 +35,34 @@ pid_t fork(void) {
 /* Bonus: a tiny posix_spawn-flavoured helper. Not exported via a
  * header in M25B (M25C will add a proper <spawn.h>); samples and
  * future ports include the prototype themselves if they need it. */
+pid_t toby_spawn_ex(const char *path, char *const argv[], char *const envp[],
+                    int fd0, int fd1, int fd2,
+                    const struct abi_spawn_fd *extra, unsigned nextra);
+pid_t toby_spawn_flags(const char *path, char *const argv[], char *const envp[],
+                       int fd0, int fd1, int fd2,
+                       const struct abi_spawn_fd *extra, unsigned nextra,
+                       unsigned flags);
+
 pid_t toby_spawn(const char *path, char *const argv[], char *const envp[],
                  int fd0, int fd1, int fd2) {
+    return toby_spawn_ex(path, argv, envp, fd0, fd1, fd2, 0, 0);
+}
+
+/* As toby_spawn, plus descriptors above 2. A shell needs them for
+ * `exec 3>file` and `cmd 8<<EOF`; every other caller passes (0, 0) and gets
+ * exactly the old behaviour. */
+pid_t toby_spawn_ex(const char *path, char *const argv[], char *const envp[],
+                    int fd0, int fd1, int fd2,
+                    const struct abi_spawn_fd *extra, unsigned nextra) {
+    return toby_spawn_flags(path, argv, envp, fd0, fd1, fd2, extra, nextra, 0);
+}
+
+/* As toby_spawn_ex, with abi_spawn_req.flags (ABI_SPAWN_F_*: the child's
+ * SIGINT and SIGQUIT at the default or ignored, whatever the caller has). */
+pid_t toby_spawn_flags(const char *path, char *const argv[], char *const envp[],
+                       int fd0, int fd1, int fd2,
+                       const struct abi_spawn_fd *extra, unsigned nextra,
+                       unsigned flags) {
     struct abi_spawn_req req = {
         .path = path,
         .argv = argv,
@@ -44,38 +70,53 @@ pid_t toby_spawn(const char *path, char *const argv[], char *const envp[],
         .fd0  = fd0,
         .fd1  = fd1,
         .fd2  = fd2,
-        .flags = 0,
+        .flags = flags,
+        .nextra = nextra,
+        .extra  = extra,
     };
     long rv = toby_sc1(ABI_SYS_SPAWN, (long)(uintptr_t)&req);
     return (pid_t)__toby_check(rv);
 }
 
 /* ============================================================
- *  Exec emulation (Milestone 25C)
+ *  exec (Milestone 25C, made real 2026-09-01)
  * ============================================================ */
 
-/* spawn-then-wait-then-exit. Returns -1 with errno set on failure;
- * otherwise never returns (the synchronous "exec" semantics). */
-static int exec_emulate(const char *path, char *const argv[],
-                        char *const envp[]) {
-    pid_t pid = toby_spawn(path, argv, envp, 0, 0, 0);
-    if (pid < 0) return -1;
-    int status = 0;
-    pid_t rc = waitpid(pid, &status, 0);
-    if (rc < 0) return -1;
-    /* Mirror the child's outcome: exited normally -> _exit(code).
-     * Anything else collapses to a non-zero exit so the parent can
-     * still tell something went wrong (the kernel doesn't surface
-     * signal info today). */
-    if (WIFEXITED(status)) _exit(WEXITSTATUS(status));
-    _exit(WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1);
-    /* unreachable */
-    return -1;
-}
-
+/* THIS USED TO BE AN EMULATION, and the difference is not cosmetic.
+ *
+ * exec_emulate() spawned a NEW process, waited for it, and exited with its
+ * status -- so the calling process survived as a wrapper and the program
+ * ran as its CHILD. For a shell running a command that is close enough to
+ * pass unnoticed, which is why it lasted. It is wrong for anything that
+ * cares which process is which:
+ *
+ *   * A traced child that exec'd stayed a traced child sitting in waitpid
+ *     while an UNTRACED grandchild ran the program. That is why the
+ *     debugger could not put a breakpoint in anything -- found the hard
+ *     way, over several boots, while the tracer looked like the broken
+ *     part.
+ *   * The pid changes, so anything holding the pre-exec pid (a supervisor,
+ *     a pidfile, a `kill`) is now pointing at a wrapper.
+ *   * Two processes exist where POSIX promises one, doubling the process
+ *     table cost of every exec.
+ *   * A setuid transition applies to the grandchild, not to the process
+ *     the caller believes it is.
+ *
+ * ABI_SYS_EXECVE (142) has been dispatched in the kernel all along; the
+ * header comment's premise ("without fork()") stopped being true when
+ * fork landed. On success this does not return, because the image is
+ * REPLACED. Descriptors survive it -- minus FD_CLOEXEC, which is the point
+ * of that flag and which the emulation could not honour because it never
+ * exec'd at all.
+ */
 int execve(const char *path, char *const argv[], char *const envp[]) {
     if (!path || !argv) { errno = EINVAL; return -1; }
-    return exec_emulate(path, argv, envp);
+    if (!envp) envp = environ;      /* execv/execvp pass environ; be safe */
+    long rv = toby_sc3(ABI_SYS_EXECVE, (long)(uintptr_t)path,
+                       (long)(uintptr_t)argv, (long)(uintptr_t)envp);
+    /* Only reached on failure: a successful execve never comes back. */
+    __toby_check(rv);
+    return -1;
 }
 
 int execv(const char *path, char *const argv[]) {
@@ -122,107 +163,72 @@ static int path_search(const char *file, char *out_buf, size_t out_sz) {
     return -1;
 }
 
+/* POSIX: execvp and execlp run a file the loader answers ENOEXEC for -- a
+ * text file with no "#!" line -- through the shell, as [sh, path,
+ * argv[1..]]. That shell is /bin/sh, as in glibc. (It was /bin/tsh by name
+ * here while /bin/sh was still the minimal shell; /bin/sh IS tsh now.) */
+static int execve_or_script(const char *path, char *const argv[]) {
+    int rv = execve(path, argv, environ);
+    if (errno != ENOEXEC) return rv;
+    int argc = 0;
+    while (argv[argc]) argc++;
+    char **nargv = malloc((size_t)(argc + 3) * sizeof *nargv);
+    if (!nargv) { errno = ENOMEM; return -1; }
+    int n = 0;
+    nargv[n++] = (char *)"/bin/sh";
+    nargv[n++] = (char *)path;
+    for (int i = 1; i < argc; i++) nargv[n++] = argv[i];
+    nargv[n] = 0;
+    rv = execve("/bin/sh", nargv, environ);
+    free(nargv);
+    return rv;
+}
+
 int execvp(const char *file, char *const argv[]) {
     if (!file || !argv) { errno = EINVAL; return -1; }
     /* If the caller embedded a slash anywhere, treat it as an
      * explicit path (POSIX behaviour). */
     for (const char *c = file; *c; c++) {
-        if (*c == '/') return execve(file, argv, environ);
+        if (*c == '/') return execve_or_script(file, argv);
     }
     char buf[256];
     if (path_search(file, buf, sizeof(buf)) < 0) return -1;
-    return execve(buf, argv, environ);
+    return execve_or_script(buf, argv);
 }
 
 /* ============================================================
- *  system() (Milestone 25C)
+ *  system() -- POSIX: `sh -c cmd`, and the waitpid status back
  * ============================================================ *
  *
- * tobyOS doesn't have a /bin/sh yet, so we emulate "sh -c" with an
- * inline whitespace tokenizer + execvp-style PATH search + waitpid.
+ * This ran `sh -c` only when it spotted a shell metacharacter, and
+ * otherwise tokenised on whitespace and spawned the words itself --
+ * because /bin/sh used to be a minimal shell nobody trusted, and the
+ * tokeniser was the lesser evil. /bin/sh is tsh now (2026-09-03), so
+ * every command gets the real parser: quoting, variables, redirection,
+ * the lot. argv[0] is "sh", as glibc passes it, which is also what puts
+ * tsh into POSIX mode.
  *
  * Returns:
- *   - if cmd is NULL: 1 (a "shell is available" probe; we always say yes)
+ *   - if cmd is NULL: 1 (a "shell is available" probe)
  *   - on spawn or wait failure: -1, errno set
- *   - on success: the encoded status (use WIFEXITED/WEXITSTATUS to
- *     decode -- same shape as waitpid). */
-
-#define SYSTEM_ARG_MAX 32
+ *   - on success: the encoded status (WIFEXITED/WEXITSTATUS decode it,
+ *     the same shape as waitpid) */
 
 int system(const char *cmd) {
     if (!cmd) return 1;
-
-    /* If the command contains shell metacharacters, delegate to /bin/sh. */
-    int need_shell = 0;
-    for (const char *c = cmd; *c; c++) {
-        if (*c == '|' || *c == '>' || *c == '<' || *c == '&' ||
-            *c == ';' || *c == '(' || *c == ')' || *c == '$' ||
-            *c == '`' || *c == '*' || *c == '?') {
-            need_shell = 1;
-            break;
-        }
-    }
-    if (need_shell) {
-        char *sh_argv[4];
-        sh_argv[0] = "/bin/sh";
-        sh_argv[1] = "-c";
-        sh_argv[2] = (char *)cmd;
-        sh_argv[3] = 0;
-        pid_t pid = toby_spawn("/bin/sh", sh_argv, environ, 0, 0, 0);
-        if (pid < 0) {
-            /* Fallback: try without shell */
-            need_shell = 0;
-        } else {
-            int status = 0;
-            pid_t rc = waitpid(pid, &status, 0);
-            if (rc < 0) return -1;
-            return status;
-        }
-    }
-
-    /* Duplicate cmd so we can tokenise in-place. */
-    size_t clen = strlen(cmd);
-    char *buf = (char *)malloc(clen + 1);
-    if (!buf) { errno = ENOMEM; return -1; }
-    memcpy(buf, cmd, clen + 1);
-
-    char *argv[SYSTEM_ARG_MAX];
-    int argc = 0;
-    char *s = buf;
-    while (*s) {
-        while (*s == ' ' || *s == '\t') s++;
-        if (!*s) break;
-        if (argc >= SYSTEM_ARG_MAX - 1) {
-            free(buf);
-            errno = E2BIG;
-            return -1;
-        }
-        argv[argc++] = s;
-        while (*s && *s != ' ' && *s != '\t') s++;
-        if (*s) *s++ = '\0';
-    }
-    argv[argc] = 0;
-    if (argc == 0) { free(buf); return 0; }       /* empty command */
-
-    /* PATH-resolve argv[0] explicitly so we can spawn with its full
-     * path (the kernel's open() doesn't search). */
-    char path_buf[256];
-    const char *path = argv[0];
-    bool has_slash = false;
-    for (const char *c = argv[0]; *c; c++) if (*c == '/') { has_slash = true; break; }
-    if (!has_slash) {
-        if (path_search(argv[0], path_buf, sizeof(path_buf)) < 0) {
-            free(buf);
-            return -1;
-        }
-        path = path_buf;
-    }
-
-    pid_t pid = toby_spawn(path, argv, environ, 0, 0, 0);
-    if (pid < 0) { free(buf); return -1; }
+    char *sh_argv[4];
+    sh_argv[0] = (char *)"sh";
+    sh_argv[1] = (char *)"-c";
+    sh_argv[2] = (char *)cmd;
+    sh_argv[3] = 0;
+    /* The child's 0, 1 and 2 are ours. It was handed our fd 0 as all
+     * three -- which worked only while 0, 1 and 2 were one terminal: under
+     * an SSH command, on pipes now (finding 69), what it wrote went into
+     * its stdin pipe and was lost (hwgate sh_system). */
+    pid_t pid = toby_spawn("/bin/sh", sh_argv, environ, 0, 1, 2);
+    if (pid < 0) return -1;
     int status = 0;
     pid_t rc = waitpid(pid, &status, 0);
-    free(buf);
     if (rc < 0) return -1;
     return status;
 }

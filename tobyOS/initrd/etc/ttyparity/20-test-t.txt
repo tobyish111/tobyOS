@@ -1,0 +1,12 @@
+# `test -t FD`: is the descriptor a terminal -- the descriptor the builtin
+# has, redirections and pipes included. At the prompt 0, 1 and 2 are; a
+# file, /dev/null or a pipe is not. tsh asked whether the process's fd could
+# seek, so a pipe was a terminal -- `[ -t 0 ]` said yes in an SSH command,
+# which runs on pipes now (finding 69) -- and a redirection on `test` was
+# not seen.
+[ -t 0 ] && echo "t0 yes"; [ -t 1 ] && echo "t1 yes"; [ -t 2 ] && echo "t2 yes"
+[ -t 0 ] < /dev/null || echo "t0 null no"
+[ -t 1 ] > /dev/null || echo "t1 null no"
+echo | { [ -t 0 ] || echo "t0 pipe no"; }
+{ [ -t 1 ] && echo yes || echo no; } | cat
+exit 0

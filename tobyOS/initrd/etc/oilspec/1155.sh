@@ -1,0 +1,5 @@
+set - +
+echo "$@"
+
+set + -
+echo "$@"

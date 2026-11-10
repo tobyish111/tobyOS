@@ -88,6 +88,9 @@ bool vmm_protect(uint64_t virt, size_t bytes, uint32_t flags);
  * 0 if unmapped. Includes the in-page offset (i.e. matches the value
  * the CPU would compute on a load). */
 uint64_t vmm_translate(uint64_t virt);
+/* Explicit-root translate for BKL-free callers (futex PROCESS_SHARED
+ * keying); *shared_out reports the MAP_SHARED software PTE bit. */
+uint64_t vmm_translate_root(uint64_t cr3, uint64_t virt, int *shared_out);
 
 /* Size of the leaf that maps `virt`: 0 (unmapped), 4096 (4 KiB leaf), or
  * 0x200000 (a 2 MiB huge leaf). Used to confirm huge-page backing. */

@@ -17,13 +17,27 @@
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/pmm.h>
+#include <tobyos/pci.h>    /* /sys/bus/pci/devices population */
+#include <tobyos/usbreg.h> /* /sys/bus/usb/devices population */
+#include <tobyos/smbios.h> /* /sys/firmware/dmi + /sys/class/dmi/id  */
+#include <tobyos/cputelem.h> /* /sys/class/hwmon + cpuN/cpufreq        */
 #include <tobyos/types.h>
 
 extern uint64_t pit_ticks(void);
 extern uint32_t pit_hz(void);
 extern uint32_t smp_cpu_count(void);
 
-#define SYSFS_MAX_NODES 96   /* slice 100: + the DRM device tree */
+/* 96 -> 320 (2026-08-23): the PCI tree costs 1 dir + 7 files per
+ * function, and a desktop board enumerates a dozen or more. The table is
+ * static, so this is ~320 * (VFS_PATH_MAX + a few words) of BSS.
+ *
+ * 320 -> 640 (2026-08-24): the USB tree costs 1 dir + up to 16 files per
+ * device (USBREG_MAX = 16 of them), and 320 was ALREADY within reach on a
+ * real board -- an EliteDesk enumerates ~25 PCI functions, which is 225
+ * nodes of PCI alone against a base of 33. The headroom checks below
+ * degrade gracefully, but a machine that silently exposes only some of
+ * its devices is the kind of half-truth this arc exists to avoid. */
+#define SYSFS_MAX_NODES 640
 #define SYSFS_BUF_SIZE  256
 
 struct sysfs_node {
@@ -36,6 +50,24 @@ struct sysfs_node {
      * /sys/dev/char/<maj>:<min>/device/subsystem and keys the bus type on
      * the target's basename -- a regular file cannot answer that. */
     const char *link;
+    /* 2026-08-23: PRE-RENDERED file content, owned by this node. The
+     * generator signature carries no context, so one function cannot
+     * serve N per-device files (every PCI device needs its own vendor,
+     * device, class, ...). PCI topology is fixed once pci_init has run,
+     * so those files are rendered once at mount and stored here. NULL
+     * for every generator-backed or directory node. */
+    char *fixed;
+    /* 2026-08-24: BINARY content, served straight from kernel memory.
+     * `fixed` cannot carry it for two reasons -- it is NUL-terminated
+     * (the DMI table is full of NULs) and the read path copies it into a
+     * 256-byte scratch buffer, while an SMBIOS table is kilobytes. A blob
+     * node points at memory the kernel already owns for the life of the
+     * system, so nothing is copied at all. */
+    const uint8_t *blob;
+    size_t         blob_len;
+    /* Linux keeps the DMI serial numbers root-only; every other sysfs
+     * node here is 0444. 0 means "use the default". */
+    uint32_t mode;
 };
 
 static struct sysfs_node g_sysfs_nodes[SYSFS_MAX_NODES];
@@ -210,8 +242,21 @@ static int gen_drm_uevent(char *b, size_t s) {
 
 /* ---- registration ---- */
 
+static void sysfs_populate_pci(void);
+static void sysfs_add_blob(const char *path, const uint8_t *data,
+                           size_t len, uint32_t mode);
+
 static void sysfs_add_dir(const char *path) {
     if (g_sysfs_count >= SYSFS_MAX_NODES) return;
+    /* Idempotent (2026-08-24). Several populators now need the same
+     * ancestor -- /class is wanted by both the DMI id tree and hwmon --
+     * and adding it twice put two nodes with one path in the table, which
+     * readdir would then list twice. Lookup would not have noticed, so
+     * this would have shown up only as a duplicated directory entry. */
+    for (int i = 0; i < g_sysfs_count; i++) {
+        if (g_sysfs_nodes[i].type == VFS_TYPE_DIR &&
+            strcmp(g_sysfs_nodes[i].path, path) == 0) return;
+    }
     struct sysfs_node *n = &g_sysfs_nodes[g_sysfs_count++];
     size_t len = strlen(path);
     if (len >= VFS_PATH_MAX) len = VFS_PATH_MAX - 1;
@@ -232,6 +277,563 @@ static void sysfs_add_file(const char *path, int (*gen)(char *, size_t)) {
     n->generate = gen;
 }
 
+/* Add a file whose bytes are computed NOW and remembered. `text` is
+ * copied; the caller keeps ownership of its buffer. */
+static void sysfs_add_fixed(const char *path, const char *text) {
+    if (g_sysfs_count >= SYSFS_MAX_NODES) return;
+    size_t tlen = strlen(text);
+    char *copy = (char *)kmalloc(tlen + 1);
+    if (!copy) return;
+    memcpy(copy, text, tlen);
+    copy[tlen] = '\0';
+    struct sysfs_node *n = &g_sysfs_nodes[g_sysfs_count++];
+    size_t len = strlen(path);
+    if (len >= VFS_PATH_MAX) len = VFS_PATH_MAX - 1;
+    memcpy(n->path, path, len);
+    n->path[len] = '\0';
+    n->type = VFS_TYPE_FILE;
+    n->generate = 0;
+    n->fixed = copy;
+}
+
+/* Slice: REAL per-device config space.
+ *
+ * There was already a gen_pci_config(), but it hand-writes a virtio-gpu
+ * header for one function because libdrm reads that one file. Every other
+ * device had no `config` at all, so `lspci -x` had nothing to dump and
+ * setpci had nothing to read.
+ *
+ * These are blob nodes: 256 bytes of the device's ACTUAL config space,
+ * read once at mount. A snapshot would go stale the moment anything wrote
+ * to config space, so the write syscall calls sysfs_pci_config_refresh()
+ * and the file never disagrees with the hardware.
+ */
+struct pci_cfg_cache {
+    uint8_t  bus, slot, fn;
+    uint8_t *bytes;                 /* 256, owned for the life of the system */
+};
+#define PCI_CFG_CACHE_MAX 64
+static struct pci_cfg_cache g_pci_cfg[PCI_CFG_CACHE_MAX];
+static int g_pci_cfg_count;
+
+static void pci_cfg_fill(uint8_t *b, uint8_t bus, uint8_t slot, uint8_t fn) {
+    for (int off = 0; off < 256; off += 4) {
+        uint32_t v = pci_cfg_read32(bus, slot, fn, (uint8_t)off);
+        b[off + 0] = (uint8_t)(v & 0xFF);
+        b[off + 1] = (uint8_t)((v >> 8) & 0xFF);
+        b[off + 2] = (uint8_t)((v >> 16) & 0xFF);
+        b[off + 3] = (uint8_t)((v >> 24) & 0xFF);
+    }
+}
+
+void sysfs_pci_config_refresh(uint8_t bus, uint8_t slot, uint8_t fn) {
+    for (int i = 0; i < g_pci_cfg_count; i++) {
+        if (g_pci_cfg[i].bus == bus && g_pci_cfg[i].slot == slot &&
+            g_pci_cfg[i].fn == fn && g_pci_cfg[i].bytes) {
+            pci_cfg_fill(g_pci_cfg[i].bytes, bus, slot, fn);
+            return;
+        }
+    }
+}
+
+/* ---- /sys/bus/pci/devices (2026-08-23) ----------------------------
+ *
+ * The layout pciutils' lspci and busybox's lspci both walk: one
+ * directory per function named <domain:bus:dev.fn>, each holding the
+ * identity as lowercase 0x-prefixed text. `class` is the full 24-bit
+ * class/subclass/prog-if word, which is what tools decode into "VGA
+ * compatible controller" and friends.
+ *
+ * Until now /sys/bus/pci existed but was EMPTY -- it was created only so
+ * the DRM subsystem symlink had somewhere to point -- so every
+ * sysfs-walking tool saw a machine with no PCI devices at all. */
+static void sysfs_populate_pci(void) {
+    sysfs_add_dir("/bus/pci/devices");
+
+    size_t n = pci_device_count();
+    size_t made = 0;
+    for (size_t i = 0; i < n; i++) {
+        struct pci_dev *d = pci_device_at(i);
+        if (!d) continue;
+        /* Leave headroom: each device costs 1 dir + 9 files. */
+        if (g_sysfs_count + 12 >= SYSFS_MAX_NODES) {
+            kprintf("[sysfs] WARN: node table full -- %lu of %lu PCI "
+                    "device(s) exposed\n",
+                    (unsigned long)made, (unsigned long)n);
+            break;
+        }
+
+        char dir[VFS_PATH_MAX], path[VFS_PATH_MAX], val[64];
+        ksnprintf(dir, sizeof dir, "/bus/pci/devices/0000:%02x:%02x.%u",
+                  (unsigned)d->bus, (unsigned)d->slot, (unsigned)d->fn);
+        sysfs_add_dir(dir);
+
+        ksnprintf(path, sizeof path, "%s/vendor", dir);
+        ksnprintf(val, sizeof val, "0x%04x\n", (unsigned)d->vendor);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/device", dir);
+        ksnprintf(val, sizeof val, "0x%04x\n", (unsigned)d->device);
+        sysfs_add_fixed(path, val);
+
+        /* class/subclass/prog-if packed exactly as PCI config space has
+         * it -- lspci reads this one word, not three files. */
+        ksnprintf(path, sizeof path, "%s/class", dir);
+        ksnprintf(val, sizeof val, "0x%02x%02x%02x\n",
+                  (unsigned)d->class_code, (unsigned)d->subclass,
+                  (unsigned)d->prog_if);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/revision", dir);
+        ksnprintf(val, sizeof val, "0x%02x\n", (unsigned)d->revision);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/irq", dir);
+        ksnprintf(val, sizeof val, "%u\n",
+                  d->irq_line == 0xFF ? 0u : (unsigned)d->irq_line);
+        sysfs_add_fixed(path, val);
+
+        /* config -- 256 REAL bytes, which is what `lspci -x` dumps and
+         * what setpci reads. Kept in a cache the write path refreshes, so
+         * the file cannot end up disagreeing with the hardware. */
+        if (g_pci_cfg_count < PCI_CFG_CACHE_MAX) {
+            uint8_t *cb = (uint8_t *)kmalloc(256);
+            if (cb) {
+                pci_cfg_fill(cb, d->bus, d->slot, d->fn);
+                g_pci_cfg[g_pci_cfg_count].bus  = d->bus;
+                g_pci_cfg[g_pci_cfg_count].slot = d->slot;
+                g_pci_cfg[g_pci_cfg_count].fn   = d->fn;
+                g_pci_cfg[g_pci_cfg_count].bytes = cb;
+                g_pci_cfg_count++;
+                ksnprintf(path, sizeof path, "%s/config", dir);
+                sysfs_add_blob(path, cb, 256, 0444);
+            }
+        }
+
+        /* We do not track subsystem ids per device; report the device's
+         * own ids rather than inventing a different vendor, which is what
+         * a device with no subsystem header reads as anyway. */
+        ksnprintf(path, sizeof path, "%s/subsystem_vendor", dir);
+        ksnprintf(val, sizeof val, "0x%04x\n", (unsigned)d->vendor);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/subsystem_device", dir);
+        ksnprintf(val, sizeof val, "0x%04x\n", (unsigned)d->device);
+        sysfs_add_fixed(path, val);
+
+        /* uevent -- THE file busybox's lspci actually parses. It ignores
+         * vendor/device/class entirely and pulls PCI_SLOT_NAME, PCI_CLASS
+         * and PCI_ID out of here; with the file absent it printed one
+         * "(null) Class 0000: 0000:0000" per device. Keys are Linux's
+         * spelling: class is the bare 24-bit hex with no 0x, ids are
+         * uppercase VVVV:DDDD. */
+        {
+            char ue[SYSFS_BUF_SIZE];
+            ksnprintf(ue, sizeof ue,
+                      "DRIVER=%s\n"
+                      "PCI_CLASS=%X\n"
+                      "PCI_ID=%04X:%04X\n"
+                      "PCI_SUBSYS_ID=%04X:%04X\n"
+                      "PCI_SLOT_NAME=0000:%02x:%02x.%u\n",
+                      (d->driver && d->driver->name) ? d->driver->name
+                                                     : "(none)",
+                      ((unsigned)d->class_code << 16) |
+                      ((unsigned)d->subclass << 8) | (unsigned)d->prog_if,
+                      (unsigned)d->vendor, (unsigned)d->device,
+                      (unsigned)d->vendor, (unsigned)d->device,
+                      (unsigned)d->bus, (unsigned)d->slot, (unsigned)d->fn);
+            ksnprintf(path, sizeof path, "%s/uevent", dir);
+            sysfs_add_fixed(path, ue);
+        }
+
+        made++;
+    }
+    kprintf("[sysfs] /sys/bus/pci/devices: %lu device(s) exposed\n",
+            (unsigned long)made);
+}
+
+/* ---- /sys/bus/usb/devices (2026-08-24) ----------------------------
+ *
+ * The layout usbutils' lsusb walks: one directory per device, named
+ * <busnum>-<rootport>[.<hubport>...], holding the device descriptor as
+ * text attributes. Linux additionally synthesises a root-hub device per
+ * host controller (with its OWN 1d6b:0002/0003 ids, which no silicon
+ * ever reported); tobyOS does not, so nothing here is a device that
+ * did not answer GET_DESCRIPTOR.
+ *
+ * Bus number: tobyOS binds exactly ONE xHC (xhci_probe refuses a second
+ * with "already bound"), and it is the only host controller that records
+ * into usbreg -- usb_legacy.c drives UHCI/OHCI/EHCI for diagnostics and
+ * legacy input without registering devices. So bus 1 is a fact here, not
+ * a placeholder. If a second controller ever registers, this must carry
+ * a real controller index instead.
+ *
+ * Port numbers are the xHC's OWN root-port indices, which is NOT what
+ * Linux would print for the same machine: Linux's xhci driver registers
+ * two HCDs per controller (USB2 primary + USB3 shared) and renumbers
+ * ports within each, so a hub on qemu-xhci's USB2 port 1 -- xHCI root
+ * port 5, because ports 1-4 are the SuperSpeed set -- is "1-1" there and
+ * "1-5" here. tobyOS drives one flat bus, so it reports the port number
+ * it actually used. Faking Linux's split would mean inventing a second
+ * bus that does not exist.
+ *
+ * A LIVE VIEW of the bus (finding 306). These nodes were once built at
+ * sysfs_init into the append-only node table, so a device pulled stayed
+ * listed and one plugged in later never appeared -- harmless only while
+ * the xHCI driver saw no hot-plug at all (304, 305). Linux's directory
+ * follows the bus, and so does this one: nothing under /bus/usb/devices
+ * is a node. Every lookup, read and listing there is answered from the
+ * usbreg row as it is now (copied under its lock), so a device leaves
+ * with its row and arrives under its own port path, with the number the
+ * bus gave it.
+ */
+static const char *usb_speed_mbps(uint8_t code) {
+    /* Linux's `speed` attribute is the signalling rate in Mbit/s as a
+     * decimal string. Anything we do not recognise gets NO attribute
+     * rather than a guessed rate. */
+    switch (code) {
+        case 1: return "12";      /* full  */
+        case 2: return "1.5";     /* low   */
+        case 3: return "480";     /* high  */
+        case 4: return "5000";    /* super */
+        default: return NULL;
+    }
+}
+
+#define USB_DEV_DIR "/bus/usb/devices"
+
+/* A device directory's attributes, in the order they are listed. */
+static const char *const usb_attrs[] = {
+    "idVendor", "idProduct", "bDeviceClass", "bDeviceSubClass",
+    "bDeviceProtocol", "busnum", "speed", "devnum", "version", "bcdDevice",
+    "bMaxPacketSize0", "bNumConfigurations", "manufacturer", "product",
+    "serial", "uevent",
+};
+#define USB_NATTRS ((int)(sizeof usb_attrs / sizeof usb_attrs[0]))
+
+/* Linux's port-path name: hub_depth nibbles of the xHCI route string
+ * spell the port taken at each tier below the root. */
+static void usb_dev_name(const struct usbreg_entry *e, char *name, size_t cap) {
+    int dl = ksnprintf(name, cap, "1-%u", (unsigned)e->port_id);
+    for (unsigned t = 0; t < e->hub_depth && dl > 0 && (size_t)dl < cap; t++)
+        dl += ksnprintf(name + dl, cap - (size_t)dl, ".%u",
+                        (unsigned)((e->route_string >> (t * 4)) & 0xFu));
+}
+
+/* The device on the bus now whose directory is NAME (len bytes). */
+static bool usb_dev_find(const char *name, size_t len, struct usbreg_entry *out) {
+    char n[32];
+    for (size_t i = 0; i < USBREG_MAX; i++) {
+        if (!usbreg_copy_live(i, out)) continue;
+        usb_dev_name(out, n, sizeof n);
+        if (strlen(n) == len && memcmp(n, name, len) == 0) return true;
+    }
+    return false;
+}
+
+/* Attribute A of device E rendered into buf: its length, or -1 when the
+ * device has none. Everything past `speed` comes from the full device
+ * descriptor, which only exists once usbreg_record_details has run;
+ * without it the fields would all read zero, and a bcdUSB of 0.00 is a
+ * lie where an absent file is the truth. An empty string descriptor
+ * means the device has no such index (or the fetch failed) -- Linux
+ * omits the attribute in exactly that case, and so do we. */
+static int usb_attr_render(const struct usbreg_entry *e, int a,
+                           char *buf, size_t cap) {
+    const char *at = usb_attrs[a];
+    const char *spd = usb_speed_mbps(e->speed);
+    if (!strcmp(at, "idVendor"))  return ksnprintf(buf, cap, "%04x\n", (unsigned)e->vendor);
+    if (!strcmp(at, "idProduct")) return ksnprintf(buf, cap, "%04x\n", (unsigned)e->product);
+    if (!strcmp(at, "bDeviceClass"))    return ksnprintf(buf, cap, "%02x\n", (unsigned)e->dev_class);
+    if (!strcmp(at, "bDeviceSubClass")) return ksnprintf(buf, cap, "%02x\n", (unsigned)e->dev_subclass);
+    if (!strcmp(at, "bDeviceProtocol")) return ksnprintf(buf, cap, "%02x\n", (unsigned)e->dev_protocol);
+    if (!strcmp(at, "busnum")) return ksnprintf(buf, cap, "1\n");
+    if (!strcmp(at, "speed"))  return spd ? ksnprintf(buf, cap, "%s\n", spd) : -1;
+    if (!strcmp(at, "uevent")) {
+        /* uevent, in Linux's spelling for a usb_device. MAJOR/MINOR/
+         * DEVNAME are deliberately absent: there is no /dev/bus/usb node
+         * to name. PRODUCT is vid/pid/bcdDevice, TYPE is the class
+         * triple in DECIMAL. */
+        return ksnprintf(buf, cap,
+                         "DEVTYPE=usb_device\n"
+                         "DRIVER=%s\n"
+                         "PRODUCT=%x/%x/%x\n"
+                         "TYPE=%u/%u/%u\n"
+                         "BUSNUM=001\n"
+                         "DEVNUM=%03u\n",
+                         e->driver[0] ? e->driver : "(none)",
+                         (unsigned)e->vendor, (unsigned)e->product,
+                         (unsigned)e->bcd_device,
+                         (unsigned)e->dev_class, (unsigned)e->dev_subclass,
+                         (unsigned)e->dev_protocol,
+                         (unsigned)e->bus_address);
+    }
+    if (!e->have_details) return -1;
+    if (!strcmp(at, "devnum")) return ksnprintf(buf, cap, "%u\n", (unsigned)e->bus_address);
+    /* Linux renders bcdUSB space-padded to width 2: " 2.00". */
+    if (!strcmp(at, "version"))
+        return ksnprintf(buf, cap, "%s%x.%02x\n",
+                         (e->bcd_usb >> 8) < 0x10 ? " " : "",
+                         (unsigned)(e->bcd_usb >> 8),
+                         (unsigned)(e->bcd_usb & 0xFFu));
+    if (!strcmp(at, "bcdDevice"))       return ksnprintf(buf, cap, "%04x\n", (unsigned)e->bcd_device);
+    if (!strcmp(at, "bMaxPacketSize0")) return ksnprintf(buf, cap, "%u\n", (unsigned)e->max_packet0);
+    if (!strcmp(at, "bNumConfigurations")) return ksnprintf(buf, cap, "%u\n", (unsigned)e->num_configs);
+    const char *s = !strcmp(at, "manufacturer") ? e->manufacturer :
+                    !strcmp(at, "product")      ? e->prod_name :
+                    !strcmp(at, "serial")       ? e->serial : "";
+    return s[0] ? ksnprintf(buf, cap, "%s\n", s) : -1;
+}
+
+/* The first '/' in s, or NULL (klibc has no strchr). */
+static const char *usb_slash(const char *s) {
+    for (; *s; s++) if (*s == '/') return s;
+    return 0;
+}
+
+/* PATH under /bus/usb/devices: 0 when it is not; 1 for a device's
+ * directory; 2 for one of its attributes (*attr, rendered into buf, its
+ * length in *len); -1 for a name no device on the bus has now. */
+static int usb_path(const char *path, struct usbreg_entry *e, int *attr,
+                    char *buf, size_t cap, size_t *len) {
+    size_t dl = sizeof USB_DEV_DIR - 1;
+    if (strncmp(path, USB_DEV_DIR, dl) != 0 || path[dl] != '/') return 0;
+    const char *name = path + dl + 1;
+    const char *slash = usb_slash(name);
+    size_t nlen = slash ? (size_t)(slash - name) : strlen(name);
+    if (nlen == 0 || !usb_dev_find(name, nlen, e)) return -1;
+    if (!slash || !slash[1]) return 1;
+    for (int a = 0; a < USB_NATTRS; a++) {
+        if (strcmp(slash + 1, usb_attrs[a]) != 0) continue;
+        int n = usb_attr_render(e, a, buf, cap);
+        if (n < 0) return -1;
+        *attr = a;
+        *len = (size_t)n < cap ? (size_t)n : cap - 1;
+        return 2;
+    }
+    return -1;
+}
+
+static void sysfs_populate_usb(void) {
+    sysfs_add_dir("/bus/usb");
+    sysfs_add_dir(USB_DEV_DIR);
+    kprintf("[sysfs] /sys/bus/usb/devices: %lu device(s) exposed\n",
+            (unsigned long)usbreg_count_active());
+}
+
+/* Add a file whose bytes are BINARY kernel memory, served in place. The
+ * caller must guarantee the pointer outlives the mount (SMBIOS's does --
+ * it is firmware memory mapped into the HHDM for the life of the
+ * system). */
+static void sysfs_add_blob(const char *path, const uint8_t *data, size_t len,
+                           uint32_t mode) {
+    if (g_sysfs_count >= SYSFS_MAX_NODES) return;
+    if (!data || !len) return;
+    struct sysfs_node *n = &g_sysfs_nodes[g_sysfs_count++];
+    size_t plen = strlen(path);
+    if (plen >= VFS_PATH_MAX) plen = VFS_PATH_MAX - 1;
+    memcpy(n->path, path, plen);
+    n->path[plen] = '\0';
+    n->type     = VFS_TYPE_FILE;
+    n->generate = 0;
+    n->blob     = data;
+    n->blob_len = len;
+    n->mode     = mode;
+}
+
+static void sysfs_add_fixed_mode(const char *path, const char *text,
+                                 uint32_t mode) {
+    int before = g_sysfs_count;
+    sysfs_add_fixed(path, text);
+    if (g_sysfs_count > before) g_sysfs_nodes[before].mode = mode;
+}
+
+/* ---- /sys/firmware/dmi + /sys/class/dmi/id (2026-08-24) -------------
+ *
+ * Two surfaces over one table, because Linux software reads two:
+ *   - dmidecode(8) opens /sys/firmware/dmi/tables/{smbios_entry_point,DMI}
+ *     and decodes the raw structures itself.
+ *   - almost everything else (systemd, hwinfo, lots of shell scripts)
+ *     reads the pre-parsed one-line files under /sys/class/dmi/id.
+ *
+ * If the firmware reported no SMBIOS at all, NOTHING is published -- not
+ * empty files, not "unknown". An absent attribute is how Linux says "this
+ * machine did not tell me", and a tool can act on that; a file containing
+ * a guess it cannot distinguish from a fact is worse than no file.
+ */
+static void sysfs_populate_dmi(void) {
+    const struct smbios_info *si = smbios_get();
+    if (!si->present) {
+        kprintf("[sysfs] /sys/firmware/dmi: no SMBIOS -- nothing published\n");
+        return;
+    }
+
+    sysfs_add_dir("/firmware");
+    sysfs_add_dir("/firmware/dmi");
+    sysfs_add_dir("/firmware/dmi/tables");
+    sysfs_add_blob("/firmware/dmi/tables/smbios_entry_point",
+                   si->entry, si->entry_len, 00400u);
+    sysfs_add_blob("/firmware/dmi/tables/DMI",
+                   si->table, si->table_len, 00400u);
+
+    /* The identity files. Each is one line, and each is present only if
+     * the firmware actually reported it. */
+    static const struct { const char *name; int id; bool secret; } ids[] = {
+        { "bios_vendor",      SMBIOS_ID_BIOS_VENDOR,      false },
+        { "bios_version",     SMBIOS_ID_BIOS_VERSION,     false },
+        { "bios_date",        SMBIOS_ID_BIOS_DATE,        false },
+        { "sys_vendor",       SMBIOS_ID_SYS_VENDOR,       false },
+        { "product_name",     SMBIOS_ID_PRODUCT_NAME,     false },
+        { "product_version",  SMBIOS_ID_PRODUCT_VERSION,  false },
+        { "product_serial",   SMBIOS_ID_PRODUCT_SERIAL,   true  },
+        { "board_vendor",     SMBIOS_ID_BOARD_VENDOR,     false },
+        { "board_name",       SMBIOS_ID_BOARD_NAME,       false },
+        { "board_version",    SMBIOS_ID_BOARD_VERSION,    false },
+        { "board_serial",     SMBIOS_ID_BOARD_SERIAL,     true  },
+        { "chassis_vendor",   SMBIOS_ID_CHASSIS_VENDOR,   false },
+    };
+
+    bool made_dir = false;
+    size_t published = 0;
+    char path[VFS_PATH_MAX], val[96];
+    for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+        const char *s = smbios_id_string(ids[i].id);
+        if (!s) continue;
+        if (!made_dir) {
+            sysfs_add_dir("/class");
+            sysfs_add_dir("/class/dmi");
+            sysfs_add_dir("/class/dmi/id");
+            made_dir = true;
+        }
+        ksnprintf(path, sizeof path, "/class/dmi/id/%s", ids[i].name);
+        ksnprintf(val, sizeof val, "%s\n", s);
+        /* Serial numbers are 0400 on Linux; match that rather than
+         * publishing a machine's serial world-readable. */
+        sysfs_add_fixed_mode(path, val, ids[i].secret ? 00400u : 00444u);
+        published++;
+    }
+
+    kprintf("[sysfs] /sys/firmware/dmi: SMBIOS %u.%u via %s, "
+            "%lu-byte table, %lu id file(s)\n",
+            si->major, si->minor, si->source,
+            (unsigned long)si->table_len, (unsigned long)published);
+}
+
+/* ---- /sys/class/hwmon + /sys/devices/system/cpu/cpuN/cpufreq (2026-08-24)
+ *
+ * temp1_input is a GENERATOR, not a pre-rendered value: a temperature
+ * that was true at boot is a lie by the time anything reads it. The
+ * frequency files are the opposite -- MSR_PLATFORM_INFO describes fixed
+ * operating points, so those are rendered once.
+ *
+ * Both publish NOTHING when their MSR gate said no. See cputelem.h: a
+ * per-core register cannot be filed under a named CPU without a
+ * cross-CPU read, and this kernel has none.
+ */
+static int gen_temp1_input(char *buf, size_t sz) {
+    int32_t mc = 0;
+    if (!cputherm_read_mc(&mc)) {
+        /* The sensor exists but says its reading is not valid right now.
+         * An empty file is how that is said; a stale number is not. */
+        if (sz) buf[0] = '\0';
+        return 0;
+    }
+    return ksnprintf(buf, sz, "%d\n", mc);
+}
+
+static void sysfs_populate_hwmon(void) {
+    const struct cputherm_info *ti = cputherm_get();
+    if (!ti->present) {
+        kprintf("[sysfs] /sys/class/hwmon: no sensor -- nothing published\n");
+        return;
+    }
+    char val[64];
+    sysfs_add_dir("/class");                 /* idempotent-ish: see note */
+    sysfs_add_dir("/class/hwmon");
+    sysfs_add_dir("/class/hwmon/hwmon0");
+    /* `name` identifies the sensor interface to userspace; "coretemp" is
+     * the standard identifier for Intel's package/core thermal MSRs,
+     * which is exactly what this is. */
+    sysfs_add_fixed("/class/hwmon/hwmon0/name", "coretemp\n");
+    sysfs_add_file ("/class/hwmon/hwmon0/temp1_input", gen_temp1_input);
+    ksnprintf(val, sizeof val, "%s\n", ti->label);
+    sysfs_add_fixed("/class/hwmon/hwmon0/temp1_label", val);
+    ksnprintf(val, sizeof val, "%u\n", ti->tjmax_c * 1000u);
+    sysfs_add_fixed("/class/hwmon/hwmon0/temp1_crit", val);
+    kprintf("[sysfs] /sys/class/hwmon/hwmon0: coretemp, TjMax %u C\n",
+            ti->tjmax_c);
+}
+
+/* Called AFTER smp_start_aps(), NOT from sysfs_init().
+ *
+ * REAL-HARDWARE BUG, 2026-08-24: this used to run inside sysfs_init(),
+ * which kmain calls at line ~4117 -- SIXTY LINES BEFORE smp_start_aps().
+ * At that moment only the BSP is online, so smp_cpu_count() answers 1 and
+ * an EliteDesk with four cores published exactly one cpufreq directory:
+ *
+ *     [sysfs] /sys/devices/system/cpu/cpuN/cpufreq: 1 cpu(s), base 3300000 kHz
+ *
+ * QEMU could never catch it -- there the vendor gate declines and this
+ * loop never runs at all -- so it took a machine where the feature
+ * actually works to expose it. Publishing 1 of 4 CPUs is exactly the
+ * quiet half-truth this arc exists to avoid.
+ *
+ * Note /sys/devices/system/cpu/online was UNAFFECTED: it is a generator,
+ * evaluated at read time, so it reported 0-3 correctly all along. That
+ * contrast is the lesson -- a value captured at init is only as true as
+ * the moment it was captured. */
+static int g_cpufreq_published;
+
+void sysfs_publish_cpufreq(void) {
+    if (g_cpufreq_published) return;      /* idempotent: add_fixed is not */
+    g_cpufreq_published = 1;
+
+    const struct cpufreq_msr_info *fi = cpufreq_msr_get();
+    if (!fi->present) {
+        kprintf("[sysfs] /sys/devices/system/cpu/*/cpufreq: no P-state info "
+                "-- nothing published\n");
+        return;
+    }
+    uint32_t ncpu = smp_cpu_count();
+    if (ncpu == 0) ncpu = 1;
+    char dir[VFS_PATH_MAX], path[VFS_PATH_MAX], val[64];
+    uint32_t made = 0;
+    for (uint32_t i = 0; i < ncpu; i++) {
+        if (g_sysfs_count + 10 >= SYSFS_MAX_NODES) break;
+        ksnprintf(dir, sizeof dir, "/devices/system/cpu/cpu%u", i);
+        sysfs_add_dir(dir);
+        ksnprintf(dir, sizeof dir, "/devices/system/cpu/cpu%u/cpufreq", i);
+        sysfs_add_dir(dir);
+
+        /* Every value below is PACKAGE-WIDE, which is why publishing it
+         * under each cpu<N> is honest even though we never read a
+         * per-core register. */
+        ksnprintf(path, sizeof path, "%s/cpuinfo_max_freq", dir);
+        ksnprintf(val, sizeof val, "%u\n", fi->max_khz);
+        sysfs_add_fixed(path, val);
+        ksnprintf(path, sizeof path, "%s/scaling_max_freq", dir);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/cpuinfo_min_freq", dir);
+        ksnprintf(val, sizeof val, "%u\n", fi->min_khz);
+        sysfs_add_fixed(path, val);
+        ksnprintf(path, sizeof path, "%s/scaling_min_freq", dir);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/base_frequency", dir);
+        ksnprintf(val, sizeof val, "%u\n", fi->base_khz);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/scaling_driver", dir);
+        ksnprintf(val, sizeof val, "%s\n", fi->driver);
+        sysfs_add_fixed(path, val);
+        made++;
+    }
+    kprintf("[sysfs] /sys/devices/system/cpu/*/cpufreq: %u cpu(s), "
+            "base %u kHz (no scaling_cur_freq/governor -- see cpufreq.c)\n",
+            made, fi->base_khz);
+}
+
 static void sysfs_add_link(const char *path, const char *target) {
     if (g_sysfs_count >= SYSFS_MAX_NODES) return;
     struct sysfs_node *n = &g_sysfs_nodes[g_sysfs_count++];
@@ -247,7 +849,8 @@ static void sysfs_add_link(const char *path, const char *target) {
 /* ---- VFS ops ---- */
 
 struct sysfs_file_priv {
-    char buf[SYSFS_BUF_SIZE];
+    char buf[SYSFS_BUF_SIZE];   /* backing store for generated content   */
+    const uint8_t *src;         /* what read() serves: buf, fixed, blob  */
     size_t len;
     size_t pos;
 };
@@ -262,17 +865,39 @@ static struct sysfs_node *sysfs_find(const char *path) {
 
 static int sysfs_open(void *mnt, const char *path, struct vfs_file *out) {
     (void)mnt;
-    struct sysfs_node *n = sysfs_find(path);
-    if (!n) return VFS_ERR_NOENT;
-    if (n->type == VFS_TYPE_DIR) return VFS_ERR_ISDIR;
+    struct usbreg_entry ue;
+    int ua; size_t ulen;
+    char ubuf[SYSFS_BUF_SIZE];
+    int u = usb_path(path, &ue, &ua, ubuf, sizeof ubuf, &ulen);
+    struct sysfs_node *n = u ? 0 : sysfs_find(path);
+    if (u < 0 || (!u && !n)) return VFS_ERR_NOENT;
+    if (u == 1 || (n && n->type == VFS_TYPE_DIR)) return VFS_ERR_ISDIR;
 
     struct sysfs_file_priv *priv = kmalloc(sizeof(*priv));
     if (!priv) return VFS_ERR_NOMEM;
     memset(priv, 0, sizeof(*priv));
 
-    if (n->generate) {
+    if (u == 2) {
+        /* the attribute as the bus has it at open, held for this handle */
+        memcpy(priv->buf, ubuf, ulen);
+        priv->len = ulen;
+        priv->src = (const uint8_t *)priv->buf;
+    } else if (n->generate) {
         int len = n->generate(priv->buf, SYSFS_BUF_SIZE);
         priv->len = (size_t)(len > 0 ? len : 0);
+        priv->src = (const uint8_t *)priv->buf;
+    } else if (n->blob) {
+        /* No copy: the blob is kernel memory that outlives every handle. */
+        priv->src = n->blob;
+        priv->len = n->blob_len;
+    } else if (n->fixed) {
+        /* Served in place rather than copied into the 256-byte scratch
+         * buffer, which used to silently truncate anything longer. */
+        priv->src = (const uint8_t *)n->fixed;
+        priv->len = strlen(n->fixed);
+    } else {
+        priv->src = (const uint8_t *)priv->buf;
+        priv->len = 0;
     }
     priv->pos = 0;
     out->priv = priv;
@@ -287,37 +912,76 @@ static int sysfs_close(struct vfs_file *f) {
 
 static long sysfs_read(struct vfs_file *f, void *buf, size_t n) {
     struct sysfs_file_priv *priv = f->priv;
-    if (!priv) return 0;
+    if (!priv || !priv->src) return 0;
+    priv->pos = f->pos;              /* the file's, which lseek moves (220) */
     if (priv->pos >= priv->len) return 0;
     size_t avail = priv->len - priv->pos;
     if (n > avail) n = avail;
-    memcpy(buf, priv->buf + priv->pos, n);
+    memcpy(buf, priv->src + priv->pos, n);
     priv->pos += n;
     f->pos = priv->pos;
     return (long)n;
 }
 
+/* Default mode for a node that did not ask for one.
+ *
+ * DIRECTORIES NEED THE EXECUTE BIT. This returned 0444 for every node,
+ * directory or not, which meant a directory nobody could TRAVERSE:
+ * vfs_opendir asks vfs_perm_check for READ|EXEC, and vfs_perm_check
+ * short-circuits for uid 0 -- so root walked /sys happily and every gate
+ * in the tree was green, while the EliteDesk, logged in as `toby`, got
+ * VFS_ERR_PERM from the first component. lspci printed "no PCI bus
+ * exposed" and exited 1 on a machine whose /sys/bus/pci/devices held all
+ * eleven functions. sensors, dmidecode, lsusb and cpupower were all
+ * failing the same way for the same reason. */
+static uint32_t sysfs_default_mode(const struct sysfs_node *n) {
+    return (n->type == VFS_TYPE_DIR) ? 00555u : 00444u;
+}
+
 static int sysfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     (void)mnt;
+    struct usbreg_entry ue;
+    int ua; size_t ulen;
+    char ubuf[SYSFS_BUF_SIZE];
+    int u = usb_path(path, &ue, &ua, ubuf, sizeof ubuf, &ulen);
+    if (u < 0) return VFS_ERR_NOENT;
+    if (u) {
+        out->type = u == 1 ? VFS_TYPE_DIR : VFS_TYPE_FILE;
+        out->size = u == 1 ? 0 : ulen;
+        out->uid = 0;
+        out->gid = 0;
+        out->mode = (u == 1 ? 00555u : 00444u) | VFS_MODE_VALID;
+        return VFS_OK;
+    }
     struct sysfs_node *n = sysfs_find(path);
     if (!n) return VFS_ERR_NOENT;
     out->type = n->type;
     out->size = 0;
     out->uid = 0;
     out->gid = 0;
-    out->mode = 00444u | VFS_MODE_VALID;
+    out->mode = (n->mode ? n->mode : sysfs_default_mode(n)) | VFS_MODE_VALID;
     if (n->type == VFS_TYPE_FILE && n->generate) {
         char tmp[SYSFS_BUF_SIZE];
         int len = n->generate(tmp, SYSFS_BUF_SIZE);
         out->size = (size_t)(len > 0 ? len : 0);
+    } else if (n->type == VFS_TYPE_FILE && n->blob) {
+        out->size = n->blob_len;
+    } else if (n->type == VFS_TYPE_FILE && n->fixed) {
+        out->size = strlen(n->fixed);
     }
     return VFS_OK;
 }
 
 static int sysfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
     (void)mnt;
-    struct sysfs_node *n = sysfs_find(path);
-    if (!n && strcmp(path, "/") != 0) return VFS_ERR_NOENT;
+    struct usbreg_entry ue;
+    int ua; size_t ulen;
+    char ubuf[SYSFS_BUF_SIZE];
+    int u = usb_path(path, &ue, &ua, ubuf, sizeof ubuf, &ulen);
+    if (u < 0) return VFS_ERR_NOENT;
+    if (u == 2) return VFS_ERR_NOTDIR;
+    struct sysfs_node *n = u ? 0 : sysfs_find(path);
+    if (!u && !n && strcmp(path, "/") != 0) return VFS_ERR_NOENT;
     out->index = 0;
     out->priv = (void *)(uintptr_t)(path[0] ? (uintptr_t)path : (uintptr_t)"/");
     return VFS_OK;
@@ -360,11 +1024,49 @@ static int sysfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
             out->size = 0;
             out->uid = 0;
             out->gid = 0;
-            out->mode = 00444u | VFS_MODE_VALID;
+            out->mode = (g_sysfs_nodes[i].mode
+                             ? g_sysfs_nodes[i].mode
+                             : sysfs_default_mode(&g_sysfs_nodes[i]))
+                        | VFS_MODE_VALID;
             d->index++;
             return VFS_OK;
         }
         idx++;
+    }
+
+    /* /bus/usb/devices and a device's directory: the bus as it is now,
+     * after any nodes (there are none) */
+    size_t dl = sizeof USB_DEV_DIR - 1;
+    if (strncmp(parent, USB_DEV_DIR, dl) != 0 ||
+        (parent[dl] != '\0' && parent[dl] != '/')) return VFS_ERR_NOENT;
+    struct usbreg_entry e;
+    char name[32], tmp[SYSFS_BUF_SIZE];
+    if (parent[dl] == '\0') {
+        for (size_t i = 0; i < USBREG_MAX; i++) {
+            if (!usbreg_copy_live(i, &e)) continue;
+            if (idx++ != d->index) continue;
+            usb_dev_name(&e, name, sizeof name);
+            memcpy(out->name, name, strlen(name) + 1);
+            out->type = VFS_TYPE_DIR;
+            out->mode = 00555u | VFS_MODE_VALID;
+            out->size = 0; out->uid = 0; out->gid = 0;
+            d->index++;
+            return VFS_OK;
+        }
+        return VFS_ERR_NOENT;
+    }
+    const char *dev = parent + dl + 1;
+    if (usb_slash(dev) || !usb_dev_find(dev, strlen(dev), &e))
+        return VFS_ERR_NOENT;
+    for (int a = 0; a < USB_NATTRS; a++) {
+        if (usb_attr_render(&e, a, tmp, sizeof tmp) < 0) continue;
+        if (idx++ != d->index) continue;
+        memcpy(out->name, usb_attrs[a], strlen(usb_attrs[a]) + 1);
+        out->type = VFS_TYPE_FILE;
+        out->mode = 00444u | VFS_MODE_VALID;
+        out->size = 0; out->uid = 0; out->gid = 0;
+        d->index++;
+        return VFS_OK;
     }
     return VFS_ERR_NOENT;
 }
@@ -388,6 +1090,7 @@ static int sysfs_readlink(void *mnt, const char *path, char *buf,
 }
 
 static const struct vfs_ops sysfs_ops = {
+    .fsname   = "sysfs",          /* batch 31: /proc/mounts */
     .open    = sysfs_open,
     .close   = sysfs_close,
     .read    = sysfs_read,
@@ -420,6 +1123,11 @@ void sysfs_init(void) {
     sysfs_add_dir("/cpu");
     sysfs_add_dir("/mem");
     sysfs_add_dir("/kernel");
+    /* /sys/fs: cgroup2 is mounted at /sys/fs/cgroup (cgroup_mount), and its
+     * parent never existed -- `ls /sys` had no `fs`, and `stat /sys/fs` was
+     * ENOENT while /sys/fs/cgroup below it worked. The mount itself is listed
+     * inside it by vfs_readdir's mount-point rule. */
+    sysfs_add_dir("/fs");
     sysfs_add_file("/cpu/count", gen_cpu_count);
     sysfs_add_file("/mem/total", gen_mem_total);
     sysfs_add_file("/mem/free", gen_mem_free);
@@ -469,6 +1177,13 @@ void sysfs_init(void) {
      * follows it finds something rather than dangling. */
     sysfs_add_dir("/bus");
     sysfs_add_dir("/bus/pci");
+    sysfs_populate_pci();
+    sysfs_populate_usb();
+    sysfs_populate_dmi();
+    sysfs_populate_hwmon();
+    /* cpufreq is NOT populated here -- it needs the AP count, and the
+     * APs are not up yet. kmain calls sysfs_publish_cpufreq() after
+     * smp_start_aps(). */
 
     int rc = vfs_mount("/sys", &sysfs_ops, 0);
     if (rc == VFS_OK) {

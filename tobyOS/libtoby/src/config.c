@@ -98,7 +98,7 @@ int config_save(const struct config_file *cf)
 {
     if (!cf || !cf->path[0]) return -1;
 
-    int fd = open(cf->path, O_WRONLY | O_CREAT | O_TRUNC);
+    int fd = open(cf->path, O_WRONLY | O_CREAT | O_TRUNC, 0644);   /* the mode was missing: garbage */
     if (fd < 0) return -1;
 
     for (int i = 0; i < cf->count; i++) {

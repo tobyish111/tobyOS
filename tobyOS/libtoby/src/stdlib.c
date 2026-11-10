@@ -1,41 +1,10 @@
-/* libtoby/src/stdlib.c -- the C stdlib core: malloc family, exit/abort,
- * atoi/strtol, getenv, and rand.
+/* libtoby/src/stdlib.c -- the C stdlib core: exit/abort, atoi/strtol,
+ * getenv, and rand.
  *
- * ---- Allocator design ----------------------------------------------
- *
- * Classic first-fit free-list malloc, lazy-initialised on the first
- * call to malloc(). All bookkeeping is in-band: each chunk carries a
- * 16-byte header so that the returned payload is 16-byte aligned (which
- * matches both x86-64 SysV's stack alignment and the worst-case scalar
- * alignment libtoby hands out).
- *
- *   chunk layout (16 bytes header + payload):
- *
- *      +0  size_t           size_with_flags     <- payload size in low bits,
- *                                                  IN_USE in bit 0
- *      +8  struct chunk *   next_free           <- only valid when free
- *                                                  (allocated chunks scribble
- *                                                  a magic word here so a
- *                                                  use-after-free that walks
- *                                                  the list trips an assert)
- *
- * Free list: singly-linked, head-inserted on free. When malloc walks
- * it for first-fit it does an opportunistic forward-coalesce for any
- * adjacent free chunks it encounters -- O(1) per chunk because we know
- * the next chunk's address (current chunk + sizeof(header) + size).
- *
- * Heap growth: we hold a "wilderness" pointer (the highest brk we've
- * asked the kernel for). When the free list can't satisfy a request,
- * we sbrk() max(needed_chunk_size, 16 KiB) bytes and carve a fresh
- * chunk out of the new region. We never shrink the heap (sbrk
- * negatives) -- the kernel's brk implementation supports it but it
- * complicates coalescing for very little real-world win in our small
- * sample programs.
- *
- * Thread safety: tobyOS doesn't have user threads yet, so the global
- * free list head is used unlocked. */
+ * The allocator lives in malloc.c (finding 107 rewrote it). */
 
 #include <stdlib.h>
+#include <stdio.h>              /* exit's fflush (finding 225) */
 #include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
@@ -65,6 +34,9 @@ void __toby_run_atexit(void) {
 
 void exit(int code) {
     __toby_run_atexit();
+    /* every stream's output, as glibc's exit writes it -- _exit's syscall
+     * did it too, but not for a program on glibc's rules (finding 225) */
+    fflush(NULL);
     _exit(code);
 }
 
@@ -80,56 +52,77 @@ void abort(void) {
 int atoi(const char *s) { return (int)strtol(s, 0, 10); }
 long atol(const char *s) { return strtol(s, 0, 10); }
 
-static int hexval(int c) {
+/* The C rules for strtol and its kin, in one place: leading white space,
+ * a sign, "0x" for base 16 (and base 0) only when a hex digit follows, a
+ * leading 0 for base 0's octal, digits up to base 36; *ENDP back at the
+ * string itself when there were no digits; the magnitude saturates and
+ * *OVER says so. They had no overflow (a too-large number wrapped, with no
+ * ERANGE -- `du -t 99999999999999999999` took a wrapped threshold and said
+ * nothing), strtoull ignored a minus ("-1" was 1, not ULLONG_MAX), and a
+ * number-less string left *ENDP after its blanks, so `end == s` missed it. */
+static int digval(int c) {
     if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
-    return -1;
+    if (c >= 'a' && c <= 'z') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'Z') return 10 + c - 'A';
+    return 99;
 }
 
-long strtol(const char *s, char **endp, int base) {
-    while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-    int sign = 1;
-    if (*s == '-') { sign = -1; s++; }
-    else if (*s == '+') { s++; }
-    if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-        s += 2; base = 16;
-    } else if (base == 0 && s[0] == '0') {
-        s++; base = 8;
-    } else if (base == 0) {
-        base = 10;
+static unsigned long long strtou_core(const char *s0, char **endp, int base,
+                                      int *neg, int *over) {
+    const char *s = s0;
+    *neg = *over = 0;
+    while (*s == ' ' || (*s >= 9 && *s <= 13)) s++;     /* isspace */
+    if (*s == '-') { *neg = 1; s++; }
+    else if (*s == '+') s++;
+    if (base < 0 || base == 1 || base > 36) {
+        errno = EINVAL;
+        if (endp) *endp = (char *)s0;
+        return 0;
     }
-    long v = 0;
-    while (*s) {
-        int d = hexval(*s);
-        if (d < 0 || d >= base) break;
-        v = v * base + d;
-        s++;
+    if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') &&
+        digval((unsigned char)s[2]) < 16) {
+        s += 2;
+        base = 16;
+    } else if (base == 0)
+        base = s[0] == '0' ? 8 : 10;
+    const char *digits = s;
+    unsigned long long v = 0, lim = ~0ULL / (unsigned)base;
+    for (;; s++) {
+        int d = digval((unsigned char)*s);
+        if (d >= base) break;
+        if (v > lim || v * (unsigned)base > ~0ULL - (unsigned)d) *over = 1;
+        else v = v * (unsigned)base + (unsigned)d;
     }
-    if (endp) *endp = (char *)s;
-    return sign * v;
-}
-
-unsigned long long strtoull(const char *s, char **endp, int base) {
-    while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-    if (*s == '+') s++;
-    else if (*s == '-') s++;      /* C allows a sign; result wraps mod 2^64 */
-    if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-        s += 2; base = 16;
-    } else if (base == 0 && s[0] == '0') {
-        s++; base = 8;
-    } else if (base == 0) {
-        base = 10;
-    }
-    unsigned long long v = 0;
-    while (*s) {
-        int d = hexval(*s);
-        if (d < 0 || d >= base) break;
-        v = v * (unsigned)base + (unsigned)d;
-        s++;
+    if (s == digits) {
+        if (endp) *endp = (char *)s0;
+        return 0;
     }
     if (endp) *endp = (char *)s;
     return v;
+}
+
+long strtol(const char *s, char **endp, int base) {
+    int neg, over;
+    unsigned long long v = strtou_core(s, endp, base, &neg, &over);
+    if (over || v > (neg ? 0x8000000000000000ULL : 0x7fffffffffffffffULL)) {
+        errno = ERANGE;
+        return neg ? (long)0x8000000000000000ULL : 0x7fffffffffffffffL;
+    }
+    return neg ? (long)(0 - v) : (long)v;
+}
+
+long long strtoll(const char *s, char **endp, int base) {
+    return strtol(s, endp, base);
+}
+
+unsigned long long strtoull(const char *s, char **endp, int base) {
+    int neg, over;
+    unsigned long long v = strtou_core(s, endp, base, &neg, &over);
+    if (over) {
+        errno = ERANGE;
+        return ~0ULL;
+    }
+    return neg ? 0 - v : v;
 }
 
 unsigned long strtoul(const char *s, char **endp, int base) {
@@ -319,10 +312,14 @@ int unsetenv(const char *name) {
     return 0;
 }
 
+/* putenv as glibc's: STRING itself goes in. A STRING with no '=' takes its
+ * name out (unsetenv), and an empty name is a name -- "=x" goes in as it is,
+ * which `env -i =x` shows (batch 30, logs/utilgate/env.sh); this refused
+ * both with EINVAL. */
 int putenv(char *string) {
     if (!string) { errno = EINVAL; return -1; }
     size_t klen = env_keylen(string);
-    if (klen == 0 || string[klen] != '=') { errno = EINVAL; return -1; }
+    if (string[klen] != '=') return klen ? unsetenv(string) : 0;
     if (env_take_ownership() < 0) { errno = ENOMEM; return -1; }
     int idx = env_find_index(string, klen);
     if (idx >= 0) {
@@ -364,264 +361,6 @@ int rand(void) {
     g_rng ^= g_rng << 25;
     g_rng ^= g_rng >> 27;
     return (int)((g_rng * 0x2545F4914F6CDD1DULL) >> 33) & RAND_MAX;
-}
-
-/* ============================================================
- *  Allocator
- * ============================================================ */
-
-#define ALIGN          16
-#define HDR_SIZE       (sizeof(struct chunk))
-#define MIN_USER_BYTES 16
-#define MIN_TOTAL      (HDR_SIZE + MIN_USER_BYTES)
-#define GROW_CHUNK     (16 * 1024)
-#define IN_USE_BIT     ((size_t)1)
-#define MAGIC_USED     ((void *)0xA110CA7EDF00DFACULL)
-
-struct chunk {
-    size_t        size_with_flags;     /* payload size + IN_USE bit */
-    struct chunk *next_free;           /* used only when !IN_USE */
-};
-
-static struct chunk *g_free_head     = 0;
-static char         *g_heap_end      = 0;   /* one-past-end of valid heap */
-
-static inline size_t round_up(size_t n, size_t a) {
-    return (n + (a - 1)) & ~(a - 1);
-}
-
-static inline size_t chunk_payload(struct chunk *c) {
-    return c->size_with_flags & ~IN_USE_BIT;
-}
-
-static inline int chunk_is_used(struct chunk *c) {
-    return (c->size_with_flags & IN_USE_BIT) != 0;
-}
-
-/* Brand-new heap region [base, base+bytes) -> a single big free chunk
- * stitched onto the list head. The wilderness end is bumped so the
- * coalescer doesn't walk past it. */
-static void heap_admit(void *base, size_t bytes) {
-    if (bytes < MIN_TOTAL) return;
-    struct chunk *c = (struct chunk *)base;
-    c->size_with_flags = bytes - HDR_SIZE;       /* payload = bytes - hdr */
-    c->next_free = g_free_head;
-    g_free_head = c;
-    char *end = (char *)base + bytes;
-    if (end > g_heap_end) g_heap_end = end;
-}
-
-/* sbrk() the wilderness up by `req_bytes`, then mint a chunk and add
- * it to the free list. Returns 0 on success, -1 on OOM. */
-static int heap_grow(size_t req_bytes) {
-    size_t want = req_bytes < GROW_CHUNK ? GROW_CHUNK : req_bytes;
-    /* Round up to a page so subsequent calls keep good alignment. */
-    want = round_up(want, 4096);
-    void *base = sbrk((long)want);
-    if (base == (void *)-1) return -1;
-    heap_admit(base, want);
-    return 0;
-}
-
-/* If `c` is followed in memory by another free chunk (according to the
- * size+next links walking from the free-list head we found `c` on),
- * splice them together. Doesn't try arbitrary-distance coalescing --
- * just immediate forward neighbour, which keeps the cost O(1). */
-static void coalesce_forward(struct chunk *c) {
-    /* Find pointer to next-in-memory candidate, but bail out if
-     * walking the size header would step past the heap we own. */
-    char *n_addr = (char *)c + HDR_SIZE + chunk_payload(c);
-    if (n_addr + HDR_SIZE > g_heap_end) return;
-    struct chunk *n = (struct chunk *)n_addr;
-    /* Only coalesce if `n` is in our free list (i.e. not in use).
-     * We detect that by walking the free list looking for `n`; for
-     * typical workloads the free list is short so this stays cheap. */
-    if (chunk_is_used(n)) return;
-    /* Stitch n out of the free list. */
-    struct chunk **link = &g_free_head;
-    while (*link && *link != n) link = &(*link)->next_free;
-    if (!*link) return;     /* not on list (must be in another arena) */
-    *link = n->next_free;
-    /* Merge sizes (header of n becomes payload of c). */
-    c->size_with_flags = chunk_payload(c) + HDR_SIZE + chunk_payload(n);
-    /* keep IN_USE bit at 0 */
-}
-
-/* Split `c` (free) so it carries exactly `payload_want` bytes; the
- * remainder (if big enough) becomes a new free chunk on the list. */
-static void split(struct chunk *c, size_t payload_want) {
-    size_t total = chunk_payload(c);
-    if (total < payload_want + MIN_TOTAL) return;       /* too small to split */
-    struct chunk *rest = (struct chunk *)((char *)c + HDR_SIZE + payload_want);
-    rest->size_with_flags = total - payload_want - HDR_SIZE;
-    rest->next_free = g_free_head;
-    g_free_head = rest;
-    c->size_with_flags = payload_want;
-}
-
-/* Slice 62b: merge EVERY address-adjacent free-chunk pair. Runs only when a
- * fit failed (pressure), so the O(list^2)-ish cost is off the hot path.
- * coalesce_forward() mutates the list, so restart the walk after each
- * successful merge. Returns 1 if anything merged. */
-static int coalesce_all(void) {
-    int merged_any = 0, merged;
-    do {
-        merged = 0;
-        for (struct chunk *c = g_free_head; c; c = c->next_free) {
-            size_t before = chunk_payload(c);
-            coalesce_forward(c);
-            if (chunk_payload(c) != before) { merged = merged_any = 1; break; }
-        }
-    } while (merged);
-    return merged_any;
-}
-
-/* Slice 62b: BEST-fit. The old FIRST-fit over the LIFO free list leaked the
- * heap under chromewin's frame churn: each frame free()s its ~1.9 MiB pixel
- * block onto the list HEAD, the next frame's SMALL decode temporaries
- * first-fit into that freshest big chunk and split it, and the following
- * big request no longer fits the nibbled remainder -- so the wilderness tip
- * grew by up to a whole frame per cycle until the 64 MiB pool was gone
- * ("outofmem" while small allocations still succeeded). Best-fit sends
- * small requests to small chunks and preserves recycled big chunks for
- * big requests; the churn reaches a steady state. */
-static void *try_alloc(size_t n) {
-    struct chunk **link = &g_free_head, **best = 0;
-    while (*link) {
-        size_t pl = chunk_payload(*link);
-        if (pl >= n && (!best || pl < chunk_payload(*best))) {
-            best = link;
-            if (pl == n) break;                 /* exact fit: stop early */
-        }
-        link = &(*link)->next_free;
-    }
-    if (!best) return 0;
-    struct chunk *c = *best;
-    *best = c->next_free;                       /* remove from free list */
-    split(c, n);
-    c->size_with_flags = chunk_payload(c) | IN_USE_BIT;
-    c->next_free = (struct chunk *)MAGIC_USED;
-    return (void *)((char *)c + HDR_SIZE);
-}
-
-void *malloc(size_t n) {
-    if (n == 0) n = 1;
-    n = round_up(n, ALIGN);
-
-    for (;;) {
-        void *p = try_alloc(n);
-        if (p) return p;
-        /* No fit: merge adjacent free chunks and retry before growing --
-         * the merge either reduces the chunk count (finite, terminates)
-         * or reports nothing left to merge. */
-        if (coalesce_all()) continue;
-        if (heap_grow(n + HDR_SIZE) != 0) {
-            errno = ENOMEM;
-            return 0;
-        }
-    }
-}
-
-/* POSIX aligned allocation. malloc already hands out 16-byte-aligned
- * payloads; alignments beyond that are only needed for SIMD (disabled in
- * the codec builds), so this is malloc-backed and the pointer is a normal
- * free()-able allocation. */
-int posix_memalign(void **memptr, size_t alignment, size_t size) {
-    (void)alignment;
-    if (!memptr) return EINVAL;
-    void *p = malloc(size);
-    *memptr = p;
-    return p ? 0 : ENOMEM;
-}
-
-void *calloc(size_t nmemb, size_t sz) {
-    /* Overflow guard: refuse n*sz that would wrap. */
-    if (sz != 0 && nmemb > ((size_t)-1) / sz) {
-        errno = ENOMEM;
-        return 0;
-    }
-    size_t bytes = nmemb * sz;
-    void *p = malloc(bytes);
-    if (p) memset(p, 0, bytes);
-    return p;
-}
-
-void free(void *p) {
-    if (!p) return;
-    struct chunk *c = (struct chunk *)((char *)p - HDR_SIZE);
-    /* Detect double free / corruption: c->next_free was set to
-     * MAGIC_USED on alloc; if it's anything else we trip an assert. */
-    if (c->next_free != (struct chunk *)MAGIC_USED) {
-        /* Best-effort: write a diagnostic and abort. We use the raw
-         * write helper to avoid going through the FILE* layer (which
-         * itself uses malloc). */
-        const char *m = "[libtoby] free(): double free or corruption\n";
-        __toby_raw_write(2, m, strlen(m));
-        abort();
-    }
-    c->size_with_flags = chunk_payload(c);          /* clear IN_USE */
-    c->next_free = g_free_head;
-    g_free_head = c;
-    coalesce_forward(c);
-}
-
-void *realloc(void *p, size_t n) {
-    if (!p) return malloc(n);
-    if (n == 0) { free(p); return 0; }
-
-    struct chunk *c = (struct chunk *)((char *)p - HDR_SIZE);
-    size_t cur = chunk_payload(c);
-    size_t want = round_up(n, ALIGN);
-
-    if (want <= cur) {
-        /* Shrink: split off the tail back into the free list. */
-        if (cur >= want + MIN_TOTAL) {
-            struct chunk *rest = (struct chunk *)((char *)c + HDR_SIZE + want);
-            rest->size_with_flags = cur - want - HDR_SIZE;
-            rest->next_free = g_free_head;
-            g_free_head = rest;
-            c->size_with_flags = want | IN_USE_BIT;
-        }
-        return p;
-    }
-
-    /* Try in-place grow if the next chunk in memory is free + big
-     * enough. Bail out if it would lie past the wilderness. */
-    char *nxt_addr = (char *)c + HDR_SIZE + chunk_payload(c);
-    if (nxt_addr + HDR_SIZE > g_heap_end) goto fallback;
-    struct chunk *nxt = (struct chunk *)nxt_addr;
-    if (!chunk_is_used(nxt)) {
-        size_t combined = cur + HDR_SIZE + chunk_payload(nxt);
-        if (combined >= want) {
-            /* Splice nxt out of free list. */
-            struct chunk **link = &g_free_head;
-            while (*link && *link != nxt) link = &(*link)->next_free;
-            if (*link) {
-                *link = nxt->next_free;
-                c->size_with_flags = combined;
-                /* Maybe split off remainder. */
-                if (combined >= want + MIN_TOTAL) {
-                    struct chunk *rest = (struct chunk *)((char *)c + HDR_SIZE + want);
-                    rest->size_with_flags = combined - want - HDR_SIZE;
-                    rest->next_free = g_free_head;
-                    g_free_head = rest;
-                    c->size_with_flags = want;
-                }
-                c->size_with_flags |= IN_USE_BIT;
-                return p;
-            }
-        }
-    }
-
-fallback:
-    /* Fall back to malloc + copy + free. */
-    {
-        void *q = malloc(n);
-        if (!q) return 0;
-        memcpy(q, p, cur);
-        free(p);
-        return q;
-    }
 }
 
 /* ============================================================

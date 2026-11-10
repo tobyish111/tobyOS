@@ -151,7 +151,7 @@ static void load_note(int idx){
 static void save_note(void){
     if(!g_filename[0])return;
     char path[128]; build_path(path,sizeof(path),g_filename);
-    long fd=sys_open(path,O_WRONLY|O_CREAT|O_TRUNC,0); if(fd<0)return;
+    long fd=sys_open(path,O_WRONLY|O_CREAT|O_TRUNC,0666); if(fd<0)return;
     if(g_buf_len>0)sys_write_fd((int)fd,g_buf,(usize)g_buf_len);
     sys_close((int)fd); g_modified=0;
     refresh_notes();
@@ -182,7 +182,7 @@ static void do_rename(const char *new_name){
     if(!g_filename[0]||!new_name[0])return;
     if(streq(g_filename,new_name))return;
     char op[128],np[128]; build_path(op,sizeof(op),g_filename); build_path(np,sizeof(np),new_name);
-    long fd=sys_open(np,O_WRONLY|O_CREAT|O_TRUNC,0); if(fd<0)return;
+    long fd=sys_open(np,O_WRONLY|O_CREAT|O_TRUNC,0666); if(fd<0)return;
     if(g_buf_len>0)sys_write_fd((int)fd,g_buf,(usize)g_buf_len);
     sys_close((int)fd); sys_unlink(op);
     str_copy(g_filename,new_name,NAME_MAX_LEN); g_modified=0;
@@ -283,6 +283,14 @@ static void editor_event(struct tk_window *w,struct tk_widget *c,struct tk_event
         update_status(); tk_redraw(w);
     } else if(ev->type==TK_EV_KEY){
         editor_key(ev->key); update_status(); tk_redraw(w);
+    } else if(ev->type==TK_EV_WHEEL&&ev->wheel){
+        /* View-only scroll; the caret stays put until a key moves it
+         * (which then calls ensure_visible and snaps back, as expected). */
+        g_scroll_y-=(int)ev->wheel*TK_WHEEL_LINES;
+        int maxs=g_total_lines-g_vis_rows; if(maxs<0)maxs=0;
+        if(g_scroll_y>maxs)g_scroll_y=maxs;
+        if(g_scroll_y<0)g_scroll_y=0;
+        tk_redraw(w);
     }
 }
 
@@ -367,8 +375,8 @@ static void rebuild(void){
 int main(int argc,char **argv);
 int main(int argc,char **argv){
     (void)argc;(void)argv;
-    sys_mkdir("/data",0);
-    sys_mkdir(NOTES_DIR,0);
+    sys_mkdir("/data",0777);
+    sys_mkdir(NOTES_DIR,0777);
 
     if(tk_window_open(&win,640,440,"Notes")!=0)return 1;
     g_base=tk_checkpoint(&win);

@@ -20,6 +20,7 @@
 #include <tobyos/socket.h>
 #include <tobyos/tcp.h>
 #include <tobyos/signal.h>   /* EINTR_RET */
+#include <tobyos/inotify.h>  /* real inotify fds (2026-08-22) */
 #include <tobyos/gui.h>
 #include <tobyos/term.h>
 #include <tobyos/heap.h>
@@ -31,6 +32,7 @@
 #include <tobyos/mmap.h>   /* memfd_* (FILE_KIND_MEMFD) */
 #include <tobyos/klibc.h>
 #include <tobyos/rng.h>   /* getrandom + /dev/urandom entropy */
+#include <tobyos/blk.h>   /* FILE_KIND_BLKDEV (finding 198) */
 #include <tobyos/cpu.h>
 #include <tobyos/sched.h>
 #include <tobyos/proc.h>   /* current_proc -- [efd] Mojo-notification trace */
@@ -276,7 +278,7 @@ static long timerfd_read(struct file *f, void *buf, size_t n) {
             return -EFD_EAGAIN;
         }
         struct proc *p = current_proc();
-        if (p && p->pending_signals) return EINTR_RET;
+        if (p && SIG_SHOULD_EINTR(p)) return EINTR_RET;
         sched_yield();
     }
 }
@@ -314,10 +316,14 @@ static long signalfd_read(struct file *f, void *buf, size_t n) {
     for (;;) {
         uint64_t hit = p->pending_signals & s->mask;
         if (hit) {
+            /* the lowest signal pending, 1..64: it scanned bits 0..31, so
+             * a realtime signal (32..64) never came out of a signalfd
+             * (batch 32, with finding 195) */
             int signo = 0;
-            for (int i = 0; i < 32; i++)
-                if (hit & (1ull << i)) { signo = i; break; }
-            p->pending_signals   &= ~(1u << signo);
+            for (int i = 1; i < SIG_MAX; i++)
+                if (hit & SIGMASK(i)) { signo = i; break; }
+            if (!signo) return -ABI_EAGAIN;
+            p->pending_signals   &= ~SIGMASK(signo);   /* 64-signal mask */
             p->sigstate.pending  &= ~SIGMASK(signo);
             uint8_t si[128];
             memset(si, 0, sizeof si);
@@ -333,12 +339,45 @@ static long signalfd_read(struct file *f, void *buf, size_t n) {
     }
 }
 
+/* Stamp the canonical path a handle was opened by (see file.h). Replaces
+ * any prior stamp; a NULL path or OOM leaves the handle anonymous. */
+void file_set_open_path(struct file *f, const char *kpath) {
+    if (!f) return;
+    if (f->open_path) { kfree(f->open_path); f->open_path = 0; }
+    if (!kpath || !kpath[0]) return;
+    size_t n = strlen(kpath) + 1;
+    f->open_path = (char *)kmalloc(n);
+    if (f->open_path) memcpy(f->open_path, kpath, n);
+}
+
 struct file *file_clone(struct file *src) {
     if (!src) return 0;
+    /* TRIPWIRE: every counter file_clone bumps (pipe readers/writers,
+     * vfs_refs, socket refs) is a plain int whose only guard is the BKL --
+     * see file.h and proc.c's slice 89 note. A clone without it can lose an
+     * update against a close on another CPU, and a lost pipe count frees
+     * the pipe early and then TWICE (hardware 2026-09-25: `double free
+     * ... by=first=` inside file_close -> pipe_close_reader). Warn-once,
+     * so a regression names itself instead of panicking hours later. */
+    if (!bkl_held()) {
+        static int unlocked_warned;
+        if (unlocked_warned < 4) {
+            unlocked_warned++;
+            struct proc *cp = current_proc();
+            kprintf("[file] file_clone kind=%d WITHOUT the BKL (pid=%d) "
+                    "caller=%p\n", (int)src->kind, cp ? cp->pid : -1,
+                    __builtin_return_address(0));
+        }
+    }
     struct file *f = (struct file *)kmalloc(sizeof(*f));
     if (!f) return 0;
     memset(f, 0, sizeof(*f));
     f->kind = src->kind;
+    /* a duplicate of ANY kind keeps the access mode and the status flags
+     * (finding 235): only a file's mode was copied, so a dup of /dev/null
+     * or of a disk said O_RDONLY to F_GETFL */
+    f->o_accmode = src->o_accmode;
+    f->fl_status = src->fl_status;
     switch (src->kind) {
     case FILE_KIND_CONSOLE:
     case FILE_KIND_NULL:
@@ -346,10 +385,26 @@ struct file *file_clone(struct file *src) {
     case FILE_KIND_PIPE_R:
         f->pipe = src->pipe;
         f->pipe->readers++;
+        f->pipe_nonblock = src->pipe_nonblock;
         break;
     case FILE_KIND_PIPE_W:
         f->pipe = src->pipe;
         f->pipe->writers++;
+        f->pipe_nonblock = src->pipe_nonblock;
+        break;
+    case FILE_KIND_PIPE_RW:                    /* a FIFO's both ends */
+        f->pipe = src->pipe;
+        f->pipe->readers++;
+        f->pipe->writers++;
+        f->pipe_nonblock = src->pipe_nonblock;
+        break;
+    case FILE_KIND_INOTIFY:
+        /* dup/fork share the INSTANCE; the last close releases it. Found
+         * live: linux-watch bit4 forks, the child exits, and its
+         * close_all_fds released the parent's instance mid-poll -- a dead
+         * instance reads as "ready" (no-block) with nothing to read. */
+        f->inotify_id = src->inotify_id;
+        inotify_ref(f->inotify_id);
         break;
     case FILE_KIND_VFS:
         /* Milestone 25A: dup()/dup2() of a VFS fd. The two struct file
@@ -457,6 +512,16 @@ struct file *file_clone(struct file *src) {
          * so a clone just remembers which device it reads. */
         f->dir_off = src->dir_off;
         break;
+    case FILE_KIND_BLKDEV:
+        /* A disk's descriptor duplicated or inherited is the same open
+         * file: its device, and one offset that each copy moves, as
+         * Linux's (finding 279). With no case here the copy had no device,
+         * and `( dd ) < /dev/sdb1` read EIO. */
+        if (!src->vfs_refs) { kfree(f); return 0; }
+        f->blkdev   = src->blkdev;
+        f->vfs_refs = src->vfs_refs;
+        (*f->vfs_refs)++;
+        break;
     case FILE_KIND_DRM:
         /* Slice 104: dir_off holds the DRM char-device MINOR (renderD128
          * -> 128, card0 -> 0), and the whole device is global state, so a
@@ -468,12 +533,25 @@ struct file *file_clone(struct file *src) {
         f->dir_off = src->dir_off;
         break;
     }
+    /* Every kind carries its opening path across dup/fork (a clone that
+     * failed above already returned). Allocation failure degrades to an
+     * anonymous handle, never a failed dup. */
+    if (src->open_path) {
+        size_t n = strlen(src->open_path) + 1;
+        f->open_path = (char *)kmalloc(n);
+        if (f->open_path) memcpy(f->open_path, src->open_path, n);
+    }
     return f;
 }
 
 void file_close(struct file *f) {
     if (!f) return;
     switch (f->kind) {
+    case FILE_KIND_RTC: {                      /* finding 157 */
+        extern void rtc_dev_release(void);
+        rtc_dev_release();
+        break;
+    }
     case FILE_KIND_SND:
         /* Audio slice 3: release the substream and stop the DAC, or the
          * next open sees in_use and returns ENOENT forever. */
@@ -483,6 +561,12 @@ void file_close(struct file *f) {
         pipe_close_reader(f->pipe);
         break;
     case FILE_KIND_PIPE_W:
+        pipe_close_writer(f->pipe);
+        break;
+    case FILE_KIND_PIPE_RW:
+        /* the reader first: the writer count it still holds keeps the
+         * pipe alive until the second close */
+        pipe_close_reader(f->pipe);
         pipe_close_writer(f->pipe);
         break;
     case FILE_KIND_VFS:
@@ -499,6 +583,11 @@ void file_close(struct file *f) {
          * close so we don't leak the priv. */
         if (f->vfs_refs) {
             if (--(*f->vfs_refs) == 0) {
+                /* The open file description dies here, and flock(2) locks
+                 * are owned by the DESCRIPTION -- release before the refs
+                 * pointer (their owner identity) is freed. */
+                { extern void fl_release_ofd(void *ofd);
+                  fl_release_ofd(f->vfs_refs); }
                 if (f->vfs.ops) (void)f->vfs.ops->close(&f->vfs);
                 kfree(f->vfs_refs);
             }
@@ -549,14 +638,121 @@ void file_close(struct file *f) {
     case FILE_KIND_NSFD:
         ns_file_close(f);      /* drops the fd's reference on the namespace */
         break;
+    case FILE_KIND_INOTIFY:
+        inotify_release(f->inotify_id);
+        break;
     case FILE_KIND_MEMFD:
         memfd_unref(f->memfd);   /* frees pages+object at the last ref */
+        break;
+    case FILE_KIND_BLKDEV:       /* the description goes with its last copy */
+        if (f->vfs_refs && --(*f->vfs_refs) == 0) kfree(f->vfs_refs);
         break;
     case FILE_KIND_CONSOLE:
     case FILE_KIND_NULL:
         break;
     }
+    if (f->open_path) kfree(f->open_path);
     kfree(f);
+}
+
+/* ---- shared offset (see struct vfs_ofd in file.h) ------------------------ */
+
+static struct vfs_ofd *file_ofd(struct file *f) {
+    /* Only VFS handles and disks carry a description; refs is the first
+     * member, so the pointer the rest of the kernel knows as `int *vfs_refs`
+     * IS the struct. */
+    if (!f || (f->kind != FILE_KIND_VFS && f->kind != FILE_KIND_BLKDEV) ||
+        !f->vfs_refs) return 0;
+    return (struct vfs_ofd *)(void *)f->vfs_refs;
+}
+
+/* In the kernel all three standard descriptors are the same console, so the
+ * fd number does not select anything -- but the CALLER still needs a real
+ * object to clone. See file_std_handle() in file.h. */
+struct file *file_std_handle(int fd) {
+    (void)fd;
+    return console_file_make();
+}
+
+size_t file_pos_get(struct file *f) {
+    struct vfs_ofd *o = file_ofd(f);
+    return o ? o->pos : (f ? f->vfs.pos : 0);
+}
+
+void file_pos_set(struct file *f, size_t pos) {
+    if (!f) return;
+    struct vfs_ofd *o = file_ofd(f);
+    if (o) o->pos = pos;
+    f->vfs.pos = pos;          /* keep the embedded copy consistent */
+}
+
+/* The driver advances the cursor it is handed, so load the shared offset
+ * before the call and store the advanced value back after it. */
+static void file_pos_load(struct file *f) {
+    struct vfs_ofd *o = file_ofd(f);
+    if (o) f->vfs.pos = o->pos;
+}
+static void file_pos_store(struct file *f) {
+    struct vfs_ofd *o = file_ofd(f);
+    if (o) o->pos = f->vfs.pos;
+}
+
+/* A DISK'S BYTES AS A FILE (finding 198): N bytes at the description's
+ * offset; short at the device's end, 0 past it. WRITE says which way.
+ * The whole sectors in the range go to the driver as one request, as
+ * many as it takes (finding 276: a request a sector, each a SCSI command
+ * of its own on a USB stick, read the box's stick at 168 KB/s); a sector
+ * the range only partly covers goes through a bounce buffer, read first
+ * for a write. A request that fails is tried again a sector at a time,
+ * so the count returned is what the device did give. */
+static long blkdev_rw(struct file *f, void *buf, size_t n, bool write) {
+    struct blk_dev *d = f->blkdev;
+    if (!d || d->gone) return -ABI_EIO;
+    /* the open's access mode, as a file's (finding 216): EBADF */
+    if ((f->o_accmode & 3) == (write ? 0 : 1)) return -ABI_EBADF;
+    uint64_t size = d->sector_count * (uint64_t)BLK_SECTOR_SIZE;
+    uint64_t at = file_pos_get(f);
+    if (at >= size) return write ? -ABI_ENOSPC : 0;
+    if (n > size - at) n = (size_t)(size - at);
+    uint8_t sec[BLK_SECTOR_SIZE];
+    uint8_t *b = (uint8_t *)buf;
+    size_t done = 0;
+    bool single = false;            /* after a failed run: a sector at a time */
+    while (done < n) {
+        uint64_t pos = at + done;
+        uint64_t lba = pos / BLK_SECTOR_SIZE;
+        size_t in = (size_t)(pos % BLK_SECTOR_SIZE);
+        if (in == 0 && n - done >= BLK_SECTOR_SIZE) {
+            size_t cnt = (n - done) / BLK_SECTOR_SIZE;  /* n <= SYS_MAX_RW */
+            if (single) cnt = 1;
+            int rc = write ? blk_write(d, lba, (uint32_t)cnt, b + done)
+                           : blk_read(d, lba, (uint32_t)cnt, b + done);
+            if (rc < 0) {
+                if (cnt == 1) break;
+                single = true;
+                continue;
+            }
+            /* a mounted filesystem's cache drops what it held of the range
+             * (finding 278) */
+            if (write) blk_notify_write(d, lba, cnt);
+            done += (size_t)cnt * BLK_SECTOR_SIZE;
+            continue;
+        }
+        size_t take = BLK_SECTOR_SIZE - in;
+        if (take > n - done) take = n - done;
+        if (blk_read(d, lba, 1, sec) < 0) break;
+        if (write) {
+            memcpy(sec + in, b + done, take);
+            if (blk_write(d, lba, 1, sec) < 0) break;
+            blk_notify_write(d, lba, 1);
+        } else {
+            memcpy(b + done, sec + in, take);
+        }
+        done += take;
+    }
+    if (done == 0 && n) return -ABI_EIO;
+    file_pos_set(f, (size_t)(at + done));
+    return (long)done;
 }
 
 long file_read(struct file *f, void *buf, size_t n) {
@@ -582,6 +778,13 @@ long file_read(struct file *f, void *buf, size_t n) {
     }
     case FILE_KIND_DEVNULL:
         return 0;                                  /* always EOF */
+    case FILE_KIND_BLKDEV:
+        return blkdev_rw(f, buf, n, false);
+    case FILE_KIND_DIR:
+        /* read(2) on a directory is EISDIR, as on Linux -- it fell to the
+         * default's -1, which userland reads as EPERM: bash's `read x < dir`
+         * said "read error: 0: Operation not permitted" (logs/b12 p59). */
+        return -ABI_EISDIR;
     case FILE_KIND_DEVZERO:
     case FILE_KIND_DEVFULL:                        /* slice 6: reads as zeroes */
         memset(buf, 0, n);
@@ -590,11 +793,37 @@ long file_read(struct file *f, void *buf, size_t n) {
         rng_fill(buf, n);
         return (long)n;                            /* never short, never blocks */
     case FILE_KIND_PIPE_R:
+    case FILE_KIND_PIPE_RW:
+        if (f->pipe_nonblock) return pipe_tryread(f->pipe, buf, n);
         return pipe_read(f->pipe, buf, n);
-    case FILE_KIND_VFS:
+    case FILE_KIND_VFS: {
         if (!f->vfs.ops || !f->vfs.ops->read) return -1;
-        return f->vfs.ops->read(&f->vfs, buf, n);
+        /* opened for writing only: EBADF, as Linux's (finding 216) */
+        if ((f->o_accmode & 3) == 1) return VFS_ERR_BADF;
+        file_pos_load(f);
+        long r = f->vfs.ops->read(&f->vfs, buf, n);
+        file_pos_store(f);
+        return r;
+    }
+    case FILE_KIND_INOTIFY: {
+        /* Block until at least one event is queued (pipe-style cooperative
+         * wait, EINTR on signals), unless IN_NONBLOCK. */
+        while (!inotify_readable(f->inotify_id)) {
+            if (inotify_nonblock(f->inotify_id)) return -ABI_EAGAIN;
+            struct proc *self = current_proc();
+            if (self && SIG_SHOULD_EINTR(self)) return EINTR_RET;
+            sched_yield();
+        }
+        long r = inotify_read(f->inotify_id, buf, n);
+        if (r < 0) return -1;
+        if (r == 0) return -ABI_EINVAL;   /* buffer < one event: Linux EINVAL */
+        return r;
+    }
     case FILE_KIND_SOCKET:
+        /* shutdown(SHUT_RD): reads are EOF from now on -- checked before the
+         * readiness probe because a shut socket is "ready" (ready to say EOF). */
+        if (f->sock && f->sock->shut_rd)
+            return 0;
         /* Non-blocking socket with nothing to read: EAGAIN, never park. Chrome
          * reads its TCP sockets with plain read() (not recv), so the check has
          * to live here as well as in the recv path -- and an optimistic read
@@ -662,15 +891,43 @@ long file_write(struct file *f, const void *buf, size_t n) {
         return (long)n;                            /* swallow everything */
     case FILE_KIND_DEVFULL:
         return -ABI_ENOSPC;                        /* slice 6: always full */
+    case FILE_KIND_BLKDEV:
+        return blkdev_rw(f, (void *)buf, n, true);
     case FILE_KIND_DEVRANDOM:
         rng_mix(buf, n);                           /* writes seed the pool */
         return (long)n;
     case FILE_KIND_PIPE_W:
+    case FILE_KIND_PIPE_RW:
+        if (f->pipe_nonblock) return pipe_trywrite(f->pipe, buf, n);
         return pipe_write(f->pipe, buf, n);
-    case FILE_KIND_VFS:
+    case FILE_KIND_VFS: {
         if (!f->vfs.ops || !f->vfs.ops->write) return -1;
-        return f->vfs.ops->write(&f->vfs, buf, n);
+        /* OPENED FOR READING ONLY: EBADF, as Linux's (finding 216). The
+         * write went through -- an open for reading is checked against
+         * read permission alone, so a file one may read and not write
+         * could be rewritten through it. */
+        if ((f->o_accmode & 3) == 0) return VFS_ERR_BADF;
+        file_pos_load(f);
+        /* O_APPEND for a driver that does not track the live size itself:
+         * the furthest this description knows of. ramfs/tmpfs/tobyfs then
+         * move it to the true end (see vfs_file.append). */
+        if (f->vfs.append && f->vfs.pos < f->vfs.size) f->vfs.pos = f->vfs.size;
+        long w = f->vfs.ops->write(&f->vfs, buf, n);
+        file_pos_store(f);
+        /* fd-addressed IN_MODIFY, possible since handles carry their
+         * opening path (2026-08-22) -- watchers of a file see writes
+         * through descriptors, not just path-level create/delete. */
+        if (w > 0 && f->open_path) {
+            extern void vfs_notify_modify(const char *);
+            vfs_notify_modify(f->open_path);
+        }
+        return w;
+    }
     case FILE_KIND_SOCKET:
+        /* shutdown(SHUT_WR): every later send is EPIPE (sys_write raises
+         * the SIGPIPE half, mirroring its pipe rule). */
+        if (f->sock && f->sock->shut_tx)
+            return -ABI_EPIPE;
         /* Connected TCP byte stream: write() == send(). A connect()-ed UDP
          * socket sends a datagram to its peer. */
         if (f->sock && f->sock->kind == SOCK_KIND_TCP && f->sock->tcp &&
@@ -687,6 +944,12 @@ long file_write(struct file *f, const void *buf, size_t n) {
         }
         if (f->sock && f->sock->kind == SOCK_KIND_NETLINK)
             return sock_netlink_send(f->sock, buf, n);
+        if (f->sock && f->sock->kind == SOCK_KIND_UDP && f->sock->is_v6 &&
+            f->sock->peer_port) {
+            long w = sock_sendto6(f->sock, buf, n,
+                                  &f->sock->peer6, f->sock->peer_port);
+            return (w < 0) ? -1 : w;
+        }
         if (f->sock && f->sock->kind == SOCK_KIND_UDP && f->sock->peer_port) {
             long w = sock_sendto(f->sock, buf, n,
                                  f->sock->peer_ip, f->sock->peer_port);

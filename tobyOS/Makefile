@@ -48,6 +48,27 @@ OVMF_VARS_SZ  := 540672
 # after this change no .d files exist yet, and stale objects from before it
 # would otherwise never notice a header edit. It costs a full kernel rebuild
 # when a top-level header is touched -- exactly the old behaviour, no worse.
+#
+# 2026-08-24 -- WHAT THIS STILL DOES NOT COVER, and what does.
+#
+# -MMD OMITS HEADERS FOUND VIA -isystem, and user programs get libtoby's
+# headers exactly that way (LIBTOBY_CFLAGS = ... -isystem $(LIBTOBY_INC)).
+# So every program .d file listed its own main.c and nothing else --
+# `wc -l programs/user_rm/user_rm.d` was 1 -- and editing
+# libtoby/include/sys/stat.h rebuilt libtoby while leaving every program's
+# object compiled against the OLD struct. That is not a stale build, it is
+# a silent ABI split: libtoby writes N bytes into a struct its caller sized
+# at M. The "touch all program sources when a struct grows" rule this block
+# says it retired was therefore still live for the directory it was written
+# about.
+#
+# -MD (which does list -isystem headers) was tried and REJECTED: on this
+# toolchain it also emits clang's own builtin headers by ABSOLUTE path
+# ("C:/msys64/ucrt64/lib/clang/22/include/stddef.h"), and a Windows drive
+# letter in a make prerequisite is a colon where make expects a target
+# separator. The fix is instead an explicit $(LIBTOBY_HEADERS) prerequisite
+# on every program object -- the same belt-and-braces the kernel already
+# gets from $(HEADERS). See LIBTOBY_PROGRAM_RULES.
 DEPFLAGS := -MMD -MP
 
 CFLAGS := --target=x86_64-elf \
@@ -97,6 +118,7 @@ DISK_IMG_BYTES     := 16777216
 # Source files -- add new .c files here and they'll be picked up by the
 # pattern rule below.
 C_SRCS := src/kernel.c \
+          src/devfs.c \
           src/klibc.c \
           src/serial.c \
           src/font8x8.c \
@@ -124,12 +146,16 @@ C_SRCS := src/kernel.c \
           src/tss.c \
           src/syscall.c \
           src/acpi.c \
+          src/smbios.c \
+          src/cputherm.c \
+          src/cpufreq_msr.c \
           src/apic.c \
           src/smp.c \
           src/vfs.c \
           src/ramfs.c \
           src/tmpfs.c \
           src/ptrace.c \
+          src/binfmt.c \
           src/initrd.c \
           src/proc.c \
           src/thread.c \
@@ -171,12 +197,19 @@ C_SRCS := src/kernel.c \
           src/blk_offset.c \
           src/partition.c \
           src/provision.c \
+          src/fsmatrix.c \
           src/tobyfs.c \
           src/fat32.c \
           src/ext4.c \
           src/ext2.c \
           src/usb_msc.c \
           src/file.c \
+          src/flock.c \
+          src/ptimer.c \
+          src/xattr.c \
+          src/shacrypt.c \
+          src/sysvipc.c \
+          src/vdso.c \
           src/pipe.c \
           src/signal.c \
           src/pci.c \
@@ -208,6 +241,8 @@ C_SRCS := src/kernel.c \
           src/tcp_shell.c \
           src/ssh.c \
           src/ssh_crypto.c \
+          src/des.c \
+          src/vnc.c \
           src/http.c \
           src/http_async.c \
           src/ws.c \
@@ -223,6 +258,7 @@ C_SRCS := src/kernel.c \
           src/service.c \
           src/session.c \
           src/users.c \
+          src/utmp.c \
           src/pkg.c \
           src/cap.c \
           src/perf.c \
@@ -330,7 +366,8 @@ C_SRCS := src/kernel.c \
 S_SRCS := src/isr_stubs.S \
           src/syscall_entry.S \
           src/ap_trampoline.S \
-          src/proc_switch.S
+          src/proc_switch.S \
+          src/vdso_blob.S
 
 # stage 13H: BearSSL X.509 chain validation (RSA + ECDSA) for TLS cert
 # verification. The decode/verify-only subset of the vendored reference
@@ -405,13 +442,16 @@ HEADERS := $(wildcard include/tobyos/*.h)
 # Full rules live further below. We declare the per-tool ELF list up
 # here so PROGRAMS (built with := immediate-expansion) can reference it.
 PORTS_SBASE_DIR    := ports/sbase
-PORTS_SBASE_TOOLS  := echo cat wc head ls grep
+PORTS_SBASE_TOOLS  := echo cat wc head ls grep \
+                      basename dirname sleep tee expr tr cut sort
 PORTS_SBASE_ELFS   := $(addprefix $(PORTS_SBASE_DIR)/,$(addsuffix .elf,$(PORTS_SBASE_TOOLS)))
 
 # Programs built and bundled into the boot initrd. Each is a tiny
 # static ELF; programs/user_hello/user_hello.elf becomes /bin/hello
 # inside the initramfs (see initrd-stage rules below).
-PROGRAMS := programs/hello/hello.elf \
+PROGRAMS := programs/awk/awk.elf \
+            programs/hello/hello.elf \
+            programs/systest/systest.elf \
             programs/user_hello/user_hello.elf \
             programs/user_bad/user_bad.elf \
             programs/user_echo/user_echo.elf \
@@ -448,6 +488,17 @@ PROGRAMS := programs/hello/hello.elf \
             programs/c_alloctest/c_alloctest.elf \
             programs/c_envtest/c_envtest.elf \
             programs/c_dynhello/c_dynhello.elf \
+            programs/lscpu/lscpu.elf \
+            programs/lspci/lspci.elf \
+            programs/lsusb/lsusb.elf \
+            programs/dmidecode/dmidecode.elf \
+            programs/sensors/sensors.elf \
+            programs/cpupower/cpupower.elf \
+            programs/tvi/tvi.elf \
+            programs/tvitest/tvitest.elf \
+            programs/tedit/tedit.elf \
+            programs/fsprobe/fsprobe.elf \
+            programs/datavol/datavol.elf \
             programs/devlist/devlist.elf \
             programs/drvtest/drvtest.elf \
             programs/usbtest/usbtest.elf \
@@ -477,24 +528,58 @@ PROGRAMS := programs/hello/hello.elf \
             programs/tobycc/tobycc.elf \
             programs/tobybuild/tobybuild.elf \
             programs/selfhosttest/selfhosttest.elf \
-            programs/user_sh/user_sh.elf \
             programs/user_pkg/user_pkg.elf \
             programs/user_svcctl/user_svcctl.elf \
             programs/user_ps/user_ps.elf \
             programs/user_top/user_top.elf \
-            programs/user_cp/user_cp.elf \
-            programs/user_mv/user_mv.elf \
-            programs/user_rm/user_rm.elf \
             programs/user_find/user_find.elf \
             programs/user_sort/user_sort.elf \
             programs/user_tee/user_tee.elf \
-            programs/user_env/user_env.elf \
+            programs/user_setsid/user_setsid.elf \
             programs/user_chmod/user_chmod.elf \
+            programs/user_vncpasswd/user_vncpasswd.elf \
             programs/user_df/user_df.elf \
             programs/user_mkdir/user_mkdir.elf \
             programs/user_touch/user_touch.elf \
+            programs/user_kill/user_kill.elf \
             programs/user_tail/user_tail.elf \
-            programs/user_uniq/user_uniq.elf \
+            programs/user_coreutil/user_coreutil.elf \
+            programs/user_admin/user_admin.elf \
+            programs/user_ssh/user_ssh.elf \
+            programs/user_utillinux/user_utillinux.elf \
+            programs/user_e2fs/user_e2fs.elf \
+            programs/user_gzip/user_gzip.elf \
+            programs/user_diffutils/user_diffutils.elf \
+            programs/user_bzip2/user_bzip2.elf \
+            programs/user_zutils/user_zutils.elf \
+            programs/user_sed/user_sed.elf \
+            programs/user_procnet/user_procnet.elf \
+            programs/user_power/user_power.elf \
+            programs/user_patch/user_patch.elf \
+            programs/user_locate/user_locate.elf \
+            programs/user_ln/user_ln.elf \
+            programs/user_shellutils/user_shellutils.elf \
+            programs/user_tar/user_tar.elf \
+            programs/user_zstd/user_zstd.elf \
+            programs/user_zip/user_zip.elf \
+            programs/user_dig/user_dig.elf \
+            programs/user_timesyncd/user_timesyncd.elf \
+            programs/user_strip/user_strip.elf \
+            programs/user_at/user_at.elf \
+            programs/user_archive/user_archive.elf \
+            programs/user_ed/user_ed.elf \
+            programs/user_cron/user_cron.elf \
+            programs/user_su/user_su.elf \
+            programs/user_moreutils/user_moreutils.elf \
+            programs/user_sysutils/user_sysutils.elf \
+            programs/user_netutils/user_netutils.elf \
+            programs/user_setpci/user_setpci.elf \
+            programs/user_systemctl/user_systemctl.elf \
+            programs/user_ping/user_ping.elf \
+            programs/user_ftp/user_ftp.elf \
+            programs/user_sudo/user_sudo.elf \
+            programs/user_ranlib/user_ranlib.elf \
+            programs/user_addr2line/user_addr2line.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
             programs/user_nc/user_nc.elf \
@@ -507,6 +592,17 @@ PROGRAMS := programs/hello/hello.elf \
             programs/pkgmgr/pkgmgr.elf \
             programs/init/init.elf \
             programs/sh/sh.elf \
+            programs/shparity/shparity.elf \
+            programs/oilspec/oilspec.elf \
+            programs/id/id.elf \
+            programs/newgrp/newgrp.elf \
+            programs/ttyparity/ttyparity.elf \
+            programs/spechelp/spechelp.elf \
+            programs/tsh/tsh.elf \
+            programs/tjoinchurn/tjoinchurn.elf \
+            programs/waittest/waittest.elf \
+            programs/stdiotest/stdiotest.elf \
+            programs/sigregs/sigregs.elf \
             programs/devmgr/devmgr.elf \
             programs/indexer/indexer.elf \
             programs/updater/updater.elf \
@@ -535,6 +631,12 @@ PROGRAMS := programs/hello/hello.elf \
 INITRD_STAGE := build/initrd
 INITRD_TAR   := build/initrd.tar
 
+# Bash-parity corpus. Wildcarded on purpose -- this is the ONE place the
+# initrd's otherwise-explicit file list uses a glob, because the corpus is
+# meant to grow a case at a time and a case that silently failed to ship
+# would show up as a PASS. The tar list globs the staged copies to match.
+SHPARITY_CASES := $(wildcard initrd/etc/shparity/*.sh)
+
 # ---------- Disk image (tobyfs, milestone 6) ----------
 #
 # Backed by a 4 MiB raw file passed to QEMU as the IDE primary master.
@@ -546,6 +648,14 @@ INITRD_TAR   := build/initrd.tar
 DISK_IMG       := disk.img
 MKFS_SRC       := tools/mkfs_tobyfs.c
 MKFS_BIN       := build/mkfs_tobyfs
+LDSOCACHE_SRC  := tools/mkldsocache.c
+LDSOCACHE_BIN  := build/mkldsocache
+# vDSO (2026-08-23): a real Linux shared object built alongside the kernel
+# and embedded via src/vdso_blob.S. Compiled with LINUX-target flags, NOT
+# the freestanding kernel CFLAGS -- it runs in ring 3 of a glibc process.
+VDSO_SRC := tools/vdso/vdso.c
+VDSO_MAP := tools/vdso/vdso.map
+VDSO_SO  := build/vdso_image.so
 MKPKG_SRC      := tools/mkpkg.c
 MKPKG_BIN      := build/mkpkg
 MKDISK_GPT_SRC := tools/mkdisk_gpt.c
@@ -701,8 +811,42 @@ install-img: $(INSTALL_IMG)
 
 # ---------- Compile ----------
 
+# THE KERNEL'S BUILD ID -- the commit it was built from, "-dirty" when src/ or
+# include/ differ from it. Readable on a running box at
+# /proc/sys/kernel/tobyos_build and logged at boot. It exists because a flash
+# that changed only the kernel could not be told apart from the image before
+# it: /bin/tsh was byte-identical and nothing else named the build.
+#
+# The header is rewritten only when the id CHANGES, so an unchanged tree does
+# not recompile what includes it.
+# THE TREE IS CHECKED OUT WITH core.autocrlf=true, which lives in Git for
+# Windows' SYSTEM config -- and make runs with MSYS2's /usr/bin first, whose
+# own git never reads that file. It saw every CRLF file as changed (21 files,
+# ~60k lines) and stamped a clean build `-dirty`. So the setting is passed
+# explicitly, and --shortstat (content, not the stat cache) decides.
+KBUILD_ID := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(if $(shell git -c core.autocrlf=true diff --shortstat HEAD -- src include 2>/dev/null),-dirty,)
+KBUILD_ID_H := build/kbuild_id.h
+# The kernel's version string, as uname -v gives Linux's ("#1 SMP ..."):
+# the date of the commit it is built from, in UTC, Linux's format -- the
+# version field was empty (finding 253).
+KBUILD_DATE := $(shell TZ=UTC0 git log -1 --date=format-local:'%a %b %e %H:%M:%S UTC %Y' --format=%cd 2>/dev/null || echo unknown)
+.PHONY: kbuild-id-force
+kbuild-id-force:
+$(KBUILD_ID_H): kbuild-id-force
+	@mkdir -p build
+	@printf '#define TOBYOS_BUILD_ID "%s"\n#define TOBYOS_BUILD_DATE "%s"\n' '$(KBUILD_ID)' '$(KBUILD_DATE)' > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
+src/procfs.o src/kernel.o src/syscall.o: $(KBUILD_ID_H)
+
 src/%.o: src/%.c $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
+
+# Loadable kernel modules: ET_REL objects built with the kernel's own flags
+# and never linked -- src/module.c relocates them against the ksym table at
+# insmod time. Staged under /lib/modules for insmod/modprobe/lsmod/rmmod.
+modules/%.ko: modules/%.c $(HEADERS) Makefile
+	$(CC) $(CFLAGS) -c $< -o $@
 
 # C14b: kfont.c runs stb_truetype's floating-point math, so it must be built
 # with SSE (overriding the kernel's default -mno-sse). The FP usage is bracketed
@@ -807,6 +951,19 @@ USER_CFLAGS := --target=x86_64-elf \
                -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
                -nostdlib -O2 -Wall -Wextra -std=c11 $(DEPFLAGS)
 
+programs/systest/systest.o: programs/systest/main.c
+	$(CC) $(LIBTOBY_CFLAGS) -c $< -o $@
+
+# The libtoby prerequisites BY NAME: $(LIBTOBY_CRT0) and $(LIBTOBY_AR) are
+# defined below, and make expands a rule's prerequisites as it reads the
+# rule -- so they were empty here, systest.elf never relinked, and the image
+# carried the September build's system() through every libtoby fix since
+# (batch 15: hwgate sh_system).
+programs/systest/systest.elf: programs/systest/systest.o libtoby/crt0.o libtoby/libtoby.a \
+                              programs/systest/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/systest/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/systest/systest.o $(LIBTOBY_AR)
+
 programs/hello/hello.o: programs/hello/main.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -897,6 +1054,7 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/errno.c \
                    $(LIBTOBY_SRC)/string.c \
                    $(LIBTOBY_SRC)/stdlib.c \
+                   $(LIBTOBY_SRC)/malloc.c \
                    $(LIBTOBY_SRC)/unistd.c \
                    $(LIBTOBY_SRC)/process.c \
                    $(LIBTOBY_SRC)/time.c \
@@ -932,6 +1090,14 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/h264_decode.c \
                    $(LIBTOBY_SRC)/media.c \
                    $(LIBTOBY_SRC)/fileassoc.c \
+                   $(LIBTOBY_SRC)/sha2.c \
+                   $(LIBTOBY_SRC)/deflate.c \
+                   $(LIBTOBY_SRC)/bzip2.c \
+                   $(LIBTOBY_SRC)/bzip2_enc.c \
+                   $(LIBTOBY_SRC)/zstd.c \
+                   $(LIBTOBY_SRC)/xz.c \
+                   $(LIBTOBY_SRC)/lzw.c \
+                   $(LIBTOBY_SRC)/md5sha1.c \
                    $(LIBTOBY_SRC)/render.c \
                    $(LIBTOBY_SRC)/clipboard_ext.c \
                    $(LIBTOBY_SRC)/unicode.c \
@@ -1045,6 +1211,23 @@ $(LIBTOBY_SRC)/oh264_glue.pic.o: $(LIBTOBY_SRC)/oh264_glue.cpp
 	$(CXX) $(LIBTOBY_CXXFLAGS) -fPIC -I third_party/openh264/api -c $< -o $@
 
 LIBTOBY_OBJS += $(LIBTOBY_SRC)/cxxrt.o $(LIBTOBY_SRC)/oh264_glue.o
+
+# Monocypher into LIBTOBY as well as the kernel.
+#
+# /bin/ssh needs exactly what the SSH server needs -- X25519, Ed25519,
+# SHA-512, ChaCha20-Poly1305 -- and monocypher was compiled only into the
+# kernel. It is dependency-free C99 (its own headers and nothing else), so
+# it drops straight into the freestanding userland build. Sharing the
+# implementation also means the client and the server cannot disagree about
+# a primitive, which is the kind of bug that shows up as an unexplained
+# handshake failure.
+LIBTOBY_OBJS += third_party/monocypher-4.0.2/src/monocypher.libtoby.o                 third_party/monocypher-4.0.2/src/optional/monocypher-ed25519.libtoby.o
+
+third_party/monocypher-4.0.2/src/%.libtoby.o: third_party/monocypher-4.0.2/src/%.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -I third_party/monocypher-4.0.2/src 	      -I third_party/monocypher-4.0.2/src/optional -c $< -o $@
+
+third_party/monocypher-4.0.2/src/optional/%.libtoby.o: third_party/monocypher-4.0.2/src/optional/%.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -I third_party/monocypher-4.0.2/src 	      -I third_party/monocypher-4.0.2/src/optional -c $< -o $@
 # (the .pic.o append lives next to the other vendored PIC appends,
 # after LIBTOBY_PIC_OBJS is first assigned)
 
@@ -1196,7 +1379,22 @@ $(LIBTOBY_AR): $(LIBTOBY_OBJS)
 # public POSIX-shape headers under libtoby/include only -- not the
 # kernel tree. Users wanting raw syscalls can still #include
 # <tobyos/abi/abi.h> by adding `-I ../../include` themselves.
-LIBTOBY_CFLAGS  := $(USER_CFLAGS) -isystem $(LIBTOBY_INC) -isystem third_party/wasm3
+# -I include: libtoby public headers may reference the SHARED kernel/userland
+# headers under include/tobyos (file_types.h is the first). LIBTOBY_BUILD_CFLAGS
+# already carries it for libtoby own sources; without it here, any PROGRAM that
+# includes such a header fails to compile while libtoby itself builds fine.
+LIBTOBY_CFLAGS  := $(USER_CFLAGS) -isystem $(LIBTOBY_INC) -isystem third_party/wasm3 -I include \
+                   -I third_party/monocypher-4.0.2/src \
+                   -I third_party/monocypher-4.0.2/src/optional
+
+# Every public libtoby header, as an explicit prerequisite for user-program
+# objects. -MMD cannot see these (they arrive through -isystem; see the
+# DEPFLAGS note at the top), so without this list a change to struct stat or
+# struct tk_event rebuilds libtoby and leaves every program's object holding
+# the old layout. Coarse on purpose: touching any libtoby header rebuilds
+# every program, which is what the kernel already does with $(HEADERS).
+LIBTOBY_HEADERS := $(wildcard $(LIBTOBY_INC)/*.h $(LIBTOBY_INC)/sys/*.h \
+                              $(LIBTOBY_INC)/toby/*.h $(LIBTOBY_INC)/toby/*.hpp)
 
 # ---------- Milestone 25D: libtoby.so (shared variant) ----------
 #
@@ -1342,7 +1540,7 @@ ldtoby: $(LDTOBY_SO)
 # Helper template: link a user program with crt0.o + main.o + libtoby.a.
 # Args: $(1) = directory under programs/, $(2) = output name (defaults to dir).
 define LIBTOBY_PROGRAM_RULES
-programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR)
+programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
 	$$(CC) $$(LIBTOBY_CFLAGS) -c $$< -o $$@
 
 programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
@@ -1364,7 +1562,7 @@ define LIBTOBY_KABI_PROGRAM_RULES
 # programs. EXTRA_CFLAGS only reaches kernel objects, so -DCHROME_FULL
 # silently missed chromewin and it exec'd the (now unstaged) headless-shell
 # path -- an exit-127 that looked like a loader failure.
-programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR)
+programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
 	$$(CC) $$(LIBTOBY_CFLAGS) $$(PROG_EXTRA_CFLAGS) -I include -c $$< -o $$@
 
 programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
@@ -1380,7 +1578,7 @@ endef
 # The program's own program.ld must define the .init_array/.fini_array
 # bounds for static constructors (see programs/user_cpptest/program.ld).
 define LIBTOBY_CPP_PROGRAM_RULES
-programs/$(1)/$(2).o: programs/$(1)/main.cpp $(LIBTOBY_AR)
+programs/$(1)/$(2).o: programs/$(1)/main.cpp $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
 	$$(CXX) $$(filter-out -std=c11,$$(LIBTOBY_CFLAGS)) \
 	      -std=c++17 -fno-exceptions -fno-rtti -nostdinc++ -c $$< -o $$@
 
@@ -1459,6 +1657,17 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,c_filedemo,c_filedemo))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_alloctest,c_alloctest))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_envtest,c_envtest))
 $(eval $(call LIBTOBY_PROGRAM_RULES,init,init))
+$(eval $(call LIBTOBY_PROGRAM_RULES,lspci,lspci))
+$(eval $(call LIBTOBY_PROGRAM_RULES,lscpu,lscpu))
+$(eval $(call LIBTOBY_PROGRAM_RULES,lsusb,lsusb))
+$(eval $(call LIBTOBY_PROGRAM_RULES,dmidecode,dmidecode))
+$(eval $(call LIBTOBY_PROGRAM_RULES,sensors,sensors))
+$(eval $(call LIBTOBY_PROGRAM_RULES,cpupower,cpupower))
+$(eval $(call LIBTOBY_PROGRAM_RULES,tvi,tvi))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,tvitest,tvitest))
+$(eval $(call LIBTOBY_PROGRAM_RULES,tedit,tedit))
+$(eval $(call LIBTOBY_PROGRAM_RULES,fsprobe,fsprobe))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,datavol,datavol))
 
 # ---------- M26A: peripheral test harness userland tools ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,devlist,devlist))
@@ -1572,7 +1781,78 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,debugger,debugger))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,pkgmgr,pkgmgr))
 
 # ---------- Advanced userland: shell, utilities, networking, GUI ----------
-$(eval $(call LIBTOBY_PROGRAM_RULES,user_sh,user_sh))
+# /bin/shparity -- the bash-parity gate. Runs every /etc/shparity/*.sh case
+# under BOTH the real GNU bash 5.2 we already ship and /bin/tsh, and requires
+# byte-identical stdout plus an identical exit status. See programs/shparity.
+$(eval $(call LIBTOBY_PROGRAM_RULES,shparity,shparity))
+
+# /bin/id and /bin/newgrp -- POSIX identity utilities. newgrp changes the
+# real/effective gid (checked against /etc/group membership) and execs a
+# fresh shell; id is its observer. Both read /etc/passwd + /etc/group.
+$(eval $(call LIBTOBY_PROGRAM_RULES,id,id))
+$(eval $(call LIBTOBY_PROGRAM_RULES,newgrp,newgrp))
+
+# /bin/ttyparity -- the INTERACTIVE bash-parity gate: both shells on real
+# pty pairs, transcripts compared byte-for-byte. See programs/ttyparity.
+$(eval $(call LIBTOBY_PROGRAM_RULES,ttyparity,ttyparity))
+
+# /bin/tjoinchurn -- churn for the NATIVE thread join/detach reap paths.
+# Those three call sites had no test at all: /bin/linux-join rides the futex
+# contract and never enters thread.c. See the header in its main.c.
+$(eval $(call LIBTOBY_PROGRAM_RULES,tjoinchurn,tjoinchurn))
+# /bin/waittest -- the NATIVE wait family (wait, waitpid -1 / 0 / -pgid).
+# libtoby's wait() failed with ENOENT in every native program until K2.
+$(eval $(call LIBTOBY_PROGRAM_RULES,waittest,waittest))
+# /bin/stdiotest -- libtoby's buffered stdio (K5): order against raw writes
+# and stderr, fork, exit/_exit, and the file position of buffered reads.
+$(eval $(call LIBTOBY_PROGRAM_RULES,stdiotest,stdiotest))
+# /bin/sigregs -- do rcx/r11 survive an ASYNCHRONOUS (timer-IRQ) signal? The
+# sigreturn path returned through SYSRETQ and could not restore them; GNU bash
+# faulted on it in the Oils corpus. Run by the distro fixture (@@sig_regs).
+$(eval $(call LIBTOBY_PROGRAM_RULES,sigregs,sigregs))
+# /bin/oilspec -- the THIRD-PARTY conformance gate. Same differential engine
+# as shparity, but over the ~2.8k-case Oils spec suite in third_party/oils-spec
+# rather than the 54 cases we wrote ourselves. See programs/oilspec.
+$(eval $(call LIBTOBY_PROGRAM_RULES,oilspec,oilspec))
+# The corpus's Python helpers (argv.py and friends) reimplemented in C, so the
+# gate does not depend on CPython and the host oracle runs the SAME code.
+$(eval $(call LIBTOBY_PROGRAM_RULES,spechelp,spechelp))
+
+# ---------- /bin/tsh: the shell language, hosted in userspace ----------
+#
+# src/shell.c is compiled TWICE -- once into the kernel (where the keyboard
+# poll loop drives it) and once here, where programs/tsh/host.c does. One
+# language implementation, two hosts, so the expansion/arithmetic/glob core
+# cannot drift between the kernel shell and /bin/tsh.
+#
+# The kernel object and this one are built from the same file with different
+# flags into DIFFERENT output paths, so neither can clobber the other. Note
+# -I include: shell.c speaks the kernel's headers (vfs.h, proc.h, file.h) and
+# the host implements that interface rather than the other way round.
+TSH_OBJS := programs/tsh/shell_hosted.o \
+            programs/tsh/host.o \
+            programs/tsh/lineedit.o \
+            programs/tsh/kstubs.o
+
+# -DSHELL_HOSTED: userspace exposes only the POSIX/bash builtin set, so the
+# kernel shell's convenience builtins (cat, ls, mkdir, ...) stop shadowing the
+# real utilities in /bin. See shell_hosted_builtin() in src/shell.c.
+# EXTRA_CFLAGS must reach THIS copy too. src/shell.c is compiled twice, and a
+# -D passed on the make line used to land only in the kernel's copy -- so
+# instrumentation added to diagnose a /bin/tsh failure silently was not in
+# /bin/tsh, and its absent output read as "this code path is never reached".
+# Same shape as the PROG_EXTRA_CFLAGS trap: a define reaching one half of a
+# twice-compiled file.
+programs/tsh/shell_hosted.o: src/shell.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) $(EXTRA_CFLAGS) -I include -DSHELL_HOSTED -c $< -o $@
+
+programs/tsh/%.o: programs/tsh/%.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/tsh/tsh.elf: $(TSH_OBJS) $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                      programs/tsh/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/tsh/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) $(TSH_OBJS) $(LIBTOBY_AR)
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_pkg,user_pkg))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_svcctl,user_svcctl))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ps,user_ps))
@@ -1583,12 +1863,73 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_rm,user_rm))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_find,user_find))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_sort,user_sort))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_tee,user_tee))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_setsid,user_setsid))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_env,user_env))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_chmod,user_chmod))
+# vncpasswd compiles src/des.c in, so it needs the kernel include path.
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_vncpasswd,user_vncpasswd))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_df,user_df))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_mkdir,user_mkdir))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_touch,user_touch))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_kill,user_kill))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_tail,user_tail))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_diffutils,user_diffutils))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_bzip2,user_bzip2))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_zutils,user_zutils))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_sed,user_sed))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_procnet,user_procnet))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_power,user_power))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_patch,user_patch))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_locate,user_locate))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_ln,user_ln))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_shellutils,user_shellutils))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_ls,user_ls))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_textutils,user_textutils))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_zstd,user_zstd))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_dig,user_dig))
+# /bin/timesyncd -- the clock from the network, a boot service (finding 157)
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_timesyncd,user_timesyncd))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_strip,user_strip))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_at,user_at))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_archive,user_archive))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ed,user_ed))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_cron,user_cron))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_su,user_su))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_moreutils,user_moreutils))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_sysutils,user_sysutils))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_netutils,user_netutils))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_setpci,user_setpci))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_systemctl,user_systemctl))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ping,user_ping))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_ftp,user_ftp))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_sudo,user_sudo))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_ranlib,user_ranlib))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_addr2line,user_addr2line))
+
+# gzip is the one user program that compiles a KERNEL source a second time:
+# src/puff.c is the inflater the browser uses for Content-Encoding: gzip, and
+# gunzip/zcat need exactly that. Sharing the source rather than copying it
+# keeps ONE implementation (same shape as programs/tsh/shell_hosted.o). It
+# needs `-I include` for <tobyos/puff.h>, so it cannot use the plain
+# LIBTOBY_PROGRAM_RULES macro.
+programs/user_gzip/user_gzip.o: programs/user_gzip/main.c $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/user_gzip/puff.o: src/puff.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/user_gzip/user_gzip.elf: programs/user_gzip/user_gzip.o \
+                                  programs/user_gzip/puff.o \
+                                  $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                                  programs/user_gzip/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_gzip/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/user_gzip/user_gzip.o \
+	      programs/user_gzip/puff.o $(LIBTOBY_AR)
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_coreutil,user_coreutil))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_admin,user_admin))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_ssh,user_ssh))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_utillinux,user_utillinux))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_e2fs,user_e2fs))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_uniq,user_uniq))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_date,user_date))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_wget,user_wget))
@@ -1596,6 +1937,39 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_nc,user_nc))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ifconfig,user_ifconfig))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_nslookup,user_nslookup))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_gui_calc,user_gui_calc))
+
+# tar decompresses in-process, so it links the same shared inflater gzip
+# does (src/puff.c, compiled a second time for userland).
+programs/user_tar/user_tar.o: programs/user_tar/main.c $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/user_tar/puff.o: src/puff.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/user_tar/user_tar.elf: programs/user_tar/user_tar.o \
+                                programs/user_tar/puff.o \
+                                $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                                programs/user_tar/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_tar/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/user_tar/user_tar.o \
+	      programs/user_tar/puff.o $(LIBTOBY_AR)
+
+# zip stores a BARE deflate stream per entry, so it links the same shared
+# inflater tar and gzip do -- src/puff.c, which grew puff_inflate_raw() for
+# exactly this. The encoder side is libtoby's deflate_raw().
+programs/user_zip/user_zip.o: programs/user_zip/main.c $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/user_zip/puff.o: src/puff.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/user_zip/user_zip.elf: programs/user_zip/user_zip.o \
+                                programs/user_zip/puff.o \
+                                $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                                programs/user_zip/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_zip/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/user_zip/user_zip.o \
+	      programs/user_zip/puff.o $(LIBTOBY_AR)
 
 # ---------- Browser application ----------
 
@@ -1971,6 +2345,16 @@ programs/linux-static-auto/linux-static-auto.elf: programs/linux-static-auto/mai
 # GetStdHandle / WriteFile / ExitProcess. PE is self-identifying by its
 # 'MZ' magic, so -- unlike the brandelf'd Linux ELFs -- it needs NO brand;
 # tobyOS's exec path sniffs the magic and routes it to the PE loader.
+# awk keeps numeric values as doubles, so this one program needs SSE
+# re-enabled -- the default userland flags disable it kernel-style.
+programs/awk/awk.o: programs/awk/main.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -msse -msse2 -c $< -o $@
+
+programs/awk/awk.elf: programs/awk/awk.o $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                      $(PORTS_SBASE_LD)
+	$(LD) $(PROG_LDFLAGS) -T $(PORTS_SBASE_LD) -o $@ \
+	      $(LIBTOBY_CRT0) programs/awk/awk.o $(LIBTOBY_AR)
+
 programs/win-hello/win-hello.exe: programs/win-hello/hello.c
 	$(CC) --target=x86_64-w64-mingw32 -nostdlib -ffreestanding -fno-builtin \
 	      -fno-stack-protector -O1 -Wl,-e,hello_entry -Wl,--subsystem,console \
@@ -2420,7 +2804,11 @@ programs/user_gui_about/user_gui_about.elf: \
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_term,user_gui_term))
 
 # File Explorer -- migrated to TobyTK (crt0 + libtoby.a).
-$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_files,user_gui_files))
+# KABI variant: the Format action speaks the real <tobyos/abi/abi.h>
+# (abi_blk_info / abi_provision_req / the ABI_PROV_F_* flags) rather than
+# hand-mirroring a 160-byte struct whose layout is frozen by a static
+# assert the mirror would not be subject to.
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_gui_files,user_gui_files))
 
 # File viewer (text/hex) -- migrated to TobyTK; monospace via tk_draw_text_mono.
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_viewer,user_gui_viewer))
@@ -2492,7 +2880,9 @@ programs/user_gui_helloapp/user_gui_helloapp.elf: \
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_taskmgr,user_gui_taskmgr))
 
 # Text editor -- migrated to TobyTK (crt0 + libtoby.a); monospace via tk_draw_text_mono.
-$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_edit,user_gui_edit))
+# Needs -I include: it logs save failures through <tobyos_slog.h>,
+# which pulls in the kernel ABI header for the errno/level constants.
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_gui_edit,user_gui_edit))
 
 # ---------- Build initramfs (USTAR tar) ----------
 #
@@ -2535,7 +2925,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_edit,user_gui_edit))
 # (bin/, lib/, etc/, repo/, ...) are exact -- this caveat is only the
 # opt-in third-party trees.
 
-$(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
+$(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf \
                programs/linux-xdg-settings/linux-xdg-settings.elf \
                programs/linux-crashpad/linux-crashpad.elf \
                programs/linux-sigtest/linux-sigtest.elf \
@@ -2627,10 +3017,14 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                $(HELLOAPP_TPKG_SIGNED) $(HELLOAPP_TPKG_SIG_UNKNOWN) \
                $(HELLOAPP_TPKG_SIG_TAMPER) \
                $(HELLOAPP_TPKG_CAPS_RO) \
-               initrd/m36/m36_part2.c initrd/m36/m36_sample.c initrd/m36/Tobyfile
+               initrd/m36/m36_part2.c initrd/m36/m36_sample.c initrd/m36/Tobyfile \
+               $(SHPARITY_CASES) modules/hello.ko
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)/bin $(INITRD_STAGE)/etc $(INITRD_STAGE)/repo $(INITRD_STAGE)/lib \
 	         $(INITRD_STAGE)/system/keys $(INITRD_STAGE)/m36
+	@# the FHS's mount points and homes (finding 217)
+	mkdir -p $(INITRD_STAGE)/mnt $(INITRD_STAGE)/media $(INITRD_STAGE)/srv \
+	         $(INITRD_STAGE)/home $(INITRD_STAGE)/root
 	cp initrd/etc/motd                       $(INITRD_STAGE)/etc/motd
 	cp initrd/etc/anim.html                  $(INITRD_STAGE)/etc/anim.html
 	cp initrd/etc/webgl.html                 $(INITRD_STAGE)/etc/webgl.html
@@ -2658,9 +3052,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/etc/fonts.conf                 $(INITRD_STAGE)/etc/fonts/fonts.conf
 	cp initrd/readme.txt                     $(INITRD_STAGE)/readme.txt
 	cp programs/user_hello/user_hello.elf    $(INITRD_STAGE)/bin/hello
+	cp programs/systest/systest.elf          $(INITRD_STAGE)/bin/systest
 	cp programs/user_bad/user_bad.elf        $(INITRD_STAGE)/bin/bad
-	cp programs/user_echo/user_echo.elf      $(INITRD_STAGE)/bin/echo
-	cp programs/user_cat/user_cat.elf        $(INITRD_STAGE)/bin/cat
 	cp programs/user_long/user_long.elf      $(INITRD_STAGE)/bin/long_task
 	cp programs/user_netecho/user_netecho.elf $(INITRD_STAGE)/bin/netecho
 	cp programs/user_gui_demo/user_gui_demo.elf   $(INITRD_STAGE)/bin/gui_demo
@@ -2771,6 +3164,19 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/etc/c19b.lua                            $(INITRD_STAGE)/etc/c19b.lua
 	cp initrd/etc/c20.lua                             $(INITRD_STAGE)/etc/c20.lua
 	cp initrd/etc/c21.lua                             $(INITRD_STAGE)/etc/c21.lua
+	cp programs/lscpu/lscpu.elf                       $(INITRD_STAGE)/bin/lscpu
+	cp programs/lspci/lspci.elf                       $(INITRD_STAGE)/bin/lspci
+	cp programs/lsusb/lsusb.elf                       $(INITRD_STAGE)/bin/lsusb
+	cp programs/dmidecode/dmidecode.elf               $(INITRD_STAGE)/bin/dmidecode
+	cp programs/sensors/sensors.elf                   $(INITRD_STAGE)/bin/sensors
+	cp programs/cpupower/cpupower.elf                 $(INITRD_STAGE)/bin/cpupower
+	cp programs/tvi/tvi.elf                           $(INITRD_STAGE)/bin/tvi
+	@# tvi IS a POSIX vi, so it holds the name too
+	cp programs/tvi/tvi.elf                          $(INITRD_STAGE)/bin/vi
+	cp programs/tvitest/tvitest.elf                   $(INITRD_STAGE)/bin/tvitest
+	cp programs/tedit/tedit.elf                       $(INITRD_STAGE)/bin/tedit
+	cp programs/fsprobe/fsprobe.elf                   $(INITRD_STAGE)/bin/fsprobe
+	cp programs/datavol/datavol.elf                   $(INITRD_STAGE)/bin/datavol
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -2782,6 +3188,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/rendertest/rendertest.elf             $(INITRD_STAGE)/bin/rendertest
 	cp programs/fonttest/fonttest.elf                 $(INITRD_STAGE)/bin/fonttest
 	cp programs/logview/logview.elf                   $(INITRD_STAGE)/bin/logview
+	@# the same reader under the name every distro uses for it
+	cp programs/logview/logview.elf                  $(INITRD_STAGE)/bin/dmesg
 	cp programs/crashinfo/crashinfo.elf               $(INITRD_STAGE)/bin/crashinfo
 	cp programs/wdogtest/wdogtest.elf                 $(INITRD_STAGE)/bin/wdogtest
 	cp programs/safesh/safesh.elf                     $(INITRD_STAGE)/bin/safesh
@@ -2799,31 +3207,243 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/reclaimtest/reclaimtest.elf           $(INITRD_STAGE)/bin/reclaimtest
 	cp programs/strace/strace.elf                     $(INITRD_STAGE)/bin/strace
 	cp programs/debugger/debugger.elf                 $(INITRD_STAGE)/bin/debugger
+	@# gdb is the debugger under the name people actually type
+	@ln -f $(INITRD_STAGE)/bin/debugger "$(INITRD_STAGE)/bin/gdb" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/debugger "$(INITRD_STAGE)/bin/gdb"
 	cp programs/pkgmgr/pkgmgr.elf                    $(INITRD_STAGE)/bin/pkgmgr
 	cp programs/tobycc/tobycc.elf                     $(INITRD_STAGE)/bin/tobycc
 	cp programs/tobybuild/tobybuild.elf             $(INITRD_STAGE)/bin/tobybuild
 	cp programs/selfhosttest/selfhosttest.elf       $(INITRD_STAGE)/bin/selfhosttest
-	cp programs/user_sh/user_sh.elf                 $(INITRD_STAGE)/bin/sh
+# /bin/tsh -- the tobyOS shell language hosted in userspace: src/shell.c
+# compiled a second time against programs/tsh/host.c. It replaced
+# programs/sh/sh.elf here, which had a parser but almost no expansion layer
+# and scored 0/14 against real bash.
+	cp programs/tsh/tsh.elf                         $(INITRD_STAGE)/bin/tsh
+# /bin/sh IS tsh (2026-09-03), the way /bin/sh is bash on many a distro: one
+# binary, and tsh runs in POSIX mode when argv[0]'s basename is "sh". Until
+# now /bin/sh was programs/user_sh, a minimal shell that scored 0/14 against
+# bash -- and system(), popen() and every #!/bin/sh script went through it.
+	@ln -f $(INITRD_STAGE)/bin/tsh "$(INITRD_STAGE)/bin/sh" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/tsh "$(INITRD_STAGE)/bin/sh"
+	cp programs/newgrp/newgrp.elf                   $(INITRD_STAGE)/bin/newgrp
+	cp initrd/etc/passwd                            $(INITRD_STAGE)/etc/passwd
+	cp initrd/etc/group                             $(INITRD_STAGE)/etc/group
+	@# the files databases getent, hostname and the resolver read (batch 31)
+	for f in hosts services protocols rpc networks nsswitch.conf; do \
+	    cp initrd/etc/$$f $(INITRD_STAGE)/etc/$$f; done
+	cp programs/shparity/shparity.elf               $(INITRD_STAGE)/bin/shparity
+	cp programs/tjoinchurn/tjoinchurn.elf           $(INITRD_STAGE)/bin/tjoinchurn
+	cp programs/waittest/waittest.elf               $(INITRD_STAGE)/bin/waittest
+	cp programs/stdiotest/stdiotest.elf             $(INITRD_STAGE)/bin/stdiotest
+	cp programs/sigregs/sigregs.elf                 $(INITRD_STAGE)/bin/sigregs
+	mkdir -p $(INITRD_STAGE)/etc/shparity
+	cp initrd/etc/shparity/*.sh                     $(INITRD_STAGE)/etc/shparity/
+	cp programs/ttyparity/ttyparity.elf             $(INITRD_STAGE)/bin/ttyparity
+	mkdir -p $(INITRD_STAGE)/etc/ttyparity
+	cp initrd/etc/ttyparity/*.txt                   $(INITRD_STAGE)/etc/ttyparity/
+	cp programs/oilspec/oilspec.elf                 $(INITRD_STAGE)/bin/oilspec
+	mkdir -p $(INITRD_STAGE)/etc/oilspec/bin
+# 2,776 case files: `cp a/*.sh b/` blows past the command-line limit here, so
+# copy the directory rather than the glob.
+	cp -r initrd/etc/oilspec/.                      $(INITRD_STAGE)/etc/oilspec/
+# One binary, four names. tobyOS has no hard links, so these are copies -- and
+# spechelp dispatches on argv[0], so the name IS the interface.
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/argv.py
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/printenv.py
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/stdout_stderr.py
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/read_from_fd.py
 	cp programs/user_pkg/user_pkg.elf               $(INITRD_STAGE)/bin/pkg
 	cp programs/user_svcctl/user_svcctl.elf         $(INITRD_STAGE)/bin/svcctl
 	cp programs/user_ps/user_ps.elf                 $(INITRD_STAGE)/bin/ps
 	cp programs/user_top/user_top.elf               $(INITRD_STAGE)/bin/top
-	cp programs/user_cp/user_cp.elf                 $(INITRD_STAGE)/bin/cp
-	cp programs/user_mv/user_mv.elf                 $(INITRD_STAGE)/bin/mv
-	cp programs/user_rm/user_rm.elf                 $(INITRD_STAGE)/bin/rm
-	cp programs/user_find/user_find.elf             $(INITRD_STAGE)/bin/find
-	cp programs/user_sort/user_sort.elf             $(INITRD_STAGE)/bin/sort
-	cp programs/user_tee/user_tee.elf               $(INITRD_STAGE)/bin/tee
-	cp programs/user_env/user_env.elf               $(INITRD_STAGE)/bin/env
-	cp programs/user_chmod/user_chmod.elf           $(INITRD_STAGE)/bin/chmod
-	cp programs/user_df/user_df.elf                 $(INITRD_STAGE)/bin/df
-	cp programs/user_mkdir/user_mkdir.elf           $(INITRD_STAGE)/bin/mkdir
-	cp programs/user_touch/user_touch.elf           $(INITRD_STAGE)/bin/touch
-	cp programs/user_tail/user_tail.elf             $(INITRD_STAGE)/bin/tail
-	cp programs/user_uniq/user_uniq.elf             $(INITRD_STAGE)/bin/uniq
-	cp programs/user_date/user_date.elf             $(INITRD_STAGE)/bin/date
+	cp programs/user_setsid/user_setsid.elf         $(INITRD_STAGE)/bin/setsid
+	cp programs/user_vncpasswd/user_vncpasswd.elf   $(INITRD_STAGE)/bin/vncpasswd
+	cp programs/user_coreutil/user_coreutil.elf     $(INITRD_STAGE)/bin/coreutil
+	cp programs/user_admin/user_admin.elf           $(INITRD_STAGE)/bin/user_admin
+	cp programs/user_ssh/user_ssh.elf               $(INITRD_STAGE)/bin/user_ssh
+	cp programs/user_utillinux/user_utillinux.elf   $(INITRD_STAGE)/bin/user_util
+	cp programs/user_e2fs/user_e2fs.elf             $(INITRD_STAGE)/bin/user_e2fs
+	cp programs/user_gzip/user_gzip.elf             $(INITRD_STAGE)/bin/compress
+	cp programs/user_zutils/user_zutils.elf        $(INITRD_STAGE)/bin/zgrep
+	cp programs/user_sed/user_sed.elf              $(INITRD_STAGE)/bin/sed
+	cp programs/user_procnet/user_procnet.elf      $(INITRD_STAGE)/bin/vmstat
+	cp programs/user_power/user_power.elf          $(INITRD_STAGE)/bin/shutdown
+	cp programs/user_patch/user_patch.elf          $(INITRD_STAGE)/bin/patch
+	cp programs/user_locate/user_locate.elf        $(INITRD_STAGE)/bin/locate
+	cp programs/user_zstd/user_zstd.elf             $(INITRD_STAGE)/bin/zstd
+	cp programs/user_zip/user_zip.elf               $(INITRD_STAGE)/bin/zip
+	cp programs/user_dig/user_dig.elf               $(INITRD_STAGE)/bin/dig
+	cp programs/user_timesyncd/user_timesyncd.elf   $(INITRD_STAGE)/bin/timesyncd
+	cp programs/user_strip/user_strip.elf           $(INITRD_STAGE)/bin/strip
+	cp programs/user_at/user_at.elf                 $(INITRD_STAGE)/bin/at
+	cp programs/user_setpci/user_setpci.elf         $(INITRD_STAGE)/bin/setpci
+	cp programs/user_systemctl/user_systemctl.elf   $(INITRD_STAGE)/bin/systemctl
+	cp programs/user_ping/user_ping.elf             $(INITRD_STAGE)/bin/ping
+	@# ping/clockdiff/tcpdump, one raw-socket binary dispatched on argv[0]
+	@for ap in clockdiff tcpdump; do \
+	    ln -f $(INITRD_STAGE)/bin/ping "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/ping "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	cp programs/user_ftp/user_ftp.elf               $(INITRD_STAGE)/bin/ftp
+	cp programs/user_sudo/user_sudo.elf             $(INITRD_STAGE)/bin/sudo
+	cp programs/user_ranlib/user_ranlib.elf         $(INITRD_STAGE)/bin/ranlib
+	cp programs/user_addr2line/user_addr2line.elf   $(INITRD_STAGE)/bin/addr2line
+	cp initrd/etc/sudoers                           $(INITRD_STAGE)/etc/sudoers
+	@# the FTP server the client is tested against
+	@ln -f $(INITRD_STAGE)/bin/ftp "$(INITRD_STAGE)/bin/ftpd" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/ftp "$(INITRD_STAGE)/bin/ftpd"
+	@# systemctl/service, one binary dispatched on argv[0]
+	@ln -f $(INITRD_STAGE)/bin/systemctl "$(INITRD_STAGE)/bin/service" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/systemctl "$(INITRD_STAGE)/bin/service"
+	@# the at family, one binary dispatched on argv[0]
+	@for ap in batch atq atrm; do \
+	    ln -f $(INITRD_STAGE)/bin/at "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/at "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	@# ---- native-parity batch (2026-09-04): the 46 busybox-only utilities ----
+	cp programs/user_archive/user_archive.elf      $(INITRD_STAGE)/bin/archive
+	@# archive family, one binary dispatched on argv[0]
+	@for ap in ar cpio; do \
+	    ln -f $(INITRD_STAGE)/bin/archive "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/archive "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	cp programs/user_ed/user_ed.elf                $(INITRD_STAGE)/bin/ed
+	cp programs/user_cron/user_cron.elf            $(INITRD_STAGE)/bin/crontab
+	cp programs/user_su/user_su.elf                $(INITRD_STAGE)/bin/su
+	cp programs/user_moreutils/user_moreutils.elf  $(INITRD_STAGE)/bin/moreutils
+	@# moreutils family, one binary dispatched on argv[0]
+	@for ap in init passwd chpasswd; do \
+	    ln -f $(INITRD_STAGE)/bin/moreutils "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/moreutils "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	cp programs/user_sysutils/user_sysutils.elf    $(INITRD_STAGE)/bin/sysutils
+	@# sysutils family, one binary dispatched on argv[0]
+	@for ap in insmod rmmod lsmod modprobe blkid fsck fsck.ext2 fsck.ext3 fsck.ext4 fsck.vfat fsck.fat fsck.minix mkfs.ext2 mke2fs mkfs.minix mkfs.vfat mkfs.fat tune2fs; do \
+	    ln -f $(INITRD_STAGE)/bin/sysutils "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/sysutils "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	cp programs/user_netutils/user_netutils.elf    $(INITRD_STAGE)/bin/netutils
+	@# netutils family, one binary dispatched on argv[0]
+	@for ap in arp arping ip netstat route telnet traceroute; do \
+	    ln -f $(INITRD_STAGE)/bin/netutils "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/netutils "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	@# dig/host, one resolver dispatched on argv[0]
+	@ln -f $(INITRD_STAGE)/bin/dig "$(INITRD_STAGE)/bin/host" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/dig "$(INITRD_STAGE)/bin/host"
+	@# zip/unzip, one binary dispatched on argv[0]
+	@ln -f $(INITRD_STAGE)/bin/zip "$(INITRD_STAGE)/bin/unzip" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/zip "$(INITRD_STAGE)/bin/unzip"
+	@# zstd family, one binary dispatched on argv[0]
+	@for ap in unzstd zstdcat; do \
+	    ln -f $(INITRD_STAGE)/bin/zstd "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/zstd "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	cp programs/user_shellutils/user_shellutils.elf $(INITRD_STAGE)/bin/rmdir
+	@# the names that were busybox applets or programs of their own, one binary
+	@for ap in yes tac seq whoami which uname free sync stat du xargs \
+	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
+	           cksum truncate install mkfifo date touch sort script hwclock \
+           arch nproc hostid logname link unlink pwd sum factor test "[" printf chgrp \
+           shred uniq who users uptime true false ls env readlink realpath mktemp getent groups hostname domainname dnsdomainname nisdomainname ypdomainname chown killall mount umount od hexdump hd comm expand unexpand fold nl paste rev shuf split rm cp mv md5sum sha1sum sha224sum sha256sum sha384sum sha512sum b2sum base64 base32 basenc dircolors dir vdir echo cat tee mkdir mknod chroot chmod ln kill id df pinky stdbuf chcon runcon getfattr setfattr unshare head tail wc cut tr basename dirname sleep expr find fmt pr join tsort numfmt csplit ptx pathchk diff cmp sdiff diff3 gzip gunzip zcat bzip2 bunzip2 bzcat xz unxz xzcat tar; do \
+	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	@# the indexer is the same binary under its other name
+	@ln -f $(INITRD_STAGE)/bin/locate $(INITRD_STAGE)/bin/updatedb 2>/dev/null || \
+	   cp $(INITRD_STAGE)/bin/locate $(INITRD_STAGE)/bin/updatedb
+	@# power control, one binary dispatched on argv[0]
+	@for ap in poweroff halt reboot; do \
+	    ln -f $(INITRD_STAGE)/bin/shutdown "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/shutdown "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	@# procps/iproute2 stragglers, one binary dispatched on argv[0]
+	@for ap in tload slabtop skill snice ss bridge tracepath; do \
+	    ln -f $(INITRD_STAGE)/bin/vmstat "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/vmstat "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	@# the compressed-file wrappers, one binary dispatched on argv[0]
+	@for ap in zegrep zfgrep zdiff zcmp zless zmore gzexe lesspipe \
+	           bzgrep bzegrep bzfgrep bzdiff bzcmp bzless bzmore; do \
+	    ln -f $(INITRD_STAGE)/bin/zgrep "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/zgrep "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	@# the LZW names stay the old gzip binary's (gzip itself is
+	@# user_shellutils', finding 197), one binary dispatched on argv[0]
+	@for ap in gzcat uncompress; do \
+	    ln -f $(INITRD_STAGE)/bin/compress "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/compress "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	@# ext2/3/4 inspection tools, one binary dispatched on argv[0]
+	@for ap in dumpe2fs e2fsck debugfs badblocks resize2fs; do \
+	    ln -f $(INITRD_STAGE)/bin/user_e2fs "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/user_e2fs "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	@# util-linux tools, one binary dispatched on argv[0]
+	@for ap in column colrm col rename whereis namei uuidgen setterm \
+	           lsblk findmnt lsns wdctl prlimit lslocks lsipc zramctl \
+	           mkfs; do \
+	    ln -f $(INITRD_STAGE)/bin/user_util "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/user_util "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	@# SSH client family, one binary dispatched on argv[0]
+	@for ap in ssh ssh-keygen ssh-add scp sftp; do \
+	    ln -f $(INITRD_STAGE)/bin/user_ssh "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/user_ssh "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	@# shadow-suite account tools, one binary dispatched on argv[0]
+	@for ap in useradd userdel usermod groupadd groupdel groupmod \
+	           gpasswd chsh chfn chage vipw vigr; do \
+	    ln -f $(INITRD_STAGE)/bin/user_admin "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/user_admin "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	cp etc/coreutils_test.sh                        $(INITRD_STAGE)/etc/coreutils_test.sh
+	cp etc/coreutils_extra.sh                       $(INITRD_STAGE)/etc/coreutils_extra.sh
+	cp etc/accounts_test.sh                         $(INITRD_STAGE)/etc/accounts_test.sh
+	cp etc/ssh_test.sh                              $(INITRD_STAGE)/etc/ssh_test.sh
+	cp etc/util_test.sh                             $(INITRD_STAGE)/etc/util_test.sh
+	cp etc/e2fs_test.sh                             $(INITRD_STAGE)/etc/e2fs_test.sh
+	cp etc/gzip_test.sh                             $(INITRD_STAGE)/etc/gzip_test.sh
+	@# A .gz produced by REAL GNU gzip, so the guest inflater is tested
+	@# against dynamic-Huffman blocks it never produces itself.
+	cp etc/gnumade.gz                               $(INITRD_STAGE)/etc/gnumade.gz
+	cp etc/gnubadcrc.gz                             $(INITRD_STAGE)/etc/gnubadcrc.gz
+	cp etc/compress_test.sh                         $(INITRD_STAGE)/etc/compress_test.sh
+	cp etc/xzsrc.txt                                $(INITRD_STAGE)/etc/xzsrc.txt
+	cp etc/gnumade.xz                               $(INITRD_STAGE)/etc/gnumade.xz
+	cp etc/gnumade32.xz                             $(INITRD_STAGE)/etc/gnumade32.xz
+	cp etc/gnumadeblk.xz                            $(INITRD_STAGE)/etc/gnumadeblk.xz
+	cp etc/gnubad.xz                                $(INITRD_STAGE)/etc/gnubad.xz
+	cp etc/distro_test.sh                           $(INITRD_STAGE)/etc/distro_test.sh
+	cp etc/libtest.a                                $(INITRD_STAGE)/etc/libtest.a
+	cp etc/dwarf_test.elf                           $(INITRD_STAGE)/etc/dwarf_test.elf
+	cp etc/dbg_test.elf                             $(INITRD_STAGE)/etc/dbg_test.elf
+	cp etc/gnumade.bz2                              $(INITRD_STAGE)/etc/gnumade.bz2
+	cp etc/gnubadbz.bz2                             $(INITRD_STAGE)/etc/gnubadbz.bz2
+	cp etc/gnumade.zst                              $(INITRD_STAGE)/etc/gnumade.zst
+	cp etc/gnubadzst.zst                            $(INITRD_STAGE)/etc/gnubadzst.zst
+	cp etc/gnumade.zip                              $(INITRD_STAGE)/etc/gnumade.zip
+	cp etc/gnubadzip.zip                            $(INITRD_STAGE)/etc/gnubadzip.zip
+	cp etc/sed_test.sh                              $(INITRD_STAGE)/etc/sed_test.sh
+	cp etc/awk_test.sh                              $(INITRD_STAGE)/etc/awk_test.sh
+	cp etc/grep_test.sh                             $(INITRD_STAGE)/etc/grep_test.sh
+	cp etc/procnet_test.sh                          $(INITRD_STAGE)/etc/procnet_test.sh
+	cp etc/power_test.sh                            $(INITRD_STAGE)/etc/power_test.sh
+	@# The 19 coreutils commands tobyOS lacked, hard-linked to one binary
+	@# that dispatches on argv[0] -- the same way busybox is installed below.
+	@# HARD links: ramfs shares bytes for tar typeflag 1 and ignores
+	@# typeflag 2, so a symlink would not resolve.
+	@for ap in           \
+	                    \
+	                ; do \
+	    ln -f $(INITRD_STAGE)/bin/coreutil "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/coreutil "$(INITRD_STAGE)/bin/$$ap"; \
+	done
 	cp programs/user_wget/user_wget.elf             $(INITRD_STAGE)/bin/wget
 	cp programs/user_nc/user_nc.elf                 $(INITRD_STAGE)/bin/nc
+	@# netcat is nc under its long name
+	@ln -f $(INITRD_STAGE)/bin/nc "$(INITRD_STAGE)/bin/netcat" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/nc "$(INITRD_STAGE)/bin/netcat"
 	cp programs/user_ifconfig/user_ifconfig.elf     $(INITRD_STAGE)/bin/ifconfig
 	cp programs/user_nslookup/user_nslookup.elf     $(INITRD_STAGE)/bin/nslookup
 	cp programs/user_gui_calc/user_gui_calc.elf     $(INITRD_STAGE)/bin/gui_calc
@@ -2841,8 +3461,13 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/lua/lua.elf                         $(INITRD_STAGE)/bin/lua
 	cp programs/make/make.elf                       $(INITRD_STAGE)/bin/make
 	cp programs/less/less.elf                       $(INITRD_STAGE)/bin/less
+	@# the same pager, dispatching on argv[0]: more cats when piped
+	cp programs/less/less.elf                       $(INITRD_STAGE)/bin/more
 	cp programs/curl/curl.elf                       $(INITRD_STAGE)/bin/curl
 	cp programs/tcc/tcc.elf                         $(INITRD_STAGE)/bin/tcc
+	@# cc is the name configure scripts and Makefiles probe for
+	@ln -f $(INITRD_STAGE)/bin/tcc "$(INITRD_STAGE)/bin/cc" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/tcc "$(INITRD_STAGE)/bin/cc"
 	cp programs/as/as.elf                           $(INITRD_STAGE)/bin/as
 	cp programs/ld/ld.elf                           $(INITRD_STAGE)/bin/ld
 	cp programs/wifipicker/wifipicker.elf           $(INITRD_STAGE)/bin/wifipicker
@@ -2853,12 +3478,25 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/m36/Tobyfile                            $(INITRD_STAGE)/m36/Tobyfile
 	cp $(PORTS_SBASE_DIR)/echo.elf                    $(INITRD_STAGE)/bin/p_echo
 	cp $(PORTS_SBASE_DIR)/cat.elf                     $(INITRD_STAGE)/bin/p_cat
+	@# a standalone sleep, for a fixture that copies one to name a process
+	cp $(PORTS_SBASE_DIR)/sleep.elf                   $(INITRD_STAGE)/bin/p_sleep
 	cp $(PORTS_SBASE_DIR)/wc.elf                      $(INITRD_STAGE)/bin/p_wc
 	cp $(PORTS_SBASE_DIR)/head.elf                    $(INITRD_STAGE)/bin/p_head
 	cp $(PORTS_SBASE_DIR)/ls.elf                      $(INITRD_STAGE)/bin/p_ls
 	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/p_grep
+# ...and under the names scripts actually use. sbase's grep/wc/head had a
+# p_ prefix and no plain entry, so `grep` was simply not a command that
+# existed. echo/cat/ls keep the prefix because other programs own those.
+	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/grep
+	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/egrep
+	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/fgrep
+	@# grep dispatches on argv[0]; rgrep is grep -r
+	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/rgrep
+	cp programs/awk/awk.elf                           $(INITRD_STAGE)/bin/awk
 	cp $(LDTOBY_SO)                                   $(INITRD_STAGE)/lib/ld-toby.so
 	cp $(LIBTOBY_SO)                                  $(INITRD_STAGE)/lib/libtoby.so
+	mkdir -p $(INITRD_STAGE)/lib/modules
+	cp modules/hello.ko                               $(INITRD_STAGE)/lib/modules/hello.ko
 	cp $(HELLOAPP_TPKG)                               $(INITRD_STAGE)/repo/helloapp.tpkg
 	cp $(HELLOAPP_TPKG_V2)                            $(INITRD_STAGE)/repo/helloapp_v2.tpkg
 	# M34A fixtures: deliberately-broken cousins of helloapp.tpkg used
@@ -2993,6 +3631,150 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         $(INITRD_STAGE)/bin/linux-gapfill;                            \
 	    echo "[initrd] staged linux-gapfill (fdinfo + new syscalls)";      \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-gapfill";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-cloexec/linux-cloexec.elf ]; then               \
+	    cp programs/linux-cloexec/linux-cloexec.elf                        \
+	         $(INITRD_STAGE)/bin/linux-cloexec;                            \
+	    echo "[initrd] staged linux-cloexec (close-on-exec + close_range)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cloexec";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-flock/linux-flock.elf ]; then                   \
+	    cp programs/linux-flock/linux-flock.elf                            \
+	         $(INITRD_STAGE)/bin/linux-flock;                              \
+	    echo "[initrd] staged linux-flock (record locks + flock)";         \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-flock";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-sock/linux-sock.elf ]; then                     \
+	    cp programs/linux-sock/linux-sock.elf                              \
+	         $(INITRD_STAGE)/bin/linux-sock;                               \
+	    echo "[initrd] staged linux-sock (socket semantics, peer-less)";   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-sock";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-sockserver/linux-sockserver.elf ]; then         \
+	    cp programs/linux-sockserver/linux-sockserver.elf                  \
+	         $(INITRD_STAGE)/bin/linux-sockserver;                         \
+	    echo "[initrd] staged linux-sockserver (host-peer gate half)";     \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-sockserver";                  \
+	fi;                                                                   \
+	if [ -f programs/linux-nptl/linux-nptl.elf ]; then                     \
+	    cp programs/linux-nptl/linux-nptl.elf                              \
+	         $(INITRD_STAGE)/bin/linux-nptl;                               \
+	    echo "[initrd] staged linux-nptl (thread-group semantics)";        \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-nptl";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-watch/linux-watch.elf ]; then                   \
+	    cp programs/linux-watch/linux-watch.elf                            \
+	         $(INITRD_STAGE)/bin/linux-watch;                              \
+	    echo "[initrd] staged linux-watch (inotify + epoll honesty)";      \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-watch";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-misc/linux-misc.elf ]; then                     \
+	    cp programs/linux-misc/linux-misc.elf                              \
+	         $(INITRD_STAGE)/bin/linux-misc;                               \
+	    echo "[initrd] staged linux-misc (syscall-tail batch)";            \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-misc";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-procdev/linux-procdev.elf ]; then               \
+	    cp programs/linux-procdev/linux-procdev.elf                        \
+	         $(INITRD_STAGE)/bin/linux-procdev;                            \
+	    echo "[initrd] staged linux-procdev (procfs+dev fidelity)";        \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-procdev";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-loop/linux-loop.elf ]; then                     \
+	    cp programs/linux-loop/linux-loop.elf                              \
+	         $(INITRD_STAGE)/bin/linux-loop;                               \
+	    echo "[initrd] staged linux-loop (loopback datapath)";             \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-loop";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-proc2/linux-proc2.elf ]; then                   \
+	    cp programs/linux-proc2/linux-proc2.elf                            \
+	         $(INITRD_STAGE)/bin/linux-proc2;                              \
+	    echo "[initrd] staged linux-proc2 (procfs deep fidelity)";         \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-proc2";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-io/linux-io.elf ]; then                         \
+	    cp programs/linux-io/linux-io.elf                                  \
+	         $(INITRD_STAGE)/bin/linux-io;                                 \
+	    echo "[initrd] staged linux-io (POSIX timers + copy family)";      \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-io";                          \
+	fi;                                                                   \
+	if [ -f programs/linux-xattr/linux-xattr.elf ]; then                   \
+	    cp programs/linux-xattr/linux-xattr.elf                            \
+	         $(INITRD_STAGE)/bin/linux-xattr;                              \
+	    echo "[initrd] staged linux-xattr (xattr + fd identity + fexecve)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-xattr";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-thread2/linux-thread2.elf ]; then               \
+	    cp programs/linux-thread2/linux-thread2.elf                        \
+	         $(INITRD_STAGE)/bin/linux-thread2;                            \
+	    echo "[initrd] staged linux-thread2 (de_thread + pshared + robust)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-thread2";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-fs2/linux-fs2.elf ]; then                       \
+	    cp programs/linux-fs2/linux-fs2.elf                                \
+	         $(INITRD_STAGE)/bin/linux-fs2;                                \
+	    echo "[initrd] staged linux-fs2 (writable root + hard links)";     \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-fs2";                         \
+	fi;                                                                   \
+	if [ -f programs/linux-ldso/linux-ldso.elf ]; then                     \
+	    cp programs/linux-ldso/linux-ldso.elf                              \
+	         $(INITRD_STAGE)/bin/linux-ldso;                               \
+	    echo "[initrd] staged linux-ldso (ld.so.cache proof)";             \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ldso";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-sysv/linux-sysv.elf ]; then                     \
+	    cp programs/linux-sysv/linux-sysv.elf                              \
+	         $(INITRD_STAGE)/bin/linux-sysv;                               \
+	    echo "[initrd] staged linux-sysv (SysV sem + msg)";                \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-sysv";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-stat/linux-stat.elf ]; then                     \
+	    cp programs/linux-stat/linux-stat.elf                              \
+	         $(INITRD_STAGE)/bin/linux-stat;                               \
+	    echo "[initrd] staged linux-stat (statfs truth)";                  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-stat";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-fdid/linux-fdid.elf ]; then                     \
+	    cp programs/linux-fdid/linux-fdid.elf                              \
+	         $(INITRD_STAGE)/bin/linux-fdid;                               \
+	    echo "[initrd] staged linux-fdid (fstat identity)";              \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-fdid";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-vfork/linux-vfork.elf ]; then                   \
+	    cp programs/linux-vfork/linux-vfork.elf                            \
+	         $(INITRD_STAGE)/bin/linux-vfork;                              \
+	    echo "[initrd] staged linux-vfork (true vfork)";                   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-vfork";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-vdso/linux-vdso.elf ]; then                     \
+	    cp programs/linux-vdso/linux-vdso.elf                              \
+	         $(INITRD_STAGE)/bin/linux-vdso;                               \
+	    echo "[initrd] staged linux-vdso (userspace clock)";               \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-vdso";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-cont/linux-cont.elf ]; then                     \
+	    cp programs/linux-cont/linux-cont.elf                              \
+	         $(INITRD_STAGE)/bin/linux-cont;                               \
+	    echo "[initrd] staged linux-cont (resume-latency)";                \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cont";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-ipv6/linux-ipv6.elf ]; then                     \
+	    cp programs/linux-ipv6/linux-ipv6.elf                              \
+	         $(INITRD_STAGE)/bin/linux-ipv6;                               \
+	    echo "[initrd] staged linux-ipv6 (AF_INET6 UDP)";                  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ipv6";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-tcp6/linux-tcp6.elf ]; then                     \
+	    cp programs/linux-tcp6/linux-tcp6.elf                              \
+	         $(INITRD_STAGE)/bin/linux-tcp6;                               \
+	    echo "[initrd] staged linux-tcp6 (TCP over IPv6)";                 \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-tcp6";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-v6host/linux-v6host.elf ]; then                 \
+	    cp programs/linux-v6host/linux-v6host.elf                          \
+	         $(INITRD_STAGE)/bin/linux-v6host;                             \
+	    echo "[initrd] staged linux-v6host (v6 vs real peer)";             \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-v6host";                      \
 	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
@@ -3320,9 +4102,13 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    done; \
 	    echo "[initrd] chromium: staged managed policy PostQuantumKeyAgreementEnabled=false (disable X25519MLKEM768 PQ KEX -- tobyOS ML-KEM wall)"; \
 	fi; \
+	if $(LDSOCACHE_BIN) $(INITRD_STAGE)                                    \
+	       $(INITRD_STAGE)/etc/ld.so.cache; then                           \
+	    EXTRA_FILES="$$EXTRA_FILES etc/ld.so.cache";                       \
+	fi; \
 	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
 	    --owner=0 --group=0 --numeric-owner -cf ../initrd.tar             \
-	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
+	    bin/hello bin/systest bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
 	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play bin/stltest bin/av1test bin/aactest bin/wasmtest \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
@@ -3340,6 +4126,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/linux-scmsg bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-demrace bin/linux-mlkem \
 	    bin/linux-qfreeze bin/linux-drmtest bin/linux-sndtest \
 	    bin/linux-xstub \
+	    bin/basename bin/dirname bin/sleep bin/tee bin/expr \
+	    bin/tr bin/cut bin/uniq bin/sort bin/awk \
 	    bin/linux-glibc \
 	    bin/win-hello.exe \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
@@ -3359,16 +4147,107 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
 	    bin/win-wide23.exe bin/win-reloc24.exe                        \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
+	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
 	    bin/services bin/svc_crasher bin/stabilitytest                    \
 	    bin/hwinfo bin/drvmatch bin/hwcompat bin/hwreport bin/compattest  \
 	    bin/sigtest bin/mctest bin/reclaimtest bin/tobycc bin/tobybuild bin/selfhosttest \
-    bin/lua bin/make bin/less bin/curl bin/tcc bin/as \
+    bin/lua bin/make bin/less bin/more bin/curl bin/tcc bin/as \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
+	    bin/p_sleep                                                       \
+	    bin/grep bin/wc bin/head bin/egrep bin/fgrep bin/rgrep                      \
+	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
+	    etc/coreutils_test.sh etc/coreutils_extra.sh etc/accounts_test.sh  \
+	    etc/ssh_test.sh etc/util_test.sh etc/e2fs_test.sh                   \
+	    etc/gzip_test.sh etc/gnumade.gz etc/gnubadcrc.gz                  \
+	    etc/compress_test.sh etc/gnumade.bz2 etc/gnubadbz.bz2 \
+	    etc/gnumade.zst etc/gnubadzst.zst              \
+	    etc/gnumade.zip etc/gnubadzip.zip              \
+	    etc/xzsrc.txt etc/gnumade.xz etc/gnumade32.xz etc/gnumadeblk.xz etc/gnubad.xz \
+	    etc/distro_test.sh                            \
+	    etc/libtest.a etc/dwarf_test.elf              \
+	    etc/dbg_test.elf                              \
+	    etc/sed_test.sh                                                   \
+	    etc/awk_test.sh                                                   \
+	    etc/grep_test.sh                                                  \
+	    etc/procnet_test.sh                                               \
+	    etc/power_test.sh                                                 \
+	    lib/modules/hello.ko                                              \
+	    bin/user_admin bin/useradd bin/userdel bin/usermod bin/groupadd    \
+	    bin/groupdel bin/groupmod bin/gpasswd bin/chsh bin/chfn bin/chage  \
+	    bin/vipw bin/vigr                                                  \
+	    bin/user_ssh bin/ssh bin/ssh-keygen bin/ssh-add bin/scp bin/sftp    \
+	    bin/gzip bin/gunzip bin/zcat bin/gzcat bin/uncompress bin/compress   \
+	    bin/diff bin/cmp bin/sdiff bin/diff3                                                 \
+	    bin/bzip2 bin/bunzip2 bin/bzcat bin/zgrep bin/zegrep bin/zfgrep    \
+	    bin/zdiff bin/zcmp bin/zless bin/zmore bin/gzexe bin/lesspipe      \
+	    bin/bzgrep bin/bzegrep bin/bzfgrep bin/bzdiff bin/bzcmp            \
+	    bin/bzless bin/bzmore                                              \
+	    bin/sed                                                          \
+	    bin/vmstat bin/tload bin/slabtop bin/skill bin/snice bin/ss       \
+	    bin/bridge bin/tracepath                                          \
+	    bin/shutdown bin/poweroff bin/halt bin/reboot bin/patch bin/locate bin/updatedb bin/ln                     \
+	    bin/rmdir bin/yes bin/tac bin/seq bin/whoami bin/which bin/uname   \
+	    bin/free bin/sync bin/stat bin/du bin/xargs bin/nohup bin/timeout  \
+	    bin/setsid \
+	    bin/watch bin/dd bin/dmesg bin/vi bin/ls bin/tar                                                   \
+	    bin/printenv bin/nice bin/pgrep bin/pkill bin/tty bin/stty        \
+	    bin/cksum bin/truncate bin/install bin/mkfifo bin/script bin/hwclock      \
+	    bin/comm bin/expand bin/unexpand bin/fold bin/nl bin/od bin/hexdump \
+	    bin/paste bin/rev bin/shuf bin/split bin/readlink bin/realpath      \
+	    bin/mktemp bin/groups bin/hostname bin/chown bin/killall           \
+	    bin/mount bin/umount                                               \
+	    bin/mknod bin/chroot                                               \
+	    bin/hd bin/dnsdomainname bin/nisdomainname bin/ypdomainname        \
+	    bin/zstd bin/unzstd bin/zstdcat                                    \
+	    bin/zip bin/unzip                                  \
+	    bin/dig bin/host bin/timesyncd                      \
+	    bin/strip bin/cc bin/mkfs bin/domainname            \
+	       bin/archive bin/ar bin/cpio bin/xz bin/unxz bin/xzcat \
+	       bin/ed \
+	       bin/crontab \
+	       bin/moreutils bin/arch bin/chgrp bin/factor bin/false bin/link \
+	    bin/logname bin/nproc bin/printf bin/pwd bin/shred bin/sum bin/test \
+	    'bin/['  bin/true bin/unlink bin/uptime bin/users bin/who bin/hostid \
+	    bin/init bin/passwd bin/chpasswd \
+	       bin/sysutils bin/insmod bin/rmmod bin/lsmod bin/modprobe bin/blkid \
+	    bin/fsck bin/fsck.ext2 bin/fsck.ext3 bin/fsck.ext4 bin/fsck.vfat \
+	    bin/fsck.fat bin/fsck.minix bin/mkfs.ext2 bin/mke2fs bin/mkfs.minix \
+	    bin/mkfs.vfat bin/mkfs.fat bin/tune2fs \
+	       bin/netutils bin/arp bin/arping bin/ip bin/netstat bin/route \
+	    bin/telnet bin/traceroute \
+	    bin/setpci                                          \
+	    bin/systemctl bin/service bin/netcat bin/getent      \
+	    bin/ping bin/clockdiff bin/tcpdump bin/ftp bin/ftpd  \
+	    bin/ranlib bin/addr2line etc/sudoers                 \
+	    bin/gdb                                             \
+	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
+	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
+	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \
+	    bin/user_e2fs bin/dumpe2fs bin/e2fsck bin/debugfs bin/badblocks bin/resize2fs    \
+	    bin/coreutil bin/tsort bin/fmt bin/join bin/pathchk bin/dir       \
+	    bin/vdir bin/dircolors bin/csplit bin/pr bin/numfmt bin/chcon     \
+	    bin/getfattr bin/setfattr bin/unshare                             \
+	    bin/runcon bin/pinky bin/ptx bin/stdbuf bin/basenc bin/b2sum      \
+	    bin/sha224sum bin/sha384sum bin/sha256sum bin/sha512sum \
+	    bin/md5sum bin/sha1sum bin/base64 bin/base32                                       \
+	    bin/kill bin/id bin/newgrp bin/vncpasswd                          \
+	    bin/env bin/find bin/tail bin/df bin/ps bin/top                  \
+	    bin/nc bin/wget bin/nslookup bin/ifconfig bin/pkg bin/svcctl      \
+	    bin/strace bin/debugger bin/indexer bin/pkgmgr bin/ld             \
+	    bin/bluescreen                                                    \
+	    bin/tsh bin/sh bin/shparity bin/oilspec bin/ttyparity             \
+	    bin/tjoinchurn bin/waittest bin/stdiotest bin/sigregs             \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    $$EXTRA_FILES                                                     \
+	  && tar --format=ustar --mode=4755 \
+	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
+	    bin/sudo bin/su                                                   \
+	  && tar --format=ustar --mode=2755 \
+	    --owner=0 --group=1 --numeric-owner -rf ../initrd.tar             \
+	    bin/at bin/batch bin/atq bin/atrm                                 \
 	  && tar --format=ustar --mode=0644 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
 	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
@@ -3387,8 +4266,75 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
 	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/audiotone.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
+	    etc/passwd etc/group \
+	    etc/hosts etc/services etc/protocols etc/rpc etc/networks etc/nsswitch.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
+	    etc/shparity/*.sh \
+	    etc/ttyparity/*.txt \
 	    readme.txt
+# The 2,776 corpus scripts are DATA (run as `bash FILE`), so 0644 is right.
+# Tarred as a TREE, not a glob: 2,776 names is 75 KB of command line. The
+# helper binaries are excluded here and added below with the executable bit,
+# because staging them 0644 made every case that calls argv.py fail to run
+# it -- 327 cases reporting a shell divergence that was a permission bit.
+# No './' prefix: gate 0 matches exact tar paths and './etc/...' is not
+# the same name as 'etc/...'.
+# Its DIRECTORIES 0755, its files 0644 (finding 131): one --mode=0644 for the
+# tree gave etc/oilspec and every directory under it 0644, so only root
+# could list them. Two lists, each without recursion, the directories
+# first; through -T, as the busybox applets go, for the same 75 KB reason.
+	cd $(INITRD_STAGE) && find etc/oilspec -path etc/oilspec/bin -prune \
+	    -o -type d -print > .oilspec.dirs \
+	  && find etc/oilspec -path etc/oilspec/bin -prune \
+	    -o -type f -print > .oilspec.files \
+	  && tar --format=ustar --mode=0755 --owner=0 --group=0 --numeric-owner \
+	    --no-recursion -rf ../initrd.tar -T .oilspec.dirs \
+	  && tar --format=ustar --mode=0644 --owner=0 --group=0 --numeric-owner \
+	    --no-recursion -rf ../initrd.tar -T .oilspec.files \
+	  && rm -f .oilspec.dirs .oilspec.files
+	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
+	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar \
+	    etc/oilspec/bin
+	@# the FHS's mount points and homes, as Linux's modes (finding 217)
+	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 --owner=0 --group=0 \
+	    --numeric-owner --no-recursion -rf ../initrd.tar mnt media srv home \
+	  && tar --format=ustar --mode=0700 --owner=0 --group=0 \
+	    --numeric-owner --no-recursion -rf ../initrd.tar root
+# busybox applets on PATH. Runs LAST, and both halves of that matter:
+#   - AFTER every other bin/ has been staged, so the "already taken"
+#     test sees the real binaries. Done earlier it reported 0 collisions
+#     and would then have had `cp` write the real awk THROUGH the hard
+#     link into the shared inode -- corrupting busybox and all 400 names
+#     with it.
+#   - appended with `-T`, not on the command line: 400 names is the same
+#     75 KB-of-argv problem the oilspec corpus above documents.
+# HARD links (tar typeflag '1'), which ramfs resolves by sharing the
+# target's bytes; it deliberately skips symlinks. busybox picks its
+# applet from argv[0], exactly as it does on a real system.
+	@if [ -f $(INITRD_STAGE)/bin/busybox ] && \
+	    [ -f programs/busybox/applets.txt ]; then \
+	    : > $(INITRD_STAGE)/.applets.list; \
+	    bb_n=0; bb_skip=0; \
+	    while read -r ap; do \
+	        ap=$${ap%$$(printf '\r')}; \
+	        case "$$ap" in ''|\#*) continue;; esac; \
+	        if [ -e "$(INITRD_STAGE)/bin/$$ap" ]; then \
+	            bb_skip=$$((bb_skip+1)); continue; \
+	        fi; \
+	        if ln $(INITRD_STAGE)/bin/busybox \
+	              "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null; then \
+	            echo "bin/$$ap" >> $(INITRD_STAGE)/.applets.list; \
+	            bb_n=$$((bb_n+1)); \
+	        fi; \
+	    done < programs/busybox/applets.txt; \
+	    if [ "$$bb_n" -gt 0 ]; then \
+	        (cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
+	            --owner=0 --group=0 --numeric-owner -rf ../initrd.tar \
+	            -T .applets.list); \
+	    fi; \
+	    rm -f $(INITRD_STAGE)/.applets.list; \
+	    echo "[initrd] busybox applets: $$bb_n linked onto PATH, $$bb_skip skipped (a real binary owns the name)"; \
+	fi
 
 # ---------- Build ISO ----------
 #
@@ -3510,6 +4456,28 @@ $(ISO): $(KERNEL) limine.conf $(LIMINE_FILES) $(INITRD_TAR) $(INSTALL_IMG)
 $(MKFS_BIN): $(MKFS_SRC)
 	mkdir -p build
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $<
+
+$(LDSOCACHE_BIN): $(LDSOCACHE_SRC)
+	mkdir -p build
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ $<
+
+# The vDSO image. -m elf_x86_64 is REQUIRED: without an explicit flavor
+# this lld build guesses COFF and rejects every GNU flag. The version
+# script is what makes glibc's LINUX_2.6-versioned lookup succeed; the
+# output must contain ZERO relocations (vdso.c's no-GOT discipline) --
+# the kernel maps the raw image and nobody ever relocates it.
+$(VDSO_SO): $(VDSO_SRC) $(VDSO_MAP)
+	mkdir -p build
+	$(CC) --target=x86_64-unknown-linux-gnu -fPIC -O2 \
+	      -fno-stack-protector -fno-asynchronous-unwind-tables \
+	      -c $(VDSO_SRC) -o build/vdso_user.o
+	ld.lld -m elf_x86_64 -shared -o $@ build/vdso_user.o \
+	      --version-script=$(VDSO_MAP) -z noseparate-code \
+	      -z max-page-size=4096 -z rodynamic --no-undefined \
+	      --image-base=0x1000 \
+	      --soname=linux-vdso.so.1 --hash-style=both
+
+src/vdso_blob.o: $(VDSO_SO)
 
 # Only formats if disk.img doesn't already exist -- protects user data
 # across normal `make` invocations. Use `make wipe-disk` to force.
@@ -4095,7 +5063,7 @@ run: $(ISO) $(DISK_IMG)
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4118,7 +5086,7 @@ run-ssh: $(ISO) $(DISK_IMG)
 	        -smp 4 \
 	        -object rng-builtin,id=rng0 \
 	        -device virtio-rng-pci,rng=rng0,disable-legacy=on \
-	        -netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4158,7 +5126,7 @@ run-installed:
 	$(QEMU) -drive file=$(DISK),format=raw,if=ide,index=0,media=disk \
 	        -boot c \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4195,7 +5163,7 @@ run-ahci: $(ISO) $(DISK_IMG)
 	        -device ide-hd,drive=hd0,bus=ahci0.0 \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4217,7 +5185,7 @@ run-ahci-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -drive file=$(DISK_IMG),format=raw,if=none,id=hd0 \
 	        -device ide-hd,drive=hd0,bus=ahci0.0 \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4253,7 +5221,7 @@ run-nvme: $(ISO) $(DISK_IMG)
 	        -device nvme,drive=hd0,serial=tobyOSnvme0 \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4273,7 +5241,7 @@ run-nvme-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -drive file=$(DISK_IMG),format=raw,if=none,id=hd0 \
 	        -device nvme,drive=hd0,serial=tobyOSnvme0 \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4312,7 +5280,7 @@ run-virtio-net: $(ISO) $(DISK_IMG)
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device virtio-net-pci,netdev=net0,disable-legacy=on,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4362,7 +5330,7 @@ run-virtio-net-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device virtio-net-pci,netdev=net0,disable-legacy=on,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4395,7 +5363,7 @@ run-e1000e: $(ISO) $(DISK_IMG)
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4414,7 +5382,7 @@ run-e1000e-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4453,7 +5421,7 @@ run-rtl8139: $(ISO) $(DISK_IMG)
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device rtl8139,netdev=net0,mac=52:54:00:12:34:78 \
 	        -netdev user,id=net1 \
 	        -device e1000,netdev=net1,mac=52:54:00:12:34:56 \
@@ -4474,7 +5442,7 @@ run-rtl8139-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device rtl8139,netdev=net0,mac=52:54:00:12:34:78 \
 	        -netdev user,id=net1 \
 	        -device e1000,netdev=net1,mac=52:54:00:12:34:56 \
@@ -4810,7 +5778,7 @@ run-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4830,7 +5798,7 @@ run-installed-uefi: $(OVMF_CODE) $(OVMF_VARS)
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -drive file=$(DISK),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -serial file:$(LOGDIR)/serial.log \
 	        -debugcon file:$(LOGDIR)/debug.log \
@@ -4863,7 +5831,7 @@ run-gpt: $(ISO) $(GPT_DISK_IMG)
 	        -drive file=$(GPT_DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4880,7 +5848,7 @@ run-gpt-uefi: $(ISO) $(GPT_DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -cdrom $(ISO) \
 	        -drive file=$(GPT_DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4897,7 +5865,7 @@ run-gpt-nvme: $(ISO) $(GPT_DISK_IMG)
 	        -device nvme,drive=hd0,serial=tobyOSnvme0 \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4947,6 +5915,7 @@ clean:
 	done
 	rm -rf $(OBJS) $(KERNEL) iso build \
 	       programs/hello/hello.o programs/hello/hello.elf \
+	       programs/systest/systest.o programs/systest/systest.elf \
 	       programs/user_hello/user_hello.o programs/user_hello/user_hello.elf \
 	       programs/user_bad/user_bad.o programs/user_bad/user_bad.elf \
 	       programs/user_echo/user_echo.o programs/user_echo/user_echo.elf \
@@ -4987,6 +5956,7 @@ clean:
 	       programs/crashinfo/crashinfo.o programs/crashinfo/crashinfo.elf \
 	       programs/wdogtest/wdogtest.o programs/wdogtest/wdogtest.elf \
 	       programs/safesh/safesh.o programs/safesh/safesh.elf \
+	       programs/shparity/shparity.o programs/shparity/shparity.elf \
 	       programs/fscheck/fscheck.o programs/fscheck/fscheck.elf \
 	       programs/services/services.o programs/services/services.elf \
 	       programs/svc_crasher/svc_crasher.o programs/svc_crasher/svc_crasher.elf \
@@ -5002,7 +5972,6 @@ clean:
 	       programs/tobycc/tobycc.o programs/tobycc/m36_elf.o programs/tobycc/tobycc.elf \
 	       programs/tobybuild/tobybuild.o programs/tobybuild/tobybuild.elf \
 	       programs/selfhosttest/selfhosttest.o programs/selfhosttest/selfhosttest.elf \
-	       programs/user_sh/user_sh.o programs/user_sh/user_sh.elf \
 	       programs/user_pkg/user_pkg.o programs/user_pkg/user_pkg.elf \
 	       programs/user_svcctl/user_svcctl.o programs/user_svcctl/user_svcctl.elf \
 	       programs/user_ps/user_ps.o programs/user_ps/user_ps.elf \
@@ -5013,12 +5982,58 @@ clean:
 	       programs/user_find/user_find.o programs/user_find/user_find.elf \
 	       programs/user_sort/user_sort.o programs/user_sort/user_sort.elf \
 	       programs/user_tee/user_tee.o programs/user_tee/user_tee.elf \
+	       programs/user_setsid/user_setsid.o programs/user_setsid/user_setsid.elf \
 	       programs/user_env/user_env.o programs/user_env/user_env.elf \
 	       programs/user_chmod/user_chmod.o programs/user_chmod/user_chmod.elf \
+	       programs/user_vncpasswd/user_vncpasswd.o programs/user_vncpasswd/user_vncpasswd.elf \
 	       programs/user_df/user_df.o programs/user_df/user_df.elf \
 	       programs/user_mkdir/user_mkdir.o programs/user_mkdir/user_mkdir.elf \
 	       programs/user_touch/user_touch.o programs/user_touch/user_touch.elf \
+	       programs/user_kill/user_kill.o programs/user_kill/user_kill.elf \
 	       programs/user_tail/user_tail.o programs/user_tail/user_tail.elf \
+	       programs/user_gzip/user_gzip.o programs/user_gzip/puff.o \
+	       programs/user_gzip/user_gzip.elf \
+	       programs/user_diffutils/user_diffutils.o \
+	       programs/user_diffutils/user_diffutils.elf \
+	       programs/user_bzip2/user_bzip2.o programs/user_bzip2/user_bzip2.elf \
+	       programs/user_zutils/user_zutils.o programs/user_zutils/user_zutils.elf \
+	       programs/user_sed/user_sed.o programs/user_sed/user_sed.elf \
+	       programs/user_procnet/user_procnet.o programs/user_procnet/user_procnet.elf \
+	       programs/user_power/user_power.o programs/user_power/user_power.elf \
+	       programs/user_patch/user_patch.o programs/user_patch/user_patch.elf \
+	       programs/user_locate/user_locate.o programs/user_locate/user_locate.elf \
+	       programs/user_ln/user_ln.o programs/user_ln/user_ln.elf \
+	       programs/user_shellutils/user_shellutils.o programs/user_shellutils/user_shellutils.elf \
+	       programs/user_ls/user_ls.o programs/user_ls/user_ls.elf \
+	       programs/user_tar/user_tar.o programs/user_tar/puff.o \
+	       programs/user_tar/user_tar.elf \
+	       programs/user_textutils/user_textutils.o programs/user_textutils/user_textutils.elf \
+	       programs/user_zstd/user_zstd.o programs/user_zstd/user_zstd.elf \
+	       programs/user_zip/user_zip.o programs/user_zip/puff.o \
+	       programs/user_zip/user_zip.elf \
+	       programs/user_dig/user_dig.o programs/user_dig/user_dig.elf \
+	       programs/user_timesyncd/user_timesyncd.o programs/user_timesyncd/user_timesyncd.elf \
+	       programs/user_strip/user_strip.o programs/user_strip/user_strip.elf \
+	       programs/user_at/user_at.o programs/user_at/user_at.elf \
+	       programs/user_archive/user_archive.o programs/user_archive/user_archive.elf \
+	       programs/user_ed/user_ed.o programs/user_ed/user_ed.elf \
+	       programs/user_cron/user_cron.o programs/user_cron/user_cron.elf \
+	       programs/user_su/user_su.o programs/user_su/user_su.elf \
+	       programs/user_moreutils/user_moreutils.o programs/user_moreutils/user_moreutils.elf \
+	       programs/user_sysutils/user_sysutils.o programs/user_sysutils/user_sysutils.elf \
+	       programs/user_netutils/user_netutils.o programs/user_netutils/user_netutils.elf \
+	       programs/user_setpci/user_setpci.o programs/user_setpci/user_setpci.elf \
+	       programs/user_systemctl/user_systemctl.o programs/user_systemctl/user_systemctl.elf \
+	       programs/user_ping/user_ping.o programs/user_ping/user_ping.elf \
+	       programs/user_ftp/user_ftp.o programs/user_ftp/user_ftp.elf \
+	       programs/user_sudo/user_sudo.o programs/user_sudo/user_sudo.elf \
+	       programs/user_ranlib/user_ranlib.o programs/user_ranlib/user_ranlib.elf \
+	       programs/user_addr2line/user_addr2line.o programs/user_addr2line/user_addr2line.elf \
+	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
+	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
+	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \
+	       programs/user_utillinux/user_utillinux.o programs/user_utillinux/user_utillinux.elf \
+	       programs/user_e2fs/user_e2fs.o programs/user_e2fs/user_e2fs.elf \
 	       programs/user_uniq/user_uniq.o programs/user_uniq/user_uniq.elf \
 	       programs/user_date/user_date.o programs/user_date/user_date.elf \
 	       programs/user_wget/user_wget.o programs/user_wget/user_wget.elf \

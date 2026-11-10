@@ -39,6 +39,10 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/uaccess.h>
+#include <tobyos/ramfs.h>        /* ramfs_is_resident (finding 247) */
+#include <tobyos/page_fault.h>   /* page_ref_* */
+#include <tobyos/spinlock.h>
+#include <tobyos/heap.h>
 
 #define KERNEL_HALF_MIN 0xFFFF800000000000ULL
 #define USER_HALF_MAX   0x0000800000000000ULL
@@ -188,6 +192,211 @@ static bool ensure_writable_pages(uint64_t virt_lo, uint64_t virt_hi,
     return true;
 }
 
+/* ---- shared text (finding 247) -------------------------------------------
+ *
+ * Every exec copied the program's whole image into fresh frames -- 1.7 MB
+ * for user_shellutils, whose every command paid about 3 ms more to start
+ * than a small program's. Linux maps an executable's pages from the page
+ * cache, shared by every process running it.
+ *
+ * Here: a program whose bytes are the initrd module itself never changes
+ * for the life of the boot (ramfs_is_resident). Each of its read-only
+ * PT_LOAD segments is built ONCE into frames this cache keeps a reference
+ * to, and every later exec maps those frames read-only -- no copy. What
+ * keeps a frame shared only for reading:
+ *   - its PTE is read-only and NOT CoW-marked, so a store is still SIGSEGV
+ *     (a CoW mark would have let the fault handler hand out a copy);
+ *   - mprotect(PROT_WRITE) of it makes it CoW (vmm_protect: a frame others
+ *     hold), so a write after that copies it out;
+ *   - fork shares it CoW like any read-only page, teardown drops one
+ *     reference (free_subtree frees only the last holder's), reclaim skips
+ *     a frame anyone else holds;
+ *   - ptrace's POKE and process_vm_writev copy it out before writing
+ *     (vmm_frame_for_write, finding 256).
+ * A page another PT_LOAD also covers (a boundary page of text and data) is
+ * built per process, as before; so is everything writable. The cache keeps
+ * at most TC_PAGE_CAP pages, the least recently used image going first: a
+ * frame still mapped stays until its last process lets it go.
+ *
+ * Not under CHROMIUM_BOOT, whose fork copies read-only pages eagerly for a
+ * refcount reason of its own (vmm_cow_fork): that build is left as it was. */
+#ifndef CHROMIUM_BOOT
+#define TC_SLOTS    96
+#define TC_PAGE_CAP 16384u                /* 64 MiB of text, at most */
+
+struct tc_ent {
+    const void *img;                      /* the key: the image, the segment */
+    size_t      size;
+    uint64_t    p_offset, p_filesz, npages;
+    uint64_t   *phys;                     /* npages frames, 0 where unshared */
+    uint64_t    nheld;                    /* how many of them are non-0 */
+    uint64_t    used;                     /* for least-recently-used */
+};
+static struct tc_ent g_tc[TC_SLOTS];
+static uint64_t g_tc_pages, g_tc_tick;
+static spinlock_t g_tc_lock = SPINLOCK_INIT;
+
+/* drop the cache's reference to each frame of E, and E itself (lock held) */
+static void tc_evict(struct tc_ent *e) {
+    for (uint64_t k = 0; k < e->npages; k++)
+        if (e->phys[k] && page_ref_dec_old(e->phys[k]) <= 1)
+            pmm_free_page(e->phys[k]);
+    g_tc_pages -= e->nheld;
+    kfree(e->phys);
+    memset(e, 0, sizeof *e);
+}
+
+static struct tc_ent *tc_find(const void *image, size_t size, const Elf64_Phdr *ph,
+                              uint64_t npages) {
+    for (int s = 0; s < TC_SLOTS; s++) {
+        struct tc_ent *e = &g_tc[s];
+        if (e->img == image && e->size == size && e->p_offset == ph->p_offset &&
+            e->p_filesz == ph->p_filesz && e->npages == npages)
+            return e;
+    }
+    return 0;
+}
+
+/* the bytes of one page of a segment whose file range is [SEG_OFF,
+ * SEG_END), the page starting at file offset PAGE_FOFF: zero where the
+ * segment has none */
+static void tc_fill(uint8_t *dst, const uint8_t *img, uint64_t page_foff,
+                    uint64_t seg_off, uint64_t seg_end) {
+    memset(dst, 0, PAGE_SIZE);
+    uint64_t a = page_foff < seg_off ? seg_off : page_foff;
+    uint64_t b = page_foff + PAGE_SIZE < seg_end ? page_foff + PAGE_SIZE : seg_end;
+    if (b > a) memcpy(dst + (a - page_foff), img + a, b - a);
+}
+
+/* Is page VA covered by a PT_LOAD of the image other than SELF? */
+static bool tc_page_shared_with(const Elf64_Ehdr *eh, const Elf64_Phdr *phdrs,
+                                Elf64_Half self, uint64_t bias, uint64_t va) {
+    for (Elf64_Half j = 0; j < eh->e_phnum; j++) {
+        const Elf64_Phdr *q = &phdrs[j];
+        if (j == self || q->p_type != PT_LOAD || q->p_memsz == 0) continue;
+        uint64_t lo = round_down(q->p_vaddr + bias, PAGE_SIZE);
+        uint64_t hi = round_up(q->p_vaddr + bias + q->p_memsz, PAGE_SIZE);
+        if (va >= lo && va < hi) return true;
+    }
+    return false;
+}
+
+/* this exec's reference on each of E's frames, into MINE (lock held) */
+static void tc_take(struct tc_ent *e, uint64_t *mine) {
+    e->used = ++g_tc_tick;
+    for (uint64_t k = 0; k < e->npages; k++) {
+        mine[k] = e->phys[k];
+        if (mine[k]) page_ref_inc(mine[k]);
+    }
+}
+
+/* Load read-only segment I of a resident user image from the cache: 1
+ * when it is mapped, 0 to load it the usual way (nothing done), -1 when a
+ * page could not be had after others were mapped (the load fails, as an
+ * out-of-memory one does) */
+static int tc_load_segment(const void *image, size_t size, const Elf64_Ehdr *eh,
+                            const Elf64_Phdr *phdrs, Elf64_Half i, uint64_t bias) {
+    const Elf64_Phdr *ph = &phdrs[i];
+    uint64_t seg_vaddr = ph->p_vaddr + bias;
+    if ((ph->p_offset & (PAGE_SIZE - 1)) != (seg_vaddr & (PAGE_SIZE - 1)))
+        return 0;                     /* file and memory pages not aligned */
+    uint64_t virt_lo = round_down(seg_vaddr, PAGE_SIZE);
+    uint64_t virt_hi = round_up(seg_vaddr + ph->p_memsz, PAGE_SIZE);
+    uint64_t npages = (virt_hi - virt_lo) / PAGE_SIZE;
+    if (npages == 0 || npages > TC_PAGE_CAP / 4) return 0;
+    uint64_t foff0 = round_down(ph->p_offset, PAGE_SIZE);
+    uint64_t seg_end = ph->p_offset + ph->p_filesz;
+    const uint8_t *img = (const uint8_t *)image;
+
+    uint64_t *mine = kmalloc(npages * sizeof *mine);
+    if (!mine) return 0;
+    uint64_t f = spin_lock_irqsave(&g_tc_lock);
+    struct tc_ent *hit = tc_find(image, size, ph, npages);
+    if (hit) tc_take(hit, mine);
+    spin_unlock_irqrestore(&g_tc_lock, f);
+
+    if (!hit) {
+        /* build it: the cache's reference on each frame, then this exec's */
+        uint64_t *built = kmalloc(npages * sizeof *built);
+        if (!built) { kfree(mine); return 0; }
+        uint64_t nheld = 0;
+        uint64_t hhdm = vmm_hhdm_offset();
+        for (uint64_t k = 0; k < npages; k++) {
+            uint64_t va = virt_lo + k * PAGE_SIZE;
+            built[k] = 0;
+            if (tc_page_shared_with(eh, phdrs, i, bias, va)) continue;
+            uint64_t fr = pmm_alloc_page();
+            if (!fr) continue;            /* that page is built per process */
+            tc_fill((uint8_t *)(fr + hhdm), img, foff0 + k * PAGE_SIZE,
+                    ph->p_offset, seg_end);
+            page_ref_inc(fr);             /* 0 -> 1: the cache's */
+            built[k] = fr;
+            nheld++;
+        }
+        f = spin_lock_irqsave(&g_tc_lock);
+        hit = tc_find(image, size, ph, npages);   /* built meanwhile? */
+        struct tc_ent *slot = 0;
+        if (!hit) {
+            for (;;) {
+                struct tc_ent *lru = 0;
+                slot = 0;
+                for (int s = 0; s < TC_SLOTS && !slot; s++) {
+                    if (!g_tc[s].img) slot = &g_tc[s];
+                    else if (!lru || g_tc[s].used < lru->used) lru = &g_tc[s];
+                }
+                if (slot && g_tc_pages + nheld <= TC_PAGE_CAP) break;
+                if (!lru) { slot = 0; break; }
+                tc_evict(lru);
+            }
+        }
+        if (hit || !slot) {
+            /* the other exec's frames, or none at all: these go back */
+            for (uint64_t k = 0; k < npages; k++)
+                if (built[k] && page_ref_dec_old(built[k]) <= 1)
+                    pmm_free_page(built[k]);
+            kfree(built);
+            if (!hit) {
+                spin_unlock_irqrestore(&g_tc_lock, f);
+                kfree(mine);
+                return 0;
+            }
+            tc_take(hit, mine);
+        } else {
+            slot->img = image; slot->size = size;
+            slot->p_offset = ph->p_offset; slot->p_filesz = ph->p_filesz;
+            slot->npages = npages; slot->phys = built; slot->nheld = nheld;
+            g_tc_pages += nheld;
+            tc_take(slot, mine);
+        }
+        spin_unlock_irqrestore(&g_tc_lock, f);
+    }
+
+    /* map: a shared frame read-only, as the segment's own permissions; a
+     * page the cache has none for, the usual way */
+    uint32_t fl = phdr_to_vmm_flags(ph->p_flags, true);
+    bool ok = true;
+    for (uint64_t k = 0; k < npages; k++) {
+        uint64_t va = virt_lo + k * PAGE_SIZE;
+        if (mine[k] && ok && vmm_translate(va) == 0 &&
+            vmm_map(va, mine[k], PAGE_SIZE, fl))
+            continue;
+        if (mine[k] && page_ref_dec_old(mine[k]) <= 1) pmm_free_page(mine[k]);
+        if (!ok) continue;
+        if (!ensure_writable_pages(va, va + PAGE_SIZE, true)) { ok = false; continue; }
+        unsigned long uflags = uaccess_begin();
+        uint64_t a = seg_vaddr > va ? seg_vaddr : va;
+        uint64_t b = seg_vaddr + ph->p_filesz < va + PAGE_SIZE
+                   ? seg_vaddr + ph->p_filesz : va + PAGE_SIZE;
+        if (b > a) memcpy((void *)a, img + ph->p_offset + (a - seg_vaddr), b - a);
+        uint64_t z = seg_vaddr + ph->p_filesz > va ? seg_vaddr + ph->p_filesz : va;
+        if (va + PAGE_SIZE > z) memset((void *)z, 0, va + PAGE_SIZE - z);
+        uaccess_end(uflags);
+    }
+    kfree(mine);
+    return ok ? 1 : -1;
+}
+#endif
+
 static bool do_elf_load(const void *image, size_t size, bool user_mode,
                         uint64_t load_base, struct elf_load_info *info) {
     if (!image || !info) return false;
@@ -322,6 +531,15 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
                 (void *)virt_lo, (void *)virt_hi);
 #endif
 
+#ifndef CHROMIUM_BOOT
+        /* a read-only segment of an initrd program: mapped from the shared
+         * text (finding 247) */
+        if (user_mode && !(ph->p_flags & PF_W) && ramfs_is_resident(image, size)) {
+            int tc = tc_load_segment(image, size, eh, phdrs, i, bias);
+            if (tc < 0) return false;
+            if (tc > 0) { loaded++; continue; }
+        }
+#endif
 #ifdef CHROMIUM_BOOT
         es_t = perf_now_ns();
 #endif
@@ -424,7 +642,7 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
         info->phdr_va = 0;
     }
 
-    kprintf("[elf] load OK%s: type=%s, %d segment(s), base=%p, entry=%p, "
+    kprintf_log("[elf] load OK%s: type=%s, %d segment(s), base=%p, entry=%p, "
             "phdr=%p (%u entries)%s\n",
             user_mode ? " (user)" : "",
             (eh->e_type == ET_DYN) ? "ET_DYN" : "ET_EXEC",

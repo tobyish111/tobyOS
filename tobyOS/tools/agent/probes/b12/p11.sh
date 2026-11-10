@@ -1,0 +1,11 @@
+declare -A a; a=([aa]=b [0]=zzz); echo "1 [${a}] [$a]"
+declare -A b2=([0]=x); echo "2 [$b2]"; c=([0]=p q); echo "3 [$c]"
+array=('1 2' 3); declare -A d; d['key']="${array[@]}"; echo "4 [${d['key']}]"
+declare -A as; as["${array[@]}"]=foo; echo "5 [${as["${array[@]}"]}]" "${!as[@]}"
+declare -A A=(['K']=val); declare -n ref='A["K"]'; echo "6 [$ref]"; ref=val2; echo "7 ${A[@]} ${!A[@]}"
+key=K; declare -n ref2='A[$key]'; echo "8 [$ref2]"; ref2=val3; echo "9 ${A[@]}"
+printf -v 'A["K"]' '/%s/' v4; echo "10 ${A[@]}"; printf -v 'A[$key]' '/%s/' v5; echo "11 ${A[@]}"
+k2='\'; declare -A B; (( B["$k2"] = 42 )); echo "12 ${!B[@]} ${B[@]}"
+declare -A T=([empty]='' [k]=v); key=empty; test -v 'T[$key]'; echo "13 $?"; key=k; [[ -v T[$key] ]]; echo "14 $?"; test -v 'T[nope]'; echo "15 $?"
+declare -A S; S[xx]=1; S[yy]=2; S[zz]=3; S[aa]=4; S[bb]=5; for o in 0 1 2 3 4 5 -1 -2; do echo "16.$o ${S[@]: $o: 3}"; done
+read 'A[$key]' <<< rd; echo "17 ${A[@]}"; unset 'A[$key]'; echo "18 ${A[@]} ${!A[@]}"

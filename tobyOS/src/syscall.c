@@ -19,6 +19,8 @@
  * /bin/echo, /bin/cat) all use the new signature.
  */
 
+#include <tobyos/spinlock.h>
+#include <tobyos/rlimit.h>
 #include <tobyos/syscall.h>
 #include <tobyos/kmath.h>      /* C20: kernel libm for the float-return shims */
 #include <tobyos/proc.h>
@@ -39,6 +41,7 @@
 #include <tobyos/term.h>
 #include <tobyos/vfs.h>
 #include <tobyos/apic.h>
+#include <tobyos/pci.h>   /* setpci: config-space accessors + struct pci_dev */
 #include <tobyos/procfs.h>
 #include <tobyos/cgroup.h>
 int sysfs_mount_at(const char *path);   /* src/sysfs.c has no public header */
@@ -49,9 +52,13 @@ void ptrace_syscall_stop(struct proc *p, bool entering, long nr, long ret);
 bool ptrace_stopped_for(struct proc *me, struct proc *t);
 int  ptrace_stop_signal(struct proc *t);
 int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
+#include <tobyos/civiltime.h> /* w32_GetSystemTime (finding 157) */
 #include <tobyos/nsproxy.h>   /* namespaces: unshare/setns/uts (slice 8) */
 #include <tobyos/rtnetlink.h> /* SIOC* interface ioctls (slice 12 cut 4) */
 #include <tobyos/seccomp.h>   /* seccomp-bpf (slice 13) */
+#include <tobyos/flock.h>     /* POSIX record locks + flock (2026-08-22) */
+#include <tobyos/xattr.h>     /* extended attributes (Phase E; finding 225) */
+#include <tobyos/sysvipc.h>   /* SysV sem + msg (Phase H) */
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/rng.h>   /* getrandom + /dev/urandom entropy */
@@ -71,7 +78,9 @@ int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/page_fault.h>   /* get_pte / PTE_* -- deadlocked-thread stack walk */
 #include <tobyos/devtest.h>
 #include <tobyos/blk.h>
+#include <tobyos/devfs.h>   /* the disks' nodes (finding 198) */
 #include <tobyos/provision.h>
+#include <tobyos/arp.h>        /* ABI_SYS_ARP */
 #include <tobyos/display.h>
 #include <tobyos/hotplug.h>
 #include <tobyos/slog.h>
@@ -107,6 +116,11 @@ int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/smp.h>
 #include <tobyos/pe.h>
 #include <tobyos/kfont.h>   /* C14b: kernel TrueType text for the GDI shims */
+#include "../build/kbuild_id.h"   /* TOBYOS_BUILD_DATE: uname's version (253) */
+
+/* the slewed CLOCK_MONOTONIC (finding 280), defined with the wall clock */
+uint64_t lx_mono_ns(uint64_t raw);
+uint64_t lx_mono_sleep_raw(uint64_t d);
 
 extern void syscall_entry(void);
 
@@ -220,6 +234,50 @@ static bool user_str_in(char *ks, size_t cap, const char *us) {
     return true;
 }
 
+/* A FILE'S ALLOCATION IN 512-BYTE BLOCKS, as Linux counts st_blocks: the
+ * filesystems here store a file in whole 4 KiB blocks or pages (tmpfs,
+ * the initrd, tobyfs, ext4), and a symbolic link under 60 bytes in its
+ * inode. It was the size in 512-byte steps, so a 1-byte file was 1 KiB
+ * where Linux's is 4 (finding 229). */
+static uint64_t vfs_stat_blocks(const struct vfs_stat *vs) {
+    if (vs->type == VFS_TYPE_SYMLINK && vs->size < 60) return 0;
+    /* a directory's whole blocks: ext4's 4096-byte ones, tmpfs's none (its
+     * 40 + 20 an entry is a count, not an allocation) */
+    if (vs->type == VFS_TYPE_DIR) return vs->size / 4096 * 8;
+    return (vs->size + 4095) / 4096 * 8;
+}
+
+/* WHAT statfs(2) ANSWERS FOR: what the path names -- a final link
+ * followed, perhaps into another mount; a dangling one is ENOENT. The VFS
+ * picks a mount by prefix, so the link's own mount answered: `df` of a
+ * link into /mnt/a printed /mnt/a's name with the link's mount's numbers
+ * (finding 244). */
+static long vfs_err_to_abi(long rv);
+static int statfs_follow(char *kpath, size_t cap) {
+    struct vfs_stat lst;
+    if (vfs_stat(kpath, &lst) != VFS_OK || lst.type != VFS_TYPE_SYMLINK) return 0;
+    char to[ABI_PATH_MAX];
+    int r = vfs_follow_link(kpath, to, sizeof to);
+    if (r != VFS_OK) return vfs_err_to_abi(r);
+    size_t l = strlen(to);
+    if (l >= cap) return -ABI_ENAMETOOLONG;
+    memcpy(kpath, to, l + 1);
+    return 0;
+}
+
+/* A path string of the caller's that is not looked up -- a symbolic link's
+ * target -- into KS, of ABI_PATH_MAX + 1 bytes: 0, -EFAULT, or
+ * -ENAMETOOLONG for one of PATH_MAX bytes or more, as Linux's getname
+ * answers (finding 227: the native symlink said EFAULT, and the Linux one
+ * cut the target short and made the link). */
+static int user_path_in(char *ks, const char *us) {
+    if (!us) return -ABI_EFAULT;
+    long n = strncpy_from_user(ks, us, ABI_PATH_MAX + 1);
+    if (n < 0) return -ABI_EFAULT;
+    if ((size_t)n >= ABI_PATH_MAX) return -ABI_ENAMETOOLONG;
+    return 0;
+}
+
 /* Translate a VFS_ERR_* code into the ABI errno userspace expects.
  *
  * The two numbering schemes are unrelated, and read()/write() were returning
@@ -247,10 +305,20 @@ static long vfs_err_to_abi(long rv) {
     case VFS_ERR_NAMETOOLONG: return -ABI_ENAMETOOLONG;
     case VFS_ERR_PERM:        return -ABI_EACCES;
     case VFS_ERR_NOTPERM:     return -ABI_EPERM;    /* slice 11 -- see vfs.h */
-    case VFS_ERR_LOOP:        return -ABI_EINVAL;   /* no ABI_ELOOP yet */
+    case VFS_ERR_LOOP:        return -ABI_ELOOP;    /* "Too many levels of symbolic links" */
+    case VFS_ERR_XDEV:        return -ABI_EXDEV;    /* Phase G: hard links */
+    case VFS_ERR_NOTEMPTY:    return -ABI_ENOTEMPTY; /* batch 31: rename */
+    case VFS_ERR_BADF:        return -ABI_EBADF;     /* finding 216 */
+    case VFS_ERR_BUSY:        return -ABI_EBUSY;     /* finding 241 */
     default:                  return rv;            /* already an ABI errno */
     }
 }
+
+/* A removed working directory (finding 200; defined beside chdir_kpath) */
+static long linux_open_dir_gone(const char *kpath);
+static bool cwd_is_gone(const char *kpath);
+static bool cwd_is_gone_named(const char *kpath);
+static void cwd_gone_stat(struct vfs_stat *vs);
 
 /* Convert a file_read()/file_write() result, WHICH ERROR SPACE IT IS IN
  * DEPENDING ON THE FILE KIND.
@@ -275,6 +343,10 @@ static long vfs_err_to_abi(long rv) {
  * bug is not a missing conversion but an INAPPLICABLE one.) */
 static long file_err_to_abi(const struct file *f, long rv) {
     if (rv >= 0) return rv;
+    /* pipe_write's "no reader" is its own -3, which as an errno is ESRCH
+     * (batch 25: a process ignoring SIGPIPE was told "No such process") */
+    if (rv == -3 && f && (f->kind == FILE_KIND_PIPE_W || f->kind == FILE_KIND_PIPE_RW))
+        return -ABI_EPIPE;
     return (f && f->kind == FILE_KIND_VFS) ? vfs_err_to_abi(rv) : rv;
 }
 
@@ -301,18 +373,107 @@ struct file **proc_fds(struct proc *p) {
     return p ? p->fds : 0;
 }
 
+/* The close-on-exec bitmap rides with the fd TABLE, so a thread must see the
+ * leader's copy through the same indirection as proc_fds() -- otherwise one
+ * thread's fcntl(F_SETFD) is invisible to its siblings while the fd itself
+ * is shared, which is a divergence no userspace can debug. */
+static uint8_t *proc_cloexec(struct proc *p) {
+    if (p && p->is_thread) {
+        struct proc *ld = proc_lookup(p->tgid);
+        if (ld) return ld->fd_cloexec;
+    }
+    return p ? p->fd_cloexec : 0;
+}
+
+void fd_cloexec_set(struct proc *p, int fd, int on) {
+    if (fd < 0 || fd >= PROC_NFDS) return;
+    uint8_t *m = proc_cloexec(p);
+    if (!m) return;
+    if (on) m[fd >> 3] |=  (uint8_t)(1u << (fd & 7));
+    else    m[fd >> 3] &= (uint8_t)~(1u << (fd & 7));
+}
+
+int fd_cloexec_get(struct proc *p, int fd) {
+    if (fd < 0 || fd >= PROC_NFDS) return 0;
+    uint8_t *m = proc_cloexec(p);
+    return m ? (m[fd >> 3] >> (fd & 7)) & 1 : 0;
+}
+
+/* RESOURCE LIMITS (include/tobyos/rlimit.h). A thread's are its leader's,
+ * as its descriptors are; a table never set reads as the defaults. */
+struct tobyos_rlim *proc_rlim(struct proc *p) {
+    if (!p) return 0;
+    if (p->is_thread) {
+        struct proc *ld = proc_lookup(p->tgid);
+        if (ld) p = ld;
+    }
+    if (!p->rlim_set) {
+        for (int r = 0; r < TOBYOS_RLIM_NLIMITS; r++)
+            tobyos_rlimit_default(r, &p->rlim[r].cur, &p->rlim[r].max);
+        p->rlim_set = true;
+    }
+    return p->rlim;
+}
+
+int proc_nofile(struct proc *p) {
+    struct tobyos_rlim *t = proc_rlim(p);
+    if (!t) return PROC_NFDS;
+    uint64_t c = t[TOBYOS_RLIMIT_NOFILE].cur;
+    return c < (uint64_t)PROC_NFDS ? (int)c : PROC_NFDS;
+}
+
+/* May CALLER read or set TARGET's limits? Its own thread group; root
+ * (Linux's CAP_SYS_RESOURCE); or a TARGET whose real, effective and saved
+ * ids are all the caller's real ones -- Linux's prlimit rule. */
+static bool proc_rlimit_may(struct proc *caller, struct proc *target) {
+    if (!caller || !target) return false;
+    if (caller == target) return true;
+    if (caller->tgid && caller->tgid == target->tgid) return true;
+    if (caller->uid == 0) return true;
+    return caller->ruid == target->ruid && caller->ruid == target->uid &&
+           caller->ruid == target->suid && caller->rgid == target->rgid &&
+           caller->rgid == target->gid && caller->rgid == target->sgid;
+}
+
+/* Linux's order: no process, then the permission, then the resource and
+ * the new values; the old values only once all of that has passed. */
+long proc_prlimit(struct proc *caller, struct proc *target, int resource,
+                  const struct tobyos_rlim *nw, struct tobyos_rlim *old) {
+    if (!target) return -ABI_ESRCH;
+    if (!proc_rlimit_may(caller, target)) return -ABI_EPERM;
+    if (resource < 0 || resource >= TOBYOS_RLIM_NLIMITS) return -ABI_EINVAL;
+    struct tobyos_rlim *t = proc_rlim(target);
+    if (!t) return -ABI_ESRCH;
+    struct tobyos_rlim was = t[resource];
+    if (nw) {
+        int e = tobyos_rlimit_check(resource, &was, nw,
+                                    caller && caller->uid == 0);
+        if (e) return e == 1 ? -ABI_EPERM : -ABI_EINVAL;
+        t[resource] = *nw;
+    }
+    if (old) *old = was;
+    return 0;
+}
+
 static struct file *fd_lookup(int fd) {
     if (fd < 0 || fd >= PROC_NFDS) return 0;
     struct file **t = proc_fds(current_proc());
     return t ? t[fd] : 0;
 }
 
+/* The lowest free descriptor BELOW P'S SOFT RLIMIT_NOFILE, holding F; -1
+ * when there is none, which every creator reports as EMFILE. */
 static int fd_alloc_into(struct proc *p, struct file *f) {
     struct file **t = proc_fds(p);
     if (!t) return -1;
-    for (int i = 0; i < PROC_NFDS; i++) {
+    int lim = proc_nofile(p);
+    for (int i = 0; i < lim; i++) {
         if (!t[i]) {
             t[i] = f;
+            /* A fresh slot starts NOT close-on-exec; a stale bit left by a
+             * previous tenant of this slot must not leak onto the new fd.
+             * Creators that want the flag set it after allocation. */
+            fd_cloexec_set(p, i, 0);
             return i;
         }
     }
@@ -321,11 +482,13 @@ static int fd_alloc_into(struct proc *p, struct file *f) {
 
 /* ---- syscall implementations ----------------------------------- */
 
-static long sys_write(int fd, const void *buf, size_t len) {
-    if (len == 0) return 0;
-    if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+/* One bounce-buffered write of at most SYS_MAX_RW bytes. */
+static long sys_write_one(int fd, const void *buf, size_t len) {
     struct file *f = fd_lookup(fd);
-    if (!f) return -1;
+    /* a descriptor that is not open is EBADF (it was a bare -1, which
+     * both libtoby and the Linux personality read as errno 1, EPERM:
+     * bash's `echo x >&-`-style failures said "Operation not permitted") */
+    if (!f) return -ABI_EBADF;
     void *k = bounce_in(buf, len);
     if (!k) return -ABI_EFAULT;
 #ifdef CHROMIUM_BOOT
@@ -352,7 +515,49 @@ static long sys_write(int fd, const void *buf, size_t len) {
 #endif
     long rv = file_write(f, k, len);
     kfree(k);
+    /* WRITING TO A PIPE WITH NO READER RAISES SIGPIPE. POSIX: the signal
+     * comes first and EPIPE is what a process that ignores or blocks it
+     * sees. Without it `cat </dev/zero | true` never ended -- cat took the
+     * EPIPE as an ordinary short write and went round again -- and every
+     * program in the "write until the reader goes away" shape ran forever
+     * instead of dying with 141. */
+    if (rv == -3 && (f->kind == FILE_KIND_PIPE_W || f->kind == FILE_KIND_PIPE_RW)) {
+        struct proc *me = current_proc();
+        if (me) signal_send_to_pid(me->pid, SIGPIPE);
+        /* ...and EPIPE is what it then sees (file_err_to_abi, below) */
+    }
+    /* Same POSIX rule for a socket whose write side was shutdown(2): the
+     * signal comes first, EPIPE is what a process that ignores it sees. */
+    if (rv == -ABI_EPIPE && f->kind == FILE_KIND_SOCKET) {
+        struct proc *me = current_proc();
+        if (me) signal_send_to_pid(me->pid, SIGPIPE);
+    }
     return file_err_to_abi(f, rv);
+}
+
+/* WRITE ALL OF IT (K4, 2026-09-30). The kernel bounces at most SYS_MAX_RW
+ * (64 KiB) per pass, and write(2) used to RETURN after one pass: a 70,000
+ * byte write to a file came back 65536. POSIX lets a regular file write be
+ * short only for an error (disk full, a signal), and real programs rely on
+ * it -- bash 5.2's here-document writer does ONE write of the whole
+ * document and calls a short count ENOSPC, so every bash here-document over
+ * 64 KiB failed with "cannot create temp file for here-document: No space
+ * left on device". Now the passes repeat until the whole buffer is written.
+ * A pass that writes less than it was given (a pipe whose reader left, a
+ * signal, a full disk, a non-blocking descriptor) ends the call with the
+ * total so far -- or with its error if nothing was written. */
+static long sys_write(int fd, const void *buf, size_t len) {
+    if (len == 0) return 0;
+    size_t done = 0;
+    while (done < len) {
+        size_t n = len - done;
+        if (n > SYS_MAX_RW) n = SYS_MAX_RW;
+        long rv = sys_write_one(fd, (const char *)buf + done, n);
+        if (rv < 0) return done ? (long)done : rv;
+        done += (size_t)rv;
+        if ((size_t)rv < n) break;
+    }
+    return (long)done;
 }
 
 static long evdev_read(unsigned dev, uint64_t ubuf, size_t len); /* evdev dev, below */
@@ -431,12 +636,12 @@ static void rdchk_verify(struct tcp_conn *tc, int fd, const void *kbuf,
 }
 #endif
 
-static long sys_read(int fd, void *buf, size_t len) {
+static long sys_read_one(int fd, void *buf, size_t len) {
     if (len == 0) return 0;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
     if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
     struct file *f = fd_lookup(fd);
-    if (!f) return -1;
+    if (!f) return -ABI_EBADF;          /* not -1 (EPERM): see sys_write_one */
     if (f->kind == FILE_KIND_EVDEV)      /* /dev/input/event<N>: input_event stream */
         return evdev_read((unsigned)f->dir_off, (uint64_t)(uintptr_t)buf, len);
     void *k = kmalloc(len);
@@ -452,6 +657,38 @@ static long sys_read(int fd, void *buf, size_t len) {
     return file_err_to_abi(f, rv);
 }
 
+/* READ ALL OF IT WHERE LINUX DOES (batch 25). The kernel bounces at most
+ * SYS_MAX_RW (64 KiB) per pass, and read(2) RETURNED after one pass: a
+ * 1 MiB read of a regular file or of /dev/zero came back 65536. Linux
+ * gives a regular file's read all it asks for up to the end of the file,
+ * and /dev/zero /dev/full /dev/urandom all of it -- and programs count on
+ * that: `dd if=/dev/zero bs=1M count=1` said "0+1 records in, 65536 bytes"
+ * (logs/utilgate dd_sizes). So for those kinds the passes repeat until the
+ * buffer is full or a pass comes back short (the end of the file). A pipe,
+ * a socket, a terminal still return what one pass found: a second pass
+ * there could wait for data the caller never asked to wait for. */
+static long sys_read(int fd, void *buf, size_t len) {
+    if (len <= SYS_MAX_RW) return sys_read_one(fd, buf, len);
+    struct file *f = fd_lookup(fd);
+    if (!f) return -ABI_EBADF;
+    /* a disk too, as Linux's block device gives a read all it asks for:
+     * `dd if=/dev/sdb1 bs=1M` said "0+N records in" (finding 276) */
+    if (f->kind != FILE_KIND_VFS && f->kind != FILE_KIND_DEVZERO &&
+        f->kind != FILE_KIND_DEVFULL && f->kind != FILE_KIND_DEVRANDOM &&
+        f->kind != FILE_KIND_BLKDEV)
+        return sys_read_one(fd, buf, SYS_MAX_RW);
+    size_t done = 0;
+    while (done < len) {
+        size_t n = len - done;
+        if (n > SYS_MAX_RW) n = SYS_MAX_RW;
+        long rv = sys_read_one(fd, (char *)buf + done, n);
+        if (rv < 0) return done ? (long)done : rv;
+        done += (size_t)rv;
+        if ((size_t)rv < n) break;
+    }
+    return (long)done;
+}
+
 /* Non-blocking read (slice 45, ABI_SYS_READ_NB): on a pipe, drains what is
  * buffered and returns -ABI_EAGAIN instead of parking when momentarily empty.
  * Native apps have no fcntl(O_NONBLOCK)/working poll on pipe fds; chromewin uses
@@ -463,8 +700,8 @@ static long sys_read_nb(int fd, void *buf, size_t len) {
     if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
-    if (f->kind != FILE_KIND_PIPE_R)
-        return sys_read(fd, buf, len);           /* only pipes get the NB path */
+    if (f->kind != FILE_KIND_PIPE_R && f->kind != FILE_KIND_PIPE_RW)
+        return sys_read_one(fd, buf, len);       /* only pipes get the NB path */
     void *k = kmalloc(len);
     if (!k) return -ABI_ENOMEM;
     long rv = pipe_tryread(f->pipe, k, len);     /* >0 / 0 EOF / -ABI_EAGAIN */
@@ -489,10 +726,10 @@ static long sys_pread64(int fd, void *buf, size_t len, int64_t offset) {
     if (f->kind != FILE_KIND_VFS) return -ABI_ESPIPE;
     void *k = kmalloc(len);
     if (!k) return -ABI_ENOMEM;
-    size_t saved = f->vfs.pos;
-    f->vfs.pos = (size_t)offset;
-    long rv = file_read(f, k, len);
-    f->vfs.pos = saved;          /* positioned read must not move the offset */
+    size_t saved = file_pos_get(f);
+    file_pos_set(f, (size_t)offset);
+    long rv = file_err_to_abi(f, file_read(f, k, len));   /* a VFS code: an errno */
+    file_pos_set(f, saved);      /* positioned read must not move the offset */
     if (rv > 0 && copy_to_user(buf, k, (size_t)rv) != 0) rv = -ABI_EFAULT;
     kfree(k);
     return rv;
@@ -500,18 +737,28 @@ static long sys_pread64(int fd, void *buf, size_t len, int64_t offset) {
 
 static long sys_pwrite64(int fd, const void *buf, size_t len, int64_t offset) {
     if (len == 0) return 0;
-    if (len > SYS_MAX_RW) len = SYS_MAX_RW;
     if (offset < 0) return -ABI_EINVAL;
     struct file *f = fd_lookup(fd);
     if (!f) return -ABI_EBADF;
     if (f->kind != FILE_KIND_VFS) return -ABI_ESPIPE;
-    void *k = bounce_in(buf, len);
-    if (!k) return -ABI_EFAULT;
-    size_t saved = f->vfs.pos;
-    f->vfs.pos = (size_t)offset;
-    long rv = file_write(f, k, len);
-    f->vfs.pos = saved;
-    kfree(k);
+    /* Whole buffer, in SYS_MAX_RW passes -- see sys_write (K4). */
+    size_t saved = file_pos_get(f);
+    size_t done = 0;
+    long rv = 0;
+    while (done < len) {
+        size_t n = len - done;
+        if (n > SYS_MAX_RW) n = SYS_MAX_RW;
+        void *k = bounce_in((const char *)buf + done, n);
+        if (!k) { rv = -ABI_EFAULT; break; }
+        file_pos_set(f, (size_t)offset + done);
+        rv = file_err_to_abi(f, file_write(f, k, n));       /* a VFS code: an errno */
+        kfree(k);
+        if (rv < 0) break;
+        done += (size_t)rv;
+        if ((size_t)rv < n) break;
+    }
+    file_pos_set(f, saved);
+    if (done) return (long)done;
     return rv;
 }
 
@@ -522,10 +769,12 @@ static long sys_pipe(int *user_fds_out) {
 
     struct proc *p = current_proc();
     struct file **t = proc_fds(p);
+    /* no room for both ends: EMFILE, as Linux's (it was a bare -1, which
+     * reads as EPERM -- logs/b47/rl, "pipe when full") */
     int fd_r = fd_alloc_into(p, r);
-    if (fd_r < 0) { file_close(r); file_close(w); return -1; }
+    if (fd_r < 0) { file_close(r); file_close(w); return -ABI_EMFILE; }
     int fd_w = fd_alloc_into(p, w);
-    if (fd_w < 0) { t[fd_r] = 0; file_close(r); file_close(w); return -1; }
+    if (fd_w < 0) { t[fd_r] = 0; file_close(r); file_close(w); return -ABI_EMFILE; }
 
     int fds[2] = { fd_r, fd_w };
     if (copy_to_user(user_fds_out, fds, sizeof(fds)) != 0) {
@@ -537,11 +786,22 @@ static long sys_pipe(int *user_fds_out) {
 }
 
 static long sys_close(int fd) {
-    if (fd < 0 || fd >= PROC_NFDS) return -1;
-    struct file **t = proc_fds(current_proc());
-    if (!t || !t[fd]) return -1;
+    /* no such descriptor: EBADF, as Linux's -- the -1 here read as EPERM
+     * ("closing standard input: Operation not permitted", finding 219) */
+    if (fd < 0 || fd >= PROC_NFDS) return -ABI_EBADF;
+    struct proc *p = current_proc();
+    struct file **t = proc_fds(p);
+    if (!t || !t[fd]) return -ABI_EBADF;
+    /* POSIX wart, faithfully kept: closing ANY descriptor for a file drops
+     * the process's fcntl record locks on that file -- even locks placed
+     * through a different, still-open descriptor. Software is written
+     * against this rule (SQLite documents fighting it), so diverging would
+     * change locking semantics underneath ported code. */
+    { extern void fl_release_close(struct file *f, struct proc *p);
+      fl_release_close(t[fd], p); }
     file_close(t[fd]);
     t[fd] = 0;
+    fd_cloexec_set(p, fd, 0);    /* the flag dies with the descriptor */
     return 0;
 }
 
@@ -563,9 +823,33 @@ static long sys_yield(void) {
 
 static long sys_socket(int domain, int type) {
     if (!cap_check(current_proc(), CAP_NET, "sys_socket")) return -1;
-    if (domain != AF_INET || type != SOCK_DGRAM) return -1;
-    struct sock *s = sock_alloc(SOCK_KIND_UDP);
+
+    /* SOCK_RAW carries its protocol in the top 16 bits of `type`, because
+     * the native ABI's socket() has only two arguments. See socket.h. */
+    int base_type = type & SOCK_TYPE_MASK;
+    unsigned raw_proto = (unsigned)(type >> SOCK_RAW_PROTO_SHIFT) & 0xFF;
+
+    int kind = SOCK_KIND_UDP;
+    int is_packet = 0;
+    if (base_type == SOCK_RAW) {
+        /* ROOT ONLY, the way Linux gates raw sockets. A raw socket can read
+         * every packet the machine receives and can forge the contents of
+         * one it sends; neither belongs to an unprivileged process. */
+        struct proc *rp = current_proc();
+        if (!rp || rp->uid != 0) return -ABI_EPERM;
+        if (domain == AF_PACKET)     is_packet = 1;
+        else if (domain != AF_INET)  return -ABI_EAFNOSUPPORT;
+        kind = SOCK_KIND_RAW;
+    } else if (domain != AF_INET || base_type != SOCK_DGRAM) {
+        return -1;
+    }
+
+    struct sock *s = sock_alloc(kind);
     if (!s) return -1;
+    if (kind == SOCK_KIND_RAW) {
+        s->raw_proto     = (uint8_t)raw_proto;
+        s->raw_is_packet = (uint8_t)is_packet;
+    }
 
     struct file *f = (struct file *)kmalloc(sizeof(*f));
     if (!f) { sock_close(s); return -1; }
@@ -783,6 +1067,29 @@ static long sys_gui_text(int fd, uint32_t xy, const char *s,
                        fd, x, y, n);
     }
     return gui_window_text(f->win, x, y, buf, fg, bg);   /* native apps: 8x8 bitmap */
+}
+
+/* Same packing as sys_gui_text, but the FIXED-CELL renderer. Split rather
+ * than flagged so a caller's choice of grid-vs-prose is visible at the call
+ * site -- the bug this fixes was precisely a call site that believed it had
+ * asked for a grid. */
+static long sys_gui_text_mono(int fd, long a2, const char *s,
+                              uint32_t fg, uint32_t bg) {
+    struct file *f = fd_lookup(fd);
+    if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+    char buf[256];
+    long n = strncpy_from_user(buf, s, sizeof(buf));
+    if (n < 0) return -1;
+    uint32_t xy = (uint32_t)(a2 & 0xFFFFFFFFu);
+    int x = (int)(int16_t)(xy & 0xFFFFu);
+    int y = (int)(int16_t)((xy >> 16) & 0xFFFFu);
+    /* Cell height rides in the UPPER 32 bits of a2, which was a packed
+     * field already and had them spare. Carrying it in the top byte of the
+     * colour would have been the other option, and the kind of cleverness
+     * that costs an afternoon two years from now. 0 = the font's own 16. */
+    int cell_h = (int)((a2 >> 32) & 0xFFFF);
+    if (cell_h < 0 || cell_h > 256) cell_h = 0;
+    return gui_window_text_mono(f->win, x, y, buf, fg, bg, cell_h);
 }
 
 static long sys_gui_flip(int fd) {
@@ -1356,6 +1663,12 @@ static long sys_term_read(int fd, void *buf, size_t cap) {
     return (long)total;
 }
 
+/* Defined further down, next to the other path plumbing. Declared here
+ * because the VFS syscalls below are the earliest callers. */
+int resolve_user_path(const char *user_path, char *out, size_t cap);
+int resolve_kernel_path(const char *kstr, char *out, size_t cap);
+static int resolve_path_str(const char *up, long plen, char *out, size_t cap);
+
 /* ---- VFS syscalls (milestone 13) --------------------------------- */
 
 static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
@@ -1365,17 +1678,47 @@ static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
     if (!user_buf_ok((uint64_t)(uintptr_t)out,
                      (size_t)cap * sizeof(*out))) return -ABI_EFAULT;
     char kpath[VFS_PATH_MAX];
-    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
+    /* resolve_user_path() is what prepends the cwd and applies chroot; this
+     * syscall used to hand the RAW user string to the VFS, so a relative path
+     * was looked up from the filesystem root instead of the working
+     * directory. `cd /tmp; cp -r t1 t2` failed with "cannot read directory
+     * 't1'" while tsh's own globbing of t1/* worked, because the shell
+     * resolves for itself and only this syscall did not. It also meant a
+     * chrooted process read outside its root here -- the same omission that
+     * once let execve run the HOST binary from inside a chroot. */
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    /* A link to a directory lists the directory, as opendir(3) follows it:
+     * `ls link/` and `find -L` failed with "No such file or directory".
+     * Resolved here, into a buffer that lives as long as this call does --
+     * the VFS's directory handle keeps the path's pointer. */
+    char followed[VFS_PATH_MAX];
+    {
+        struct vfs_stat lst;
+        if (vfs_stat(kpath, &lst) == VFS_OK && lst.type == VFS_TYPE_SYMLINK &&
+            vfs_follow_link(kpath, followed, sizeof followed) == VFS_OK)
+            memcpy(kpath, followed, strlen(followed) + 1);
+    }
 
     struct vfs_dir d;
     int rc = vfs_opendir(kpath, &d);
-    if (rc != VFS_OK) return -1;
+    /* WHY, not -1: a directory without read permission is EACCES, a file
+     * is ENOTDIR, as opendir(3) says them on Linux -- -1 was every error,
+     * and libtoby called it ENOENT, so `ls` of a 0700 directory not one's
+     * own said "No such file or directory" (batch 30, logs/utilgate/ls.sh) */
+    if (rc != VFS_OK) return vfs_err_to_abi(rc);
 
     struct vfs_dirent ent;
     int written = 0;
     int index   = 0;
+    /* where the last window ended, without reading the way there
+     * (finding 277) */
+    if (offset > 0) index = (int)vfs_seekdir(&d, (size_t)offset);
     while (written < cap && vfs_readdir(&d, &ent) == VFS_OK) {
         if (index++ < offset) continue;
+        /* this listing gives size, owner and mode: a driver that reads only
+         * the directory leaves them to a stat (finding 277) */
+        vfs_dirent_fill(kpath, &ent);
         /* Copy via a kernel staging buffer so a partial iteration
          * can't leave bad data in user memory. */
         struct vfs_dirent_user u;
@@ -1401,12 +1744,158 @@ static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
     return written;
 }
 
+/* ---- readdir as Linux's (batch 31, finding 187) ------------------------
+ * Linux's readdir gives "." and ".." first, each entry's inode -- the one
+ * lstat of it says -- and its type whole. Neither personality did: the
+ * native listing had no dots, two types and an index for an inode; the
+ * Linux one (getdents64) no dots and an index too. GNU ls -a listed what
+ * readdir gave (su_ls added the two itself), and `ls -i`, find -inum and
+ * fts's cycle check read d_ino. */
+
+/* Linux's d_type of a VFS entry: the format its mode keeps (devfs's
+ * S_IFCHR, a FIFO's), else its VFS type. */
+static uint8_t vfs_entry_dt(enum vfs_type type, uint32_t mode) {
+    if (type == VFS_TYPE_DIR)     return ABI_DT2_DIR;
+    if (type == VFS_TYPE_SYMLINK) return ABI_DT2_LNK;
+    switch (mode & 0xF000u) {
+    case 0x1000u: return ABI_DT2_FIFO;
+    case 0x2000u: return ABI_DT2_CHR;
+    case 0x6000u: return ABI_DT2_BLK;
+    case 0xC000u: return ABI_DT2_SOCK;
+    case 0x4000u: return ABI_DT2_DIR;
+    case 0xA000u: return ABI_DT2_LNK;
+    default:      return ABI_DT2_REG;
+    }
+}
+
+/* The directory a listing's ".." is: KPATH's parent, but never above the
+ * caller's root (a chroot's "/.." is itself, as "/..'s" is "/"). */
+static void readdir_parent(const char *kpath, char *out, size_t cap) {
+    struct proc *p = current_proc();
+    const char *root = (p && p->fs_root[0]) ? p->fs_root : "";
+    size_t rl = strlen(root), n = strlen(kpath);
+    while (n > 1 && kpath[n - 1] == '/') n--;
+    bool at_root = (n == 1 && kpath[0] == '/') ||
+                   (rl && n == rl && strncmp(kpath, root, rl) == 0);
+    if (!at_root) {
+        while (n > 0 && kpath[n - 1] != '/') n--;     /* drop the leaf */
+        while (n > 1 && kpath[n - 1] == '/') n--;     /* and its slash */
+        if (rl && n < rl) n = rl;
+    }
+    if (n == 0) n = 1;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, kpath, n);
+    out[n] = '\0';
+}
+
+static uint64_t lx_ino_hash(const char *s);
+static bool lx_fs_identity(const struct vfs_stat *vs, uint32_t *maj,
+                           uint32_t *min);
+
+/* An entry's inode, as each personality's lstat reports it: the native
+ * stat gives the filesystem's own (0 where it keeps none), the Linux one
+ * that, or the path's hash where there is none. */
+static uint64_t readdir_ino(const char *path, bool linux_rule) {
+    struct vfs_stat vs;
+    if (vfs_stat(path, &vs) != VFS_OK) return linux_rule ? lx_ino_hash(path) : 0;
+    if (!linux_rule) return vs.ino;
+    uint32_t maj, min;
+    if (lx_fs_identity(&vs, &maj, &min) && vs.ino) return vs.ino;
+    return lx_ino_hash(path);
+}
+
+/* DIR + "/" + NAME into OUT; false if it does not fit. */
+static bool readdir_join(char *out, size_t cap, const char *dir, const char *name) {
+    size_t dl = strlen(dir), nl = strlen(name);
+    bool slash = !(dl && dir[dl - 1] == '/');
+    if (dl + (slash ? 1 : 0) + nl + 1 > cap) return false;
+    memcpy(out, dir, dl);
+    if (slash) out[dl++] = '/';
+    memcpy(out + dl, name, nl + 1);
+    return true;
+}
+
+static long sys_fs_readdir2(const char *path, struct abi_dirent2 *out,
+                            int cap, int offset) {
+    if (cap <= 0) return 0;
+    if (offset < 0) offset = 0;
+    if (!user_buf_ok((uint64_t)(uintptr_t)out, (size_t)cap * sizeof(*out)))
+        return -ABI_EFAULT;
+    char kpath[VFS_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    char followed[VFS_PATH_MAX];                /* a link to a directory */
+    {
+        struct vfs_stat lst;
+        if (vfs_stat(kpath, &lst) == VFS_OK && lst.type == VFS_TYPE_SYMLINK &&
+            vfs_follow_link(kpath, followed, sizeof followed) == VFS_OK)
+            memcpy(kpath, followed, strlen(followed) + 1);
+    }
+    /* the removed working directory lists nothing, not even "." and "..",
+     * as Linux's (finding 200) */
+    if (cwd_is_gone_named(kpath)) return 0;
+    struct vfs_dir d;
+    int rc = vfs_opendir(kpath, &d);
+    if (rc != VFS_OK) return vfs_err_to_abi(rc);
+
+    int written = 0, index = 0;
+    struct abi_dirent2 u;
+    char child[VFS_PATH_MAX];
+    /* "." and ".." are entries 0 and 1 */
+    for (int k = 0; k < 2 && written < cap; k++, index++) {
+        if (index < offset) continue;
+        memset(&u, 0, sizeof u);
+        u.name[0] = '.';
+        if (k == 1) u.name[1] = '.';
+        u.type = ABI_DT2_DIR;
+        if (k == 0) {
+            u.ino = readdir_ino(kpath, false);
+        } else {
+            readdir_parent(kpath, child, sizeof child);
+            u.ino = readdir_ino(child, false);
+        }
+        if (copy_to_user(&out[written], &u, sizeof u) != 0) {
+            vfs_closedir(&d);
+            return -ABI_EFAULT;
+        }
+        written++;
+    }
+    struct vfs_dirent ent;
+    /* the window's first entry, passed to without reading the way there
+     * where the driver can (finding 277: each call opened the directory
+     * again and read every entry before it) */
+    if (offset > index) index += (int)vfs_seekdir(&d, (size_t)(offset - index));
+    while (written < cap && vfs_readdir(&d, &ent) == VFS_OK) {
+        if (index++ < offset) continue;
+        memset(&u, 0, sizeof u);
+        size_t i = 0;
+        for (; i + 1 < ABI_DIRENT2_NAME_MAX && ent.name[i]; i++)
+            u.name[i] = ent.name[i];
+        u.name[i] = '\0';
+        u.type = vfs_entry_dt(ent.type, ent.mode);
+        /* the inode the entry names, where the directory says it: a stat
+         * of each name was a lookup of it (finding 277) */
+        u.ino = ent.ino ? ent.ino
+              : readdir_join(child, sizeof child, kpath, ent.name)
+              ? readdir_ino(child, false) : 0;
+        if (copy_to_user(&out[written], &u, sizeof u) != 0) {
+            vfs_closedir(&d);
+            return -ABI_EFAULT;
+        }
+        written++;
+    }
+    vfs_closedir(&d);
+    return written;
+}
+
 static long sys_fs_readfile(const char *path, void *out, size_t cap) {
     if (cap == 0) return 0;
     if (cap > SYS_MAX_RW) cap = SYS_MAX_RW;
     if (!user_buf_ok((uint64_t)(uintptr_t)out, cap)) return -ABI_EFAULT;
     char kpath[VFS_PATH_MAX];
-    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
+    /* Same omission as sys_fs_readdir above: no cwd, no chroot. */
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
 
     struct vfs_file f;
     int rc = vfs_open(kpath, &f);
@@ -1535,6 +2024,17 @@ static long sys_session_info(char *out, size_t cap) {
     for (int j = 0; info.username[j] && i < sizeof(buf) - 1; j++) {
         buf[i++] = info.username[j];
     }
+    /* since=<epoch seconds> (2026-09-04): who/users/uptime need a login
+     * time, and the console session is the only one the kernel tracks. */
+    const char *p4 = " since=";
+    while (*p4 && i < sizeof(buf) - 1) buf[i++] = *p4++;
+    {
+        char tmp[24]; int k = 0;
+        uint64_t v = info.since_epoch_s;
+        if (v == 0) tmp[k++] = '0';
+        while (v) { tmp[k++] = (char)('0' + v % 10u); v /= 10u; }
+        while (k && i < sizeof(buf) - 1) buf[i++] = tmp[--k];
+    }
     if (i < sizeof(buf) - 1) buf[i++] = '\n';
     buf[i] = '\0';
 
@@ -1565,6 +2065,65 @@ static long sys_getuid(void) {
  * credential models in one kernel drift, and the lenient one would be a privilege
  * bug rather than a cosmetic inconsistency. */
 static long lx_do_setid(bool is_uid, long id);
+/* Declared here (defined with the Linux table below) because the native
+ * dispatcher forwards ABI_SYS_IOCTL into it -- one tty/pty ioctl surface. */
+static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long a5);
+/* ...and the xattr calls into theirs (ABI_SYS_XATTR, finding 225) */
+static long lx_xattr(long n, long a1, long a2, long a3, long a4, long a5);
+
+/* Process groups, shared by BOTH ABIs for the same drift-avoidance reason
+ * as lx_do_setid. Until this existed LX_setpgid was a stub that RETURNED 0
+ * -- bash's `set -m` was told its process groups existed and none did, and
+ * `kill -- -pgid` succeeded while signalling nobody.
+ *
+ * pgids are kernel-wide ids (the group leader's kpid) and are NOT yet
+ * translated through pid namespaces the way pids are; the initial
+ * namespace -- where every gate and shell runs -- sees identity either
+ * way. A proc whose pgid was never set reads as leading its own group. */
+static int proc_pgid_of(const struct proc *t) {
+    return t->pgid > 0 ? t->pgid : t->pid;
+}
+
+static long lx_do_setpgid(long a1, long a2) {
+    struct proc *me = current_proc();
+    if (!me) return -ABI_ESRCH;
+    int tk = (a1 == 0) ? me->pid : pid_knr((int)a1);
+    if (!tk) return -ABI_ESRCH;
+    struct proc *t = proc_lookup(tk);
+    if (!t) return -ABI_ESRCH;
+    /* Only yourself or your own child, within your session. */
+    if (t != me && t->ppid != me->pid) return -ABI_EPERM;
+    if (t->session_id != me->session_id) return -ABI_EPERM;
+    if (a2 < 0) return -ABI_EINVAL;
+    /* the group by the caller's number for it (finding 226) */
+    long pg = (a2 == 0) ? t->pid : pid_knr((int)a2);
+    if (pg == 0) return -ABI_EPERM;          /* no such group to join */
+    if (pg != t->pid) {
+        /* Joining a group: it must exist in this session. */
+        extern struct proc g_proc[];
+        bool found = false;
+        for (int i = 0; i < PROC_MAX && !found; i++) {
+            if (g_proc[i].state == PROC_UNUSED ||
+                g_proc[i].state == PROC_EMBRYO) continue;
+            if (proc_pgid_of(&g_proc[i]) == (int)pg &&
+                g_proc[i].session_id == t->session_id) found = true;
+        }
+        if (!found) return -ABI_EPERM;
+    }
+    t->pgid = (int)pg;
+    return 0;
+}
+
+static long lx_do_getpgid(long a1) {
+    struct proc *me = current_proc();
+    if (!me) return -ABI_ESRCH;
+    /* the caller's number for the group, as /proc says it (finding 226) */
+    if (a1 == 0) return pid_vnr_of_kpid(proc_pgid_of(me));
+    int tk = pid_knr((int)a1);
+    struct proc *t = tk ? proc_lookup(tk) : 0;
+    if (!t) return -ABI_ESRCH;
+    return pid_vnr_of_kpid(proc_pgid_of(t));
+}
 
 static long sys_getgid(void) {
     struct proc *p = current_proc();
@@ -1604,18 +2163,41 @@ static long sys_username(int uid, char *out, size_t cap) {
  * refusal was correct and the errno userspace saw was ENOMEM. "Out of memory" for a
  * permission denial sends a debugger in precisely the wrong direction, and a test
  * that only asserted "chown failed" would have accepted it forever. */
+/* RESOLVE THE PATH AGAINST THE CALLER'S CWD, like every other path
+ * syscall here does.
+ *
+ * These two took the user string verbatim and handed it to the VFS, so a
+ * RELATIVE path never resolved: `cd /tmp; chmod 755 f` reported "No such
+ * file or directory" for a file that stat() in the same process found
+ * without trouble. That asymmetry is what made it survive -- chmod's own
+ * stat() succeeds first, so the tool gets far enough to look like it is
+ * working on the right file and fails at the last step.
+ *
+ * Found by a distro-gate case for `test -x`, and it is also the cause of
+ * the Oils builtin-type failure (1286), where `touch _tmp/date` works and
+ * `chmod +x _tmp/date` then cannot find what touch just made. */
 static long sys_chmod(const char *path, uint32_t mode) {
     if (!cap_check(current_proc(), CAP_SETTINGS_WRITE, "sys_chmod")) return -ABI_EPERM;
-    char kpath[VFS_PATH_MAX];
-    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
     return vfs_err_to_abi(vfs_chmod(kpath, mode));
 }
 
 static long sys_chown(const char *path, uint32_t uid, uint32_t gid) {
     if (!cap_check(current_proc(), CAP_SETTINGS_WRITE, "sys_chown")) return -ABI_EPERM;
-    char kpath[VFS_PATH_MAX];
-    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
     return vfs_err_to_abi(vfs_chown(kpath, uid, gid));
+}
+
+static long sys_lchown(const char *path, uint32_t uid, uint32_t gid) {
+    if (!cap_check(current_proc(), CAP_SETTINGS_WRITE, "sys_lchown")) return -ABI_EPERM;
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    return vfs_err_to_abi(vfs_lchown(kpath, uid, gid));
 }
 
 /* ============================================================
@@ -1662,6 +2244,9 @@ static long sys_getppid(void) {
      * number there and pid_vnr_of_kpid returns 0 -- which is exactly what Linux
      * reports for getppid() in that position. Do not "fix" the 0 up to the real
      * parent: that would leak a host pid across the boundary. */
+    /* An orphan in the initial namespace (PROC_PPID_ORPHAN) is a child of 1,
+     * which is what Linux reports once init has adopted it. */
+    if (p->ppid < 0) return 1;
     return pid_vnr_of_kpid(p->ppid);
 }
 
@@ -1699,6 +2284,109 @@ static long sys_getpriority(int pid) {
     if (pid <= 0) pid = me ? me->pid : 0;
     else { int k = pid_knr(pid); if (!k) return ABI_PRIO_NONE; pid = k; }  /* slice 10 */
     return sched_get_prio(pid);
+}
+
+/* ---- POSIX niceness (batch 25) ------------------------------------------
+ *
+ * getpriority(2) and setpriority(2) as Linux defines them, for both
+ * personalities (LX_getpriority/LX_setpriority, ABI_SYS_GETNICE/SETNICE).
+ * WHICH is a process (0), a process group (1) or a user (2, by real uid);
+ * WHO 0 is the caller's own. get answers 20 less the lowest niceness among
+ * the matches -- the raw call's convention, which libc turns back -- or
+ * ESRCH. set clamps to -20..19 and, for each match: EPERM unless root or
+ * one of the target's uids (real or effective) is the caller's effective
+ * uid; EACCES for a niceness below the target's own, unless root; else it
+ * is set, and the scheduling class with it. One failure is the call's
+ * answer even if another match took the value, as on Linux.
+ *
+ * The Linux personality said "nice 0" for everything and took every set
+ * without doing it; the native ABI had only the scheduling class, so
+ * nice(1) could not say or change a niceness at all. */
+static int nice_class(int nice) {
+    return nice > 0 ? PRIO_LOW : nice < 0 ? PRIO_HIGH : PRIO_NORMAL;
+}
+
+/* WHO as a kernel id for WHICH (0: the caller's own), or -1 for none */
+static int nice_target(int which, int who) {
+    struct proc *me = current_proc();
+    if (which == 2) return who ? who : (me ? (int)me->ruid : 0);
+    if (!who) return me ? (which == 0 ? me->pid : me->pgid) : -1;
+    int k = pid_knr(who);                           /* slice 10: a vpid */
+    return k ? k : -1;
+}
+
+static bool nice_match(const struct proc *q, int which, int id) {
+    if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+        q->state == PROC_TERMINATED || q->pid == 0) return false;
+    if (which == 0) return q->pid == id;
+    if (which == 1) return q->pgid == id;
+    return (int)q->ruid == id;
+}
+
+static long nice_get(int which, int who) {
+    if (which < 0 || which > 2) return -ABI_EINVAL;
+    int id = nice_target(which, who);
+    if (id < 0) return -ABI_ESRCH;
+    extern struct proc g_proc[];
+    int best = 100;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (nice_match(&g_proc[i], which, id) && g_proc[i].nice < best)
+            best = g_proc[i].nice;
+    return best == 100 ? -ABI_ESRCH : 20 - best;
+}
+
+static long lx_clock_settime(int clk, const void *uts);   /* finding 157 */
+
+static long nice_set(int which, int who, long niceval) {
+    if (which < 0 || which > 2) return -ABI_EINVAL;
+    if (niceval < -20) niceval = -20;
+    if (niceval > 19) niceval = 19;
+    int id = nice_target(which, who);
+    if (id < 0) return -ABI_ESRCH;
+    struct proc *me = current_proc();
+    bool root = me && me->uid == 0;
+    extern struct proc g_proc[];
+    long err = -ABI_ESRCH;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (!nice_match(q, which, id)) continue;
+        if (!root && (!me || (q->ruid != me->uid && q->uid != me->uid))) {
+            err = -ABI_EPERM;
+            continue;
+        }
+        if (!root && niceval < q->nice) {
+            err = -ABI_EACCES;
+            continue;
+        }
+        q->nice = (int)niceval;
+        (void)sched_set_prio(q->pid, nice_class(q->nice));
+        if (err == -ABI_ESRCH) err = 0;
+    }
+    return err;
+}
+
+/* prlimit64(2) for both personalities (LX_prlimit64, ABI_SYS_PRLIMIT):
+ * PID 0 is the caller, any other a pid as the caller sees it (slice 10's
+ * namespaces); NEWP and OLDP point at { cur, max } pairs, either 0. The new
+ * values are read before anything is judged, the old written back only
+ * when the call has succeeded -- Linux's order. */
+static long sys_prlimit(int pid, int resource, uint64_t newp, uint64_t oldp) {
+    struct tobyos_rlim nw, old;
+    if (newp && copy_from_user(&nw, (const void *)(uintptr_t)newp, sizeof nw) != 0)
+        return -ABI_EFAULT;
+    struct proc *me = current_proc();
+    struct proc *t = me;
+    if (pid < 0) {
+        t = 0;
+    } else if (pid > 0) {
+        int k = pid_knr(pid);
+        t = k ? proc_lookup(k) : 0;
+    }
+    long r = proc_prlimit(me, t, resource, newp ? &nw : 0, oldp ? &old : 0);
+    if (r == 0 && oldp &&
+        copy_to_user((void *)(uintptr_t)oldp, &old, sizeof old) != 0)
+        return -ABI_EFAULT;
+    return r;
 }
 
 /* Copy a user-provided path into the kernel and resolve it against the
@@ -1773,15 +2461,303 @@ static int lx_path_has(const char *h, const char *n) {
 #define PATHFAIL_LOG(...) ((void)0)
 #endif
 
+/* LINKS IN THE MIDDLE OF A PATH ARE FOLLOWED. The VFS resolves a path by
+ * mount and name, and a filesystem looks a name up whole, so "a/link/f"
+ * with link -> ../d found nothing: `cat link/f`, `cd link` then `ls`, a
+ * relative open under a linked directory -- all "No such file or directory"
+ * (finding 88; logs/b15 lk3). Each proper prefix that is a symbolic link is
+ * replaced by what it names (vfs_link_target: the caller's root, `..`
+ * cleaned), left to right, until the path resolves or nothing more can be
+ * substituted; the LAST component is never followed here -- lstat,
+ * readlink, unlink and symlink act on a link itself. Only when the path as
+ * given does not resolve, so a path with no links in it costs one stat. */
+static int resolve_mid_links(char *kpath, size_t cap) {
+    struct vfs_stat st;
+    if (vfs_stat(kpath, &st) == VFS_OK) return 0;
+    char work[VFS_PATH_MAX], tgt[VFS_PATH_MAX];
+    size_t kl = strlen(kpath);
+    if (kl >= sizeof work) return 0;
+    memcpy(work, kpath, kl + 1);
+    bool changed = false;
+    int hops = 0;
+    for (;;) {
+        bool sub = false;
+        for (size_t i = 1; work[i]; i++) {
+            if (work[i] != '/') continue;
+            work[i] = '\0';
+            int rc = vfs_stat(work, &st);
+            if (rc != VFS_OK) { work[i] = '/'; break; }   /* a missing component */
+            /* THROUGH A NON-DIRECTORY IS ENOTDIR, as Linux's walk says it:
+             * `cat f/x` with f a file said ENOENT, and tmpfs made a file
+             * under a file for `mktemp f/XXX` (batch 31) */
+            if (st.type != VFS_TYPE_SYMLINK && st.type != VFS_TYPE_DIR)
+                return -ABI_ENOTDIR;
+            if (st.type == VFS_TYPE_SYMLINK) {
+                rc = vfs_link_target(work, tgt, sizeof tgt);
+                work[i] = '/';
+                if (rc != VFS_OK) break;
+                if (++hops > 40) return -ABI_ELOOP;
+                size_t tl = strlen(tgt), rest = strlen(work + i);
+                if (tl + rest + 1 > sizeof work) return -ABI_ENAMETOOLONG;
+                memmove(work + tl, work + i, rest + 1);
+                memcpy(work, tgt, tl);
+                changed = sub = true;
+                break;                          /* rescan the new path */
+            }
+            work[i] = '/';
+        }
+        if (!sub) break;
+    }
+    if (!changed) return 0;
+    size_t wl = strlen(work);
+    if (wl + 1 > cap) return -ABI_ENAMETOOLONG;
+    memcpy(kpath, work, wl + 1);
+    return 0;
+}
+
+/* Does PATH have a `..` component? */
+static bool path_has_dotdot(const char *p) {
+    for (const char *s = p; *s; ) {
+        while (*s == '/') s++;
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        if (e - s == 2 && s[0] == '.' && s[1] == '.') return true;
+        s = e;
+    }
+    return false;
+}
+
+/* `..` IS THE PHYSICAL PARENT. A path with `..` in it is walked as Linux's
+ * namei walks one: component by component from "/", a symbolic link before
+ * the last component replaced by its target as it is met, `..` taking the
+ * parent of where the walk IS -- so `a/lx/../f`, lx a link to ../t/x, is
+ * t/f, not a/f -- and a component before the last that is missing or not a
+ * directory ending it with ENOENT or ENOTDIR, where a lexical `..` skipped
+ * over it. FULL is the caller's view of the path, absolute; ROOT its chroot
+ * ("" for none), which the walk never climbs above; the result, ROOT +
+ * the walked path, goes to OUT. The LAST component is not followed: that
+ * is the syscall's to decide, as for resolve_mid_links. Lexical cleaning
+ * took `..` before any link was looked at (finding 88). */
+static int path_walk_physical(const char *root, const char *full,
+                              char *out, size_t cap) {
+    char cur[ABI_PATH_MAX];               /* where the walk is: caller view */
+    char rest[ABI_PATH_MAX * 2];          /* what is left to walk */
+    char kp[ABI_PATH_MAX * 2], tgt[VFS_PATH_MAX];
+    size_t rl = strlen(root);
+    size_t fl = strlen(full);
+    if (fl >= sizeof rest) return -ABI_ENAMETOOLONG;
+    memcpy(rest, full, fl + 1);
+    cur[0] = '/'; cur[1] = '\0';
+    size_t cl = 1;
+    int hops = 0;
+    size_t r = 0;                         /* read position in rest */
+    for (;;) {
+        while (rest[r] == '/') r++;
+        if (!rest[r]) break;
+        size_t s = r;
+        while (rest[r] && rest[r] != '/') r++;
+        size_t n = r - s;
+        size_t q = r;
+        while (rest[q] == '/') q++;
+        bool last = rest[q] == '\0';
+        if (n == 1 && rest[s] == '.') continue;
+        if (n == 2 && rest[s] == '.' && rest[s + 1] == '.') {
+            while (cl > 1 && cur[cl - 1] != '/') cl--;
+            if (cl > 1) cl--;                     /* and its '/' */
+            cur[cl] = '\0';
+            continue;
+        }
+        size_t prev = cl;                         /* to drop it again */
+        if (cl > 1) {
+            if (cl + 1 >= sizeof cur) return -ABI_ENAMETOOLONG;
+            cur[cl++] = '/';
+        }
+        if (cl + n >= sizeof cur) return -ABI_ENAMETOOLONG;
+        memcpy(cur + cl, rest + s, n);
+        cl += n;
+        cur[cl] = '\0';
+        if (last) break;
+        if (rl + cl + 1 > sizeof kp) return -ABI_ENAMETOOLONG;
+        memcpy(kp, root, rl);
+        memcpy(kp + rl, cur, cl + 1);
+        struct vfs_stat st;
+        if (vfs_stat(kp, &st) != VFS_OK) return -ABI_ENOENT;
+        if (st.type == VFS_TYPE_SYMLINK) {
+            if (++hops > 40) return -ABI_ELOOP;
+            if (vfs_readlink(kp, tgt, sizeof tgt) != VFS_OK) return -ABI_ENOENT;
+            /* the target, then what was left after the link */
+            size_t tl = strlen(tgt), left = strlen(rest + r);
+            if (tl + 1 + left + 1 > sizeof rest) return -ABI_ENAMETOOLONG;
+            memmove(rest + tl + 1, rest + r, left + 1);
+            memcpy(rest, tgt, tl);
+            rest[tl] = '/';
+            r = 0;
+            if (tgt[0] == '/') {                  /* absolute: from the root */
+                cl = 1;
+            } else {                              /* relative: the link's dir */
+                cl = prev;
+            }
+            cur[cl] = '\0';
+            continue;
+        }
+        if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+    }
+    /* the root itself is ROOT, the root's "/" when there is none */
+    size_t ol = (rl && cl == 1) ? 0 : cl;
+    if (rl + ol + 1 > cap) return -ABI_ENAMETOOLONG;
+    memcpy(out, root, rl);
+    memcpy(out + rl, cur, ol);
+    out[rl + ol] = '\0';
+    if (!out[0]) { out[0] = '/'; out[1] = '\0'; }
+    return 0;
+}
+
+/* SEARCH PERMISSION ON THE WAY THROUGH (finding 188). Linux's path walk
+ * asks for x on every directory it passes: the one it starts in -- the
+ * root, the working directory for a relative path, a dirfd's directory
+ * for an *at() call -- and each one after it, up to the last component's
+ * parent; never anything above where it starts, so a relative lookup
+ * from a directory whose parent has since lost its x still works. tobyOS
+ * looked at the last component alone: `cat d/f` with d at 0000 read the
+ * file, and a 0644 file under someone else's 0700 directory was anyone's.
+ * KPATH is absolute; the walk starts at FROM (0: the root), and stops at
+ * the first component that is not a directory -- a missing one, or a
+ * link, whose target the caller checks after resolving it -- leaving the
+ * call to say what is wrong there. Root searches anything, as Linux's
+ * CAP_DAC_READ_SEARCH does. */
+static int path_search_ok(const char *kpath, size_t from) {
+    struct proc *p = current_proc();
+    if (!p || p->uid == 0) return 0;
+    size_t n = strlen(kpath);
+    while (n > 1 && kpath[n - 1] == '/') n--;        /* a trailing slash */
+    size_t last = n;
+    while (last > 0 && kpath[last - 1] != '/') last--;
+    char dir[VFS_PATH_MAX];
+    for (size_t i = from; i < last; i++) {
+        if (kpath[i] != '/') continue;
+        size_t len = i ? i : 1;                      /* "/" for the root */
+        if (len >= sizeof dir) return -ABI_ENAMETOOLONG;
+        memcpy(dir, kpath, len);
+        dir[len] = '\0';
+        struct vfs_stat st;
+        if (vfs_stat(dir, &st) != VFS_OK || st.type != VFS_TYPE_DIR) return 0;
+        if (vfs_perm_check_st(&st, VFS_WANT_EXEC) != VFS_OK) return -ABI_EACCES;
+    }
+    return 0;
+}
+
+/* resolve_mid_links, with the search permission asked first of the path as
+ * written (up to its first link), then -- when links were followed -- of
+ * the path they led to, from the caller's root: Linux checks both the
+ * directories on the way to a link and those on the way through its
+ * target. */
+static int resolve_mid_links(char *kpath, size_t cap);
+static int resolve_links_searched(char *kpath, size_t cap, size_t from,
+                                  size_t root_len) {
+    int s = path_search_ok(kpath, from);
+    if (s) return s;
+    char before[VFS_PATH_MAX];
+    size_t bl = strlen(kpath);
+    if (bl >= sizeof before) return resolve_mid_links(kpath, cap);
+    memcpy(before, kpath, bl + 1);
+    int r = resolve_mid_links(kpath, cap);
+    if (r) return r;
+    if (strcmp(before, kpath) != 0) return path_search_ok(kpath, root_len);
+    return 0;
+}
+
+/* A name longer than 255 bytes in PATH: ENAMETOOLONG, as Linux's
+ * filesystems answer it -- to a lookup as to a creation. tmpfs keeps
+ * whole names, so one was made, and listed cut short (finding 227). */
+static bool path_name_too_long(const char *path) {
+    for (const char *s = path; *s; ) {
+        while (*s == '/') s++;
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        if ((size_t)(e - s) > VFS_NAME_MAX - 1) return true;
+        s = e;
+    }
+    return false;
+}
+
+/* WHAT LINUX'S WALK OF UP MEETS FIRST, for a path with a name longer than
+ * 255 bytes or one too long to join to where it starts. Linux looks the
+ * names up in order, so a name on the way that is missing, not a directory
+ * or not searchable stops it there -- `nosuch/<256 bytes>` is ENOENT, and
+ * GNU pathchk tells the cases apart by it -- and only a walk that reaches
+ * the long name, or runs past PATH_MAX, is ENAMETOOLONG (finding 227).
+ * BASE: the kernel path a relative UP starts from (0: the cwd). */
+static int walk_first_error(const char *base, const char *up) {
+    struct proc *cp = current_proc();
+    const char *root = (cp && cp->fs_root[0]) ? cp->fs_root : "";
+    size_t rl = strlen(root), bl;
+    char buf[ABI_PATH_MAX];
+    if (rl >= sizeof buf) return -ABI_ENAMETOOLONG;
+    memcpy(buf, root, rl);
+    bl = rl;
+    if (up[0] != '/') {
+        const char *from = base;
+        size_t skip = 0;
+        if (!from) from = (cp && cp->cwd[0]) ? cp->cwd : "/";
+        else skip = rl;                    /* a kernel path holds the root */
+        size_t fl = strlen(from);
+        while (fl > skip && from[fl - 1] == '/') fl--;
+        if (fl < skip) fl = skip;
+        if (bl + fl - skip >= sizeof buf) return -ABI_ENAMETOOLONG;
+        memcpy(buf + bl, from + skip, fl - skip);
+        bl += fl - skip;
+    }
+    buf[bl] = '\0';
+    for (const char *s = up; ; ) {
+        while (*s == '/') s++;
+        if (!*s) return -ABI_ENAMETOOLONG;
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        size_t n = (size_t)(e - s);
+        if (n > VFS_NAME_MAX - 1) return -ABI_ENAMETOOLONG;
+        if (n == 1 && s[0] == '.') { s = e; continue; }
+        if (n == 2 && s[0] == '.' && s[1] == '.') {
+            while (bl > rl && buf[bl - 1] != '/') bl--;
+            if (bl > rl) bl--;
+            buf[bl] = '\0';
+            s = e;
+            continue;
+        }
+        if (bl + 1 + n >= sizeof buf) return -ABI_ENAMETOOLONG;
+        buf[bl++] = '/';
+        memcpy(buf + bl, s, n);
+        bl += n;
+        buf[bl] = '\0';
+        if (!*e) return -ABI_ENAMETOOLONG;
+        struct vfs_stat st;
+        int r = vfs_stat(buf, &st);
+        if (r == VFS_OK && st.type == VFS_TYPE_SYMLINK) {
+            /* a link on the way is followed, as Linux's walk follows it --
+             * a dangling one is ENOENT (pathchk's `dang/<300 bytes>`) */
+            char to[ABI_PATH_MAX];
+            if (vfs_follow_link(buf, to, sizeof to) != VFS_OK) return -ABI_ENOENT;
+            size_t tl = strlen(to);
+            memcpy(buf, to, tl + 1);
+            bl = tl;
+            r = vfs_stat(buf, &st);
+        }
+        if (r != VFS_OK) return r == VFS_ERR_NOTDIR ? -ABI_ENOTDIR : -ABI_ENOENT;
+        if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+        if (vfs_perm_check(buf, VFS_WANT_EXEC) != VFS_OK) return -ABI_EACCES;
+        s = e;
+    }
+}
+
 int resolve_user_path(const char *user_path, char *out, size_t cap) {
-    char up[ABI_PATH_MAX];
+    /* Linux's PATH_MAX counts the NUL: 4095 bytes are a path, 4096 are too
+     * many. One byte more than that here, so the copy can tell the two
+     * apart (finding 227). */
+    char up[ABI_PATH_MAX + 1];
     long plen = strncpy_from_user(up, user_path, sizeof(up));
     if (plen < 0) return -ABI_EFAULT;
-    if ((size_t)plen >= sizeof(up) - 1) {
-        /* NAME THE PATH. ABI_PATH_MAX is 256 here and Linux's PATH_MAX is
-         * 4096, so a program that is perfectly well-behaved on Linux can be
-         * refused by this branch -- and the refusal surfaces a long way from
-         * its cause. Chromium maps errno ENAMETOOLONG through MapSystemError()
+    if ((size_t)plen >= ABI_PATH_MAX) {
+        /* NAME THE PATH. A refusal here surfaces a long way from its
+         * cause. Chromium maps errno ENAMETOOLONG through MapSystemError()
          * to net::ERR_FILE_PATH_TOO_LONG and reports it as a NETWORK failure,
          * so a page fails to load with an error naming neither a file nor a
          * path. Without the string there is nothing to connect the two.
@@ -1789,10 +2765,61 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
          * The truncated path IS the diagnosis: it says which subsystem (cache,
          * profile, socket dir) is generating the over-long name. */
         PATHFAIL_LOG("resolve_user_path: ENAMETOOLONG len>=%d first=%.*s\n",
-                     (int)sizeof(up) - 1, 64, up);
+                     (int)ABI_PATH_MAX, 64, up);
         return -ABI_ENAMETOOLONG;
     }
-    if (plen == 0 || cap == 0) return -ABI_EINVAL;
+    return resolve_path_str(up, plen, out, cap);
+}
+
+/* A path already in the kernel -- an AF_UNIX socket's name (finding 193) --
+ * resolved as resolve_user_path resolves a user's. */
+int resolve_kernel_path(const char *kstr, char *out, size_t cap) {
+    if (!kstr) return -ABI_EFAULT;
+    size_t n = strlen(kstr);
+    if (n >= ABI_PATH_MAX) return -ABI_ENAMETOOLONG;
+    return resolve_path_str(kstr, (long)n, out, cap);
+}
+
+/* THE WORKING DIRECTORY AS A RELATIVE NAME STARTS FROM IT (finding 250).
+ * The cwd is kept as its directory's real path -- chdir stores the
+ * resolved name, a chroot's prefix included -- and inside a chroot a
+ * relative name starts from it as the root sees it: the cwd less the
+ * root's prefix. That prefix was added to the whole cwd again, so in a
+ * chroot every relative name missed and getcwd said the host's path. A
+ * cwd chroot(2) left outside the new root (it does not move the cwd, on
+ * Linux either) keeps its real path: names from it are not prefixed, and
+ * `..` from it climbs past the jail, as on Linux. *OUTSIDE says which. */
+static const char *cwd_view(struct proc *p, bool *outside) {
+    *outside = false;
+    const char *cwd = (p && p->cwd[0]) ? p->cwd : "/";
+    if (!p || !p->fs_root[0]) return cwd;
+    size_t rl = strlen(p->fs_root);
+    if (strncmp(cwd, p->fs_root, rl) == 0) {
+        if (cwd[rl] == '\0') return "/";
+        if (cwd[rl] == '/') return cwd + rl;
+    }
+    *outside = true;
+    return cwd;
+}
+
+/* resolve_user_path's walk, of UP (PLEN bytes, NUL-terminated). */
+static int resolve_path_str(const char *up, long plen, char *out, size_t cap) {
+    /* an empty path names nothing: ENOENT, as Linux's (EINVAL for a
+     * zero-sized buffer, which only the kernel can pass) */
+    if (plen == 0) return -ABI_ENOENT;
+    if (cap == 0) return -ABI_EINVAL;
+    {   /* "." or "./" -- what may still name a removed cwd (finding 200) */
+        struct proc *dp = current_proc();
+        if (dp) {
+            bool dot = up[0] != '/';
+            for (const char *s = up; *s && dot; s++)
+                if (*s != '.' && *s != '/') dot = false;
+            for (const char *s = up; *s && dot; s++)
+                if (s[0] == '.' && s[1] == '.') dot = false;
+            dp->path_was_dot = dot;
+        }
+    }
+    if (path_name_too_long(up)) return walk_first_error(0, up);
 #ifdef CHROMIUM_BOOT
     /* slice 20: chrome's --dump-dom loads headless_command_resources.pak from
      * DIR_ASSETS (resolved via /proc/self/exe) to serve
@@ -1809,21 +2836,48 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
      * path_lexical_clean, so a bare "." / "./foo" cwd-relative path Just Works
      * (e.g. `busybox ls .` -> opendir(".") -> the cwd) without a special case. */
     char full[ABI_PATH_MAX];
+    bool outside = false;                 /* a cwd outside the chroot (250) */
+    const char *vcwd = "/";
     if (up[0] == '/') {
+        if ((size_t)plen >= sizeof full) return -ABI_ENAMETOOLONG;
         memcpy(full, up, (size_t)plen);
         full[plen] = '\0';
     } else {
         struct proc *p = current_proc();
-        const char *cwd = (p && p->cwd[0]) ? p->cwd : "/";
+        const char *cwd = vcwd = cwd_view(p, &outside);
         size_t clen = strlen(cwd);
         bool need_slash = (clen == 0 || cwd[clen - 1] != '/');
         size_t need = clen + (need_slash ? 1 : 0) + (size_t)plen + 1;
-        if (need > sizeof(full)) return -ABI_ENAMETOOLONG;
+        /* too long beside the cwd: what the walk would meet first (227) */
+        if (need > sizeof(full)) return walk_first_error(0, up);
         memcpy(full, cwd, clen);
         size_t o = clen;
         if (need_slash) full[o++] = '/';
         memcpy(full + o, up, (size_t)plen);
         full[o + plen] = '\0';
+    }
+    if (path_has_dotdot(up)) {                     /* see path_walk_physical */
+        struct proc *cp = current_proc();
+        const char *root = (cp && cp->fs_root[0] && !outside) ? cp->fs_root : "";
+        int wr = path_walk_physical(root, full, out, cap);
+        /* A WORKING DIRECTORY THAT WAS REMOVED STILL HAS A "..": Linux's
+         * walk climbs from the directory it holds, whose parent link
+         * outlives its name -- `rm -r ../e` from inside e, then `ls ..`,
+         * lists the parent there (batch 31, rm's fixture). The walk here
+         * starts at the cwd's NAME, which is gone, so for a cwd that no
+         * longer exists the path is cleaned lexically instead: the cwd is
+         * a physical path (chdir resolved it). Outside a chroot only. */
+        if (wr == -ABI_ENOENT && up[0] != '/' && !root[0] && cp && cp->cwd[0]) {
+            struct vfs_stat cst;
+            if (vfs_stat(cp->cwd, &cst) != VFS_OK) {
+                wr = path_lexical_clean(full, out, cap);
+                if (wr) return wr;
+                return path_search_ok(out, 0);
+            }
+        }
+        if (wr) return wr;
+        /* walked from the root (or its chroot), so searched from there */
+        return path_search_ok(out, strlen(root));
     }
     {
         int rc = path_lexical_clean(full, out, cap);
@@ -1840,7 +2894,7 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
          * insertion point covers open/stat/exec/mkdir/... rather than needing
          * a check per syscall. */
         struct proc *cp = current_proc();
-        if (cp && cp->fs_root[0]) {
+        if (cp && cp->fs_root[0] && !outside) {
             char joined[ABI_PATH_MAX];
             size_t rl = strlen(cp->fs_root);
             size_t ol = strlen(out);
@@ -1857,7 +2911,15 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
             if (jl + 1 > cap) return -ABI_ENAMETOOLONG;
             memcpy(out, joined, jl + 1);
         }
-        return 0;
+        /* where the walk starts: the root, or the working directory */
+        size_t rootl = (cp && cp->fs_root[0] && !outside) ? strlen(cp->fs_root) : 0;
+        size_t from = rootl;
+        if (up[0] != '/') {
+            size_t cl = strlen(vcwd);
+            while (cl > 1 && vcwd[cl - 1] == '/') cl--;
+            if (cl > 1) from += cl;
+        }
+        return resolve_links_searched(out, cap, from, rootl);
     }
 }
 
@@ -1873,23 +2935,97 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
  * relativity test MUST be made on the RAW user string, before that happens. */
 static int resolve_user_path_at(int dirfd, const char *upath,
                                 char *out, size_t cap) {
-    char rawp[ABI_PATH_MAX];
+    char rawp[ABI_PATH_MAX + 1];           /* see resolve_user_path */
     long rl = strncpy_from_user(rawp, upath, sizeof rawp);
     if (rl < 0) return -ABI_EFAULT;
     if (rl > 0 && rawp[0] != '/' && dirfd >= 0) {
         struct file *df = fd_lookup(dirfd);
         if (df && df->kind == FILE_KIND_DIR && df->dirpath) {
+            if (rl >= ABI_PATH_MAX) return -ABI_ENAMETOOLONG;
+            if (path_name_too_long(rawp)) return walk_first_error(df->dirpath, rawp);
             char joined[ABI_PATH_MAX];
             size_t dl = strlen(df->dirpath);
-            if (dl + 1 + (size_t)rl < sizeof(joined)) {
+            /* too long to join: what the walk from the directory meets
+             * first. It went on to resolve the path from the cwd --
+             * another file (finding 227). */
+            if (dl + 1 + (size_t)rl >= sizeof(joined))
+                return walk_first_error(df->dirpath, rawp);
+            {
                 memcpy(joined, df->dirpath, dl);
                 if (dl && joined[dl - 1] != '/') joined[dl++] = '/';
                 memcpy(joined + dl, rawp, (size_t)rl + 1);
-                return path_lexical_clean(joined, out, cap);
+                if (path_has_dotdot(rawp)) {       /* see path_walk_physical */
+                    /* the directory's path is the kernel's: the caller's
+                     * view is what follows its root */
+                    struct proc *cp = current_proc();
+                    const char *root = (cp && cp->fs_root[0]) ? cp->fs_root : "";
+                    size_t rtl = strlen(root);
+                    const char *view = joined;
+                    if (rtl && strncmp(joined, root, rtl) == 0 &&
+                        (joined[rtl] == '/' || !joined[rtl]))
+                        view = joined[rtl] ? joined + rtl : "/";
+                    return path_walk_physical(root, view, out, cap);
+                }
+                int crc = path_lexical_clean(joined, out, cap);
+                if (crc != 0) return crc;
+                /* an *at() walk starts in the dirfd's directory */
+                struct proc *dp = current_proc();
+                size_t rootl = (dp && dp->fs_root[0]) ? strlen(dp->fs_root) : 0;
+                size_t from = strlen(df->dirpath);
+                while (from > 1 && df->dirpath[from - 1] == '/') from--;
+                if (from == 1) from = 0;
+                return resolve_links_searched(out, cap, from, rootl);
             }
         }
     }
     return resolve_user_path(upath, out, cap);
+}
+
+/* A PATH THAT ENDS IN '/' NAMES A DIRECTORY, as Linux's lookup takes one:
+ * its last component is followed through any links and must be a
+ * directory -- ENOTDIR else -- for the calls that look a name up (stat,
+ * lstat, statx, readlink, access). The walk cleans the slash away, so
+ * `readlink lf/` (lf a link to a file) gave lf's target and `stat f/` the
+ * file (batch 31, readlink's and realpath's fixtures). URAW is the
+ * caller's string, KPATH what resolve_user_path made of it; a link there
+ * is replaced by the directory it leads to, so lstat("ld/") is the
+ * directory and readlink("ld/") EINVAL. NOT for unlink, rmdir or rename:
+ * they judge the link itself (sys_unlink, rmdir_path). */
+static int trailing_slash_dir(const char *uraw, char *kpath, size_t cap) {
+    char raw[ABI_PATH_MAX];
+    long rl = strncpy_from_user(raw, uraw, sizeof raw);
+    if (rl < 2) return 0;
+    raw[sizeof raw - 1] = 0;
+    size_t n = strlen(raw);
+    if (n < 2 || raw[n - 1] != '/') return 0;
+    struct vfs_stat st;
+    if (vfs_stat(kpath, &st) != VFS_OK) return 0;      /* the call says why */
+    if (st.type == VFS_TYPE_SYMLINK) {
+        char t[VFS_PATH_MAX];
+        int fr = vfs_follow_link(kpath, t, sizeof t);
+        if (fr != VFS_OK) return (int)vfs_err_to_abi(fr);
+        if (vfs_stat(t, &st) != VFS_OK) return -ABI_ENOENT;
+        if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+        size_t tl = strlen(t);
+        if (tl + 1 > cap) return -ABI_ENAMETOOLONG;
+        memcpy(kpath, t, tl + 1);
+        return 0;
+    }
+    return st.type == VFS_TYPE_DIR ? 0 : -ABI_ENOTDIR;
+}
+
+/* A LINK'S NEW NAME ENDING IN '/' (finding 223): Linux's link and symlink
+ * say EEXIST when something has the name and ENOENT when nothing does --
+ * the walk cleaned the slash away, and `ln a x/` made x. */
+static int new_name_slash(const char *uraw, const char *kpath) {
+    char raw[ABI_PATH_MAX];
+    long rl = strncpy_from_user(raw, uraw, sizeof raw);
+    if (rl < 2) return 0;
+    raw[sizeof raw - 1] = 0;
+    size_t n = strlen(raw);
+    if (n < 2 || raw[n - 1] != '/') return 0;
+    struct vfs_stat st;
+    return vfs_stat(kpath, &st) == VFS_OK ? -ABI_EEXIST : -ABI_ENOENT;
 }
 
 /* ---- Track B graphics: the Linux framebuffer device /dev/fb0 -----------
@@ -2086,6 +3222,8 @@ void fbdev_proc_exit(int pid) {
 #define SYN_REPORT      0x00
 #define REL_X           0x00
 #define REL_Y           0x01
+#define REL_HWHEEL      0x06
+#define REL_WHEEL       0x08           /* detents, + = away from user */
 #define BTN_LEFT        0x110
 #define BTN_RIGHT       0x111
 #define BTN_MIDDLE      0x112
@@ -2141,15 +3279,16 @@ void evdev_feed_key(uint8_t code, int value) {
  * exactly the packet shape a real PS/2 evdev mouse emits. `prev` is the button
  * bitmask before this report so we can emit press/release edges. The button
  * masks are the PS/2 driver's MOUSE_BTN_* bits (1=left,2=right,4=middle). */
-void evdev_feed_mouse(int dx, int dy, uint8_t buttons, uint8_t prev) {
+void evdev_feed_mouse(int dx, int dy, int dz, uint8_t buttons, uint8_t prev) {
     if (g_fbdev.win) return;        /* M3: windowed -> focus-routed feed instead */
     if (dx) evdev_push(EVDEV_MOUSE, EV_REL, REL_X, dx);
     if (dy) evdev_push(EVDEV_MOUSE, EV_REL, REL_Y, dy);
+    if (dz) evdev_push(EVDEV_MOUSE, EV_REL, REL_WHEEL, dz);
     uint8_t changed = (uint8_t)(buttons ^ prev);
     if (changed & 0x01) evdev_push(EVDEV_MOUSE, EV_KEY, BTN_LEFT,   (buttons & 0x01) ? 1 : 0);
     if (changed & 0x02) evdev_push(EVDEV_MOUSE, EV_KEY, BTN_RIGHT,  (buttons & 0x02) ? 1 : 0);
     if (changed & 0x04) evdev_push(EVDEV_MOUSE, EV_KEY, BTN_MIDDLE, (buttons & 0x04) ? 1 : 0);
-    if (dx || dy || changed)
+    if (dx || dy || dz || changed)
         evdev_push(EVDEV_MOUSE, EV_SYN, SYN_REPORT, 0);
 }
 
@@ -2183,6 +3322,15 @@ void fbdev_window_event(struct window *w, const struct gui_event *e) {
         evdev_push(EVDEV_MOUSE, EV_SYN, SYN_REPORT, 0);
         break;
     }
+    case GUI_EV_WHEEL:
+        /* Focus-routed wheel: same REL_WHEEL record the global feed emits,
+         * so a windowed Linux app scrolls identically to a fullscreen one. */
+        g_fbdev.last_mx = e->x; g_fbdev.last_my = e->y;
+        if (e->wheel) {
+            evdev_push(EVDEV_MOUSE, EV_REL, REL_WHEEL, e->wheel);
+            evdev_push(EVDEV_MOUSE, EV_SYN, SYN_REPORT, 0);
+        }
+        break;
     case GUI_EV_KEY:
         /* deliver a press+release pair (the compositor has no key-up event) */
         evdev_push(EVDEV_KBD, EV_KEY, e->key, 1);
@@ -2288,7 +3436,12 @@ static long evdev_ioctl(unsigned dev, unsigned long req, unsigned long arg) {
     }
     case 0x22: {                                   /* EVIOCGBIT(EV_REL): rel axes */
         uint8_t relbits[4] = { 0 };
-        if (is_mouse) relbits[0] = (1u << REL_X) | (1u << REL_Y);  /* 0x03 */
+        /* 0x103: X | Y | WHEEL. A Linux app checks this bitmap to decide
+         * whether the device HAS a wheel -- advertising motion only, as
+         * this did before 2026-08-23, made toolkits ignore REL_WHEEL
+         * records even when we emitted them. */
+        if (is_mouse) relbits[0] = (1u << REL_X) | (1u << REL_Y) |
+                                   (1u << REL_WHEEL);
         return evdev_copy_bits(arg, size, relbits, sizeof(relbits));
     }
     case 0x21: {                                   /* EVIOCGBIT(EV_KEY): key map */
@@ -2311,11 +3464,141 @@ static long evdev_ioctl(unsigned dev, unsigned long req, unsigned long arg) {
 
 /* ---- file open / close / dup ----------------------------------- */
 
+/* Phase G: sys_open split into a user-pointer wrapper and a body that
+ * takes an already-resolved KERNEL path, so openat(dirfd, file, ...) can
+ * finally open its dirfd-resolved path instead of falling through to a
+ * cwd-relative interpretation (the long-documented LIMITATION in the
+ * LX_openat arm -- surfaced live when openat(dfd_of_/data, "x", O_CREAT)
+ * created /x at the root the moment the root became writable). */
+static long sys_open_resolved(const char *kpath, int flags, int mode);
+
+/* A PATH ENDING IN '/' NAMES A DIRECTORY for open too (finding 218): an
+ * existing non-directory is ENOTDIR -- `cat g/` read the file g -- a link
+ * is followed to what it names, and a name that does not exist is EISDIR
+ * to O_CREAT, as Linux's open says. URAW is the caller's string, KPATH
+ * what it resolved to. */
+static int open_trailing_slash(const char *uraw, char *kpath, size_t cap, int flags) {
+    int rr = trailing_slash_dir(uraw, kpath, cap);
+    if (rr || !(flags & ABI_O_CREAT)) return rr;
+    char raw[ABI_PATH_MAX];
+    long rl = strncpy_from_user(raw, uraw, sizeof raw);
+    if (rl < 2) return 0;
+    raw[sizeof raw - 1] = 0;
+    size_t n = strlen(raw);
+    struct vfs_stat st;
+    if (n >= 2 && raw[n - 1] == '/' && vfs_stat(kpath, &st) != VFS_OK)
+        return -ABI_EISDIR;
+    return 0;
+}
+
 static long sys_open(const char *path, int flags, int mode) {
-    (void)mode;     /* M25A: permissions on creation not honoured yet */
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
+    rr = open_trailing_slash(path, kpath, sizeof kpath, flags);
+    if (rr) return rr;
+    return sys_open_resolved(kpath, flags, mode);
+}
+
+/* O_DIRECTORY, at Linux's value. A NATIVE open of a directory is refused
+ * (EISDIR from the filesystem) unless the caller asks for a directory this
+ * way -- then it gets the same descriptor the Linux personality hands out
+ * for any directory (linux_open_dir): one getdents64 lists and read(2)
+ * refuses with EISDIR. /bin/tsh asks, for `cmd < dir`: bash opens that
+ * fine and its readers fail -- `read` says "read error: 0: Is a
+ * directory", `mapfile` reads nothing, status 0 (Oils 1122; logs/b12 p59).
+ * Opt-in, so no native caller that relies on the refusal changes. */
+#define SYS_O_DIRECTORY 0x10000
+static bool lx_dir_open_refused(long flags);
+static long linux_open_dir(const char *kpath);
+
+#define LX_O_NOFOLLOW 0x20000              /* Linux x86-64's O_NOFOLLOW */
+/* Is KPATH a directory to open as one -- itself, or through a link in its
+ * last component (unless NOFOLLOW), KPATH then becoming where it leads?
+ * The open paths asked vfs_stat, which answers for the link, so a link to
+ * a directory was opened as a FILE: busybox's `ls link/` said "Is a
+ * directory" (logs/b15 lk3). */
+static bool open_dir_path(char *kpath, bool nofollow) {
+    struct vfs_stat vs;
+    if (vfs_stat(kpath, &vs) != VFS_OK) return false;
+    if (vs.type == VFS_TYPE_DIR) return true;
+    if (vs.type != VFS_TYPE_SYMLINK || nofollow) return false;
+    char t[VFS_PATH_MAX];
+    if (vfs_follow_link(kpath, t, sizeof t) != VFS_OK) return false;
+    if (vfs_stat(t, &vs) != VFS_OK || vs.type != VFS_TYPE_DIR) return false;
+    memcpy(kpath, t, strlen(t) + 1);
+    return true;
+}
+
+/* THE MODE A PROCESS'S NEW FILE OR DIRECTORY GETS: the mode it asked for
+ * less its umask (POSIX open, creat, mknod, mkdir). Every file used to be
+ * 0644 whatever was asked -- `umask 000; > f` was 0644 where Linux gives
+ * 0666, `umask 077; > f` 0644 for 0600 (logs/b14 r2). A mode of 0 is a
+ * real 0000 for every caller, as on Linux: a NATIVE caller's 0 meant
+ * "unspecified" and took 0666 or 0777, so the native `mkdir -m 0 d` made
+ * 0755 (finding 199). The GUI programs that passed 0 for "the default"
+ * pass 0666 and 0777 now. */
+static uint32_t sys_creation_mode(int mode) {
+    struct proc *p = current_proc();
+    uint32_t m = (uint32_t)mode & 07777u;
+    if (p) m &= ~(p->umask & 0777u);
+    return m;
+}
+
+/* A LINK TO WHAT ONLY sys_open CAN OPEN. A symbolic link in the last
+ * component whose target is under /dev or /proc -- a device node, /dev/fd/N,
+ * /proc/self/fd/N -- names something this function makes BY NAME (the
+ * descriptor duplicates and device files below); vfs_open has none to hand
+ * back. devfs refuses an open (EACCES: `cat link-to-/dev/zero`), and where
+ * a hop failed vfs_open kept the LINK's path and opened the link node as a
+ * file: `echo a > link-to-/dev/null` wrote into it and `read < link` read
+ * its target text, under the guest's bash, where Linux opens the device
+ * (logs/b18 symdev). The link is followed here, hop by hop, and the open is
+ * made by the name it reaches, as an open of that name would be. Not for
+ * O_NOFOLLOW, nor O_CREAT|O_EXCL, which must fail on the link itself. */
+static bool open_link_to_synth(const char *kpath, int flags, char *out,
+                               size_t cap) {
+    if (flags & LX_O_NOFOLLOW) return false;
+    if ((flags & ABI_O_CREAT) && (flags & ABI_O_EXCL)) return false;
+    char hop[2][VFS_PATH_MAX];
+    const char *cur = kpath;
+    for (int n = 0; n < 40; n++) {
+        struct vfs_stat vs;
+        if (vfs_stat(cur, &vs) != VFS_OK || vs.type != VFS_TYPE_SYMLINK)
+            return false;
+        char *nx = hop[n & 1];                      /* never into `cur` */
+        if (vfs_link_target(cur, nx, VFS_PATH_MAX) != VFS_OK) return false;
+        if (strncmp(nx, "/dev/", 5) == 0 || strncmp(nx, "/proc/", 6) == 0) {
+            size_t l = strlen(nx);
+            if (l >= cap) return false;
+            memcpy(out, nx, l + 1);
+            return true;
+        }
+        cur = nx;
+    }
+    return false;
+}
+
+static long sys_open_resolved_at(const char *kpath, int flags, int mode,
+                                 int depth);
+
+static long sys_open_resolved(const char *kpath, int flags, int mode) {
+    return sys_open_resolved_at(kpath, flags, mode, 0);
+}
+
+static long sys_open_resolved_at(const char *kpath, int flags, int mode,
+                                 int depth) {
+    if (flags & SYS_O_DIRECTORY) {
+        char dk[VFS_PATH_MAX];
+        size_t kl = strlen(kpath);
+        if (kl < sizeof dk) {
+            memcpy(dk, kpath, kl + 1);
+            if (open_dir_path(dk, false)) {
+                if (lx_dir_open_refused(flags)) return -ABI_EISDIR;
+                return linux_open_dir(dk);
+            }
+        }
+    }
 
     /* Slice 8: /proc/<pid>/ns/<kind> and /proc/self/ns/<kind>.
      *
@@ -2341,6 +3624,16 @@ static long sys_open(const char *path, int flags, int mode) {
             if (q != rest && *q == '/') { nspid = v; rest = q + 1; }
         }
         if (nspid >= 0 && strncmp(rest, "ns/", 3) == 0) {
+            /* 2026-08-22: the numeric component is a VPID in the caller's
+             * pid namespace and must translate before proc_lookup -- this
+             * arm was the one /proc consumer that skipped it, so inside a
+             * pid namespace it opened the WRONG process's nsfd (or ENOENT).
+             * self/ carries the host pid already. */
+            if (strncmp(kpath + 6, "self/", 5) != 0) {
+                int kk = pid_knr(nspid);
+                if (!kk) return -ABI_ENOENT;
+                nspid = kk;
+            }
             struct proc *target = proc_lookup(nspid);
             if (!target) return -ABI_ENOENT;
             int kind = ns_kind_from_name(rest + 3);
@@ -2353,6 +3646,91 @@ static long sys_open(const char *path, int flags, int mode) {
         }
     }
 
+    /* /dev/fd/<n> AND /proc/self/fd/<n> OPEN AS A DUPLICATE of the caller's
+     * descriptor <n> -- they do NOT resolve as symlinks.
+     *
+     * This is the mechanism bash's process substitution runs on. `cat
+     * <(head f)` hands `cat` the path /dev/fd/63 and keeps the pipe's read
+     * end open at descriptor 63; `cat` opens that path and must come out
+     * holding the pipe. A pipe has no name, so readlink's answer
+     * ("pipe:[r]", which is what Linux reports too) cannot be re-opened --
+     * the magic is in open(), not in the link text.
+     *
+     * Only the CALLER's own descriptors. /proc/<other>/fd/<n> still goes to
+     * procfs and reads as a symlink, which is what ls -l wants.
+     *
+     * The clone shares the open file description, so the two descriptors
+     * share one position -- the same thing dup(2) gives, and the same thing
+     * Linux gives for a pipe. */
+    {
+        const char *fdnum = 0;
+        if (strncmp(kpath, "/dev/fd/", 8) == 0) {
+            fdnum = kpath + 8;
+        } else if (strcmp(kpath, "/dev/stdin") == 0) {
+            /* /dev/stdin, /dev/stdout, /dev/stderr: Linux's links to
+             * /proc/self/fd/0..2, opened the same way. They did not
+             * exist, so `cat < /dev/stdin` failed in bash and tsh alike
+             * (logs/b14 r6: "/dev/stdin: No such file or directory"). */
+            fdnum = "0";
+        } else if (strcmp(kpath, "/dev/stdout") == 0) {
+            fdnum = "1";
+        } else if (strcmp(kpath, "/dev/stderr") == 0) {
+            fdnum = "2";
+        } else if (strncmp(kpath, "/proc/self/fd/", 14) == 0) {
+            fdnum = kpath + 14;
+        } else if (strncmp(kpath, "/proc/", 6) == 0) {
+            const char *q = kpath + 6;
+            int v = 0;
+            while (*q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); q++; }
+            struct proc *me = current_proc();
+            if (q != kpath + 6 && strncmp(q, "/fd/", 4) == 0 && me) {
+                int kk = pid_knr(v);
+                if (kk && kk == me->pid) fdnum = q + 4;
+            }
+        }
+        if (fdnum && *fdnum) {
+            const char *q = fdnum;
+            int v = 0;
+            while (*q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); q++; }
+            if (*q == ' ') {                  /* a bare number, not fd/3/x */
+                struct file *src = fd_lookup(v);
+                if (!src) return -ABI_EBADF;
+                struct file *cl = file_clone(src);
+                if (!cl) return -ABI_ENOMEM;
+                int nfd = fd_alloc_into(current_proc(), cl);
+                if (nfd < 0) { file_close(cl); return -ABI_EMFILE; }
+                return nfd;
+            }
+        }
+    }
+
+    /* a link to one of this function's own names: open that name */
+    {
+        char tgt[VFS_PATH_MAX];
+        if (open_link_to_synth(kpath, flags, tgt, sizeof tgt)) {
+            if (depth >= 8) return -ABI_ELOOP;
+            return sys_open_resolved_at(tgt, flags, mode, depth + 1);
+        }
+    }
+
+    /* 2026-08-22: /dev itself is openable and listable. It has never been
+     * a real directory -- nodes are synthesised in the open path -- so
+     * `ls /dev` answered ENOENT since forever, an inventory every Unix
+     * user types. The listing is the synth table, in getdents64. */
+    if (strcmp(kpath, "/dev") == 0 || strcmp(kpath, "/dev/") == 0) {
+        struct file *f = (struct file *)kmalloc(sizeof(*f));
+        if (!f) return -ABI_ENOMEM;
+        memset(f, 0, sizeof(*f));
+        f->kind    = FILE_KIND_DIR;
+        f->dirpath = (char *)kmalloc(5);      /* heap-owned: close kfrees */
+        if (!f->dirpath) { kfree(f); return -ABI_ENOMEM; }
+        memcpy(f->dirpath, "/dev", 5);
+        f->dir_off = 0;
+        int fd = fd_alloc_into(current_proc(), f);
+        if (fd < 0) { kfree(f->dirpath); kfree(f); return -ABI_EMFILE; }
+        return fd;
+    }
+
     /* B23: pseudoterminal device nodes. /dev/ptmx allocates a fresh pair and
      * yields its master; /dev/pts/<N> yields the slave of pair N. These are
      * synthesized (no VFS backing). */
@@ -2363,6 +3741,37 @@ static long sys_open(const char *path, int flags, int mode) {
          * remap a child's stdio before execve; without it chrome's children
          * bailed with _exit(127) ("GPU process exited unexpectedly:
          * exit_code=32512"). Ubiquitous in Unix programs generally. */
+        /* A DISK OR PARTITION'S NODE (finding 198): root's and the disk
+         * group's, 0660, as the VFS's check of devfs's stat says; its
+         * bytes as a file. */
+        {
+            struct blk_dev *bd = devfs_blk_by_path(kpath, 0, 0);
+            if (bd) {
+                int acc = flags & ABI_O_ACCMODE;
+                int want = acc == ABI_O_RDONLY ? VFS_WANT_READ
+                         : acc == ABI_O_WRONLY ? VFS_WANT_WRITE
+                         : VFS_WANT_READ | VFS_WANT_WRITE;
+                int pc = vfs_perm_check(kpath, want);
+                if (pc != VFS_OK) return vfs_err_to_abi(pc);
+                struct file *f = (struct file *)kmalloc(sizeof(*f));
+                if (!f) return -ABI_ENOMEM;
+                memset(f, 0, sizeof(*f));
+                f->kind = FILE_KIND_BLKDEV;
+                f->blkdev = bd;
+                f->o_accmode = acc;
+                /* the open file description, its offset what dup and fork
+                 * share (finding 279) */
+                struct vfs_ofd *ofd = (struct vfs_ofd *)kmalloc(sizeof *ofd);
+                if (!ofd) { kfree(f); return -ABI_ENOMEM; }
+                ofd->refs = 1;
+                ofd->pos  = 0;
+                f->vfs_refs = &ofd->refs;
+                int fd = fd_alloc_into(current_proc(), f);
+                if (fd < 0) { kfree(ofd); kfree(f); return -ABI_EMFILE; }
+                file_set_open_path(f, kpath);
+                return fd;
+            }
+        }
         if (strcmp(dev, "null") == 0 || strcmp(dev, "zero") == 0) {
             struct file *f = (struct file *)kmalloc(sizeof(*f));
             if (!f) return -ABI_ENOMEM;
@@ -2371,6 +3780,7 @@ static long sys_open(const char *path, int flags, int mode) {
             f->o_accmode = 2;                       /* O_RDWR */
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            file_set_open_path(f, kpath);           /* /proc/PID/fd names it */
             return fd;
         }
         /* Linux slice 6: /dev/tty and /dev/full.
@@ -2385,11 +3795,48 @@ static long sys_open(const char *path, int flags, int mode) {
          * error handling can be tested, and costs one line here -- it reads as
          * zeroes (like /dev/zero) and fails every write. */
         if (strcmp(dev, "tty") == 0) {
-            struct file *f = console_file_make();
+            /* ...THE CALLER'S controlling terminal (struct proc's ctty):
+             * the console, its session's pty, or ENXIO when it has none
+             * -- after setsid(), in an SSH command's session. It was the
+             * console for everyone: an SSH session's `bash -i` read the
+             * CONSOLE's foreground group as its terminal's and stopped
+             * itself on SIGTTIN for good (finding 61). */
+            struct proc *me = current_proc();
+            struct file *f = 0;
+            if (!me || me->ctty_kind == PROC_CTTY_CONSOLE) {
+                f = console_file_make();
+            } else if (me->ctty_kind == PROC_CTTY_PTY &&
+                       pty_ctty_live(me->ctty_index, me->ctty_gen)) {
+                f = pty_open_slave(me->ctty_index);
+                if (!f) return -ABI_ENXIO;
+                f->o_accmode = 2;
+                int pfd = fd_alloc_into(me, f);
+                if (pfd < 0) { file_close(f); return -ABI_EMFILE; }
+                return pfd;
+            } else {
+                return -ABI_ENXIO;
+            }
             if (!f) return -ABI_ENOMEM;
             f->o_accmode = 2;                       /* O_RDWR */
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { file_close(f); return -ABI_EMFILE; }
+            return fd;
+        }
+        /* /dev/rtc0 and its /dev/rtc link (finding 157): the node is
+         * root's 0600, so anyone else is EACCES, and it is one
+         * opener's at a time (EBUSY), as Linux's. */
+        if (strcmp(dev, "rtc0") == 0 || strcmp(dev, "rtc") == 0) {
+            struct proc *op = current_proc();
+            if (op && op->uid != 0) return -ABI_EACCES;
+            if (!rtc_dev_claim()) return -ABI_EBUSY;
+            struct file *f = (struct file *)kmalloc(sizeof(*f));
+            if (!f) { rtc_dev_release(); return -ABI_ENOMEM; }
+            memset(f, 0, sizeof(*f));
+            f->kind = FILE_KIND_RTC;
+            f->o_accmode = 2;
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { kfree(f); rtc_dev_release(); return -ABI_EMFILE; }
+            file_set_open_path(f, "/dev/rtc0");
             return fd;
         }
         if (strcmp(dev, "full") == 0) {
@@ -2400,6 +3847,7 @@ static long sys_open(const char *path, int flags, int mode) {
             f->o_accmode = 2;
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            file_set_open_path(f, kpath);
             return fd;
         }
         /* /dev/urandom and /dev/random: the kernel CSPRNG as a readable file.
@@ -2416,6 +3864,7 @@ static long sys_open(const char *path, int flags, int mode) {
             f->o_accmode = 2;                       /* O_RDWR: writes are mixed in */
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            file_set_open_path(f, kpath);           /* random or urandom */
             return fd;
         }
         if (strcmp(dev, "ptmx") == 0) {
@@ -2435,6 +3884,15 @@ static long sys_open(const char *path, int flags, int mode) {
             if (!any) return -ABI_ENOENT;
             struct file *f = pty_open_slave(idx);
             if (!f) return -ABI_ENOENT;
+            /* a session leader with no terminal takes the first it opens
+             * without O_NOCTTY (0400), as on Linux -- what getty and a
+             * terminal emulator's setsid()'d child rely on */
+            {
+                struct proc *me = current_proc();
+                if (me && !(flags & 0400) && me->sid == me->pid &&
+                    me->ctty_kind == PROC_CTTY_NONE)
+                    (void)pty_make_ctty(me, idx, false);
+            }
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { file_close(f); return -ABI_EMFILE; }
             return fd;
@@ -2573,10 +4031,18 @@ static long sys_open(const char *path, int flags, int mode) {
          * LX_ioctl). */
         {
             bool is_con = (strcmp(dev, "console") == 0) || (strcmp(dev, "tty") == 0);
-            if (!is_con && dev[0] == 't' && dev[1] == 't' && dev[2] == 'y') {
-                is_con = true;                       /* /dev/tty<N> */
-                for (const char *q = dev + 3; *q; q++)
+            /* /dev/tty<N>: tty0..tty63 only, no leading zeros -- exactly the
+             * set devfs lists and stats (devfs_vt_index). Any number used to
+             * open, so /dev/tty999 existed for open() and for nothing else. */
+            if (!is_con && dev[0] == 't' && dev[1] == 't' && dev[2] == 'y' &&
+                dev[3] && !(dev[3] == '0' && dev[4])) {
+                is_con = true;
+                int vt = 0;
+                for (const char *q = dev + 3; *q; q++) {
                     if (*q < '0' || *q > '9') { is_con = false; break; }
+                    vt = vt * 10 + (*q - '0');
+                    if (vt > 63) { is_con = false; break; }
+                }
             }
             if (is_con) {
                 struct file *f = console_file_make();
@@ -2593,35 +4059,177 @@ static long sys_open(const char *path, int flags, int mode) {
     bool want_excl   = (flags & ABI_O_EXCL)  != 0;
     bool want_trunc  = (flags & ABI_O_TRUNC) != 0;
     bool want_append = (flags & ABI_O_APPEND)!= 0;
-    (void)want_append; /* honoured at write-time once we plumb seek */
+
+    /* THE LAST COMPONENT'S LINK IS FOLLOWED FIRST, as Linux's open follows
+     * it (not with O_NOFOLLOW, nor for O_CREAT|O_EXCL, which fail on the
+     * link): what is created, truncated and opened is what the link names.
+     * Only the open itself followed (vfs_open_access), so O_TRUNC truncated
+     * the LINK's path, failed, and took its unlink-and-create fallback --
+     * `cp b la`, la a link to a, replaced the link with a regular file and
+     * left a as it was -- and O_CREAT through a dangling link made nothing
+     * (batch 31, cp's fixture). A dangling link's target is where O_CREAT
+     * makes the file. */
+    char lk[VFS_PATH_MAX];
+    if (!(flags & LX_O_NOFOLLOW) && !(want_create && want_excl)) {
+        struct vfs_stat lst;
+        size_t kl = strlen(kpath);
+        if (kl < sizeof lk && vfs_stat(kpath, &lst) == VFS_OK &&
+            lst.type == VFS_TYPE_SYMLINK) {
+            char hop[2][VFS_PATH_MAX];
+            const char *cur = kpath;
+            int n = 0;
+            for (;;) {
+                struct vfs_stat hs;
+                if (vfs_stat(cur, &hs) != VFS_OK || hs.type != VFS_TYPE_SYMLINK)
+                    break;                       /* there, or where to make it */
+                if (++n > 40) return -ABI_ELOOP;
+                char *nx = hop[n & 1];           /* never into `cur` */
+                if (vfs_link_target(cur, nx, VFS_PATH_MAX) != VFS_OK) break;
+                cur = nx;
+            }
+            size_t cl = strlen(cur);
+            if (cl >= sizeof lk) return -ABI_ENAMETOOLONG;
+            memcpy(lk, cur, cl + 1);
+            kpath = lk;
+        }
+    }
+
+    /* A DIRECTORY IS OPENED AS LINUX OPENS ONE, by every caller: EISDIR
+     * for writing, O_CREAT or O_TRUNC, else the descriptor the Linux
+     * personality gives (linux_open_dir) -- read(2) is EISDIR on it,
+     * fstat says directory. A native open of a directory used to reach
+     * the filesystem: tmpfs opened it as an empty file (`split -n 3 dir`
+     * read nothing and said nothing), and O_TRUNC's unlink-and-create
+     * fallback REPLACED an empty directory with a regular file (`shuf -o
+     * dir` wrote its output there) (batch 31, shuf's and split's
+     * fixtures). O_CREAT|O_EXCL is EEXIST, below. */
+    if (!(want_create && want_excl)) {
+        struct vfs_stat dvs;
+        if (vfs_stat(kpath, &dvs) == VFS_OK && dvs.type == VFS_TYPE_DIR) {
+            if (lx_dir_open_refused(flags)) return -ABI_EISDIR;
+            return linux_open_dir(kpath);
+        }
+        /* the removed working directory opens -- `ls .` there lists
+         * nothing -- as Linux's (finding 200) */
+        if (cwd_is_gone_named(kpath)) {
+            if (lx_dir_open_refused(flags)) return -ABI_EISDIR;
+            return linux_open_dir_gone(kpath);
+        }
+    }
 
     /* Optionally create. Returns EEXIST if O_EXCL set and present. */
+    bool created = false;
     if (want_create) {
         struct vfs_stat st;
         int sr = vfs_stat(kpath, &st);
         if (sr == VFS_OK && want_excl) return -ABI_EEXIST;
         if (sr == VFS_ERR_NOENT) {
-            int cr = vfs_create(kpath);
+            int cr = vfs_create_mode(kpath, sys_creation_mode(mode));
             /* Slice 61c: map the REAL failure. The old blanket EACCES made
              * a FULL /data volume report "Permission denied" -- chrome's
              * shared-memory allocator logged 64k of those while the actual
              * condition was ENOSPC (4 MiB tobyfs exhausted), which sent the
              * frame-pipeline-freeze investigation toward permissions and
              * cost a day. Errno fidelity is diagnostic infrastructure. */
-            if (cr == VFS_ERR_NOSPC)        return -ABI_ENOSPC;
-            if (cr == VFS_ERR_NAMETOOLONG)  return -ABI_ENAMETOOLONG;
-            if (cr != VFS_OK)               return -ABI_EACCES;
+            /* ...and not only those two. A missing parent directory is
+             * ENOENT on Linux, and every program on this system reported it
+             * as "Permission denied":
+             *
+             *     echo x > /nope/f     bash: "Permission denied"
+             *                          (Linux: "No such file or directory")
+             *
+             * -- bash, /bin/tsh, every libc caller. vfs_err_to_abi is the
+             * one converter for this, and it keeps PERM as EACCES. */
+            if (cr != VFS_OK)               return vfs_err_to_abi(cr);
+            created = true;
+        }
+    }
+
+    /* The permission this open needs: none for the file it has just made
+     * (Linux never refuses that open, whatever mode it gave the file), else
+     * what the access mode asks -- checked BEFORE O_TRUNC, which used to
+     * empty a file its caller could not write and only then fail the open. */
+    int want = 0;
+    if (!created) {
+        if (access == ABI_O_RDONLY) want = VFS_WANT_READ;
+        else if (access == ABI_O_WRONLY) want = VFS_WANT_WRITE;
+        else want = VFS_WANT_READ | VFS_WANT_WRITE;
+        if (want_trunc && access == ABI_O_RDONLY) want |= VFS_WANT_WRITE;
+        int pc = vfs_perm_check(kpath, want);
+        if (pc != VFS_OK && pc != VFS_ERR_NOENT) return vfs_err_to_abi(pc);
+    }
+
+    /* A FIFO is opened as its PIPE (pipe.c fifo_open): a reader waits for
+     * a writer and a writer for a reader -- O_NONBLOCK: the reader goes on,
+     * the writer is ENXIO -- and O_RDWR is both ends at once. Its path is
+     * the descriptor's, as /proc/PID/fd names a FIFO by it. */
+    {
+        struct vfs_stat fs;
+        /* a socket's node opens to nothing: ENXIO, as Linux's open says
+         * (finding 193) */
+        if (vfs_stat_follow(kpath, &fs) == VFS_OK && fs.type == VFS_TYPE_FILE &&
+            (fs.mode & 0170000u) == 0140000u)
+            return -ABI_ENXIO;
+        /* A DEVICE NODE OUTSIDE /dev (finding 214) opens the device its
+         * numbers name, as Linux's open does -- 1:3 is null wherever the
+         * node is: EACCES on a nodev mount, ENXIO when no device has the
+         * numbers. The node's own permissions were asked above; O_TRUNC
+         * means nothing to a device. */
+        if (strncmp(kpath, "/dev/", 5) != 0 &&
+            vfs_stat_follow(kpath, &fs) == VFS_OK && fs.type == VFS_TYPE_FILE &&
+            ((fs.mode & 0170000u) == 0020000u || (fs.mode & 0170000u) == 0060000u)) {
+            if (vfs_path_mount_flags(kpath) & VFS_MNT_NODEV) return -ABI_EACCES;
+            char dp[48];
+            if (!devfs_path_by_rdev(fs.mode & 0170000u, fs.rmaj, fs.rmin, dp, sizeof dp))
+                return -ABI_ENXIO;
+            if (depth >= 8) return -ABI_ELOOP;
+            return sys_open_resolved_at(dp, flags & ~(ABI_O_CREAT | ABI_O_EXCL | ABI_O_TRUNC),
+                                        mode, depth + 1);
+        }
+        if (vfs_stat_follow(kpath, &fs) == VFS_OK && fs.type == VFS_TYPE_FILE &&
+            (fs.mode & 0170000u) == 0010000u) {
+            struct file *ff = 0;
+            long fr = fifo_open(kpath, fs.dev, fs.ino, access,
+                                (flags & ABI_O_NONBLOCK) != 0, &ff);
+            if (fr < 0) return fr;
+            file_set_open_path(ff, kpath);
+            int ffd = fd_alloc_into(current_proc(), ff);
+            if (ffd < 0) { file_close(ff); return -ABI_EMFILE; }
+            return ffd;
         }
     }
 
     if (want_trunc) {
-        /* Trivial truncate: unlink + recreate. The VFS doesn't expose
-         * a real truncate primitive yet (M25A scope). Honoured only
-         * when the file already exists. */
+        /* O_TRUNC truncates the file IN PLACE. It used to unlink and
+         * recreate, with the note "the VFS doesn't expose a real truncate
+         * primitive yet (M25A scope)" -- that stopped being true when
+         * ->truncate/->ftruncate landed, and the workaround outlived its
+         * reason by long enough to become three bugs:
+         *
+         *   1. It changes the inode. POSIX requires O_TRUNC to keep the same
+         *      file; anyone else holding a descriptor is silently detached
+         *      from the file the truncating process goes on to write.
+         *   2. It LEAKS A NODE per truncate whenever any handle is open. The
+         *      unlink cannot free a node with open_count > 0 -- correctly, by
+         *      unlink-while-open semantics -- so it marks it and moves on,
+         *      and the recreate allocates a fresh one. The third-party shell
+         *      gate re-truncated four capture files per case and killed
+         *      /tmp after 127 cases: 506 of 512 nodes unlinked-but-held.
+         *   3. Between the unlink and the create the path does not exist, so
+         *      a concurrent opener sees ENOENT on a file that never went away.
+         *
+         * Fall back to the old dance only where the filesystem genuinely has
+         * no truncate op, so read-only-ish drivers behave as before. */
         struct vfs_stat st;
         if (vfs_stat(kpath, &st) == VFS_OK) {
-            vfs_unlink(kpath);
-            (void)vfs_create(kpath);
+            int tr = vfs_truncate(kpath, 0);
+            if (tr != VFS_OK) {
+                /* the file keeps its mode through the recreate */
+                uint32_t keep = (st.mode & VFS_MODE_VALID) ? (st.mode & 07777u)
+                                                           : 0644u;
+                vfs_unlink(kpath);
+                (void)vfs_create_mode(kpath, keep);
+            }
         }
     }
 
@@ -2635,11 +4243,15 @@ static long sys_open(const char *path, int flags, int mode) {
      * triggers the underlying vfs ops->close when it hits zero. We
      * allocate before vfs_open so the failure path doesn't have to
      * unwind a successfully-opened handle on a refcount OOM. */
-    f->vfs_refs = (int *)kmalloc(sizeof(int));
-    if (!f->vfs_refs) { kfree(f); return -ABI_ENOMEM; }
-    *f->vfs_refs = 1;
+    {
+        struct vfs_ofd *ofd = (struct vfs_ofd *)kmalloc(sizeof *ofd);
+        if (!ofd) { kfree(f); return -ABI_ENOMEM; }
+        ofd->refs = 1;
+        ofd->pos  = 0;
+        f->vfs_refs = &ofd->refs;   /* refs is first; see struct vfs_ofd */
+    }
 
-    int rc = vfs_open(kpath, &f->vfs);
+    int rc = vfs_open_access(kpath, &f->vfs, want);
     if (rc != VFS_OK) {
         kfree(f->vfs_refs);
         kfree(f);
@@ -2655,10 +4267,37 @@ static long sys_open(const char *path, int flags, int mode) {
          * ISDIR, PERM and NOMOUNT all map identically. */
         return vfs_err_to_abi(rc);
     }
-    /* Reject write attempts on a read-only access mode early -- we
-     * still let the file_write path enforce mount-level RO. */
+    /* The access mode is the descriptor's for good: file_read and
+     * file_write refuse what it does not allow (EBADF, finding 216), and
+     * fcntl(F_GETFL) reports it. The mount's read-only state is the
+     * driver's to refuse. */
     (void)access;
-    f->o_accmode = flags & 3;    /* O_ACCMODE: O_RDONLY/O_WRONLY/O_RDWR for F_GETFL */
+    f->o_accmode = flags & 3;    /* O_ACCMODE: O_RDONLY/O_WRONLY/O_RDWR */
+
+    /* O_APPEND: start at end of file.
+     *
+     * This used to be parsed and then explicitly discarded ("honoured at
+     * write-time once we plumb seek"), so every `>>` wrote at offset 0 and
+     * OVERWROTE what it was supposed to append to. It is invisible in the
+     * usual test because `echo two >> f` replacing `one` leaves a file of the
+     * same length containing plausible content -- it surfaced only when the
+     * bash-parity gate ran `echo one > f1; echo two >> f1` under real GNU
+     * bash and the file came back holding just "two".
+     *
+     * Positioning at open is correct for the sequential single-writer case,
+     * which is what shells and log writers do. It is NOT the full atomic
+     * seek-to-end-per-write that two processes appending to one file need;
+     * that wants a flag in struct file, and changing that struct's layout
+     * requires a full rebuild of every object that includes it.
+     *
+     * 2026-10-01: it is the full thing now -- vfs_file.append makes every
+     * write go to the end, and it fit in existing padding. */
+    if (want_append) {
+        f->vfs.append = true;
+        file_pos_set(f, f->vfs.size);
+    }
+
+    file_set_open_path(f, kpath);
 
     struct proc *p = current_proc();
     int fd = fd_alloc_into(p, f);
@@ -2676,18 +4315,68 @@ static long sys_open(const char *path, int flags, int mode) {
 static long sys_lseek(int fd, int64_t off, int whence) {
     struct file *f = fd_lookup(fd);
     if (!f) return -ABI_EBADF;
+    /* WHAT CANNOT SEEK SAYS ESPIPE, as Linux's no_llseek does -- a pipe, a
+     * socket, a terminal -- and the character devices that ignore a seek
+     * answer 0 (noop_llseek). Every non-file was EINVAL, and bash tells a
+     * pipe by ESPIPE alone (read.def: input_is_pipe): it then read a piped
+     * script's input ahead in a buffer, could not seek back, and lost the
+     * rest -- `printf 'read v\nx\necho $v\n' | bash` printed nothing
+     * (logs/b13 q58, fx272). */
+    switch (f->kind) {
+    case FILE_KIND_PIPE_R: case FILE_KIND_PIPE_W: case FILE_KIND_PIPE_RW:
+    case FILE_KIND_SOCKET:
+    case FILE_KIND_CONSOLE: case FILE_KIND_TERM: case FILE_KIND_PTY_MASTER:
+    case FILE_KIND_PTY_SLAVE: case FILE_KIND_EPOLL:
+        return -ABI_ESPIPE;
+    case FILE_KIND_DEVNULL: case FILE_KIND_DEVZERO: case FILE_KIND_DEVRANDOM:
+    case FILE_KIND_EVENTFD:
+        return 0;
+    default:
+        break;
+    }
+    if (f->kind == FILE_KIND_BLKDEV) {          /* finding 198 */
+        int64_t bsz = f->blkdev ? (int64_t)(f->blkdev->sector_count * BLK_SECTOR_SIZE) : 0;
+        int64_t bp = whence == ABI_SEEK_SET ? off
+                   : whence == ABI_SEEK_CUR ? (int64_t)file_pos_get(f) + off
+                   : whence == ABI_SEEK_END ? bsz + off : -1;
+        if (whence != ABI_SEEK_SET && whence != ABI_SEEK_CUR && whence != ABI_SEEK_END)
+            return -ABI_EINVAL;
+        if (bp < 0) return -ABI_EINVAL;
+        file_pos_set(f, (size_t)bp);   /* the description's (finding 279) */
+        return bp;
+    }
     if (f->kind != FILE_KIND_VFS) return -ABI_EINVAL;
-    int64_t cur  = (int64_t)f->vfs.pos;
+    int64_t cur  = (int64_t)file_pos_get(f);
+    /* the file's size NOW, as Linux's i_size: what another descriptor
+     * appended or cut off counts (finding 258: the size this descriptor
+     * was opened with, so SEEK_END missed every other writer's bytes) */
     int64_t size = (int64_t)f->vfs.size;
+    if (whence >= ABI_SEEK_END && whence <= 4) {   /* only these ask it */
+        struct vfs_stat cs;
+        if (vfs_fstat(&f->vfs, &cs) == VFS_OK && cs.type == VFS_TYPE_FILE)
+            size = (int64_t)cs.size;
+    }
     int64_t newp;
     switch (whence) {
     case ABI_SEEK_SET: newp = off;        break;
     case ABI_SEEK_CUR: newp = cur + off;  break;
     case ABI_SEEK_END: newp = size + off; break;
+    /* SEEK_DATA and SEEK_HOLE (finding 215), as Linux answers them for a
+     * filesystem that keeps no holes (generic_file_llseek): the whole file
+     * is data, its end the one hole; at or past the end -- a negative
+     * offset too -- there is neither, ENXIO */
+    case 3:
+        if ((uint64_t)off >= (uint64_t)size) return -ABI_ENXIO;
+        newp = off;
+        break;
+    case 4:
+        if ((uint64_t)off >= (uint64_t)size) return -ABI_ENXIO;
+        newp = size;
+        break;
     default: return -ABI_EINVAL;
     }
     if (newp < 0) return -ABI_EINVAL;
-    f->vfs.pos = (size_t)newp;
+    file_pos_set(f, (size_t)newp);
     /* POSIX: seeking past EOF does NOT change the file size -- the file only
      * grows when bytes are actually written. (Was: bumped vfs.size to the seek
      * offset, a latent bug. It surfaced via SQLite's positioned reads: seeking
@@ -2701,18 +4390,70 @@ static long sys_lseek(int fd, int64_t off, int whence) {
 static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
     memset(dst, 0, sizeof(*dst));
     dst->size = (uint64_t)src->size;
-    uint32_t typ = (src->type == VFS_TYPE_DIR) ? ABI_S_IFDIR : ABI_S_IFREG;
-    dst->mode = typ | (src->mode & ABI_S_IFMT ? src->mode : (src->mode & 0777));
-    /* If the underlying fs doesn't carry mode info, default to 0644 / 0755. */
-    if ((src->mode & 0777) == 0) {
-        dst->mode |= (src->type == VFS_TYPE_DIR) ? 0755 : 0644;
+    /* THE TYPE: the format bits a filesystem keeps in its mode (devfs's
+     * S_IFCHR), else what the VFS says -- a symbolic link included. A link
+     * was S_IFREG, so nothing native could tell one (finding 87); and a
+     * mode carrying S_IFCHR was OR'd onto S_IFREG, which is S_IFLNK's bit
+     * pattern -- unseen while no device path reached here. */
+    uint32_t fmt = src->mode & ABI_S_IFMT;
+    uint32_t typ = fmt ? fmt :
+                   (src->type == VFS_TYPE_DIR)     ? ABI_S_IFDIR :
+                   (src->type == VFS_TYPE_SYMLINK) ? ABI_S_IFLNK : ABI_S_IFREG;
+    /* 07777, not 0777: the mask decides what userland can SEE, and 0777
+     * silently drops setuid, setgid and sticky. ramfs preserves all three
+     * from the USTAR header and execve reads S_ISUID straight from the VFS,
+     * so a setuid binary WORKED while `ls -l` and every stat()-based check
+     * reported it as an ordinary 0755 file -- the one place you would look
+     * to find out. */
+    dst->mode = typ | (src->mode & 07777);
+    /* If the underlying fs doesn't carry mode info, default to 0644 / 0755
+     * (and a link's 0777). VFS_MODE_VALID says it does: a VALID 0000 (umask
+     * 777, chmod 000) is enforced as 0000 and must be REPORTED as 0000. */
+    if (!(src->mode & VFS_MODE_VALID) && (src->mode & 0777) == 0) {
+        dst->mode |= (src->type == VFS_TYPE_DIR)     ? 0755 :
+                     (src->type == VFS_TYPE_SYMLINK) ? 0777 : 0644;
     }
     /* Slice 11: the native stat path reports through the caller's user
      * namespace too -- a namespaced process must not see host ids on files just
      * because it used the native ABI instead of the Linux one. */
     dst->uid = userns_cur_uid(src->uid);
     dst->gid = userns_cur_gid(src->gid);
+    dst->mtime = src->mtime;
+    dst->atime = src->atime;
+    /* 0 from the filesystem means "no answer": substitute what every stat
+     * emitter here has always substituted, so nothing that reads nlink
+     * sees a zero where a count belongs. */
+    dst->nlink = src->nlink ? src->nlink
+                            : ((src->type == VFS_TYPE_DIR) ? 2u : 1u);
+    /* A DIRECTORY HAS AT LEAST TWO LINKS by construction -- its own name in
+     * its parent, and the "." inside it -- so anything below 2 is not a
+     * link count, it is a filesystem that does not keep one. tobyfs stores
+     * an on-disk nlink that counts only the parent's entry, and reporting
+     * that verbatim would print 1 where every Unix prints 2 or more. This
+     * is a floor, not a substitution: a filesystem that really does track
+     * subdirectories passes through untouched. */
+    if (src->type == VFS_TYPE_DIR && dst->nlink < 2u) dst->nlink = 2u;
+    if (src->nlink == VFS_NLINK_NONE) dst->nlink = 0;    /* finding 200 */
+    dst->ino = src->ino;
+    dst->dev = (uint64_t)src->dev;
+    /* Batch 25 (ABI_SYS_XSTAT): the Linux personality's numbers, so a
+     * native tool and a Linux one agree (linux_emit_stat). */
+    dst->ctime = src->ctime;
+    dst->blocks = vfs_stat_blocks(src);              /* finding 229 */
+    /* the preferred I/O size, as Linux gives a file on ext4 or tmpfs: GNU
+     * shred rounds a file up to it, and cp and stat %o read it (512 made
+     * `shred f` of a 2-byte file 512 bytes where Linux makes it 4096) */
+    dst->blksize = 4096;
+    if (typ == ABI_S_IFCHR || typ == ABI_S_IFBLK) {     /* a node (214) */
+        dst->rdev_major = src->rmaj;
+        dst->rdev_minor = src->rmin;
+    }
+    dst->mtime_ns = src->mtime_ns;                       /* finding 239 */
+    dst->atime_ns = src->atime_ns;
+    dst->ctime_ns = src->ctime_ns;
 }
+_Static_assert(offsetof(struct abi_stat, ctime) == ABI_STAT_V1_SIZE,
+               "SYS_STAT/FSTAT/LSTAT write the struct up to ctime");
 
 
 /* ---- the synthetic /dev nodes, in ONE place ------------------------------
@@ -2732,35 +4473,20 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
  * Found by tracing the path behind an ENOENT (-DPATHFAIL_TRACE) rather than by
  * guessing at Chromium's source.
  *
- * This table is the single answer to "what exists in /dev", so the open path
- * and the stat path cannot drift apart. programs/linux-gapfill asserts they
- * agree NODE BY NODE: anything listed here must both open AND stat, and a node
- * that opens without appearing here fails the test. That symmetry is the whole
- * point -- the bug above was exactly the two disagreeing. */
-struct dev_synth { const char *name; uint32_t mode; };
-static const struct dev_synth g_dev_synth[] = {
-    { "null",     ABI_S_IFCHR | 0666 },
-    { "zero",     ABI_S_IFCHR | 0666 },
-    { "full",     ABI_S_IFCHR | 0666 },
-    { "tty",      ABI_S_IFCHR | 0620 },
-    { "ptmx",     ABI_S_IFCHR | 0666 },
-    { "random",   ABI_S_IFCHR | 0666 },
-    { "urandom",  ABI_S_IFCHR | 0666 },
-};
+ * The single answer to "what exists in /dev" is now the table in devfs.c,
+ * which also mounts /dev as a directory tree -- so the open path, these stat
+ * arms, the listing, chdir and the in-kernel shell cannot drift apart.
+ * programs/linux-gapfill asserts the open/stat symmetry NODE BY NODE, and
+ * logs/kdevtreeprobe.sh walks the whole tree. (The old table here knew seven
+ * nodes; /dev/console, /dev/fb0 and /dev/input/* opened but did not stat.) */
+#include <tobyos/devfs.h>
 
-/* Non-zero (the mode) if `kpath` names a synthesised device node. */
-static uint32_t dev_synth_mode(const char *kpath)
+/* Non-zero (the mode) if `kpath` names a synthesised device node; see
+ * devfs_node_mode for the major/minor. Also the in-kernel shell's fallback
+ * for `test -e /dev/null` (see file.h). */
+uint32_t dev_synth_mode(const char *kpath)
 {
-    if (!kpath || kpath[0] != '/' || kpath[1] != 'd' || kpath[2] != 'e' ||
-        kpath[3] != 'v' || kpath[4] != '/')
-        return 0;
-    const char *dev = kpath + 5;
-    for (unsigned i = 0; i < sizeof g_dev_synth / sizeof g_dev_synth[0]; i++)
-        if (strcmp(g_dev_synth[i].name, dev) == 0)
-            return g_dev_synth[i].mode;
-    /* /dev/pts/<n> is synthesised per pair rather than named up front. */
-    if (strncmp(dev, "pts/", 4) == 0 && dev[4]) return ABI_S_IFCHR | 0620;
-    return 0;
+    return devfs_node_mode(kpath, 0, 0);
 }
 
 /* Fill an abi_stat for a synthesised node. Character devices, because that is
@@ -2771,11 +4497,319 @@ static void dev_synth_stat(uint32_t mode, struct abi_stat *out)
     memset(out, 0, sizeof *out);
     out->mode  = mode;
     out->size  = 0;
+    out->nlink = 1;
+    out->blksize = 4096;              /* as linux_emit_special_stat */
 }
 
-static long sys_stat(const char *path, struct abi_stat *out) {
+/* WHEN /dev's NODES WERE MADE (finding 202): devtmpfs stamps each node as
+ * the kernel creates it, at boot, so stat and ls -l say the boot instant --
+ * tobyOS's said 1970. The wall clock less the uptime, in nanoseconds so two
+ * reads agree; it moves with the clock as /proc/stat's btime does. */
+uint64_t dev_boot_time(void) {
+    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+    uint64_t mono = perf_now_ns();
+    uint64_t now  = lx_realtime_ns(mono);
+    return (now > mono) ? (now - mono) / 1000000000ull : 0;
+}
+
+/* A PTY SLAVE'S OWNER AND TIMES, by its name (/dev/pts/N) or an open
+ * slave descriptor (finding 190): what the pair keeps (pty.c), as Linux's
+ * devpts gives them -- the device nodes said root and 1970, and GNU who's
+ * IDLE column said "old" for every login. T is atime, mtime, ctime. False
+ * for anything that is not a live slave. */
+static bool pts_node_times(const char *kpath, struct file *f, uint32_t *uid,
+                           uint32_t *gid, uint64_t t[3]) {
+    int idx = -1;
+    if (f) {
+        if (f->kind == FILE_KIND_PTY_SLAVE) idx = pty_file_index(f);
+    } else if (kpath && strncmp(kpath, "/dev/pts/", 9) == 0 && kpath[9]) {
+        idx = 0;
+        for (const char *q = kpath + 9; *q; q++) {
+            if (*q < '0' || *q > '9' || idx > 9999) { idx = -1; break; }
+            idx = idx * 10 + (*q - '0');
+        }
+    }
+    if (idx < 0) return false;
+    return pty_node_info(idx, uid, gid, &t[0], &t[1], &t[2]);
+}
+
+/* ...and a device node's numbers, devfs's (batch 25: stat's %t %T). */
+static void dev_synth_stat_path(const char *kpath, uint32_t mode, struct abi_stat *out)
+{
+    dev_synth_stat(mode, out);
+    uint32_t maj = 0, min = 0;
+    (void)devfs_node_mode(kpath, &maj, &min);
+    if ((mode & ABI_S_IFMT) == ABI_S_IFCHR || (mode & ABI_S_IFMT) == ABI_S_IFBLK) {
+        out->rdev_major = maj;
+        out->rdev_minor = min;
+    }
+    if ((mode & ABI_S_IFMT) == ABI_S_IFBLK) out->gid = userns_cur_gid(6);   /* 198 */
+    out->atime = out->mtime = out->ctime = dev_boot_time();      /* 202 */
+    uint32_t pu, pg;
+    uint64_t pt[3];
+    if (pts_node_times(kpath, 0, &pu, &pg, pt)) {
+        out->uid = userns_cur_uid(pu);
+        out->gid = userns_cur_gid(pg);
+        out->atime = pt[0]; out->mtime = pt[1]; out->ctime = pt[2];
+    }
+}
+
+/* Defined with the Linux stat emitters, below. */
+static uint32_t lx_fd_special_mode(struct file *f, uint32_t *maj, uint32_t *min);
+uint64_t file_object_ino(struct file *f);
+
+static uint64_t lx_ino_hash(const char *s);
+static uint64_t lx_fd_ino(struct file *f, int fd);
+
+/* WHAT stat(2) SAYS OF AN OPEN REGULAR FILE -- the one its name would say,
+ * identity included (finding 106): the driver's answer through the handle
+ * (vfs_fstat), which a rename or an unlink does not disturb; for a
+ * filesystem with no fstat, the stat of the path it was opened by while
+ * that names a regular file, the handle's own size kept (it is what a read
+ * gives -- a /proc file's); and only else what the handle itself knows, as
+ * before. *INO is the inode a filesystem with none of its own gets: the
+ * Linux stat's hash of the path, so the two agree there too. FD may be -1. */
+static void fd_vfs_stat(struct file *f, int fd, struct vfs_stat *vs,
+                        uint64_t *ino) {
+    const char *op = f->open_path;
+    bool have_path = op && op[0] == '/';
+    *ino = have_path ? lx_ino_hash(op) : lx_fd_ino(f, fd);
+    if (vfs_fstat(&f->vfs, vs) == VFS_OK) return;
+    if (have_path && vfs_stat_follow(op, vs) == VFS_OK &&
+        vs->type == VFS_TYPE_FILE) {
+        vs->size = f->vfs.size;
+        return;
+    }
+    *vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = f->vfs.size,
+                             .uid = f->vfs.uid, .gid = f->vfs.gid,
+                             .mode = f->vfs.mode };
+    *ino = lx_fd_ino(f, fd);
+}
+
+/* A NAMED FIFO'S DESCRIPTOR IS ITS NODE, as Linux's fstat says: the
+ * filesystem's device and inode, and the node's owner, mode and times --
+ * what stat of its name gives. It said what an unnamed pipe says (a pipefs
+ * device, the pipe object's number), so the two never agreed, and bash's
+ * noclobber, which opens a file that is not regular and then checks that
+ * fstat and stat name one file, refused `echo x > fifo` (logs/b18
+ * noclob; Linux writes). The node is stat'ed by the name the FIFO was
+ * opened by while that still names it; renamed or gone, by what the FIFO
+ * table kept of it. false for an unnamed pipe. */
+static bool fd_fifo_stat(struct file *f, struct vfs_stat *vs) {
+    if (!(f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W ||
+          f->kind == FILE_KIND_PIPE_RW) || !f->pipe)
+        return false;
+    uint32_t dev = 0;
+    uint64_t ino = 0;
+    const char *path = 0;
+    if (!pipe_fifo_identity(f->pipe, &dev, &ino, &path)) return false;
+    const char *op = f->open_path ? f->open_path : path;
+    if (op && op[0] == '/' && vfs_stat_follow(op, vs) == VFS_OK &&
+        (vs->mode & 0170000u) == 0010000u &&
+        (!ino || (vs->dev == dev && vs->ino == ino)))
+        return true;
+    if (!ino) return false;
+    struct proc *p = current_proc();
+    *vs = (struct vfs_stat){ .type = VFS_TYPE_FILE,
+                             .mode = 0010000u | 0600u | VFS_MODE_VALID,
+                             .uid = p ? (uint32_t)p->uid : 0,
+                             .gid = p ? (uint32_t)p->gid : 0,
+                             .nlink = 1, .dev = dev, .ino = ino };
+    return true;
+}
+
+/* LINUX'S MAGIC LINKS. /proc/PID/fd/N -- and so /proc/self/fd/N, /dev/fd/N,
+ * /dev/stdin, /dev/stdout and /dev/stderr, which are links to them -- name
+ * the OPEN FILE itself: stat() through one is fstat() of that descriptor,
+ * whatever its link text says ("pipe:[N]" is no path). The file, or NULL
+ * when KPATH is not one (or names no open descriptor); *fdno its number. */
+static struct file *stat_magic_fd(const char *kpath, int *fdno) {
+    const char *num = 0;
+    int kpid = -1;
+    if (strcmp(kpath, "/dev/stdin") == 0)        num = "0";
+    else if (strcmp(kpath, "/dev/stdout") == 0)  num = "1";
+    else if (strcmp(kpath, "/dev/stderr") == 0)  num = "2";
+    else if (strncmp(kpath, "/dev/fd/", 8) == 0) num = kpath + 8;
+    else if (strncmp(kpath, "/proc/self/fd/", 14) == 0) num = kpath + 14;
+    else if (strncmp(kpath, "/proc/", 6) == 0) {
+        const char *q = kpath + 6;
+        int v = 0;
+        while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
+        if (q == kpath + 6 || strncmp(q, "/fd/", 4) != 0) return 0;
+        kpid = pid_knr(v);
+        if (!kpid) return 0;
+        num = q + 4;
+    }
+    if (!num || !*num) return 0;
+    int n = 0;
+    const char *q = num;
+    while (*q >= '0' && *q <= '9') {
+        n = n * 10 + (*q++ - '0');
+        if (n >= PROC_NFDS) return 0;
+    }
+    if (*q || q == num) return 0;
+    struct proc *p = kpid < 0 ? current_proc() : proc_lookup(kpid);
+    struct file **tab = p ? proc_fds(p) : 0;
+    struct file *f = tab ? tab[n] : 0;
+    if (f) *fdno = n;
+    return f;
+}
+
+/* WHAT stat(2) ANSWERS FOR KPATH: the path's own vfs_stat with FOLLOW
+ * false (lstat); with it true a link in the last component is followed,
+ * hop by hop (vfs_link_target), up to 40 -- and a magic link stops at its
+ * descriptor, given back in *fdf (and *fdno) for the caller to emit as
+ * fstat would; a regular file there is stat'ed by the path it was opened
+ * by, when that still names it. FINAL gets the path answered for. */
+static int stat_resolve(const char *kpath, bool follow, char *final,
+                        size_t cap, struct vfs_stat *vs, struct file **fdf,
+                        int *fdno) {
+    char hop[2][VFS_PATH_MAX];
+    const char *cur = kpath;
+    bool need_dir = false;
+    *fdf = 0;
+    for (int n = 0; n < 40; n++) {
+        if (follow) {
+            int fdn = -1;
+            struct file *f = stat_magic_fd(cur, &fdn);
+            if (f) {
+                /* A DIRECTORY is stat'ed by its path, as its fstat is. A
+                 * file is the OPEN file, whatever its old name holds now:
+                 * it was stat'ed by that name while the name existed, so a
+                 * file renamed while open, or replaced, answered for the
+                 * wrong one -- the open file's identity was not stat's to
+                 * give before (fd_vfs_stat). */
+                const char *op = (f->kind == FILE_KIND_DIR) ? f->dirpath : 0;
+                if (op && op[0] == '/' && vfs_stat(op, vs) == VFS_OK) {
+                    size_t l = strlen(op);
+                    if (l >= cap) return VFS_ERR_NAMETOOLONG;
+                    memcpy(final, op, l + 1);
+                    return VFS_OK;
+                }
+                *fdf = f;
+                *fdno = fdn;
+                return VFS_OK;
+            }
+        }
+        int rc = vfs_stat(cur, vs);
+        if (rc == VFS_ERR_NOENT && cwd_is_gone_named(cur)) {
+            cwd_gone_stat(vs);               /* finding 200 */
+            rc = VFS_OK;
+        }
+        if (rc != VFS_OK) return rc;
+        if (!follow || vs->type != VFS_TYPE_SYMLINK) {
+            /* a link whose target ends in '/' ("f/") names a directory:
+             * stat -L of one to a file is ENOTDIR, as Linux's walk says
+             * (batch 31, realpath -s's fixture) */
+            if (need_dir && vs->type != VFS_TYPE_DIR) return VFS_ERR_NOTDIR;
+            size_t l = strlen(cur);
+            if (l >= cap) return VFS_ERR_NAMETOOLONG;
+            memcpy(final, cur, l + 1);
+            return VFS_OK;
+        }
+        {
+            char raw[VFS_PATH_MAX];
+            if (vfs_readlink(cur, raw, sizeof raw) == VFS_OK) {
+                size_t rl = strlen(raw);
+                if (rl > 0 && raw[rl - 1] == '/') need_dir = true;   /* any hop's */
+            }
+        }
+        char *nx = hop[n & 1];                      /* never into `cur` */
+        rc = vfs_link_target(cur, nx, VFS_PATH_MAX);
+        if (rc != VFS_OK) return rc;
+        cur = nx;
+    }
+    return VFS_ERR_LOOP;
+}
+
+static long stat_errno(int vr) {
+    if (vr == VFS_ERR_NOENT)       return -ABI_ENOENT;
+    if (vr == VFS_ERR_NOTDIR)      return -ABI_ENOTDIR;
+    if (vr == VFS_ERR_LOOP)        return -ABI_ELOOP;
+    if (vr == VFS_ERR_NAMETOOLONG) return -ABI_ENAMETOOLONG;
+    return -ABI_EACCES;
+}
+
+/* The native stat of an open file: what sys_fstat answers. A pipe is a
+ * FIFO, a socket a socket, a terminal or device a character device, as
+ * the Linux personality's fstat says (lx_fd_special_mode); they were all
+ * "a regular file, 0666". */
+static void native_fd_stat(struct file *f, struct abi_stat *tmp) {
+    memset(tmp, 0, sizeof *tmp);
+    if (f->kind == FILE_KIND_DIR && f->dirpath) {
+        /* a directory's descriptor is its directory (a native open of one
+         * makes it since batch 31): it said "a regular file, 0666" */
+        struct vfs_stat vs;
+        if (vfs_stat(f->dirpath, &vs) == VFS_OK) { fill_abi_stat(&vs, tmp); return; }
+        if (cwd_is_gone(f->dirpath)) {           /* finding 200 */
+            cwd_gone_stat(&vs);
+            fill_abi_stat(&vs, tmp);
+            return;
+        }
+        tmp->mode = ABI_S_IFDIR | 0755;
+        tmp->nlink = 2;
+        return;
+    }
+    if (f->kind == FILE_KIND_VFS) {
+        struct vfs_stat vs;
+        uint64_t ino;
+        fd_vfs_stat(f, -1, &vs, &ino);    /* the native ino is the fs's own */
+        fill_abi_stat(&vs, tmp);
+        return;
+    }
+    {
+        struct vfs_stat vs;
+        if (fd_fifo_stat(f, &vs)) { fill_abi_stat(&vs, tmp); return; }
+    }
+    uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
+    if (sm) {
+        tmp->mode = sm;
+        tmp->nlink = 1;
+        if ((sm & ABI_S_IFMT) == ABI_S_IFBLK) {          /* a disk (198) */
+            tmp->rdev_major = mj;
+            tmp->rdev_minor = mn;
+            tmp->gid = userns_cur_gid(6);
+            tmp->blksize = 4096;
+            tmp->atime = tmp->mtime = tmp->ctime = dev_boot_time();   /* 202 */
+            return;
+        }
+        if ((sm & ABI_S_IFMT) != ABI_S_IFCHR) {
+            struct proc *p = current_proc();
+            tmp->uid = userns_cur_uid(p ? (uint32_t)p->uid : 0);
+            tmp->gid = userns_cur_gid(p ? (uint32_t)p->gid : 0);
+        } else {
+            tmp->rdev_major = mj;
+            tmp->rdev_minor = mn;
+            tmp->atime = tmp->mtime = tmp->ctime = dev_boot_time();   /* 202 */
+            uint32_t pu, pg;
+            uint64_t pt[3];
+            if (pts_node_times(0, f, &pu, &pg, pt)) {
+                tmp->uid = userns_cur_uid(pu);
+                tmp->gid = userns_cur_gid(pg);
+                tmp->atime = pt[0]; tmp->mtime = pt[1]; tmp->ctime = pt[2];
+            }
+        }
+        tmp->ino = file_object_ino(f);
+        tmp->blksize = 4096;          /* as linux_emit_special_stat */
+        return;
+    }
+    /* The rest (a window, a term) report a minimal regular file. */
+    tmp->mode = ABI_S_IFREG | 0666;
+}
+
+/* stat and lstat: FOLLOW says which. A link was reported as the file it
+ * names by neither -- native stat called the LINK a regular file and
+ * there was no lstat (finding 87): `test -L` could not be answered and
+ * `ls -l` showed no link. */
+/* OUTSZ is how much of OUT the caller has: ABI_STAT_V1_SIZE through the
+ * old calls, its own sizeof through ABI_SYS_XSTAT (batch 25). */
+static long sys_stat_follow_sz(const char *path, struct abi_stat *out, bool follow,
+                               size_t outsz) {
+    if (outsz > sizeof(struct abi_stat)) outsz = sizeof(struct abi_stat);
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    rr = trailing_slash_dir(path, kpath, sizeof kpath);
     if (rr) return rr;
     /* A synthesised /dev node has no VFS entry -- see dev_synth_mode. Checked
      * BEFORE the VFS so a real file of the same name could never shadow the
@@ -2783,43 +4817,126 @@ static long sys_stat(const char *path, struct abi_stat *out) {
     {   uint32_t dm = dev_synth_mode(kpath);
         if (dm) {
             struct abi_stat dtmp;
-            dev_synth_stat(dm, &dtmp);
-            if (copy_to_user(out, &dtmp, sizeof dtmp) != 0) return -ABI_EFAULT;
+            dev_synth_stat_path(kpath, dm, &dtmp);
+            if (copy_to_user(out, &dtmp, outsz) != 0) return -ABI_EFAULT;
             return 0;
         }
     }
     struct vfs_stat vs;
-    int sr = vfs_stat(kpath, &vs);
-    if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
-    if (sr != VFS_OK)        return -ABI_EACCES;
-
+    struct file *ff = 0;
+    int fdn = -1;
+    char fin[VFS_PATH_MAX];
+    int sr = stat_resolve(kpath, follow, fin, sizeof fin, &vs, &ff, &fdn);
+    if (sr != VFS_OK) return stat_errno(sr);
     struct abi_stat tmp;
-    fill_abi_stat(&vs, &tmp);
-    if (copy_to_user(out, &tmp, sizeof(tmp)) != 0) return -ABI_EFAULT;
+    if (ff) {
+        native_fd_stat(ff, &tmp);
+    } else {
+        uint32_t dm = (follow && strcmp(fin, kpath) != 0) ? dev_synth_mode(fin) : 0;
+        if (dm) dev_synth_stat_path(fin, dm, &tmp);   /* a link to a device */
+        else fill_abi_stat(&vs, &tmp);
+    }
+    if (copy_to_user(out, &tmp, outsz) != 0) return -ABI_EFAULT;
+    return 0;
+}
+
+static long sys_stat_follow(const char *path, struct abi_stat *out, bool follow) {
+    return sys_stat_follow_sz(path, out, follow, ABI_STAT_V1_SIZE);
+}
+
+static long sys_stat(const char *path, struct abi_stat *out) {
+    return sys_stat_follow(path, out, true);
+}
+
+static long sys_fstat_sz(int fd, struct abi_stat *out, size_t outsz) {
+    if (outsz > sizeof(struct abi_stat)) outsz = sizeof(struct abi_stat);
+    struct file *f = fd_lookup(fd);
+    if (!f) return -ABI_EBADF;
+    struct abi_stat tmp;
+    native_fd_stat(f, &tmp);
+    if (copy_to_user(out, &tmp, outsz) != 0) return -ABI_EFAULT;
     return 0;
 }
 
 static long sys_fstat(int fd, struct abi_stat *out) {
-    struct file *f = fd_lookup(fd);
-    if (!f) return -ABI_EBADF;
-    struct abi_stat tmp;
-    memset(&tmp, 0, sizeof(tmp));
-    if (f->kind == FILE_KIND_VFS) {
-        struct vfs_stat vs = {
-            .type = VFS_TYPE_FILE, .size = f->vfs.size,
-            .uid  = f->vfs.uid,    .gid  = f->vfs.gid,
-            .mode = f->vfs.mode,
-        };
-        fill_abi_stat(&vs, &tmp);
-    } else {
-        /* Pseudo-files (console, pipe, socket, window, term) report a
-         * minimal "character device"-like stat. We use ABI_S_IFREG
-         * because libc programs commonly only check ISDIR vs ISREG;
-         * the size is simply zero. */
-        tmp.mode = ABI_S_IFREG | 0666;
+    return sys_fstat_sz(fd, out, ABI_STAT_V1_SIZE);
+}
+
+static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5);
+
+/* The kernel copy loop behind sendfile/copy_file_range/splice
+ * (2026-08-22). Offset-pointer arguments demand a seekable (VFS) side --
+ * ESPIPE otherwise, as Linux answers -- and are implemented by save/
+ * position/restore around each chunk, updating the user's offset word at
+ * the end. The natural-position forms just stream. Partial progress
+ * returns the count moved so far; only a first-chunk failure surfaces
+ * the errno. */
+static long lx_copy_fds(int in_fd, uint64_t uoff_in, int out_fd,
+                        uint64_t uoff_out, size_t count) {
+    struct file *fi = fd_lookup(in_fd), *fo = fd_lookup(out_fd);
+    if (!fi || !fo) return -ABI_EBADF;
+    uint64_t off_in = 0, off_out = 0;
+    bool has_oin = uoff_in != 0, has_oout = uoff_out != 0;
+    if (has_oin &&
+        copy_from_user(&off_in, (const void *)(uintptr_t)uoff_in, 8) != 0)
+        return -ABI_EFAULT;
+    if (has_oout &&
+        copy_from_user(&off_out, (const void *)(uintptr_t)uoff_out, 8) != 0)
+        return -ABI_EFAULT;
+    if ((has_oin && fi->kind != FILE_KIND_VFS) ||
+        (has_oout && fo->kind != FILE_KIND_VFS))
+        return -ABI_ESPIPE;
+
+    /* Offset forms position through the CANONICAL lseek path -- poking
+     * fi->vfs.pos directly is overwritten by file_read's shared-OFD
+     * position load (file_pos_load), which is exactly how v1 of this loop
+     * read 0 bytes at EOF while claiming to have advanced the offset. */
+    long cur_in = 0, cur_out = 0;
+    if (has_oin) {
+        cur_in = do_syscall(SYS_LSEEK, (uint64_t)in_fd, 0, 1, 0, 0);
+        do_syscall(SYS_LSEEK, (uint64_t)in_fd, off_in, 0, 0, 0);
     }
-    if (copy_to_user(out, &tmp, sizeof(tmp)) != 0) return -ABI_EFAULT;
-    return 0;
+    if (has_oout) {
+        cur_out = do_syscall(SYS_LSEEK, (uint64_t)out_fd, 0, 1, 0, 0);
+        do_syscall(SYS_LSEEK, (uint64_t)out_fd, off_out, 0, 0, 0);
+    }
+
+    enum { CFR_CHUNK = 16384 };
+    void *kb = kmalloc(CFR_CHUNK);
+    if (!kb) return -ABI_ENOMEM;
+    size_t done = 0;
+    long   err  = 0;
+    while (done < count) {
+        size_t chunk = count - done > CFR_CHUNK ? CFR_CHUNK : count - done;
+        long r = file_read(fi, kb, chunk);
+        if (r <= 0) {
+            if (!done && r != 0) err = file_err_to_abi(fi, r);
+            break;
+        }
+        long w = file_write(fo, kb, (size_t)r);
+        if (w <= 0) {
+            if (!done) err = file_err_to_abi(fo, w);
+            break;
+        }
+        done += (size_t)w;
+        if (w < r || r < (long)chunk) break;      /* short write or EOF */
+    }
+    kfree(kb);
+
+    if (has_oin) {
+        long newo = do_syscall(SYS_LSEEK, (uint64_t)in_fd, 0, 1, 0, 0);
+        do_syscall(SYS_LSEEK, (uint64_t)in_fd, (uint64_t)cur_in, 0, 0, 0);
+        off_in = (uint64_t)newo;
+        (void)copy_to_user((void *)(uintptr_t)uoff_in, &off_in, 8);
+    }
+    if (has_oout) {
+        long newo = do_syscall(SYS_LSEEK, (uint64_t)out_fd, 0, 1, 0, 0);
+        do_syscall(SYS_LSEEK, (uint64_t)out_fd, (uint64_t)cur_out, 0, 0, 0);
+        off_out = (uint64_t)newo;
+        (void)copy_to_user((void *)(uintptr_t)uoff_out, &off_out, 8);
+    }
+    if (err && !done) return err;
+    return (long)done;
 }
 
 static long sys_dup(int oldfd) {
@@ -2840,6 +4957,10 @@ static long sys_dup2(int oldfd, int newfd) {
     if (oldfd == newfd) {
         return fd_lookup(oldfd) ? newfd : -ABI_EBADF;
     }
+    /* a number at or past the soft RLIMIT_NOFILE is no descriptor to make
+     * (Linux's dup2/dup3) -- though one already open there stays, and
+     * dup2(n, n) of it answered above */
+    if (newfd >= proc_nofile(current_proc())) return -ABI_EBADF;
     struct file *f = fd_lookup(oldfd);
     if (!f) return -ABI_EBADF;
     struct file *cl = file_clone(f);
@@ -2851,21 +4972,44 @@ static long sys_dup2(int oldfd, int newfd) {
         t[newfd] = 0;
     }
     t[newfd] = cl;
+    /* POSIX: the duplicate starts with FD_CLOEXEC clear (dup3(O_CLOEXEC)
+     * sets it again after this returns). Also scrubs any stale bit from
+     * newfd's previous tenant. */
+    fd_cloexec_set(current_proc(), newfd, 0);
     return newfd;
 }
 
+/* unlink(2), for both personalities (LX_unlink and unlinkat without
+ * AT_REMOVEDIR come here).
+ *
+ * A DIRECTORY IS EISDIR. The drivers' unlink removes files and empty
+ * directories alike, and this passed it straight through, so `unlink d`
+ * removed an empty directory where Linux refuses: rmdir(2) is the call
+ * for that (batch 30, logs/utilgate/unlink.sh). The last component is not
+ * followed -- unlinking a symlink to a directory removes the link -- and a
+ * path ending in '/' is judged by that same unfollowed name, as Linux's
+ * do_unlinkat judges it: a directory is EISDIR, anything else ENOTDIR
+ * (`unlink file/`, and `unlink link-to-dir/` too, which following the
+ * link made EISDIR). And the errors go through the shared mapper: the
+ * hand-written switch here turned every code it did not list -- ENOTDIR,
+ * ENAMETOOLONG, ELOOP -- into EACCES. */
 static long sys_unlink(const char *path) {
+    char up[ABI_PATH_MAX];
+    long plen = strncpy_from_user(up, path, sizeof up);
+    if (plen < 0) return -ABI_EFAULT;
+    up[sizeof up - 1] = 0;
+    size_t ul = strlen(up);
+    bool slash = ul > 1 && up[ul - 1] == '/';
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
-    int rc = vfs_unlink(kpath);
-    switch (rc) {
-    case VFS_OK:        return 0;
-    case VFS_ERR_NOENT: return -ABI_ENOENT;
-    case VFS_ERR_ROFS:  return -ABI_EROFS;
-    case VFS_ERR_PERM:  return -ABI_EACCES;
-    default:            return -ABI_EACCES;
+    struct vfs_stat st;
+    int sr = vfs_stat(kpath, &st);
+    if (sr == VFS_OK) {
+        if (st.type == VFS_TYPE_DIR) return -ABI_EISDIR;
+        if (slash) return -ABI_ENOTDIR;
     }
+    return vfs_err_to_abi(vfs_unlink(kpath));
 }
 
 static long sys_rename(const char *oldp, const char *newp) {
@@ -2874,18 +5018,173 @@ static long sys_rename(const char *oldp, const char *newp) {
     if (rr) return rr;
     rr = resolve_user_path(newp, kn, sizeof(kn));
     if (rr) return rr;
-    int rc = vfs_rename(ko, kn);
-    switch (rc) {
-    case VFS_OK:        return 0;
-    case VFS_ERR_NOENT: return -ABI_ENOENT;
-    case VFS_ERR_NOTDIR:return -ABI_ENOTDIR;
-    case VFS_ERR_EXIST: return -ABI_EEXIST;
-    case VFS_ERR_NOSPC: return -ABI_ENOSPC;
-    case VFS_ERR_ROFS:  return -ABI_EROFS;
-    case VFS_ERR_PERM:  return -ABI_EACCES;
-    case VFS_ERR_INVAL: return -ABI_EINVAL;
-    default:            return -ABI_EIO;
+    /* The shared mapper rather than a hand-written switch: the switch this
+     * replaces had a `default: -EIO` that swallowed VFS_ERR_XDEV, which is
+     * precisely the code mv needs to see to fall back to copy-then-unlink.
+     * A hand-listed set of arms is one new VFS code away from being wrong
+     * again. */
+    return vfs_err_to_abi(vfs_rename(ko, kn));
+}
+
+/* rmdir(2), the native ABI's. libtoby's rmdir() was `return unlink(path)`,
+ * so `rmdir notadirectory` DELETED THE FILE instead of reporting ENOTDIR.
+ * The type check is the only thing rmdir adds over unlink here -- the
+ * drivers already refuse to remove a non-empty directory -- but it is the
+ * whole point of having a separate call. */
+/* rmdir(2), for both personalities (batch 25, logs/utilgate/rmdir.sh).
+ *
+ * THE LAST COMPONENT IS LOOKED AT BEFORE THE PATH IS RESOLVED, as Linux
+ * does: resolving folds "." away, so `rmdir a/.` removed a -- where Linux
+ * refuses it, EINVAL -- and `rmdir .` tried the working directory. ".."
+ * last is ENOTEMPTY, as Linux says.
+ *
+ * A NON-EMPTY DIRECTORY IS ENOTEMPTY whichever way the driver says it:
+ * most report VFS_ERR_INVAL, tmpfs VFS_ERR_EXIST, and EXIST fell to the
+ * default here -- "Permission denied" for `rmdir a` on a /tmp directory
+ * with a file in it. Anything else is the VFS's own errno, not EACCES. */
+static long rmdir_path(const char *path) {
+    char up[ABI_PATH_MAX];
+    long plen = strncpy_from_user(up, path, sizeof up);
+    if (plen < 0) return -ABI_EFAULT;
+    up[sizeof up - 1] = 0;
+    size_t n = strlen(up);
+    while (n > 1 && up[n - 1] == '/') n--;
+    size_t s = n;
+    while (s > 0 && up[s - 1] != '/') s--;
+    if (n - s == 1 && up[s] == '.') return -ABI_EINVAL;
+    if (n - s == 2 && up[s] == '.' && up[s + 1] == '.') return -ABI_ENOTEMPTY;
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    struct vfs_stat st;
+    int sr = vfs_stat(kpath, &st);
+    if (sr != VFS_OK) return vfs_err_to_abi(sr);
+    if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+    int rc = vfs_unlink(kpath);
+    if (rc == VFS_OK) return 0;
+    if (rc == VFS_ERR_INVAL || rc == VFS_ERR_EXIST) return -ABI_ENOTEMPTY;
+    return vfs_err_to_abi(rc);
+}
+
+static long sys_rmdir(const char *path) {
+    return rmdir_path(path);
+}
+
+/* utimes(2), native. (uint64_t)-1 means "now" in either field -- that is
+ * how touch(1) spells its default, and resolving it kernel-side keeps the
+ * clock in one place rather than having every caller invent one. */
+static long sys_utimes_native(const char *path, uint64_t mtime, uint64_t atime) {
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    uint64_t now = 0;
+    if (mtime == (uint64_t)-1 || atime == (uint64_t)-1) {
+        extern uint64_t file_time_ns(void);
+        now = file_time_ns() / 1000000000ull;
     }
+    if (mtime == (uint64_t)-1) mtime = now;
+    if (atime == (uint64_t)-1) atime = now;
+    return vfs_err_to_abi(vfs_utimes(kpath, mtime, atime));
+}
+
+/* ---- utimensat(2), both personalities (batch 26) -----------------------
+ *
+ * KPATH's access and modification times (A, M: seconds and ns; an ns of
+ * ABI_UTIME_NOW or ABI_UTIME_OMIT means now or leave it; !HAVE: now for
+ * both), Linux's rules: a link is followed unless NOFOLLOW; an explicit time
+ * needs the owner (or root) -- EPERM; now needs the owner or write
+ * permission -- EACCES; a read-only mount EROFS. A filesystem that keeps
+ * nanoseconds gets them (tmpfs, finding 239); one that keeps whole seconds
+ * gets those. A filesystem that keeps no times at all (the initrd's
+ * ramfs) says yes, as the Linux personality always has.
+ *
+ * It was two half-answers: SYS_UTIMES, unsigned with -1 for now, so 1969
+ * could not be set and one time could not be left alone (touch -a had to
+ * read and rewrite the other); and the Linux utime family, which read the
+ * seconds and dropped UTIME_NOW/UTIME_OMIT -- an explicit 1970-01-01 there
+ * was taken for now -- and set a link's own times when asked for its
+ * target's. */
+static long do_utimensat(const char *kpath, bool have, int64_t a_s, long a_ns,
+                         int64_t m_s, long m_ns, bool nofollow) {
+    char hop[ABI_PATH_MAX];
+    const char *path = kpath;
+    struct vfs_stat vs;
+    int sr = vfs_stat(path, &vs);
+    for (int hops = 0; sr == VFS_OK && vs.type == VFS_TYPE_SYMLINK && !nofollow; hops++) {
+        if (hops >= 40) return -ABI_ELOOP;
+        char next[ABI_PATH_MAX];
+        if (vfs_link_target(path, next, sizeof next) != VFS_OK) return -ABI_ENOENT;
+        memcpy(hop, next, sizeof hop);
+        path = hop;
+        sr = vfs_stat(path, &vs);
+    }
+    if (sr != VFS_OK) return vfs_err_to_abi(sr);
+    if (vfs_path_mount_flags(path) & VFS_MNT_RDONLY) return -ABI_EROFS;
+    if (!have) { a_ns = m_ns = ABI_UTIME_NOW; }
+    bool a_omit = a_ns == ABI_UTIME_OMIT, m_omit = m_ns == ABI_UTIME_OMIT;
+    bool a_now = a_ns == ABI_UTIME_NOW, m_now = m_ns == ABI_UTIME_NOW;
+    if ((!a_omit && !a_now && (a_ns < 0 || a_ns > 999999999)) ||
+        (!m_omit && !m_now && (m_ns < 0 || m_ns > 999999999)))
+        return -ABI_EINVAL;
+    if (a_omit && m_omit) return 0;
+    struct proc *me = current_proc();
+    bool root = !me || me->uid == 0;
+    bool owner = root || (uint32_t)me->uid == vs.uid;
+    bool only_now = (a_now || a_omit) && (m_now || m_omit);
+    if (!only_now && !owner) return -ABI_EPERM;
+    if (only_now && !owner) {
+        uint32_t mode = vs.mode, bits;
+        if (!(mode & VFS_MODE_VALID)) bits = 7;
+        else if (me && (uint32_t)me->gid == vs.gid) bits = (mode >> 3) & 7u;
+        else bits = mode & 7u;
+        if (!(bits & 2u)) return -ABI_EACCES;
+    }
+    /* to the nanosecond, the clock's and the caller's (finding 239): the
+     * nanoseconds were dropped, every time a whole second */
+    extern uint64_t file_time_ns(void);
+    uint64_t now_ns = file_time_ns();
+    int64_t now = (int64_t)(now_ns / 1000000000ull);
+    uint32_t now_frac = (uint32_t)(now_ns % 1000000000ull);
+    int64_t na = a_omit ? (int64_t)vs.atime : a_now ? now : a_s;
+    int64_t nm = m_omit ? (int64_t)vs.mtime : m_now ? now : m_s;
+    uint32_t na_ns = a_omit ? vs.atime_ns : a_now ? now_frac : (uint32_t)a_ns;
+    uint32_t nm_ns = m_omit ? vs.mtime_ns : m_now ? now_frac : (uint32_t)m_ns;
+    int rc = vfs_utimens(path, (uint64_t)nm, nm_ns, (uint64_t)na, na_ns);
+    if (rc == VFS_ERR_ROFS) return 0;          /* keeps no times (ramfs) */
+    return vfs_err_to_abi(rc);
+}
+
+static long sys_utimensat_native(const char *upath, const void *utimes2, int flags) {
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(upath, kpath, sizeof(kpath));
+    if (rr) return rr;
+    if (flags & ~ABI_AT_SYMLINK_NOFOLLOW) return -ABI_EINVAL;
+    struct { int64_t a_s, a_ns, m_s, m_ns; } tv;
+    if (utimes2 && copy_from_user(&tv, utimes2, sizeof tv) != 0) return -ABI_EFAULT;
+    return do_utimensat(kpath, utimes2 != 0, utimes2 ? tv.a_s : 0, utimes2 ? (long)tv.a_ns : 0,
+                        utimes2 ? tv.m_s : 0, utimes2 ? (long)tv.m_ns : 0,
+                        (flags & ABI_AT_SYMLINK_NOFOLLOW) != 0);
+}
+
+static long sys_truncate_path(const char *path, uint64_t len) {
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    struct vfs_stat st;
+    int sr = vfs_stat(kpath, &st);
+    if (sr != VFS_OK) return vfs_err_to_abi(sr);
+    if (st.type == VFS_TYPE_DIR) return -ABI_EISDIR;
+    return vfs_err_to_abi(vfs_truncate(kpath, len));
+}
+
+static long sys_ftruncate_fd(int fd, uint64_t len) {
+    struct file *f = fd_lookup(fd);
+    if (!f) return -ABI_EBADF;
+    if (f->kind == FILE_KIND_MEMFD) return memfd_ftruncate(f->memfd, len);
+    if (f->kind != FILE_KIND_VFS)   return -ABI_EINVAL;
+    /* not open for writing: EINVAL, as Linux's (finding 216) */
+    if ((f->o_accmode & 3) == 0)    return -ABI_EINVAL;
+    return vfs_err_to_abi(vfs_file_truncate(&f->vfs, len));
 }
 
 static long sys_mkdir(const char *path, int mode) {
@@ -2894,23 +5193,9 @@ static long sys_mkdir(const char *path, int mode) {
     if (rr) return rr;
     /* Slice 86: honour the requested mode. A caller that asks for a private
      * directory and then verifies it (chrome's ProcessSingleton CHECKs for
-     * exactly 0700) must not be told 0755. Mode 0 means "unspecified" from
-     * in-kernel callers, which keep the old default. */
-    uint32_t m = (uint32_t)mode & 07777u;
-    /* Linux slice 1: apply the process umask. POSIX clears the umask bits
-     * from the requested mode. Only a CALLER-SUPPLIED mode is masked -- mode
-     * 0 still means "unspecified" from in-kernel callers and keeps the old
-     * default, so boot-time mkdirs are unaffected by whatever umask pid 0
-     * happens to carry.
-     *
-     * Note this is the only creation path that carries a mode at all:
-     * vfs_create() (the open(O_CREAT) path) takes no mode argument, so files
-     * are not umask-filtered yet. Closing that needs a vfs_create_mode()
-     * across every filesystem -- deliberately not in this slice. */
-    if (m) {
-        struct proc *mp = current_proc();
-        if (mp) m &= ~(mp->umask & 07777u);
-    }
+     * exactly 0700) must not be told 0755. Linux slice 1: less the process
+     * umask, as POSIX has it; 0 is a real 0000 (sys_creation_mode). */
+    uint32_t m = sys_creation_mode(mode);
     /* Linux slice 1: an ALREADY-EXISTING path is EEXIST, even on a read-only
      * mount. The VFS checks writability before existence, so mkdir("/") --
      * which is on the read-only ramfs -- used to report EROFS. That broke
@@ -2926,7 +5211,7 @@ static long sys_mkdir(const char *path, int mode) {
         struct vfs_stat exvs;
         if (vfs_stat(kpath, &exvs) == VFS_OK) return -ABI_EEXIST;
     }
-    int rc = m ? vfs_mkdir_mode(kpath, m) : vfs_mkdir(kpath);
+    int rc = vfs_mkdir_mode(kpath, m);
 #ifdef CHROMIUM_BOOT
     { static int mk = 0; if (mk < 24) { mk++;
         struct vfs_stat vs; int sr = vfs_stat(kpath, &vs);
@@ -2934,14 +5219,10 @@ static long sys_mkdir(const char *path, int mode) {
         kprintf("[mkdir] '%s' mode=0x%x rc=%d -> readback 0x%x\n", kpath, m, rc,
                 sr == VFS_OK ? (vs.mode & 07777u) : 0); } }
 #endif
-    switch (rc) {
-    case VFS_OK:         return 0;
-    case VFS_ERR_EXIST:  return -ABI_EEXIST;
-    case VFS_ERR_ROFS:   return -ABI_EROFS;
-    case VFS_ERR_NOENT:  return -ABI_ENOENT;
-    case VFS_ERR_PERM:   return -ABI_EACCES;
-    default:             return -ABI_EACCES;
-    }
+    /* every error as itself (finding 252): the rest were EACCES -- a name
+     * past tobyfs's 55 bytes said "Permission denied", where Linux says
+     * ENAMETOOLONG, and a full disk or a file on the way did the same */
+    return vfs_err_to_abi(rc);
 }
 
 /* ---- memory: brk ----------------------------------------------- */
@@ -2961,27 +5242,120 @@ static long sys_getcwd(char *out, size_t cap) {
     if (cap > ABI_PATH_MAX) cap = ABI_PATH_MAX;
     struct proc *p = current_proc();
     const char *cwd = (p && p->cwd[0]) ? p->cwd : "/";
-    size_t n = strlen(cwd);
+    /* a removed working directory has no path: ENOENT, as Linux's
+     * getcwd(2) says (finding 200) */
+    if (cwd_is_gone(cwd)) return -ABI_ENOENT;
+    /* in a chroot, the path from its root; a cwd outside the root is
+     * "(unreachable)" and its real path, Linux's answer (finding 250) */
+    bool outside;
+    const char *view = cwd_view(p, &outside);
+    char ub[ABI_PATH_MAX + 16];
+    if (outside) {
+        ksnprintf(ub, sizeof ub, "(unreachable)%s", cwd);
+        view = ub;
+    }
+    size_t n = strlen(view);
     if (n + 1 > cap) return -ABI_ERANGE;
-    if (copy_to_user(out, cwd, n + 1) != 0) return -ABI_EFAULT;
+    if (copy_to_user(out, view, n + 1) != 0) return -ABI_EFAULT;
     return (long)n;
+}
+
+/* A WORKING DIRECTORY THAT HAS BEEN REMOVED (finding 200). tobyOS keeps
+ * the cwd as a path, so once its directory is gone there is nothing behind
+ * it; Linux keeps the inode, and in a removed cwd `ls .` lists nothing
+ * (status 0), `stat .` is a directory with no links, getcwd(2) is ENOENT
+ * and making anything there is ENOENT. The directory's identity is noted
+ * when the cwd is set (proc_note_cwd) and these answer from it. */
+void proc_note_cwd(struct proc *p) {
+    if (!p) return;
+    struct vfs_stat st;
+    if (vfs_stat(p->cwd[0] ? p->cwd : "/", &st) != VFS_OK) return;
+    p->cwd_ino = st.ino;
+    p->cwd_mtime = st.mtime;
+    p->cwd_dev = st.dev;
+    p->cwd_mode = st.mode;
+    p->cwd_uid = st.uid;
+    p->cwd_gid = st.gid;
+}
+
+/* Is KPATH the caller's working directory, and is that gone? */
+static bool cwd_is_gone(const char *kpath) {
+    struct proc *p = current_proc();
+    if (!p || !p->cwd[0] || !kpath || strcmp(kpath, p->cwd) != 0) return false;
+    struct vfs_stat st;
+    return vfs_stat(kpath, &st) != VFS_OK;
+}
+
+/* KPATH is the removed cwd AND the caller named it "." -- the one way a
+ * NAME reaches a removed directory on Linux. An absolute path to it, or
+ * ../NAME, is ENOENT there; this answered for them too, and GNU pwd -L
+ * took $PWD as fit (finding 200). */
+static bool cwd_is_gone_named(const char *kpath) {
+    struct proc *p = current_proc();
+    return p && p->path_was_dot && cwd_is_gone(kpath);
+}
+
+/* stat of the removed working directory: what it was, with no links */
+static void cwd_gone_stat(struct vfs_stat *vs) {
+    struct proc *p = current_proc();
+    memset(vs, 0, sizeof *vs);
+    vs->type = VFS_TYPE_DIR;
+    vs->nlink = VFS_NLINK_NONE;
+    if (!p) return;
+    vs->ino = p->cwd_ino;
+    vs->dev = p->cwd_dev;
+    vs->mode = p->cwd_mode ? p->cwd_mode : (VFS_MODE_VALID | 0755u);
+    vs->uid = p->cwd_uid;
+    vs->gid = p->cwd_gid;
+    vs->mtime = vs->atime = p->cwd_mtime;
+}
+
+/* Adopt an ALREADY-RESOLVED kernel path as the cwd.
+ *
+ * Split out of sys_chdir so fchdir(2) shares the identical validation --
+ * exists, is a directory, fits -- rather than growing a second copy that can
+ * drift from this one. The caller is responsible for resolution: chdir(2)
+ * resolves a user path, fchdir(2) takes the path off an open handle. */
+static long chdir_kpath(const char *kpath) {
+    struct vfs_stat st;
+    int sr = vfs_stat(kpath, &st);
+    if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
+    if (sr != VFS_OK)        return -ABI_EACCES;
+    /* A LINK TO A DIRECTORY IS GONE THROUGH, and the working directory is
+     * where it leads -- getcwd and `pwd -P` say the physical path, as on
+     * Linux. `cd link` said "Not a directory" (logs/b15 lk3). */
+    char followed[VFS_PATH_MAX];
+    if (st.type == VFS_TYPE_SYMLINK) {
+        sr = vfs_follow_link(kpath, followed, sizeof followed);
+        if (sr == VFS_OK) sr = vfs_stat(followed, &st);
+        if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
+        if (sr != VFS_OK)        return -ABI_EACCES;
+        kpath = followed;
+    }
+    if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+    /* and SEARCH permission on it, as Linux's chdir asks (finding 188):
+     * `cd d` into a 0600 directory went in */
+    if (vfs_perm_check_st(&st, VFS_WANT_EXEC) != VFS_OK) return -ABI_EACCES;
+    struct proc *p = current_proc();
+    if (!p) return -ABI_EINVAL;
+    size_t n = strlen(kpath);
+    if (n >= ABI_PATH_MAX) n = ABI_PATH_MAX - 1;
+    memcpy(p->cwd, kpath, n);
+    p->cwd[n] = '\0';
+    p->cwd_ino = st.ino;                 /* finding 200 */
+    p->cwd_mtime = st.mtime;
+    p->cwd_dev = st.dev;
+    p->cwd_mode = st.mode;
+    p->cwd_uid = st.uid;
+    p->cwd_gid = st.gid;
+    return 0;
 }
 
 static long sys_chdir(const char *path) {
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
-    struct vfs_stat st;
-    int sr = vfs_stat(kpath, &st);
-    if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
-    if (sr != VFS_OK)        return -ABI_EACCES;
-    if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
-    struct proc *p = current_proc();
-    size_t n = strlen(kpath);
-    if (n >= ABI_PATH_MAX) n = ABI_PATH_MAX - 1;
-    memcpy(p->cwd, kpath, n);
-    p->cwd[n] = '\0';
-    return 0;
+    return chdir_kpath(kpath);
 }
 
 /* SYS_GETENV is a kernel-side stub: the kernel does NOT maintain a
@@ -3004,6 +5378,55 @@ static long sys_getenv(const char *name, char *out, size_t cap) {
 
 /* ---- time ------------------------------------------------------ */
 
+/* Signals whose pendency must NOT abort a sleep: the stop class (the tick
+ * delivery stops the proc in place; SIGCONT resumes it and the sleep runs
+ * on to its deadline, as Linux behaves) and the default-ignored set.
+ * Anything else acts on the process, so it interrupts. */
+#define SIGMASK_STOP_CLASS   (SIGMASK(SIGSTOP) | SIGMASK(SIGTSTP) | \
+                              SIGMASK(SIGTTIN) | SIGMASK(SIGTTOU))
+#define SLEEP_UNINTERRUPTING (SIGMASK_STOP_CLASS | \
+                              SIGMASK(SIGCONT) | SIGMASK(SIGCHLD) | \
+                              SIGMASK(SIGURG)  | SIGMASK(SIGWINCH))
+
+/* A blocking wait for a child ends for a signal that acts now (see
+ * proc.h): a fatal one is delivered on the way out, a handler gets EINTR
+ * or the restart SA_RESTART asks for. */
+bool proc_wait_interrupted(struct proc *self) {
+    if (!self) return false;
+    /* A STOP SIGNAL STOPS THE WAITER WHERE IT WAITS, and the wait goes on
+     * once it is continued (Linux: wait4 restarts). The stop class was only
+     * excluded here, so a process blocked waiting for a child could not be
+     * stopped at all -- not by SIGSTOP: a subshell of `{ sleep 30; } | cat`
+     * ran on through ^Z, and the shell waited for it for good (logs/b15
+     * stopw: state B after STOP, T on Linux). */
+    while (signal_take_pending_stop()) { }
+    uint64_t pend = self->pending_signals & ~self->sigstate.mask;
+    pend |= self->pending_signals & SIGMASK(SIGKILL);
+    /* ...and a CAUGHT one acts: its handler runs (EINTR, or the restart
+     * SA_RESTART asks for) */
+    uint64_t caught = 0;
+    struct sigaction *act = sig_actions_of(self);
+    static const int stops[] = { SIGTSTP, SIGTTIN, SIGTTOU };
+    for (int k = 0; act && k < 3; k++)
+        if ((pend & SIGMASK(stops[k])) &&
+            act[stops[k]].sa_handler != SIG_DFL &&
+            act[stops[k]].sa_handler != SIG_IGN)
+            caught |= SIGMASK(stops[k]);
+    return ((pend & ~SLEEP_UNINTERRUPTING) && SIG_SHOULD_EINTR(self)) ||
+           caught != 0;
+}
+
+/* sync(2) and syncfs(2): every mounted filesystem's own sync first -- ext4
+ * commits its running transaction there, which a block-cache flush never
+ * reached (finding 278) -- then the devices. */
+static bool sync_mount_cb(const char *mp, const struct vfs_ops *ops,
+                          void *data, void *cookie) {
+    (void)mp; (void)cookie;
+    if (ops && ops->sync) (void)ops->sync(data);
+    return true;
+}
+static void sync_all_mounts(void) { vfs_iter_mounts(sync_mount_cb, 0); }
+
 static long sys_nanosleep(uint64_t ns) {
     /* Resolution is set by the timer tick (~10 ms on QEMU) -- good enough
      * for the uses libc has in M25A (sleep, usleep).
@@ -3017,9 +5440,82 @@ static long sys_nanosleep(uint64_t ns) {
      * tcp_poll_until. sched_yield still runs other ready work on this CPU;
      * with nothing ready we genuinely idle in hlt until the next IRQ. */
     uint64_t end = perf_now_ns() + ns;
+
+    /* Slice 128: PARK, don't spin.
+     *
+     * This function used to pause-spin to the deadline with a sched_yield()
+     * every iteration. It was polite (BKL dropped, peers ran) but it was not
+     * a sleep: the process stayed READY, took a scheduling slot on every
+     * pass, and paid a BKL round-trip per yield for the entire duration.
+     *
+     * MEASURED on the EliteDesk: chromewin's main loop is one usleep(15000)
+     * per pass, and it burned 6027 ms of CPU in a 17.5 s session -- 34% of a
+     * core to do nothing -- while chrome-headless-shell, the thing actually
+     * rendering the page, got 1492 ms (8.7%) and the browser managed ~3 fps.
+     * Chrome was never render-bound; it was starved by a busy-wait.
+     *
+     * Now the proc blocks with a deadline and the sweep in sched_yield wakes
+     * it. The old comment's fear -- that a parked sleeper could wedge the box
+     * if a timer IRQ went missing -- is answered by WHERE the wake lives: the
+     * sweep runs from sched_yield's slow path (and pid 0's idle loop, which
+     * pause-spins rather than halting), so waking depends on the scheduler
+     * running at all, not on IRQ delivery. Same structure the futex and
+     * alarm deadlines already use.
+     *
+     * Very short sleeps still spin: below one tick, parking costs more in
+     * switch overhead than it saves, and callers that usleep(100) in a
+     * tight retry loop would otherwise take a full tick each time. */
+    struct proc *sp = current_proc();
+    if (sp && ns >= 2000000ull) {                 /* >= 2 ms: worth parking */
+        bool had = bkl_held();
+        sp->sleep_deadline_ns = end;
+        sp->state = PROC_BLOCKED;
+        if (had) bkl_exit();
+        /* Signal semantics, all MEASURED on the interactive gate:
+         *  - a signal that ACTS interrupts the sleep (EINTR) -- before
+         *    this, a SIGTERM sat pending for the sleep's full duration;
+         *  - a default STOP parks the proc RIGHT HERE and the remaining
+         *    sleep continues after SIGCONT, like Linux -- the IRQ tick
+         *    cannot stop a proc parked in this loop, so the loop offers
+         *    the stop itself (the deadline is disarmed across the stop so
+         *    the sweep cannot wake a STOPPED proc);
+         *  - a CAUGHT stop signal is an ordinary interruption (EINTR). */
+        bool intr = false;
+        while (__atomic_load_n(&sp->sleep_deadline_ns, __ATOMIC_ACQUIRE) &&
+               perf_now_ns() < end) {
+            if (sp->pending_signals & SIGMASK_STOP_CLASS) {
+                sp->sleep_deadline_ns = 0;
+                sp->state = PROC_RUNNING;
+                if (!signal_take_pending_stop()) { intr = true; break; }
+                if (perf_now_ns() >= end) break;
+                sp->sleep_deadline_ns = end;
+                sp->state = PROC_BLOCKED;
+                continue;
+            }
+            if (sp->pending_signals & ~SLEEP_UNINTERRUPTING) {
+                intr = true;
+                break;
+            }
+            sched_yield();
+        }
+        sp->sleep_deadline_ns = 0;
+        if (sp->state == PROC_BLOCKED) sp->state = PROC_RUNNING;
+        if (had) bkl_enter();
+        if ((intr || (sp->pending_signals & ~SLEEP_UNINTERRUPTING)) &&
+            perf_now_ns() < end) return -ABI_EINTR;
+        return 0;
+    }
+
     bool had_bkl = bkl_held();
     if (had_bkl) bkl_exit();
     while (perf_now_ns() < end) {
+        {
+            struct proc *me = current_proc();
+            if (me && (me->pending_signals & ~SLEEP_UNINTERRUPTING)) {
+                if (had_bkl) bkl_enter();      /* EINTR, same as above */
+                return -ABI_EINTR;
+            }
+        }
         sched_yield();
         if (perf_now_ns() >= end) break;
         /* PAUSE-spin, NOT `sti(); hlt()`.
@@ -3045,6 +5541,10 @@ static long sys_nanosleep(uint64_t ns) {
     return 0;
 }
 
+/* nanosleep for a blocking call that polls, from inside the kernel: the
+ * caller is parked for NS with the BKL put down (see proc.h). */
+long proc_nap_ns(uint64_t ns) { return sys_nanosleep(ns); }
+
 static long sys_clock_ms(void) {
     return (long)(perf_now_ns() / 1000000ull);
 }
@@ -3055,58 +5555,129 @@ static long sys_abi_version(void) {
 
 /* ---- spawn / waitpid ------------------------------------------- */
 
-/* Copy one user pointer-array (NULL-terminated) into a fresh
- * kernel-allocated array of kstrdup'd strings. *out_count is the
- * number of strings (excluding the NULL terminator). The caller
- * frees the strings + the array via free_kvec. */
-static int copy_kvec_in(char *const *user_arr,
-                        int max_entries, int max_strlen,
-                        char ***out_arr, int *out_count) {
+/* A kernel string vector is ONE allocation: the NULL-terminated pointer
+ * array, then the strings it points at. kvec_free is a single kfree.
+ *
+ * Not one allocation per string: kmalloc is a first-fit walk over every
+ * block and kfree sweeps the arena, so an exec made two heap operations
+ * per argument: 0.6 s for 24,000 on a fresh boot, and 30 s for 22,000
+ * after half an hour of gate traffic had fragmented the heap (xargs
+ * filling commands to 128 KiB in shparity's stress run). */
+char **kvec_pack(char *const *v, int n) {
+    size_t bytes = 0;
+    for (int i = 0; i < n; i++) bytes += strlen(v[i]) + 1;
+    size_t hdr = (size_t)(n + 1) * sizeof(char *);
+    char **arr = (char **)kmalloc(hdr + bytes);
+    if (!arr) return 0;
+    char *s = (char *)arr + hdr;
+    for (int i = 0; i < n; i++) {
+        size_t l = strlen(v[i]) + 1;
+        memcpy(s, v[i], l);
+        arr[i] = s;
+        s += l;
+    }
+    arr[n] = 0;
+    return arr;
+}
+
+/* Copy one user NULL-terminated string vector into a kernel vector (see
+ * kvec_pack for its shape); *out_count excludes the NULL. The caller
+ * frees it with kvec_free.
+ *
+ * NO COUNT LIMIT: what bounds a vector is bytes, as on Linux. Each string
+ * must be shorter than ABI_ARG_STRLEN_MAX, and every string plus its
+ * pointer comes out of *budget -- one budget for argv and envp together,
+ * starting at ABI_ARGS_TOTAL_MAX. Either one exceeded is E2BIG: nothing
+ * is ever cut short and passed on. Shared by spawn and execve, which had
+ * two different answers (E2BIG past 64 entries, and silent truncation).
+ *
+ * The strings collect in one pool and their offsets in one array, both
+ * doubling as they fill, and the result is built from them in a single
+ * allocation: a handful of heap operations however many strings. */
+long kvec_copy_in(char *const *user_arr, char ***out_arr, int *out_count,
+                  size_t *budget) {
     *out_arr = 0;
     *out_count = 0;
     if (!user_arr) return 0;
-    if (max_strlen <= 1 || max_strlen > 4096) return -ABI_EINVAL;
 
-    /* Count first: read each user pointer slot through the accessor. */
-    int n = 0;
+    char *tmp = (char *)kmalloc(ABI_ARG_STRLEN_MAX);
+    size_t pool_cap = 4096, pool_len = 0;
+    char *pool = (char *)kmalloc(pool_cap);
+    int cap = 64, n = 0;
+    size_t *offs = (size_t *)kmalloc(sizeof(size_t) * (size_t)cap);
+    long rc = 0;
+    if (!tmp || !pool || !offs) {
+        kfree(tmp); kfree(pool); kfree(offs);
+        return -ABI_ENOMEM;
+    }
+
     for (;;) {
         uint64_t slot = 0;
-        if (get_user_u64(&slot, user_arr + n) != 0) return -ABI_EFAULT;
+        if (get_user_u64(&slot, user_arr + n) != 0) { rc = -ABI_EFAULT; break; }
         if (slot == 0) break;
-        if (n >= max_entries) return -ABI_E2BIG;
-        n++;
+        long sl = strncpy_from_user(tmp, (const void *)(uintptr_t)slot,
+                                    ABI_ARG_STRLEN_MAX);
+        if (sl < 0) { rc = -ABI_EFAULT; break; }
+        if ((size_t)sl >= ABI_ARG_STRLEN_MAX - 1) { rc = -ABI_E2BIG; break; }
+        size_t need = (size_t)sl + 1 + sizeof(char *);
+        if (need > *budget) { rc = -ABI_E2BIG; break; }
+        *budget -= need;
+        if (n >= cap) {
+            int ncap = cap * 2;
+            size_t *no = (size_t *)kmalloc(sizeof(size_t) * (size_t)ncap);
+            if (!no) { rc = -ABI_ENOMEM; break; }
+            memcpy(no, offs, sizeof(size_t) * (size_t)n);
+            kfree(offs);
+            offs = no;
+            cap = ncap;
+        }
+        if (pool_len + (size_t)sl + 1 > pool_cap) {
+            size_t ncap = pool_cap * 2;
+            while (pool_len + (size_t)sl + 1 > ncap) ncap *= 2;
+            char *np = (char *)kmalloc(ncap);
+            if (!np) { rc = -ABI_ENOMEM; break; }
+            memcpy(np, pool, pool_len);
+            kfree(pool);
+            pool = np;
+            pool_cap = ncap;
+        }
+        memcpy(pool + pool_len, tmp, (size_t)sl + 1);
+        offs[n++] = pool_len;
+        pool_len += (size_t)sl + 1;
     }
-    if (n == 0) return 0;
-
-    char **arr = (char **)kmalloc(sizeof(char *) * (size_t)(n + 1));
-    if (!arr) return -ABI_ENOMEM;
-    memset(arr, 0, sizeof(char *) * (size_t)(n + 1));
-
-    for (int i = 0; i < n; i++) {
-        uint64_t slot = 0;
-        if (get_user_u64(&slot, user_arr + i) != 0) goto fail;
-        char *kc = (char *)kmalloc((size_t)max_strlen);
-        if (!kc) goto fail;
-        long sl = strncpy_from_user(kc, (const void *)(uintptr_t)slot,
-                                    (size_t)max_strlen);
-        if (sl < 0 || sl >= max_strlen - 1) { kfree(kc); goto fail; }
-        arr[i] = kc;
+    kfree(tmp);
+    char **arr = 0;
+    if (rc == 0) {
+        size_t hdr = (size_t)(n + 1) * sizeof(char *);
+        arr = (char **)kmalloc(hdr + pool_len);
+        if (!arr) {
+            rc = -ABI_ENOMEM;
+        } else {
+            char *s = (char *)arr + hdr;
+            memcpy(s, pool, pool_len);
+            for (int i = 0; i < n; i++) arr[i] = s + offs[i];
+            arr[n] = 0;
+        }
     }
-    arr[n] = 0;
+    kfree(pool);
+    kfree(offs);
+    if (rc < 0) return rc;
     *out_arr   = arr;
     *out_count = n;
     return 0;
-
-fail:
-    for (int i = 0; i < n; i++) if (arr[i]) kfree(arr[i]);
-    kfree(arr);
-    return -ABI_ENOMEM;
 }
 
-static void free_kvec(char **arr) {
-    if (!arr) return;
-    for (int i = 0; arr[i]; i++) kfree(arr[i]);
+void kvec_free(char **arr) {
     kfree(arr);
+}
+
+static void free_kvec(char **arr) { kvec_free(arr); }
+
+long lx_access_kpath(const char *kpath, int mode);
+/* sys_spawn's reference to a child's fd 0-2, released: not the console's
+ * NULL, nor the marker of a closed one (finding 234). */
+static void spawn_fd_put(struct file *f) {
+    if (f && f != PROC_FD_CLOSED) file_close(f);
 }
 
 static long sys_spawn(const struct abi_spawn_req *req) {
@@ -3116,20 +5687,46 @@ static long sys_spawn(const struct abi_spawn_req *req) {
      * user mutation can't change pointers we already validated. */
     struct abi_spawn_req kreq;
     if (copy_from_user(&kreq, req, sizeof(kreq)) != 0) return -ABI_EFAULT;
-    if (kreq.flags != 0) return -ABI_EINVAL;
+    if (kreq.flags & ~(ABI_SPAWN_F_DFL_INT | ABI_SPAWN_F_DFL_QUIT |
+                       ABI_SPAWN_F_IGN_INT | ABI_SPAWN_F_IGN_QUIT |
+                       ABI_SPAWN_F_SETSID | ABI_SPAWN_F_MOVEFDS))
+        return -ABI_EINVAL;
+    /* ABI_SPAWN_F_MOVEFDS (abi.h): the caller's descriptors marked
+     * ABI_SPAWN_FD_MOVE are closed once the child has its clones (below,
+     * from kreq's fd0..fd2 and the extras kept in uex_moves) */
+    const bool movefds = (kreq.flags & ABI_SPAWN_F_MOVEFDS) != 0;
+    struct abi_spawn_fd *uex_moves = 0;
 
+    /* A RELATIVE PATH IS THE CALLER'S CWD's, as execve's is (sys_execve
+     * resolves; this did not):
+     *
+     *     cd /bin && ./true          bash: 0
+     *     /bin/tsh: ./true: cannot execute binary file, 126
+     *
+     * The string went to vfs_read_all as written, which takes only a whole
+     * path -- "[proc] cannot read './true': no filesystem mounted at that
+     * path" -- so no program and no #! script was ever run by a relative
+     * path from /bin/tsh, which spawns (logs/b13 q16 q17; the batch 12 gate
+     * logs have './zcmd'). */
     char kpath[ABI_PATH_MAX];
-    if (!user_str_in(kpath, sizeof(kpath), kreq.path)) return -ABI_EFAULT;
+    {
+        int rr = resolve_user_path(kreq.path, kpath, sizeof kpath);
+        if (rr) return rr;
+    }
+    /* ...AND IT MUST BE EXECUTABLE, as execve's must (lx_access_kpath, the
+     * one rule): a mode-0644 copy of /bin/true ran, where bash's execve
+     * says "Permission denied", 126 (logs/b13 q17). */
+    {
+        long ar = lx_access_kpath(kpath, 1 /* X_OK */);
+        if (ar < 0) return ar;
+    }
 
     char **kargv = 0; int kargc = 0;
     char **kenvp = 0; int kenvc = 0;
-    int rc = copy_kvec_in((char *const *)kreq.argv,
-                          ABI_ARGV_MAX, ABI_ARG_MAX,
-                          &kargv, &kargc);
+    size_t budget = ABI_ARGS_TOTAL_MAX;
+    long rc = kvec_copy_in((char *const *)kreq.argv, &kargv, &kargc, &budget);
     if (rc < 0) return rc;
-    rc = copy_kvec_in((char *const *)kreq.envp,
-                      ABI_ENVP_MAX, ABI_ARG_MAX,
-                      &kenvp, &kenvc);
+    rc = kvec_copy_in((char *const *)kreq.envp, &kenvp, &kenvc, &budget);
     if (rc < 0) { free_kvec(kargv); return rc; }
 
     /* Map fd0/fd1/fd2 into struct file pointers, dup-cloning when the
@@ -3147,9 +5744,14 @@ static long sys_spawn(const struct abi_spawn_req *req) {
             *out[i] = 0;            /* let spawn_internal install console */
             continue;
         }
+        if (v == ABI_SPAWN_FD_CLOSED) {
+            *out[i] = PROC_FD_CLOSED;   /* the child's slot stays empty (234) */
+            continue;
+        }
         if (v == ABI_SPAWN_FD_INHERIT) {
             v = i;                   /* inherit parent's same-numbered fd */
         }
+        if (movefds && v >= 0) v &= ~ABI_SPAWN_FD_MOVE;
         if (v < 0 || v >= PROC_NFDS || !ptab || !ptab[v]) {
             failed = true; break;
         }
@@ -3158,22 +5760,112 @@ static long sys_spawn(const struct abi_spawn_req *req) {
         *out[i] = cl;
     }
     if (failed) {
-        if (f0) file_close(f0);
-        if (f1) file_close(f1);
-        if (f2) file_close(f2);
+        spawn_fd_put(f0);
+        spawn_fd_put(f1);
+        spawn_fd_put(f2);
         free_kvec(kargv); free_kvec(kenvp);
         return -ABI_EBADF;
+    }
+
+    /* Descriptors above 2, if the caller asked for any. Each is cloned like
+     * fd0/1/2 and released below, whatever the outcome -- install_initial_fds
+     * clones again into the child. */
+    /* On the heap, sized from the request: a table of up to
+     * ABI_SPAWN_EXTRA_MAX entries is too big for a kernel stack. */
+    struct proc_fd_map *kextra = 0;
+    int nextra = 0;
+    if (kreq.nextra) {
+        struct abi_spawn_fd *uex = 0;
+        if (kreq.nextra > ABI_SPAWN_EXTRA_MAX || !kreq.extra ||
+            !(kextra = (struct proc_fd_map *)kmalloc(sizeof(*kextra) *
+                                                     kreq.nextra)) ||
+            !(uex = (struct abi_spawn_fd *)kmalloc(sizeof(*uex) *
+                                                   kreq.nextra))) {
+            kfree(kextra);
+            spawn_fd_put(f0);
+            spawn_fd_put(f1);
+            spawn_fd_put(f2);
+            free_kvec(kargv); free_kvec(kenvp);
+            return (kreq.nextra > ABI_SPAWN_EXTRA_MAX || !kreq.extra)
+                   ? -ABI_EINVAL : -ABI_ENOMEM;
+        }
+        if (copy_from_user(uex, kreq.extra,
+                           sizeof(uex[0]) * kreq.nextra) != 0) {
+            kfree(uex);
+            kfree(kextra);
+            spawn_fd_put(f0);
+            spawn_fd_put(f1);
+            spawn_fd_put(f2);
+            free_kvec(kargv); free_kvec(kenvp);
+            return -ABI_EFAULT;
+        }
+        for (uint32_t i = 0; i < kreq.nextra; i++) {
+            int cfd = uex[i].child_fd, pfd = uex[i].parent_fd;
+            if (movefds && pfd >= 0) pfd &= ~ABI_SPAWN_FD_MOVE;
+            /* NOT judged by the soft RLIMIT_NOFILE: this is how a shell
+             * hands on what it holds, and a fork-and-exec child inherits a
+             * descriptor opened above a limit lowered later still open, as
+             * Linux's does. A shell refuses a NEW redirection there itself,
+             * as bash's dup2 does (batch 47). */
+            if (cfd < 0 || cfd >= PROC_NFDS ||
+                pfd < 0 || pfd >= PROC_NFDS || !ptab || !ptab[pfd]) {
+                failed = true;
+                break;
+            }
+            struct file *cl = file_clone(ptab[pfd]);
+            if (!cl) { failed = true; break; }
+            kextra[nextra].fd = cfd;
+            kextra[nextra].f  = cl;
+            nextra++;
+        }
+        /* (kept for the moves, when the spawn has succeeded) */
+        if (movefds && !failed) uex_moves = uex;
+        else kfree(uex);
+        if (failed) {
+            for (int i = 0; i < nextra; i++) file_close(kextra[i].f);
+            kfree(kextra);
+            spawn_fd_put(f0);
+            spawn_fd_put(f1);
+            spawn_fd_put(f2);
+            free_kvec(kargv); free_kvec(kenvp);
+            return -ABI_EBADF;
+        }
     }
 
     struct proc_spec spec = {
         .path = kpath, .name = 0,
         .fd0 = f0, .fd1 = f1, .fd2 = f2,
+        .extra_fds = nextra ? kextra : 0,
+        .extra_nfds = nextra,
         .argc = kargc, .argv = kargv,
         .envc = kenvc, .envp = kenvp,
         .sandbox_profile = 0,
         .cwd = 0,
+        .sig_default = ((kreq.flags & ABI_SPAWN_F_DFL_INT)  ? SIGMASK(SIGINT)  : 0) |
+                       ((kreq.flags & ABI_SPAWN_F_DFL_QUIT) ? SIGMASK(SIGQUIT) : 0),
+        .sig_ignore  = ((kreq.flags & ABI_SPAWN_F_IGN_INT)  ? SIGMASK(SIGINT)  : 0) |
+                       ((kreq.flags & ABI_SPAWN_F_IGN_QUIT) ? SIGMASK(SIGQUIT) : 0),
     };
     int pid = proc_spawn(&spec);
+    /* ABI_SPAWN_F_SETSID: a session of the child's own, whose terminal is
+     * the pty on its fd 0 (abi.h). Set before the child's first system
+     * call, which waits for the BKL this one holds -- as ssh.c gives an SSH
+     * session its pty. */
+    if (pid >= 0 && (kreq.flags & ABI_SPAWN_F_SETSID)) {
+        struct proc *cp = proc_lookup(pid);
+        if (cp) {
+            cp->sid = pid;
+            cp->pgid = pid;
+            cp->ctty_kind = PROC_CTTY_NONE;
+            cp->ctty_index = 0;
+            cp->ctty_gen = 0;
+            int idx = (f0 && f0 != PROC_FD_CLOSED && f0->kind == FILE_KIND_PTY_SLAVE)
+                    ? pty_file_index(f0) : -1;
+            if (idx >= 0) (void)pty_make_ctty(cp, idx, false);
+        }
+    }
+    for (int i = 0; i < nextra; i++) file_close(kextra[i].f);
+    kfree(kextra);
 
     /* Whether spawn succeeded or not, our k-copies of argv/envp have
      * already been deep-copied onto the child's user stack and are no
@@ -3181,14 +5873,43 @@ static long sys_spawn(const struct abi_spawn_req *req) {
     free_kvec(kargv);
     free_kvec(kenvp);
 
-    /* If proc_spawn fails, the file_clone'd fds are NOT yet owned by
-     * the child; release them. On success they were transferred. */
-    if (pid < 0) {
-        if (f0) file_close(f0);
-        if (f1) file_close(f1);
-        if (f2) file_close(f2);
-        return -ABI_ENOMEM;
+    /* RELEASE THESE EITHER WAY. They were never "transferred": proc_spawn ->
+     * install_initial_fds CLONES each one into the child's table, so on the
+     * success path our clone was a second reference that nothing ever dropped.
+     *
+     * Every spawn carrying an explicit descriptor leaked one reference to the
+     * underlying open file. For a regular file that is invisible. For a PIPE
+     * it is not: the write end never reached writers == 0, so the reader never
+     * saw EOF and ANY pipeline of two external programs hung forever --
+     *
+     *     /bin/echo hi | /bin/cat        # data arrives, then hangs
+     *
+     * while `echo hi | /bin/cat` was fine, because a builtin writer means the
+     * shell holds the only write end and closes it itself. The refcount trace
+     * read: create w=1, clone w=2, clone w=3, close w=2, close w=1, stop. */
+    spawn_fd_put(f0);
+    spawn_fd_put(f1);
+    spawn_fd_put(f2);
+    /* ABI_SPAWN_F_MOVEFDS: the descriptors the caller gave the child for
+     * its own go now, before this call lets the big lock go and so before
+     * the child can ask about its parent's table (finding 618). A number
+     * named twice -- `>f 2>&1` -- is closed once. */
+    if (pid >= 0 && movefds) {
+        int fv[3] = { kreq.fd0, kreq.fd1, kreq.fd2 };
+        for (int i = 0; i < 3; i++)
+            if (fv[i] >= 0 && (fv[i] & ABI_SPAWN_FD_MOVE)) {
+                int n = fv[i] & ~ABI_SPAWN_FD_MOVE;
+                if (n < PROC_NFDS && ptab && ptab[n]) (void)sys_close(n);
+            }
+        for (uint32_t i = 0; uex_moves && i < kreq.nextra; i++)
+            if (uex_moves[i].parent_fd >= 0 &&
+                (uex_moves[i].parent_fd & ABI_SPAWN_FD_MOVE)) {
+                int n = uex_moves[i].parent_fd & ~ABI_SPAWN_FD_MOVE;
+                if (n < PROC_NFDS && ptab && ptab[n]) (void)sys_close(n);
+            }
     }
+    kfree(uex_moves);
+    if (pid < 0) return -ABI_ENOMEM;
     return pid;
 }
 
@@ -3501,8 +6222,12 @@ static long sys_data_provision(const struct abi_provision_req *ureq) {
 
     struct blk_dev *d = blk_find(req.dev);
     if (!d) return -ABI_ENOENT;
+    /* Pass the flags through verbatim: the guard re-validates every one of
+     * them against the device it actually finds, so masking here would only
+     * hide what userspace asked for. */
     return provision_create_data_volume(d,
-        (req.flags & ABI_PROV_F_FORCE) != 0);
+        req.flags & (ABI_PROV_F_FORCE | ABI_PROV_F_ERASE |
+                     ABI_PROV_F_FORMAT_ONLY | ABI_PROV_F_ERASE_ISO));
 }
 
 /* ---- Milestone 28E: filesystem check ------------------------ */
@@ -3964,7 +6689,7 @@ static long sys_notify_dismiss(uint32_t id) {
  * implementation lives in service.c; this wrapper just enforces
  * the user-buffer contract. */
 static long sys_svc_list(struct abi_service_info *out, uint32_t cap) {
-    if (cap == 0 || cap > 64) return -ABI_EINVAL;
+    if (cap == 0 || cap > ABI_SVC_LIST_MAX) return -ABI_EINVAL;
     if (!user_buf_ok((uint64_t)(uintptr_t)out,
                      (size_t)cap * sizeof(struct abi_service_info))) {
         return -ABI_EFAULT;
@@ -3981,6 +6706,23 @@ static long sys_svc_list(struct abi_service_info *out, uint32_t cap) {
     return (long)n;
 }
 
+/* Is `c` a child of `self`'s process -- of `self`, or of another thread of
+ * its group? Any thread may wait for its process's children on Linux. */
+static bool wait_child_of(struct proc *self, struct proc *c) {
+    if (c->ppid == self->pid) return true;
+    int stg = self->is_thread ? self->tgid : self->pid;
+    struct proc *par = c->ppid > 0 ? proc_lookup(c->ppid) : 0;
+    return par && (par->is_thread ? par->tgid : par->pid) == stg;
+}
+
+/* May `self` wait for `c`? Its process's child, or a tracee it traces --
+ * what Linux's wait4 accepts. */
+static bool waitpid_may_wait(struct proc *self, struct proc *c) {
+    return wait_child_of(self, c) || c->tracer_pid == self->pid;
+}
+
+static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms);
+
 static long sys_waitpid(int vpid, int *status_out, int flags) {
     /* Slice 10: the caller's number, translated in; the same number back out.
      * Identity in the initial namespace. */
@@ -3988,6 +6730,112 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
     if (vpid > 0) {
         pid = pid_knr(vpid);
         if (!pid) return -ABI_ENOENT;
+        /* ONLY ONE'S OWN CHILD. Any pid was accepted, and proc_wait_info
+         * reaps whatever it is given, so a process could collect another's
+         * child: a forked $( ) of /bin/tsh, polling the job table it
+         * inherited, reaped and reported its PARENT's killed background
+         * job -- on the wrong line, before the parent's own output, and
+         * gone from the parent's table (logs/b12 p67). ECHILD, as Linux. */
+        struct proc *self = current_proc();
+        struct proc *c = proc_lookup(pid);
+        if (self && c && !waitpid_may_wait(self, c)) return -ABI_ECHILD;
+    } else {
+        /* K2 (2026-09-30): -1 = any child, 0 = any in the caller's group,
+         * -N = any in group N -- POSIX waitpid, and exactly what LX_wait4
+         * does. This used to fall through to proc_lookup(-1) and return
+         * ENOENT, so libtoby's wait() -- waitpid(-1, ...) -- failed in
+         * EVERY native program. The child picked is the first with an
+         * event (proc_wait_any); the single-child code below then answers
+         * it at once, with the native status encoding unchanged. */
+        struct proc *self = current_proc();
+        if (!self) return -ABI_ECHILD;
+        if (vpid == -2147483647 - 1) return -ABI_ESRCH;
+        int pgid = vpid == 0 ? proc_pgid_of(self) : vpid < -1 ? -vpid : 0;
+        int lxopt = ((flags & ABI_WNOHANG)    ? 0x1 : 0) |
+                    ((flags & ABI_WUNTRACED)  ? 0x2 : 0) |
+                    ((flags & ABI_WCONTINUED) ? 0x8 : 0);
+        for (;;) {
+            int k = proc_wait_any(pgid, lxopt);
+            if (k == PROC_WAIT_INTR) return -ABI_EINTR;
+            if (k < 0) return -ABI_ECHILD;
+            if (k > 0) { pid = k; break; }
+            if (flags & ABI_WNOHANG) return 0;
+            /* stop/continue mode polls, as the single-child arm does */
+            if (self->pending_signals & ~SLEEP_UNINTERRUPTING)
+                return -ABI_EINTR;
+            sched_yield();
+        }
+        vpid = pid_vnr_of_kpid(pid);
+        if (!vpid) vpid = pid;
+    }
+
+    /* ABI_WUNTRACED: report a job-control stop once, without reaping.
+     * Native status encoding: 0x10000 | signal (the Linux 0x7f byte would
+     * collide with a real `exit 127`, which shells produce constantly).
+     * libtoby's WIFSTOPPED/WIFEXITED know the bit. */
+    if (flags & (ABI_WUNTRACED | ABI_WCONTINUED)) {
+        for (;;) {
+            struct proc *child = proc_lookup(pid);
+            if (!child) return -ABI_ENOENT;
+            if ((flags & ABI_WUNTRACED) &&
+                child->state == PROC_STOPPED && !child->stop_reported) {
+                child->stop_reported = true;
+                uint32_t st = 0x10000u |
+                    (uint32_t)(child->stop_sig > 0 ? child->stop_sig : SIGSTOP);
+                if (status_out && put_user_u32(status_out, st) != 0)
+                    return -ABI_EFAULT;
+                return vpid;
+            }
+            if ((flags & ABI_WCONTINUED) && child->cont_pending) {
+                child->cont_pending = false;
+                if (status_out && put_user_u32(status_out, 0x20000u) != 0)
+                    return -ABI_EFAULT;
+                return vpid;
+            }
+            if (child->state == PROC_TERMINATED) break;
+            if (flags & ABI_WNOHANG) return 0;
+            struct proc *self = current_proc();
+            if (self && (self->pending_signals & ~SLEEP_UNINTERRUPTING))
+                return -ABI_EINTR;
+            sched_yield();
+        }
+    }
+    /* A PTRACE STOP IS REPORTED HERE TOO, and it was not before.
+     *
+     * The Linux personality's wait4 has always had this arm; the native
+     * waitpid never did, so a native tracer -- which is what /bin/gdb is --
+     * called waitpid on a child parked in a ptrace stop and got either
+     * "still running" or a block that never ended. Every debugger operation
+     * begins with "wait for the target to stop", so without this the whole
+     * tool is unreachable however correct the rest of it is.
+     *
+     * The child is NOT reaped: it is stopped, not dead, and the tracer is
+     * going to resume it. */
+    /* A PTRACE STOP IS REPORTED HERE TOO, and it was not before: the Linux
+     * personality's wait4 has always had this arm and the native waitpid
+     * never did, so a native tracer -- which /bin/gdb is -- saw a traced
+     * child as merely "still running".
+     *
+     * DELIBERATELY NARROW. An earlier version routed EVERY blocking wait
+     * through proc_wait_or_ptrace so that a blocking tracer would work
+     * too; that put a tracing feature in the path of every waitpid in the
+     * system and wedged unrelated things (the `at` runner, an FTP
+     * session). A tracer polls instead -- WNOHANG plus a yield, which is
+     * what /bin/gdb and /bin/strace both do -- and this stays a check that
+     * cannot affect an untraced child at all.
+     *
+     * The child is NOT reaped: it is stopped, not dead, and the tracer is
+     * going to resume it. */
+    {
+        struct proc *me = current_proc();
+        struct proc *child = (pid > 0) ? proc_lookup(pid) : 0;
+        if (me && child && ptrace_stopped_for(me, child)) {
+            int ssig = ptrace_stop_signal(child);
+            uint32_t st = 0x10000u | (uint32_t)(ssig > 0 ? ssig : SIGTRAP);
+            if (status_out && put_user_u32(status_out, st) != 0)
+                return -ABI_EFAULT;
+            return vpid;
+        }
     }
 
     if (flags & ABI_WNOHANG) {
@@ -3996,15 +6844,198 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
         if (child->state != PROC_TERMINATED) return 0;
     }
 
-    int code = proc_wait(pid);
+    /* THE BLOCKING WAIT IS INTERRUPTIBLE, as the arms above and every other
+     * blocking call here are. It went straight into proc_wait_info, which
+     * sleeps until the child is gone and never looks at a signal: a signal
+     * woke it, it went back to sleep, and the signal landed only when the
+     * child died. So a subshell waiting for its command could not be
+     * killed -- `( sleep 4 ) & kill $!` took four seconds under tsh and none
+     * under bash, whose wait4(-1) polls (logs/b12 cpk3) -- and a killed
+     * coprocess subshell held its pipe open for good (p80). A signal that
+     * acts now ends the wait: a fatal one is delivered on the way out, a
+     * handler gets EINTR or the restart SA_RESTART asks for. The stop class
+     * and the default-ignored signals do not, as in the arms above. */
+    {
+        struct proc *self = current_proc();
+        for (;;) {
+            struct proc *child = proc_lookup(pid);
+            if (!self || !child || child->state == PROC_TERMINATED) break;
+            if (proc_wait_interrupted(self)) return -ABI_EINTR;
+            self->wait_pid = pid;
+            self->state    = PROC_BLOCKED;
+            sched_yield();
+            self->wait_pid = -1;        /* see proc_wait_any */
+        }
+    }
+
+    struct proc_exit_info xi;
+    memset(&xi, 0, sizeof xi);
+    int code = proc_wait_info(pid, &xi);
     if (code < 0 && pid < 0) {
         /* proc_wait can't synthesize -ABI_E* directly; -1 means
          * "no such pid / waited on self". */
         return -ABI_ENOENT;
     }
-    if (status_out && put_user_u32(status_out, (uint32_t)code) != 0)
+    /* A SIGNAL DEATH STILL READS AS EXIT 128+N here -- WIFEXITED true,
+     * WEXITSTATUS 128+N, what every native program has always been given --
+     * and now ALSO names the signal: bit 0x40000 with N in bits 20..26
+     * (libtoby's WIFSIGNALED / WTERMSIG). Both sit outside every bit the
+     * existing macros test. /bin/tsh needs the difference since bash, which
+     * reads the Linux wait4 status, reports "Killed" / "Terminated" where
+     * tsh said "Exit 137" (K3). */
+    uint32_t st = (uint32_t)code;
+    if (xi.term_sig > 0)
+        st = ((uint32_t)code & 0xffu) | 0x40000u |
+             ((uint32_t)(xi.term_sig & 0x7f) << 20);
+    if (status_out && put_user_u32(status_out, st) != 0)
         return -ABI_EFAULT;
     return vpid;
+}
+
+/* ---- chroot(2) and mknod(2), for both ABIs (finding 214) ----------------
+ *
+ * In Linux's order of answers. The Linux personality checked the
+ * capability first, so an unprivileged chroot of a missing path said EPERM
+ * where Linux says ENOENT; the native ABI had neither call, and its chroot
+ * and mknod commands imitated the order in userland -- root's chroot was
+ * "Function not implemented", root's mknod of a device EPERM. */
+
+/* The directory KPATH is in (its last '/' and before; "/" for a name at the
+ * root) into OUT. */
+static void kpath_parent(const char *kpath, char *out, size_t cap) {
+    size_t n = strlen(kpath), cut = 0;
+    while (n > 1 && kpath[n - 1] == '/') n--;
+    for (size_t i = 0; i < n; i++) if (kpath[i] == '/') cut = i;
+    if (cut == 0) cut = 1;
+    if (cut >= cap) cut = cap - 1;
+    memcpy(out, kpath, cut);
+    out[cut] = '\0';
+}
+
+/* chroot(UPATH): the path's errors first -- ENOENT, ENOTDIR, EACCES for a
+ * component or the directory itself that may not be searched -- and only
+ * then EPERM for a caller without CAP_SYS_CHROOT. */
+static long sys_chroot_user(const char *upath) {
+    struct proc *cp = current_proc();
+    if (!cp) return -ABI_EPERM;
+    char knew[ABI_PATH_MAX];
+    int rr = resolve_user_path(upath, knew, sizeof knew);
+    if (rr != 0) return rr;                   /* EACCES too (finding 188) */
+    struct vfs_stat st;
+    int sr = vfs_stat_follow(knew, &st);
+    if (sr != VFS_OK) return sr == VFS_ERR_NOENT ? -ABI_ENOENT : vfs_err_to_abi(sr);
+    if (st.type != VFS_TYPE_DIR)         return -ABI_ENOTDIR;
+    int pc = vfs_perm_check(knew, VFS_WANT_EXEC);
+    if (pc != VFS_OK)                    return vfs_err_to_abi(pc);
+    /* Slice 11: CAP_SYS_CHROOT. No ownership requirement, because chroot
+     * changes only the CALLER's own path resolution -- it grants no
+     * authority over anything outside the caller. */
+    if (!userns_capable(LCAP_SYS_CHROOT)) return -ABI_EPERM;
+    size_t n = strlen(knew);
+    if (n >= sizeof(cp->fs_root))        return -ABI_ENAMETOOLONG;
+    /* "/" means "no chroot": storing it would double every prefix. */
+    if (n == 1 && knew[0] == '/') cp->fs_root[0] = '\0';
+    else { memcpy(cp->fs_root, knew, n); cp->fs_root[n] = '\0'; }
+    kprintf("[chroot] pid=%d root='%s'\n", cp->pid,
+            cp->fs_root[0] ? cp->fs_root : "/");
+    return 0;
+}
+
+/* mknodat(DIRFD, UPATH, MODE, DEV), DEV as Linux encodes one: a type that is
+ * not a file's, a FIFO's, a socket's or a device's is EINVAL (a
+ * directory's EPERM) before the path is looked at; then the path's errors,
+ * EEXIST, the directory's write permission (EACCES); then a device for a
+ * caller without CAP_MKNOD -- which only the initial user namespace gives,
+ * as Linux's capable() asks -- is EPERM. A device node keeps its numbers
+ * (vfs_mknod_dev); a filesystem that keeps none says EPERM. */
+static long sys_mknod_user(int dirfd, const char *upath, uint32_t mode, uint64_t dev) {
+    uint32_t fmt = mode & 0170000u;
+    switch (fmt) {
+    case 0: case 0100000u: case 0020000u: case 0060000u:
+    case 0010000u: case 0140000u: break;
+    case 0040000u: return -ABI_EPERM;
+    default:       return -ABI_EINVAL;
+    }
+    char kpath[ABI_PATH_MAX], par[ABI_PATH_MAX];
+    int rr = resolve_user_path_at(dirfd, upath, kpath, sizeof kpath);
+    if (rr != 0) return rr;                   /* EACCES too (finding 188) */
+    kpath_parent(kpath, par, sizeof par);
+    struct vfs_stat ps, ms;
+    int sr = vfs_stat_follow(par, &ps);
+    if (sr != VFS_OK) return sr == VFS_ERR_NOENT ? -ABI_ENOENT : vfs_err_to_abi(sr);
+    if (ps.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+    if (vfs_stat(kpath, &ms) == VFS_OK) return -ABI_EEXIST;
+    int pc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
+    if (pc != VFS_OK) return vfs_err_to_abi(pc);
+    bool device = fmt == 0020000u || fmt == 0060000u;
+    struct proc *p = current_proc();
+    if (device && !(userns_is_initial(p) && userns_capable(LCAP_MKNOD)))
+        return -ABI_EPERM;
+    uint32_t perm = sys_creation_mode((int)(mode & 07777u));
+    int cr;
+    if (fmt == 0010000u)      cr = vfs_mkfifo(kpath, perm);
+    else if (fmt == 0140000u) cr = vfs_mksock(kpath, perm);
+    else if (device) {
+        /* Linux's dev_t: 12 bits of major over 20 of minor, split */
+        uint32_t maj = (uint32_t)(((dev >> 8) & 0xfffu) | ((dev >> 32) & ~0xfffu));
+        uint32_t min = (uint32_t)((dev & 0xffu) | ((dev >> 12) & ~0xffu));
+        cr = vfs_mknod_dev(kpath, fmt | perm, maj, min);
+    } else                    cr = vfs_create_mode(kpath, perm);
+    return cr == VFS_OK ? 0 : vfs_err_to_abi(cr);
+}
+
+/* ---- a descriptor's status flags (finding 235) ---------------------------
+ *
+ * As Linux's file keeps them: what open was given, less the flags that act
+ * only at open time (O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC) and O_CLOEXEC (the
+ * descriptor's, not the file's), and O_LARGEFILE, which every open on a
+ * 64-bit kernel sets -- O_NOFOLLOW, O_DIRECTORY and the sync flags read
+ * back. F_SETFL changes O_APPEND, O_NONBLOCK, O_ASYNC, O_DIRECT and
+ * O_NOATIME, and nothing else. F_GETFL said the access mode alone, O_APPEND
+ * and O_NONBLOCK for some kinds, a pipe's write end O_RDONLY, and F_SETFL
+ * of O_APPEND was dropped (the next write went to the old position). */
+#define FL_OPEN_ONLY   (0100u | 0200u | 0400u | 01000u | 02000000u)
+#define FL_LARGEFILE   0100000u
+#define FL_APPEND      02000u
+#define FL_NONBLOCK    04000u
+#define FL_SETTABLE    (FL_APPEND | FL_NONBLOCK | 020000u | 040000u | 01000000u)
+
+/* FD was just made by open(2) with FLAGS: its status, and FD_CLOEXEC */
+static void fd_note_open(long fd, long flags) {
+    struct file *f = fd >= 0 ? fd_lookup((int)fd) : 0;
+    if (!f) return;
+    f->fl_status = ((uint32_t)flags & ~(FL_OPEN_ONLY | 3u)) | FL_LARGEFILE;
+    if (flags & 02000000L) fd_cloexec_set(current_proc(), (int)fd, 1);
+}
+
+/* F_GETFL of FF */
+static long fcntl_getfl(struct file *ff) {
+    uint32_t acc = (uint32_t)ff->o_accmode & 3u;
+    bool pipe = ff->kind == FILE_KIND_PIPE_R || ff->kind == FILE_KIND_PIPE_W ||
+                ff->kind == FILE_KIND_PIPE_RW;
+    if (ff->kind == FILE_KIND_PIPE_R) acc = 0;
+    else if (ff->kind == FILE_KIND_PIPE_W) acc = 1;
+    else if (ff->kind == FILE_KIND_PIPE_RW) acc = 2;
+    bool app = ff->kind == FILE_KIND_VFS ? ff->vfs.append
+                                         : (ff->fl_status & FL_APPEND) != 0;
+    bool nb = (ff->kind == FILE_KIND_SOCKET && ff->sock) ? ff->sock->nonblock
+            : pipe ? ff->pipe_nonblock : (ff->fl_status & FL_NONBLOCK) != 0;
+    return (long)(acc | (ff->fl_status & ~(FL_APPEND | FL_NONBLOCK)) |
+                  (app ? FL_APPEND : 0u) | (nb ? FL_NONBLOCK : 0u));
+}
+
+/* F_SETFL of FF to V: the settable bits, and the kinds that act on them */
+static void fcntl_setfl(struct file *ff, uint32_t v) {
+    v &= FL_SETTABLE;
+    ff->fl_status = (ff->fl_status & ~FL_SETTABLE) | v;
+    if (ff->kind == FILE_KIND_VFS) ff->vfs.append = (v & FL_APPEND) != 0;
+    if (ff->kind == FILE_KIND_SOCKET && ff->sock)
+        ff->sock->nonblock = (v & FL_NONBLOCK) != 0;
+    /* a pipe's O_NONBLOCK: reads and writes that would wait are EAGAIN
+     * (file.c) */
+    if (ff->kind == FILE_KIND_PIPE_R || ff->kind == FILE_KIND_PIPE_W ||
+        ff->kind == FILE_KIND_PIPE_RW)
+        ff->pipe_nonblock = (v & FL_NONBLOCK) != 0;
 }
 
 static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
@@ -4059,6 +7090,9 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     case SYS_GUI_TEXT:
         return sys_gui_text((int)a1, (uint32_t)a2, (const char *)a3,
                             (uint32_t)a4, (uint32_t)a5);
+    case ABI_SYS_GUI_TEXT_MONO:
+        return sys_gui_text_mono((int)a1, a2, (const char *)a3,
+                                 (uint32_t)a4, (uint32_t)a5);
     case SYS_GUI_FLIP:
         return sys_gui_flip((int)a1);
     case SYS_GUI_FLIP_RECT:
@@ -4071,10 +7105,546 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_term_write((int)a1, (const void *)a2, (size_t)a3);
     case SYS_TERM_READ:
         return sys_term_read((int)a1, (void *)a2, (size_t)a3);
+    /* ---- native-parity batch (2026-09-04) ---------------------------- */
+
+    case ABI_SYS_BLK_WRITE: {
+        /* Root only, like BLK_READ -- and REFUSED for a device that backs a
+         * live mount. mkfs.ext2 aimed at /data's device through this would
+         * be a silent filesystem wipe under a running kernel, which is the
+         * one thing a "write raw sectors" call must not be able to do by
+         * accident. Unmounted devices (the gate's scratch disk, a fresh USB
+         * stick) are exactly what mkfs/fsck/tune2fs are for. */
+        { struct proc *me = current_proc();
+          if (!me || me->uid != 0) return -ABI_EPERM; }
+        char name[ABI_BLK_NAME_MAX];
+        if (!user_str_in(name, sizeof(name), (const char *)a1)) return -ABI_EFAULT;
+        uint64_t lba = (uint64_t)a2;
+        uint32_t nsec = (uint32_t)a4;
+        if (nsec == 0 || nsec > 256u) return -ABI_EINVAL;
+        size_t bytes = (size_t)nsec * 512u;
+        if (!user_buf_ok((uint64_t)(uintptr_t)a3, bytes)) return -ABI_EFAULT;
+        struct blk_dev *d = blk_find(name);
+        if (!d) return -ABI_ENOENT;
+        const char *mp = NULL;
+        if (provision_dev_mounted(d, &mp)) return -ABI_EBUSY;
+        void *tmp = kmalloc(bytes);
+        if (!tmp) return -ABI_ENOMEM;
+        if (copy_from_user(tmp, (const void *)a3, bytes) != 0) { kfree(tmp); return -ABI_EFAULT; }
+        int rc = blk_write(d, lba, nsec, tmp);
+        kfree(tmp);
+        return rc == 0 ? 0 : -ABI_EIO;
+    }
+
+    case ABI_SYS_LINK: {
+        /* The Linux personality has had link(2) since Phase G; the native
+         * ABI never did, so /bin/link and `ln` (hard) could not exist. Same
+         * semantics: real where the fs has inode indirection (tobyfs, tmpfs),
+         * EPERM where it cannot. */
+        char kold[ABI_PATH_MAX], knew[ABI_PATH_MAX];
+        long orr = resolve_user_path((const char *)a1, kold, sizeof kold);
+        long nrr = resolve_user_path((const char *)a2, knew, sizeof knew);
+        /* the walk's own error -- EACCES for a directory not searchable
+         * (finding 188), ENAMETOOLONG -- not always ENOENT */
+        if (orr != 0) return orr;
+        if (nrr != 0) return nrr;
+        /* "f/" and "x/" as Linux's (finding 223) */
+        orr = trailing_slash_dir((const char *)a1, kold, sizeof kold);
+        if (orr != 0) return orr;
+        nrr = new_name_slash((const char *)a2, knew);
+        if (nrr != 0) return nrr;
+        long lr = vfs_link(kold, knew);
+        if (lr == VFS_ERR_ROFS) return -ABI_EPERM;
+        return vfs_err_to_abi(lr);
+    }
+
+    case ABI_SYS_SETPASSWD: {
+        /* (user, newpw, oldpw). Root sets anyone's password and the old one
+         * is not consulted. Anyone else may change ONLY their own, and only
+         * by presenting the current one -- the same contract passwd(1) has
+         * enforced since 1979, now available to a native /bin/passwd. Before
+         * this the ONLY way to change a password was the GUI login screen. */
+        struct proc *me = current_proc();
+        if (!me) return -ABI_EPERM;
+        char user[64], newpw[512], oldpw[512];
+        if (!user_str_in(user, sizeof(user), (const char *)a1)) return -ABI_EFAULT;
+        if (!user_str_in(newpw, sizeof(newpw), (const char *)a2)) return -ABI_EFAULT;
+        /* root may set an empty one, as chpasswd does (finding 194) */
+        if (!user[0] || (!newpw[0] && me->uid != 0)) return -ABI_EINVAL;
+        const struct user *u = users_lookup_by_name(user);
+        if (!u) return -ABI_ENOENT;
+        if (me->uid != 0) {
+            if (u->uid != me->uid) return -ABI_EPERM;
+            if (!a3 || !user_str_in(oldpw, sizeof(oldpw), (const char *)a3))
+                return -ABI_EFAULT;
+            if (!users_check_password(user, oldpw)) return -ABI_EACCES;
+        }
+        int src = users_set_password(user, newpw);
+        return src == 0 ? 0 : -ABI_EIO;
+    }
+
+    case ABI_SYS_SIGQUEUE:
+        /* (pid, sig, value): sigqueue(3) -- the signal delivered with
+         * SI_QUEUE and the value in its siginfo (finding 215) */
+        return signal_queue((int)a1, (int)a2, SI_QUEUE, (uint64_t)a3);
+    case ABI_SYS_LXSTATFS:
+        /* (which, path|fd, buf): statfs(2) or fstatfs(2) as the Linux
+         * personality answers them, in Linux's struct statfs (finding 215:
+         * libtoby had neither) */
+        if (a1 == 0) return linux_syscall_impl(137, a2, a3, 0, 0, 0);
+        if (a1 == 1) return linux_syscall_impl(138, a2, a3, 0, 0, 0);
+        return -ABI_EINVAL;
+    case ABI_SYS_FSYNC:
+        /* (fd, datasync): fsync(2) / fdatasync(2), the Linux arms (finding
+         * 215: shred asked for the whole cache, libtoby having no fsync) */
+        return linux_syscall_impl(a2 ? 75 : 74, a1, 0, 0, 0, 0);
+    case ABI_SYS_UNSHARE:
+        /* (flags): unshare(2) for a native program -- the namespaces the
+         * Linux personality's has made since slice 8, under the same rules
+         * (ns_unshare), for tobyOS's unshare(1) (finding 241) */
+        return ns_unshare((uint32_t)a1);
+    case ABI_SYS_SHADOW: {
+        /* (op, name, arg): the account's aging and password state, as
+         * shadow-utils keeps them in /etc/shadow (finding 213). Changes are
+         * root's -- the initial namespace's, as the table is the machine's;
+         * the state is root's or the account's own user's to read. */
+        struct proc *me = current_proc();
+        if (!me) return -ABI_EPERM;
+        char user[64];
+        if (!user_str_in(user, sizeof(user), (const char *)a2)) return -ABI_EFAULT;
+        if (!user[0]) return -ABI_EINVAL;
+        bool root = me->uid == 0 && userns_is_initial(me);
+        if (a1 == ABI_SHADOW_GET) {
+            struct user u;
+            int state;
+            if (users_shadow_get(user, &u, &state) != 0) return -ABI_ENOENT;
+            if (!root && u.uid != me->uid) return -ABI_EPERM;
+            struct abi_shadow out;
+            memset(&out, 0, sizeof out);
+            out.lastchg = u.lastchg; out.minage = u.minage; out.maxage = u.maxage;
+            out.warn = u.warn; out.inactive = u.inactive; out.expire = u.expire;
+            out.state = state;
+            return copy_to_user((void *)(uintptr_t)a3, &out, sizeof out) ? -ABI_EFAULT : 0;
+        }
+        if (!root) return -ABI_EPERM;
+        int r;
+        if (a1 == ABI_SHADOW_AGE) {
+            struct abi_shadow in;
+            if (copy_from_user(&in, (const void *)(uintptr_t)a3, sizeof in)) return -ABI_EFAULT;
+            r = users_shadow_age(user, in.minage, in.maxage, in.warn, in.inactive);
+        } else if (a1 == ABI_SHADOW_SETHASH) {
+            char h[USER_PWHASH_MAX];
+            if (!user_str_in(h, sizeof h, (const char *)a3)) return -ABI_EFAULT;
+            r = users_shadow_op(user, USERS_SH_SETHASH, h);
+        } else {
+            static const int ops[] = { [ABI_SHADOW_LOCK] = USERS_SH_LOCK,
+                [ABI_SHADOW_UNLOCK] = USERS_SH_UNLOCK, [ABI_SHADOW_DELETE] = USERS_SH_DELETE,
+                [ABI_SHADOW_EXPIRE] = USERS_SH_EXPIRE };
+            if (a1 < ABI_SHADOW_LOCK || a1 > ABI_SHADOW_EXPIRE) return -ABI_EINVAL;
+            r = users_shadow_op(user, ops[a1], 0);
+        }
+        return r == 0 ? 0 : r == -2 ? -ABI_EINVAL : -ABI_ENOENT;
+    }
+
+    case ABI_SYS_SOCKOPT: {
+        /* native sockets live in the file table: the socket table's index is
+         * NOT the fd (the first cut indexed it by fd and got EBADF) */
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_SOCKET || !f->sock) return -ABI_EBADF;
+        return sock_setopt(f->sock, (int)a2, (long)a3);
+    }
+
+    case ABI_SYS_GETRUID: {             /* as the namespace sees it, as GETUID */
+        struct proc *p = current_proc();
+        return p ? (long)userns_cur_uid(p->ruid) : 0;
+    }
+    case ABI_SYS_GETRGID: {             /* finding 206: getgid()'s real gid */
+        struct proc *p = current_proc();
+        return p ? (long)userns_cur_gid(p->rgid) : 0;
+    }
+    case ABI_SYS_CHROOT:                /* finding 214 */
+        return sys_chroot_user((const char *)a1);
+    case ABI_SYS_MKNOD:                 /* finding 214 */
+        return sys_mknod_user((int)a1, (const char *)a2, (uint32_t)a3, (uint64_t)a4);
+    case ABI_SYS_FCNTL:                 /* finding 235: LX_fcntl, 72 */
+        return linux_syscall_impl(72, a1, a2, a3, 0, 0);
+    case ABI_SYS_XATTR: {               /* finding 225: (lxnr, a, b, c, d) */
+        if (a1 < 188 || a1 > 199) return -ABI_EINVAL;
+        if (a1 <= 190)                  /* a set: size | flags << 32 */
+            return lx_xattr(a1, a2, a3, a4, (long)((uint64_t)a5 & 0xffffffffu),
+                            (long)((uint64_t)a5 >> 32));
+        return lx_xattr(a1, a2, a3, a4, a5, 0);
+    }
+
+    case ABI_SYS_TIMES: {
+        struct proc *p = current_proc();
+        struct abi_times t;
+        memset(&t, 0, sizeof t);
+        if (p) {
+            if (a1 == 1) proc_cputimes(p, &t.utime_ns, &t.stime_ns);
+            else proc_group_cputimes(p, &t.utime_ns, &t.stime_ns);
+            t.cutime_ns = p->cutime_ns;
+            t.cstime_ns = p->cstime_ns;
+        }
+        if (copy_to_user((void *)a2, &t, sizeof t) != 0) return -ABI_EFAULT;
+        return 0;
+    }
+
+    case ABI_SYS_STATFS: {
+        /* The Linux personality's statfs(2), for native programs: the same
+         * vfs_statfs numbers busybox's df reads. vfs_statfs answers for any
+         * path inside a mount, so the path is stat()ed first -- statfs on a
+         * missing file is ENOENT on Linux. */
+        char kpath[ABI_PATH_MAX];
+        {   int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+            if (rr != 0) return rr;            /* EACCES too (finding 188) */
+            rr = statfs_follow(kpath, sizeof kpath);       /* finding 244 */
+            if (rr != 0) return rr;
+        }
+        struct vfs_stat st;
+        int src = vfs_stat(kpath, &st);
+        if (src != VFS_OK) return vfs_err_to_abi(src);
+        struct vfs_statfs vs;
+        int rc = vfs_statfs(kpath, &vs);
+        if (rc != VFS_OK) return vfs_err_to_abi(rc);
+        struct abi_statfs out;
+        memset(&out, 0, sizeof out);
+        out.bsize      = vs.bsize;
+        out.blocks     = vs.blocks;
+        out.bfree      = vs.bfree;
+        out.bavail     = vs.bfree;      /* no reserved blocks anywhere */
+        out.files      = vs.files;
+        out.ffree      = vs.ffree;
+        out.type_magic = vs.type_magic;
+        out.namelen    = vs.namelen;
+        if (copy_to_user((void *)a2, &out, sizeof out) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
+
+    case ABI_SYS_USERADD: {
+        struct proc *me = current_proc();
+        if (!me || me->uid != 0) return -ABI_EPERM;
+        char name[64];
+        if (!user_str_in(name, sizeof(name), (const char *)a2)) return -ABI_EFAULT;
+        if (!name[0]) return -ABI_EINVAL;
+        int op = (int)a1;
+        if (op == 0) {
+            if (users_lookup_by_name(name) || users_lookup_by_uid((int)a3)) return -ABI_EEXIST;
+            if (users_add(name, (int)a3, (int)a4) != 0) return -ABI_ENOSPC;
+        } else if (op == 1) {
+            if (users_del(name) != 0) return -ABI_ENOENT;
+        } else return -ABI_EINVAL;
+        return users_save() == 0 ? 0 : -ABI_EIO;
+    }
+
+    case ABI_SYS_ARP: {
+        /* Native arping/arp. AF_PACKET sockets are receive-only in this
+         * kernel (the injection side was never built), so the ARP cache
+         * and the request sender are reached directly instead. */
+        int op = (int)a1;
+        if (op == 0) {
+            uint8_t mac[6];
+            if (!arp_resolve((uint32_t)a2, mac)) return -ABI_ENOENT;
+            if (copy_to_user((void *)a3, mac, 6) != 0) return -ABI_EFAULT;
+            return 0;
+        }
+        if (op == 1) {
+            if (!net_is_up()) return -ABI_EIO;
+            arp_request((uint32_t)a2);
+            return 0;
+        }
+        if (op == 5) {
+            /* Resolve, pumping the NIC once. On a miss send a request and
+             * drain the RX ring so the reply is actually processed -- the
+             * caller loops this with a userspace sleep. */
+            uint8_t mac[6];
+            if (arp_resolve((uint32_t)a2, mac)) {
+                if (copy_to_user((void *)a3, mac, 6) != 0) return -ABI_EFAULT;
+                return 0;
+            }
+            if (!net_is_up()) return -ABI_EIO;         /* net down */
+            arp_request((uint32_t)a2);
+            net_poll();
+            if (arp_resolve((uint32_t)a2, mac)) {
+                if (copy_to_user((void *)a3, mac, 6) != 0) return -ABI_EFAULT;
+                return 0;
+            }
+            return -ABI_ENOENT;
+        }
+        if (op == 3 || op == 4) {
+            struct proc *me = current_proc();
+            if (!me || me->uid != 0) return -ABI_EPERM;
+            if (op == 3) return arp_cache_delete((uint32_t)a2) ? 0 : -ABI_ENOENT;
+            uint8_t mac[6];
+            if (copy_from_user(mac, (const void *)a3, 6) != 0) return -ABI_EFAULT;
+            arp_cache_set((uint32_t)a2, mac);
+            return 0;
+        }
+        if (op == 2) {
+            struct abi_arp_entry e; uint32_t ip; uint8_t mac[6];
+            int idx = (int)a2;
+            if (idx < 0 || idx >= arp_cache_capacity()) return -ABI_ENOENT;
+            memset(&e, 0, sizeof e);
+            if (arp_cache_entry(idx, &ip, mac)) {
+                e.ip_be = ip; memcpy(e.mac, mac, 6); e.valid = 1;
+            }
+            if (copy_to_user((void *)a3, &e, sizeof e) != 0) return -ABI_EFAULT;
+            return 0;
+        }
+        return -ABI_EINVAL;
+    }
+
+    case ABI_SYS_NETCFG: {
+        struct proc *me = current_proc();
+        int op = (int)a1;
+        if (op == 5) {
+            /* get the interface MAC: read-only, any uid (ip link show) */
+            const uint8_t *mac = net_my_mac();
+            if (!mac || copy_to_user((void *)a2, mac, 6) != 0) return -ABI_EFAULT;
+            return 0;
+        }
+        if (!me || me->uid != 0) return -ABI_EPERM;
+        switch (op) {
+        case 0:
+            g_my_ip = (uint32_t)a2;
+            g_my_netmask = (uint32_t)a3;
+            return 0;
+        case 1:
+            g_gateway_ip = (uint32_t)a2;
+            return 0;
+        case 2: case 3: {
+            void *ns = me->net_ns;
+            uint32_t dst = (uint32_t)a2, mask = (uint32_t)a3, gw = (uint32_t)a4;
+            if (op == 3) return net_ns_route_del(ns, dst & mask, mask) ? 0 : -ABI_ENOENT;
+            struct net_dev *dev = NULL; uint32_t nh = 0;
+            if (gw) { struct net_dev *g = NULL; if (net_ns_route_lookup(ns, gw, &nh, &g)) dev = g; }
+            if (!dev) dev = net_ns_find_dev(ns, "eth0");
+            /* the initial namespace keeps its NIC in net.c, not in its
+             * interface table: fall back to the primary device */
+            if (!dev) dev = net_default();
+            if (!dev) return -ABI_ENODEV;
+            return net_ns_route_add(ns, dst & mask, mask, gw, dev) ? 0 : -ABI_ENOSPC;
+        }
+        case 4:
+            net_set_up(a2 != 0);
+            return 0;
+        default:
+            return -ABI_EINVAL;
+        }
+    }
+
+    case ABI_SYS_BLK_READ: {
+        /* Root only. Raw sectors are every byte of every filesystem on the
+         * machine, including other users' files and the password database,
+         * so this is exactly as privileged as the disk itself. */
+        { struct proc *me = current_proc();
+          if (!me || me->uid != 0) return -ABI_EPERM; }
+        char name[ABI_BLK_NAME_MAX];
+        if (!user_str_in(name, sizeof(name), (const char *)a1)) return -ABI_EFAULT;
+        uint64_t lba = (uint64_t)a2;
+        uint32_t nsec = (uint32_t)a4;
+        if (nsec == 0 || nsec > 256u) return -ABI_EINVAL;
+        size_t bytes = (size_t)nsec * 512u;
+        if (!user_buf_ok((uint64_t)(uintptr_t)a3, bytes)) return -ABI_EFAULT;
+        struct blk_dev *d = blk_find(name);
+        if (!d) return -ABI_ENOENT;
+        void *tmp = kmalloc(bytes);
+        if (!tmp) return -ABI_ENOMEM;
+        int rc = blk_read(d, lba, nsec, tmp);
+        if (rc != 0) { kfree(tmp); return -ABI_EIO; }
+        if (copy_to_user((void *)a3, tmp, bytes) != 0) { kfree(tmp); return -ABI_EFAULT; }
+        kfree(tmp);
+        return 0;
+    }
+    case ABI_SYS_SYNC: {
+        /* Not privileged: flushing writes is not a privileged act. */
+        extern void bcache_sync(struct blk_dev *dev);
+        sync_all_mounts();          /* each filesystem's own (finding 278) */
+        bcache_sync(NULL);          /* NULL == every device */
+        return 0;
+    }
+    case ABI_SYS_PTRACE:
+        /* ABI_SYS_PTRACE (149) has been DECLARED in abi.h since the ptrace
+         * slice and never dispatched here: only the Linux personality's
+         * syscall 101 reached ptrace_do, so a native program calling it got
+         * "unknown number 149 -- returning -ENOSYS". That is exactly why
+         * /bin/debugger printed "ptrace not fully available, running in demo
+         * mode" -- it was telling the truth about a syscall the header
+         * promised. Same implementation, no second credential model. */
+        return ptrace_do((long)a1, (int)a2, (uint64_t)a3, (uint64_t)a4);
+
+    case ABI_SYS_UMASK: {
+        /* Same semantics as the Linux personality's umask(2) below: set the
+         * caller's mask, answer with the old one. Nothing to validate --
+         * every value is a legal mask. */
+        struct proc *up = current_proc();
+        uint32_t old = up ? up->umask : 0022u;
+        if (up) up->umask = (uint32_t)a1 & 07777u;
+        return (long)old;
+    }
+
+    case ABI_SYS_CLOCK_NS: {
+        /* The native realtime clock (2026-09-03). Until this existed the
+         * native ABI's only clock was CLOCK_MS, milliseconds since boot, so
+         * libtoby's time() counted from boot and `date` printed 2025 on a
+         * machine whose RTC said 2026 -- while busybox, on the Linux path,
+         * printed the truth. Same converter as CLOCK_REALTIME there:
+         * anchored to the RTC once, driven by the TSC, so a native and a
+         * Linux program asking at the same instant get the same number,
+         * and tobyfs/tmpfs mtimes (stamped from it) read back in the same
+         * calendar. No CMOS read on this path: lx_realtime_ns latches the
+         * RTC on its first call and never touches the port pair again. */
+        extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+        uint64_t mono = perf_now_ns();
+        if ((int)a1 == ABI_CLOCK_REALTIME)  return (long)lx_realtime_ns(mono);
+        /* slewed with realtime, as Linux's CLOCK_MONOTONIC (finding 280) */
+        if ((int)a1 == ABI_CLOCK_MONOTONIC) return (long)lx_mono_ns(mono);
+        return -ABI_EINVAL;
+    }
+
+    case ABI_SYS_AUTH_CHECK: {
+        /* Verify a password WITHOUT touching the session.
+         *
+         * users_check_password() has existed since the accounts milestone
+         * and nothing outside the kernel could reach it: the only exposed
+         * entry point was SYS_LOGIN, which calls session_login() and
+         * switches the active desktop session. `sudo` must not do that --
+         * it authenticates the person at the keyboard and then runs one
+         * command, leaving the session exactly as it found it.
+         *
+         * ROOT ONLY, and that is not a formality: an unprivileged caller
+         * with this syscall has an offline password oracle. sudo reaches
+         * it because it is setuid-root, which is the same shape as every
+         * other system that lets you type your password to a helper. */
+        struct proc *ap = current_proc();
+        if (!ap || ap->uid != 0) return -ABI_EPERM;
+        char kuser[64], kpass[65];
+        if (!user_str_in(kuser, sizeof kuser, (const char *)(uintptr_t)a1))
+            return -ABI_EFAULT;
+        kpass[0] = 0;
+        if (a2 && strncpy_from_user(kpass, (const char *)(uintptr_t)a2,
+                                    sizeof kpass) < 0)
+            return -ABI_EFAULT;
+        extern bool users_check_password(const char *username, const char *password);
+        return users_check_password(kuser, kpass) ? 0 : -ABI_EACCES;
+    }
+    case ABI_SYS_PCI_CFG: {
+        /* setpci(8)'s two operations, and nothing else.
+         *
+         * Reads are open to anyone -- the same 256 bytes are already
+         * readable as /sys/bus/pci/devices/<addr>/config, so refusing them
+         * here would only make the tool inconsistent with the file.
+         *
+         * WRITES ARE ROOT-ONLY, and deliberately narrow: config space is
+         * where a wrong dword unmaps a disk controller mid-write. The
+         * offset is bounds-checked to the 256-byte header, the address is
+         * checked against a device that ACTUALLY EXISTS (so a typo pokes
+         * nothing rather than an unenumerated function), and the sysfs
+         * snapshot is refreshed afterwards so the file and the hardware
+         * cannot disagree.
+         *
+         * a1 = op, a2 = bdf packed as (bus << 16) | (slot << 8) | fn,
+         * a3 = byte offset (dword-aligned), a4 = value for a write.
+         */
+        /* pci.h supplies the accessors and struct pci_dev; only the sysfs
+         * refresh is declared here, the way bcache_sync is below. */
+        extern void sysfs_pci_config_refresh(uint8_t, uint8_t, uint8_t);
+
+        unsigned op   = (unsigned)a1;
+        unsigned bdf  = (unsigned)a2;
+        unsigned off  = (unsigned)a3;
+        uint8_t  bus  = (uint8_t)((bdf >> 16) & 0xFF);
+        uint8_t  slot = (uint8_t)((bdf >> 8) & 0x1F);
+        uint8_t  fn   = (uint8_t)(bdf & 0x07);
+
+        if (off > 252 || (off & 3)) return -ABI_EINVAL;
+
+        /* The address must name a function this kernel enumerated. */
+        int known = 0;
+        for (size_t i = 0, n = pci_device_count(); i < n; i++) {
+            struct pci_dev *d = pci_device_at(i);
+            if (d && d->bus == bus && d->slot == slot && d->fn == fn) { known = 1; break; }
+        }
+        if (!known) return -ABI_ENODEV;
+
+        if (op == ABI_PCI_CFG_READ32)
+            return (long)(uint32_t)pci_cfg_read32(bus, slot, fn, (uint8_t)off);
+
+        if (op == ABI_PCI_CFG_WRITE32) {
+            struct proc *me = current_proc();
+            if (!me || me->uid != 0) return -ABI_EPERM;
+            kprintf("[setpci] pid %d writes %02x:%02x.%u off 0x%02x = 0x%08x\n",
+                    me->pid, (unsigned)bus, (unsigned)slot, (unsigned)fn,
+                    off, (unsigned)a4);
+            pci_cfg_write32(bus, slot, fn, (uint8_t)off, (uint32_t)a4);
+            sysfs_pci_config_refresh(bus, slot, fn);
+            return 0;
+        }
+        return -ABI_EINVAL;
+    }
+    case ABI_SYS_POWER: {
+        /* Root only: this ends every other process on the machine without
+         * asking them. acpi_shutdown() flushes the block cache first, so a
+         * graceful power-off does not lose /data. */
+        { struct proc *me = current_proc();
+          if (!me || me->uid != 0) return -ABI_EPERM; }
+        /* Declared here rather than pulling acpi.h into this translation
+         * unit for three symbols; bcache_sync is already extern'd this way
+         * further down the file. */
+        extern __attribute__((noreturn)) void acpi_shutdown(void);
+        extern __attribute__((noreturn)) void acpi_reboot(void);
+        extern void bcache_sync(struct blk_dev *dev);
+        unsigned action = (unsigned)a1;
+        kprintf("[power] pid %d requested action %u\n",
+                current_proc() ? current_proc()->pid : -1, action);
+        /* every filesystem's own sync before the power goes: ext4's running
+         * transaction is in memory until it is committed (finding 278) */
+        sync_all_mounts();
+        switch (action) {
+        case ABI_POWER_OFF:    acpi_shutdown();   /* noreturn */ break;
+        case ABI_POWER_REBOOT: acpi_reboot();     /* noreturn */ break;
+        case ABI_POWER_HALT:   bcache_sync(NULL); cli(); hlt_forever(); break;
+        default: return -ABI_EINVAL;
+        }
+        /* Only reached if the ACPI path could not act. */
+        return -ABI_EIO;
+    }
+    case ABI_SYS_DNS_RESOLVE: {
+        /* The kernel already had dns_resolve(); nothing exposed it, so no
+         * userland program could turn a name into an address for a raw TCP
+         * connection. A literal dotted quad is answered WITHOUT a query --
+         * asking a DNS server to resolve "127.0.0.1" is both pointless and
+         * guaranteed to fail. */
+        char name[256];
+        if (!user_str_in(name, sizeof(name), (const char *)a1)) return -ABI_EFAULT;
+        if (!user_buf_ok((uint64_t)(uintptr_t)a2, sizeof(uint32_t))) return -ABI_EFAULT;
+        uint32_t ip_be = 0;
+        unsigned b[4]; int nb = 0; const char *p = name; bool literal = true;
+        while (nb < 4) {
+            unsigned v = 0; int digits = 0;
+            while (*p >= '0' && *p <= '9') { v = v*10 + (unsigned)(*p++ - '0'); digits++; }
+            if (!digits || v > 255) { literal = false; break; }
+            b[nb++] = v;
+            if (nb < 4) { if (*p != '.') { literal = false; break; } p++; }
+        }
+        if (literal && nb == 4 && *p == 0) {
+            ip_be = ((uint32_t)b[0]) | ((uint32_t)b[1] << 8) |
+                    ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+        } else {
+            struct dns_result r;
+            if (!dns_resolve(name, 4000, &r)) return -1;
+            ip_be = r.ip_be;
+        }
+        if (copy_to_user((void *)a2, &ip_be, sizeof ip_be) != 0) return -ABI_EFAULT;
+        return 0;
+    }
     case SYS_FS_READDIR:
         return sys_fs_readdir((const char *)a1,
                               (struct vfs_dirent_user *)a2,
                               (int)a3, (int)a4);
+    case ABI_SYS_FS_READDIR2:
+        return sys_fs_readdir2((const char *)a1, (struct abi_dirent2 *)a2,
+                               (int)a3, (int)a4);
     case SYS_FS_READFILE:
         return sys_fs_readfile((const char *)a1, (void *)a2, (size_t)a3);
     case SYS_EXEC:
@@ -4108,40 +7678,113 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return lx_do_setid(true,  a1);
     case SYS_SETGID:
         return lx_do_setid(false, a1);
+    /* Same shared-body rule for process groups: the native shell's
+     * `set -m` and the Linux personality's job control use one model. */
+    case ABI_SYS_SETPGID:
+        return lx_do_setpgid(a1, a2);
+    case ABI_SYS_GETPGID:
+        return lx_do_getpgid(a1);
+    case ABI_SYS_SETSID:
+        return proc_setsid(current_proc());
+    case ABI_SYS_POLL:
+        return lx_do_poll((uint64_t)a1, (unsigned long)a2, (long)(int)a3);
+    case ABI_SYS_IOCTL:
+        /* Forward to the Linux arm (LX_ioctl == 16): the tty/pty control
+         * surface is one implementation for both ABIs. */
+        return linux_syscall_impl(16, a1, a2, a3, 0, 0);
     case SYS_USERNAME:
         return sys_username((int)a1, (char *)a2, (size_t)a3);
     case SYS_CHMOD:
         return sys_chmod((const char *)a1, (uint32_t)a2);
     case SYS_CHOWN:
         return sys_chown((const char *)a1, (uint32_t)a2, (uint32_t)a3);
+    case ABI_SYS_LCHOWN:
+        return sys_lchown((const char *)a1, (uint32_t)a2, (uint32_t)a3);
+    case ABI_SYS_GETGROUPS:         /* one implementation: the Linux arm */
+        return linux_syscall_impl(115, a1, a2, 0, 0, 0);
+    case ABI_SYS_SETGROUPS:         /* finding 203: su's initgroups */
+        return linux_syscall_impl(116, a1, a2, 0, 0, 0);
+    case ABI_SYS_MOUNT:             /* batch 31: mount(8); the Linux arm */
+        return linux_syscall_impl(165, a1, a2, a3, a4, a5);
+    case ABI_SYS_UMOUNT2:           /* batch 31: umount(8); the Linux arm */
+        return linux_syscall_impl(166, a1, a2, 0, 0, 0);
+    case ABI_SYS_RENAMEAT2:         /* batch 31: mv --exchange; the Linux arm */
+        return linux_syscall_impl(316, a1, a2, a3, a4, a5);
 
     /* ---- Milestone 25A: libc-shape calls ------------------------ */
     case SYS_GETPID:        return sys_getpid();
     case SYS_GETPPID:       return sys_getppid();
     case ABI_SYS_SETPRIORITY: return sys_setpriority((int)a1, (int)a2);
     case ABI_SYS_GETPRIORITY: return sys_getpriority((int)a1);
-    case SYS_SPAWN:
-        return sys_spawn((const struct abi_spawn_req *)a1);
+    case SYS_SPAWN: {
+        /* the child as the caller's pid namespace numbers it (finding 207) */
+        long r = sys_spawn((const struct abi_spawn_req *)a1);
+        if (r > 0) { int v = pid_vnr_of_kpid((int)r); if (v) r = v; }
+        return r;
+    }
     case SYS_WAITPID:
         return sys_waitpid((int)a1, (int *)a2, (int)a3);
-    case SYS_OPEN:
-        return sys_open((const char *)a1, (int)a2, (int)a3);
+    case SYS_OPEN: {
+        long ofd = sys_open((const char *)a1, (int)a2, (int)a3);
+        fd_note_open(ofd, a2);               /* F_GETFL, O_CLOEXEC (235) */
+        return ofd;
+    }
     case SYS_LSEEK:
         return sys_lseek((int)a1, (int64_t)a2, (int)a3);
     case SYS_STAT:
         return sys_stat((const char *)a1, (struct abi_stat *)a2);
+    case ABI_SYS_MKFIFO: {
+        char kpath[ABI_PATH_MAX];
+        int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+        if (rr) return rr;
+        int fr = vfs_mkfifo(kpath, sys_creation_mode((int)a2));
+        return fr == VFS_OK ? 0 : vfs_err_to_abi(fr);
+    }
+    case ABI_SYS_LSTAT:
+        return sys_stat_follow((const char *)a1, (struct abi_stat *)a2, false);
+    case ABI_SYS_UTIMENSAT:
+        return sys_utimensat_native((const char *)a1, (const void *)a2, (int)a3);
+    case ABI_SYS_CLOCK_SETTIME:     /* as Linux's clock_settime (finding 157) */
+        return lx_clock_settime((int)a1, (const void *)a2);
+    case ABI_SYS_ADJTIMEX: {        /* as Linux's adjtimex (finding 280) */
+        extern long lx_adjtimex(void *utx);
+        return lx_adjtimex((void *)a1);
+    }
+    case ABI_SYS_GETNICE: return nice_get((int)a1, (int)a2);
+    case ABI_SYS_SETNICE: return nice_set((int)a1, (int)a2, (long)(int)a3);
+    case ABI_SYS_PRLIMIT:           /* as Linux's prlimit64 (batch 47) */
+        return sys_prlimit((int)a1, (int)a2, (uint64_t)a3, (uint64_t)a4);
+    case ABI_SYS_XSTAT:
+        if (a1 == 2) return sys_fstat_sz((int)a2, (struct abi_stat *)a3, (size_t)a4);
+        if (a1 != 0 && a1 != 1) return -ABI_EINVAL;
+        return sys_stat_follow_sz((const char *)a2, (struct abi_stat *)a3, a1 == 0,
+                                  (size_t)a4);
     case SYS_FSTAT:
         return sys_fstat((int)a1, (struct abi_stat *)a2);
     case SYS_DUP:           return sys_dup((int)a1);
     case SYS_DUP2:          return sys_dup2((int)a1, (int)a2);
     case SYS_UNLINK:        return sys_unlink((const char *)a1);
     case SYS_MKDIR:         return sys_mkdir((const char *)a1, (int)a2);
+    /* 2026-08-24: the write-side calls the native ABI was missing. Every
+     * one of these already existed for the Linux personality against the
+     * same VFS -- a busybox binary could truncate and rename where a
+     * native tobyOS program got ENOSYS from its own libc. */
+    case ABI_SYS_TRUNCATE:
+        return sys_truncate_path((const char *)a1, (uint64_t)a2);
+    case ABI_SYS_FTRUNCATE:
+        return sys_ftruncate_fd((int)a1, (uint64_t)a2);
+    case ABI_SYS_RENAME:
+        return sys_rename((const char *)a1, (const char *)a2);
+    case ABI_SYS_RMDIR:     return sys_rmdir((const char *)a1);
+    case ABI_SYS_UTIMES:
+        return sys_utimes_native((const char *)a1, (uint64_t)a2, (uint64_t)a3);
     case SYS_BRK:           return sys_brk((uintptr_t)a1);
     case SYS_GETCWD:        return sys_getcwd((char *)a1, (size_t)a2);
     case SYS_CHDIR:         return sys_chdir((const char *)a1);
     case SYS_GETENV:
         return sys_getenv((const char *)a1, (char *)a2, (size_t)a3);
-    case SYS_NANOSLEEP:     return sys_nanosleep((uint64_t)a1);
+    /* the duration is CLOCK_MONOTONIC's, slewed (finding 280) */
+    case SYS_NANOSLEEP:     return sys_nanosleep(lx_mono_sleep_raw((uint64_t)a1));
     case SYS_CLOCK_MS:      return sys_clock_ms();
     case SYS_ABI_VERSION:   return sys_abi_version();
 
@@ -4684,31 +8327,54 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Phase 1 M1.5: Enhanced VFS ---- */
 
     case ABI_SYS_SYMLINK: {
-        char kpath[ABI_PATH_MAX], ktarget[ABI_PATH_MAX];
-        if (!user_str_in(kpath, sizeof(kpath),
-                         (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
-        if (!user_str_in(ktarget, sizeof(ktarget),
-                         (const char *)(uintptr_t)a2)) return -ABI_EFAULT;
-        int rc = vfs_symlink(kpath, ktarget);
-        if (rc == VFS_OK) return 0;
-        if (rc == VFS_ERR_EXIST) return -ABI_EEXIST;
-        if (rc == VFS_ERR_NOSPC) return -ABI_ENOSPC;
-        return -ABI_EINVAL;
+        /* POSIX order is symlink(TARGET, LINKPATH): a1 is what the link
+         * points at, a2 is the link to create. vfs_symlink() takes them the
+         * other way round -- link first -- and this passed them STRAIGHT
+         * THROUGH, so every native symlink() ever made created a link named
+         * after the TARGET, pointing at the link name. It returned success
+         * while doing it. Nothing had noticed because no native program
+         * called symlink() until `ln` was written; the Linux compat path
+         * (LX_symlink) had it right all along, and this now matches it --
+         * including resolving a relative link path against the caller's
+         * cwd, which vfs_symlink cannot do for itself (it rejects any path
+         * that does not start with '/'). */
+        char ktarget[ABI_PATH_MAX + 1], klink[ABI_PATH_MAX];
+        int tr = user_path_in(ktarget, (const char *)(uintptr_t)a1);
+        if (tr) return tr;
+        if (!ktarget[0]) return -ABI_ENOENT;     /* as Linux's (223) */
+        int rr = resolve_user_path((const char *)(uintptr_t)a2,
+                                   klink, sizeof klink);
+        if (rr) return rr;
+        rr = new_name_slash((const char *)(uintptr_t)a2, klink);
+        if (rr) return rr;
+        int rc = vfs_symlink(klink, ktarget);
+        /* every error as itself: a directory without write permission is
+         * EACCES now that vfs_symlink asks (finding 188) -- this said
+         * EINVAL for all but two */
+        return rc == VFS_OK ? 0 : vfs_err_to_abi(rc);
     }
 
     case ABI_SYS_READLINK: {
         char *buf        = (char *)(uintptr_t)a2;
         size_t bufsz     = (size_t)a3;
         char kpath[ABI_PATH_MAX], ktmp[ABI_PATH_MAX];
-        if (!user_str_in(kpath, sizeof(kpath),
-                         (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
+        /* Resolved against the cwd for the same reason as symlink above:
+         * vfs_readlink only understands absolute paths. */
+        { int rr = resolve_user_path((const char *)(uintptr_t)a1,
+                                     kpath, sizeof kpath);
+          if (rr) return rr;
+          rr = trailing_slash_dir((const char *)(uintptr_t)a1, kpath, sizeof kpath);
+          if (rr) return rr; }
         if (!buf || bufsz == 0) return -ABI_EFAULT;
-        if (bufsz > sizeof(ktmp)) bufsz = sizeof(ktmp);
         memset(ktmp, 0, sizeof ktmp);          /* slice 86: see LX_readlink */
-        int rc = vfs_readlink(kpath, ktmp, bufsz);
+        /* The whole target, then as much as the buffer holds: a target
+         * that fills it returns its size, so the caller knows to grow it
+         * (finding 227: it read bufsz-1 and returned that). */
+        int rc = vfs_readlink(kpath, ktmp, sizeof ktmp);
         if (rc == VFS_OK) {
             size_t n = 0;
-            while (n < bufsz && ktmp[n]) n++;
+            while (n < sizeof ktmp && ktmp[n]) n++;
+            if (n > bufsz) n = bufsz;
             size_t w = n + 1 > bufsz ? bufsz : n + 1;   /* never past the buffer */
             if (copy_to_user(buf, ktmp, w) != 0) return -ABI_EFAULT;
             return (long)n;
@@ -4764,8 +8430,13 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return clipboard_clear();
 
     /* ---- Phase 3 M3.2: Fork/Exec ----------------------------------- */
-    case ABI_SYS_FORK:
-        return sys_fork();
+    case ABI_SYS_FORK: {
+        /* the child as the caller's pid namespace numbers it, as getpid and
+         * waitpid speak (finding 207): it was the kernel's pid */
+        long r = sys_fork();
+        if (r > 0) { int v = pid_vnr_of_kpid((int)r); if (v) r = v; }
+        return r;
+    }
 
     case ABI_SYS_EXECVE:
         return sys_execve((const char *)(uintptr_t)a1,
@@ -4975,11 +8646,19 @@ enum {
     LX_setsockopt = 54,
     LX_getsockopt = 55, LX_accept4 = 288,
     LX_gettimeofday = 96, LX_sysinfo = 99, LX_getresuid = 118,
+    LX_settimeofday = 164, LX_clock_settime = 227,
+    LX_adjtimex = 159, LX_clock_adjtime = 305,   /* finding 280 */
     LX_getresgid = 120, LX_statfs = 137, LX_fstatfs = 138,
     LX_getpriority = 140, LX_setpriority = 141,
     LX_sched_setaffinity = 203, LX_sched_getaffinity = 204,
     LX_clock_getres = 229,
-    LX_time = 201, LX_inotify_add_watch = 253, LX_inotify_rm_watch = 254,
+    /* 2026-08-22: these two were OFF BY ONE for their whole life (x86-64:
+     * inotify_init=253, add_watch=254, rm_watch=255). Nobody noticed while
+     * the arms were argument-ignoring fakes; the first REAL implementation
+     * saw glibc's add_watch land in the rm arm and its rm fall into the
+     * ENOSYS census. */
+    LX_time = 201, LX_inotify_init = 253,
+    LX_inotify_add_watch = 254, LX_inotify_rm_watch = 255,
     LX_fallocate = 285, LX_statx = 332,
     /* B17: real busybox network clients arm an alarm-timeout (setitimer) around
      * each network op and ftruncate the wget output file. */
@@ -5036,6 +8715,16 @@ enum {
     LX_epoll_pwait2 = 441, LX_sched_setscheduler = 144,
     /* Tier 2.5: SysV shm for MIT-SHM / Ozone */
     LX_shmget = 29, LX_shmat = 30, LX_shmctl = 31, LX_shmdt = 67,
+    /* Phase E (2026-08-22): extended attributes (user.* namespace; the
+     * f* forms ride the new struct file open_path), mknod, execveat. */
+    LX_setxattr = 188, LX_lsetxattr = 189, LX_fsetxattr = 190,
+    LX_getxattr = 191, LX_lgetxattr = 192, LX_fgetxattr = 193,
+    LX_listxattr = 194, LX_llistxattr = 195, LX_flistxattr = 196,
+    LX_removexattr = 197, LX_lremovexattr = 198, LX_fremovexattr = 199,
+    LX_mknod = 133, LX_mknodat = 259, LX_execveat = 322,
+    /* Phase H: SysV semaphores + message queues (shm was Tier 2.5). */
+    LX_semget = 64, LX_semop = 65, LX_semctl = 66, LX_semtimedop = 220,
+    LX_msgget = 68, LX_msgsnd = 69, LX_msgrcv = 70, LX_msgctl = 71,
 };
 
 /* arch_prctl codes. */
@@ -5171,24 +8860,203 @@ static long linux_emit_chrdev_stat(uint32_t maj, uint32_t min, uint64_t ino,
     return 0;
 }
 
+/* A synthesised /dev node, as Linux reports it: its own major/minor and its
+ * own permissions. (linux_emit_chrdev_stat above is the DRM arms' -- it
+ * stamps 0666 and logs; every other node reported 1:3 and 0666 through it.) */
+static long linux_emit_devnode_stat(const char *kpath, void *ubuf) {
+    uint32_t maj = 0, min = 0;
+    uint32_t dm = devfs_node_mode(kpath, &maj, &min);
+    struct lx_stat st;
+    memset(&st, 0, sizeof st);
+    /* the node's own format -- a character device, or a disk's block one
+     * (finding 198), which is the disk group's */
+    st.st_mode    = (dm & 0xF000u) | (dm & 0xFFFu);
+    st.st_dev     = 6;
+    st.st_ino     = lx_ino_hash(kpath);
+    st.st_nlink   = 1;
+    st.st_rdev    = lx_makedev(maj, min);
+    st.st_blksize = 4096;
+    if ((dm & 0xF000u) == 0x6000u) st.st_gid = userns_cur_gid(6);
+    st.st_atime = st.st_mtime = st.st_ctime = (int64_t)dev_boot_time();   /* 202 */
+    {   uint32_t pu, pg;
+        uint64_t pt[3];
+        if (pts_node_times(kpath, 0, &pu, &pg, pt)) {
+            st.st_uid = userns_cur_uid(pu);
+            st.st_gid = userns_cur_gid(pg);
+            st.st_atime = (int64_t)pt[0];
+            st.st_mtime = (int64_t)pt[1];
+            st.st_ctime = (int64_t)pt[2];
+        }
+    }
+    if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
+    return 0;
+}
+
+/* THE /dev NODE A DEVICE DESCRIPTOR IS: the name it was opened by --
+ * /dev/random and /dev/urandom are one kind of file, and fstat of the
+ * first said the second's numbers (1,9 for 1,8) -- else its kind's node;
+ * a pty slave's in PTS (its own buffer). NULL for what is not a device.
+ * /dev/full was missing, so its fstat said a regular file (logs/b18
+ * devid; Linux: the node, as stat says). */
+static const char *lx_fd_dev_node(struct file *f, char *pts, size_t cap) {
+    switch (f->kind) {
+    case FILE_KIND_DEVNULL:
+    case FILE_KIND_DEVZERO:
+    case FILE_KIND_DEVFULL:
+    case FILE_KIND_DEVRANDOM:
+        if (f->open_path && strncmp(f->open_path, "/dev/", 5) == 0)
+            return f->open_path;
+        return f->kind == FILE_KIND_DEVNULL ? "/dev/null"
+             : f->kind == FILE_KIND_DEVZERO ? "/dev/zero"
+             : f->kind == FILE_KIND_DEVFULL ? "/dev/full" : "/dev/urandom";
+    case FILE_KIND_CONSOLE:    return "/dev/console";
+    case FILE_KIND_RTC:        return "/dev/rtc0";
+    case FILE_KIND_PTY_MASTER: return "/dev/ptmx";
+    case FILE_KIND_PTY_SLAVE: {
+        int idx = pty_file_index(f);
+        if (idx < 0) return 0;
+        ksnprintf(pts, cap, "/dev/pts/%d", idx);
+        return pts;
+    }
+    default:                   return 0;
+    }
+}
+
+/* WHAT AN FD THAT IS NOT A FILE IS, as Linux's fstat says: a pipe is a FIFO
+ * (0600, its creator's), a socket a socket, a terminal or a device a
+ * character device with its own numbers -- devfs's table, so the fd and the
+ * path agree. All of these said "a regular file, 0666", and bash's `read -t`
+ * turns its timeout OFF for a regular file: `sleep 4 | read -t 2` waited
+ * the four seconds under the guest's bash, where Linux's times out at two
+ * (logs/b15 rt; tools/agent/probes/b15/fst.c: mode 0100666 here, 010600 on
+ * Linux). 0 for the kinds that keep the regular-file answer. */
+static uint32_t lx_fd_special_mode(struct file *f, uint32_t *maj,
+                                   uint32_t *min) {
+    *maj = *min = 0;
+    if (!f) return 0;
+    switch (f->kind) {
+    case FILE_KIND_PIPE_R:
+    case FILE_KIND_PIPE_W:
+    case FILE_KIND_PIPE_RW:   return 0x1000u | 0600u;          /* S_IFIFO  */
+    case FILE_KIND_SOCKET:    return 0xC000u | 0777u;          /* S_IFSOCK */
+    case FILE_KIND_DEVNULL:
+    case FILE_KIND_DEVZERO:
+    case FILE_KIND_DEVFULL:
+    case FILE_KIND_DEVRANDOM: {
+        char pts[24];
+        return devfs_node_mode(lx_fd_dev_node(f, pts, sizeof pts), maj, min);
+    }
+    case FILE_KIND_CONSOLE:   return devfs_node_mode("/dev/console", maj, min);
+    case FILE_KIND_RTC:       return devfs_node_mode("/dev/rtc0", maj, min);
+    case FILE_KIND_BLKDEV:    return devfs_node_mode(f->open_path, maj, min);   /* 198 */
+    case FILE_KIND_PTY_MASTER: return devfs_node_mode("/dev/ptmx", maj, min);
+    case FILE_KIND_PTY_SLAVE: {
+        int idx = pty_file_index(f);
+        if (idx < 0) return 0;
+        *maj = 136; *min = (uint32_t)idx;
+        return 0x2000u | 0620u;                                /* /dev/pts/N */
+    }
+    default:                  return 0;
+    }
+}
+
+static long linux_emit_special_stat(uint32_t mode, uint32_t maj, uint32_t min,
+                                    uint64_t ino, struct file *f, void *ubuf) {
+    struct lx_stat st;
+    memset(&st, 0, sizeof st);
+    uint32_t fmt = mode & 0xF000u;
+    st.st_mode    = mode;
+    /* a block node is devtmpfs's as a character one is (finding 198) */
+    st.st_dev     = (fmt == 0x2000u || fmt == 0x6000u) ? 6 : 12;
+    st.st_ino     = ino ? ino : 1;
+    st.st_nlink   = 1;
+    if (fmt == 0x6000u) {                 /* a disk: root's and disk's */
+        st.st_rdev = lx_makedev(maj, min);
+        st.st_gid = userns_cur_gid(6);
+        st.st_atime = st.st_mtime = st.st_ctime = (int64_t)dev_boot_time();
+    } else if (fmt == 0x2000u) {
+        st.st_rdev = lx_makedev(maj, min);
+        st.st_atime = st.st_mtime = st.st_ctime = (int64_t)dev_boot_time();
+        uint32_t pu, pg;
+        uint64_t pt[3];
+        if (pts_node_times(0, f, &pu, &pg, pt)) {
+            st.st_uid = userns_cur_uid(pu);
+            st.st_gid = userns_cur_gid(pg);
+            st.st_atime = (int64_t)pt[0];
+            st.st_mtime = (int64_t)pt[1];
+            st.st_ctime = (int64_t)pt[2];
+        }
+    } else {
+        struct proc *p = current_proc();
+        st.st_uid = userns_cur_uid(p ? (uint32_t)p->uid : 0);
+        st.st_gid = userns_cur_gid(p ? (uint32_t)p->gid : 0);
+    }
+    st.st_blksize = 4096;
+    if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
+    return 0;
+}
+
+/* A stat's S_IFMT: the format bits the filesystem keeps in its mode, else
+ * the VFS type -- a symbolic link included, which both emitters reported
+ * as a regular file (finding 87: busybox stat said "regular file" of a
+ * link, and `ls -l` showed none). */
+static uint32_t lx_vfs_type_bits(const struct vfs_stat *vs) {
+    uint32_t fmt = vs->mode & 0xF000u;
+    if (fmt) return fmt;
+    if (vs->type == VFS_TYPE_DIR)     return 0x4000u;
+    if (vs->type == VFS_TYPE_SYMLINK) return 0xA000u;
+    return 0x8000u;
+}
+
+/* A FILESYSTEM WITH INODES GIVES ITS OWN. tobyfs and tmpfs report an inode
+ * and a device (vfs_stat ino and dev), and a hard link is the same file
+ * only by them: the path hash made every name a file of its own, so `test
+ * a -ef hardlink` was false in the Linux personality -- the guest's bash,
+ * Oils 0707 -- where the native stat said true. A filesystem with no inodes
+ * keeps the path hash, but its DEVICE is its own too (vfs_anon_dev: /proc
+ * and /dev said the root's 0:1, finding 32). The device split as Linux
+ * splits one, 12 bits of major over 20 of minor, the same in stat and
+ * statx. */
+static bool lx_fs_identity(const struct vfs_stat *vs, uint32_t *maj, uint32_t *min) {
+    if (!vs->dev) return false;
+    *maj = ((uint32_t)vs->dev >> 20) & 0xfffu;
+    *min = (uint32_t)vs->dev & 0xfffffu;
+    return true;
+}
+
 static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf) {
     struct lx_stat st;
     memset(&st, 0, sizeof st);
-    uint32_t typ  = (vs->type == VFS_TYPE_DIR) ? 0x4000u : 0x8000u; /* S_IFDIR/REG */
+    uint32_t typ  = lx_vfs_type_bits(vs);
     uint32_t perm = vs->mode & 0xFFFu;
-    if (perm == 0) perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
+    if (perm == 0 && !(vs->mode & VFS_MODE_VALID))      /* a VALID 0000 is 0000 */
+        perm = (vs->type == VFS_TYPE_DIR)     ? 0755u :
+               (vs->type == VFS_TYPE_SYMLINK) ? 0777u : 0644u;
     st.st_mode    = typ | perm;
     st.st_dev     = 1;
     st.st_ino     = ino ? ino : 1;
+    {
+        uint32_t maj, min;
+        if (lx_fs_identity(vs, &maj, &min)) {
+            if (vs->ino) st.st_ino = vs->ino;
+            st.st_dev = ((uint64_t)maj << 8) | (min & 0xffu) |
+                        ((uint64_t)(min & ~0xffu) << 12);
+        }
+    }
     /* 0 = unset -> the usual default (dirs 2, files 1). procfs sets a real
      * count for /proc/<pid>/task/, which chrome's sandbox tests. */
     st.st_nlink   = vs->nlink ? vs->nlink
                               : (vs->type == VFS_TYPE_DIR ? 2u : 1u);
+    /* A DIRECTORY HAS AT LEAST TWO LINKS -- its name and its "." -- as the
+     * native stat already says; tmpfs counts 1, and busybox's `find -links
+     * 1 -type d` matched directories GNU's never does (logs/b15 findbb). */
+    if (vs->type == VFS_TYPE_DIR && st.st_nlink < 2u) st.st_nlink = 2u;
+    if (vs->nlink == VFS_NLINK_NONE) st.st_nlink = 0;   /* finding 200 */
     st.st_uid     = userns_cur_uid(vs->uid);   /* slice 11 */
     st.st_gid     = userns_cur_gid(vs->gid);   /* slice 11 */
     st.st_size    = (int64_t)vs->size;
-    st.st_blksize = 512;
-    st.st_blocks  = (int64_t)((vs->size + 511) / 512);
+    st.st_blksize = 4096;                      /* as the native stat */
+    st.st_blocks  = (int64_t)vfs_stat_blocks(vs);   /* finding 229 */
     /* Slice 6: report the real timestamps. These were left at 0, so every
      * file in the system claimed 1970-01-01 -- `ls -l` showed it, and
      * anything comparing mtimes (make, tar, apk, rsync) saw every file as
@@ -5197,6 +9065,12 @@ static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf)
     st.st_mtime   = (int64_t)vs->mtime;
     st.st_atime   = (int64_t)vs->atime;
     st.st_ctime   = (int64_t)vs->ctime;
+    /* ...and their nanoseconds, where the filesystem keeps them (239) */
+    st.st_mtime_nsec = vs->mtime_ns;
+    st.st_atime_nsec = vs->atime_ns;
+    st.st_ctime_nsec = vs->ctime_ns;
+    if (typ == 0x2000u || typ == 0x6000u)              /* a node (214) */
+        st.st_rdev = lx_makedev(vs->rmaj, vs->rmin);
     if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
     return 0;
 }
@@ -5216,19 +9090,23 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
         uint64_t mnt_id, spare2; uint64_t spare3[12];
     } sx;
     memset(&sx, 0, sizeof sx);
-    uint32_t typ  = (vs->type == VFS_TYPE_DIR) ? 0x4000u : 0x8000u;
+    uint32_t typ  = lx_vfs_type_bits(vs);
     uint32_t perm = vs->mode & 0xFFFu;
-    if (perm == 0) perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
+    if (perm == 0 && !(vs->mode & VFS_MODE_VALID))      /* a VALID 0000 is 0000 */
+        perm = (vs->type == VFS_TYPE_DIR)     ? 0755u :
+               (vs->type == VFS_TYPE_SYMLINK) ? 0777u : 0644u;
     sx.mask      = 0x000007ffu;              /* STATX_BASIC_STATS */
     sx.blksize   = 512;
     sx.nlink     = vs->nlink ? vs->nlink
                               : (vs->type == VFS_TYPE_DIR ? 2u : 1u);
+    if (vs->type == VFS_TYPE_DIR && sx.nlink < 2u) sx.nlink = 2u;
+    if (vs->nlink == VFS_NLINK_NONE) sx.nlink = 0;      /* finding 200 */
     sx.uid       = userns_cur_uid(vs->uid);    /* slice 11 */
     sx.gid       = userns_cur_gid(vs->gid);    /* slice 11 */
     sx.mode      = (uint16_t)(typ | perm);
     sx.ino       = ino ? ino : 1;
     sx.size      = vs->size;
-    sx.blocks    = (vs->size + 511) / 512;
+    sx.blocks    = vfs_stat_blocks(vs);              /* finding 229 */
     /* Slice 6: statx carries the times too. busybox and modern glibc prefer
      * statx over stat, so leaving these zero here would have kept `ls -l`
      * showing 1970 even after the stat(2) path was fixed. */
@@ -5236,8 +9114,155 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
     sx.atime.sec = (int64_t)vs->atime;
     sx.ctime.sec = (int64_t)vs->ctime;
     sx.btime.sec = (int64_t)vs->ctime;       /* no separate birth time */
+    sx.mtime.nsec = vs->mtime_ns;            /* finding 239 */
+    sx.atime.nsec = vs->atime_ns;
+    sx.ctime.nsec = sx.btime.nsec = vs->ctime_ns;
+    if (typ == 0x2000u || typ == 0x6000u) {            /* a node (214) */
+        sx.rdev_major = vs->rmaj;
+        sx.rdev_minor = vs->rmin;
+    }
     sx.dev_minor = 1;
+    {
+        uint32_t maj, min;
+        if (lx_fs_identity(vs, &maj, &min)) {      /* see linux_emit_stat */
+            if (vs->ino) sx.ino = vs->ino;
+            sx.dev_major = maj;
+            sx.dev_minor = min;
+        }
+    }
     if (copy_to_user(ubuf, &sx, sizeof sx) != 0) return -ABI_EFAULT;
+    return 0;
+}
+
+static uint64_t lx_fd_ino(struct file *f, int fd);
+
+/* fstat(2) of an open file, as struct stat: LX_fstat's answer, and
+ * newfstatat's with AT_EMPTY_PATH, and stat(2)'s through a magic link to
+ * it (stat_resolve). */
+static long lx_emit_fd_stat(struct file *f, int fd, void *ubuf) {
+    struct vfs_stat vs;
+    if (f->kind == FILE_KIND_DRM)         /* slice 99: S_IFCHR 226:128 */
+        return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
+                                      lx_fd_ino(f, fd), ubuf);
+    if (fd_fifo_stat(f, &vs))             /* a named FIFO: its node */
+        return linux_emit_stat(&vs, lx_fd_ino(f, fd), ubuf);
+    {   /* a pipe, a socket, a terminal, a device: see lx_fd_special_mode */
+        uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
+        if (sm) return linux_emit_special_stat(sm, mj, mn, lx_fd_ino(f, fd), f,
+                                               ubuf);
+    }
+    if (f->kind == FILE_KIND_DIR && f->dirpath) {
+        if (vfs_stat(f->dirpath, &vs) != VFS_OK) {
+            if (cwd_is_gone(f->dirpath)) cwd_gone_stat(&vs);    /* 200 */
+            else vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
+        }
+    } else if (f->kind == FILE_KIND_VFS) {
+        uint64_t ino;
+        fd_vfs_stat(f, fd, &vs, &ino);
+        return linux_emit_stat(&vs, ino, ubuf);
+    } else if (f->kind == FILE_KIND_MEMFD) {
+        /* Chrome fstats the memfd to size its mapping + CHECK st_size. */
+        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE,
+                                .size = (size_t)memfd_size(f->memfd),
+                                .mode = 0777 };
+    } else {
+        /* a window, a term: a minimal regular file */
+        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = 0,
+                                .mode = 0666 };
+    }
+    return linux_emit_stat(&vs, lx_fd_ino(f, fd), ubuf);
+}
+
+/* The same, in statx's layout: the generic emitter, then the type and the
+ * device stamped in place (mode at 0x1c, rdev at 0x80/0x84). */
+static long lx_emit_fd_statx(struct file *f, int fd, void *ubuf) {
+    if (f->kind == FILE_KIND_DRM) {           /* slice 103 */
+        struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0, .mode = 0666 };
+        long src = linux_emit_statx(&cvs, lx_fd_ino(f, fd), ubuf);
+        if (src == 0) {
+            uint16_t m = (uint16_t)(0x2000u | 0666u);
+            uint32_t rmaj = DRM_CHR_MAJOR, rmin = f->dir_off;
+            (void)copy_to_user((uint8_t *)ubuf + 0x1c, &m, sizeof m);
+            (void)copy_to_user((uint8_t *)ubuf + 0x80, &rmaj, sizeof rmaj);
+            (void)copy_to_user((uint8_t *)ubuf + 0x84, &rmin, sizeof rmin);
+        }
+        return src;
+    }
+    {
+        struct vfs_stat fvs;                  /* a named FIFO: its node */
+        if (fd_fifo_stat(f, &fvs))
+            return linux_emit_statx(&fvs, lx_fd_ino(f, fd), ubuf);
+    }
+    {
+        uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
+        if (sm) {
+            struct proc *sp = current_proc();
+            bool chr = (sm & 0xF000u) == 0x2000u;
+            bool blk = (sm & 0xF000u) == 0x6000u;     /* a disk (198) */
+            struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0,
+                                    .mode = sm & 0xFFFu };
+            if (blk) cvs.gid = 6;
+            else if (!chr && sp) { cvs.uid = sp->uid; cvs.gid = sp->gid; }
+            if (chr || blk)                           /* 202 */
+                cvs.atime = cvs.mtime = cvs.ctime = dev_boot_time();
+            {   uint64_t pt[3];                 /* a pty slave's (finding 190) */
+                if (chr && pts_node_times(0, f, &cvs.uid, &cvs.gid, pt)) {
+                    cvs.atime = pt[0]; cvs.mtime = pt[1]; cvs.ctime = pt[2];
+                }
+            }
+            long src = linux_emit_statx(&cvs, lx_fd_ino(f, fd), ubuf);
+            if (src == 0 && ubuf) {
+                uint16_t m = (uint16_t)sm;
+                (void)copy_to_user((uint8_t *)ubuf + 0x1c, &m, sizeof m);
+                if (chr || blk) {
+                    (void)copy_to_user((uint8_t *)ubuf + 0x80, &mj, sizeof mj);
+                    (void)copy_to_user((uint8_t *)ubuf + 0x84, &mn, sizeof mn);
+                }
+            }
+            return src;
+        }
+    }
+    struct vfs_stat vs;
+    if (f->kind == FILE_KIND_DIR && f->dirpath) {
+        if (vfs_stat(f->dirpath, &vs) != VFS_OK) {
+            if (cwd_is_gone(f->dirpath)) cwd_gone_stat(&vs);    /* 200 */
+            else vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
+        }
+    } else if (f->kind == FILE_KIND_VFS) {
+        uint64_t ino;
+        fd_vfs_stat(f, fd, &vs, &ino);
+        return linux_emit_statx(&vs, ino, ubuf);
+    } else if (f->kind == FILE_KIND_MEMFD) {
+        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE,
+                                .size = (size_t)memfd_size(f->memfd),
+                                .mode = 0777 };
+    } else {
+        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = 0, .mode = 0666 };
+    }
+    return linux_emit_statx(&vs, lx_fd_ino(f, fd), ubuf);
+}
+
+/* stat(2)'s FOLLOWING for the Linux path arms, ahead of their own logic:
+ * KPATH becomes what a link in its last component names (stat_resolve), or
+ * *fdf the descriptor a magic link -- /dev/stdin, /proc/PID/fd/N -- names.
+ * The arms stat'ed the path itself, so stat and lstat agreed and a link
+ * read as a regular file. 0, or -errno. */
+static long lx_stat_follow_first(char *kpath, size_t cap, struct file **fdf,
+                                 int *fdno) {
+    struct vfs_stat vs;
+    char fin[VFS_PATH_MAX];
+    int sr = stat_resolve(kpath, true, fin, sizeof fin, &vs, fdf, fdno);
+    if (sr != VFS_OK) {
+        /* a node the arms synthesise with no VFS entry is theirs to answer */
+        if (sr == VFS_ERR_NOENT &&
+            (lx_dev_dri_minor(kpath) >= 0 || dev_synth_mode(kpath)))
+            return 0;
+        return stat_errno(sr);
+    }
+    if (*fdf) return 0;
+    size_t l = strlen(fin);
+    if (l >= cap) return -ABI_ENAMETOOLONG;
+    memcpy(kpath, fin, l + 1);
     return 0;
 }
 
@@ -5246,8 +9271,42 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
  * distinct inodes, while two handles onto the same file share a node (so
  * glibc's ld.so sees them as the same object, which is correct). Directories
  * hash their path; other kinds fall back to an fd-derived value. */
+/* One pipe or socket, one inode: its object, hashed -- so every descriptor
+ * onto it, in any process, reports the same st_ino, and /proc/PID/fd names
+ * it with the same number (pipe:[N], file_object_ino). It was the fd
+ * number, so a pipe's two ends -- and the same end in parent and child --
+ * looked like different files. */
+static uint64_t lx_obj_ino(char tag, const void *obj) {
+    uintptr_t p = (uintptr_t)obj;
+    char buf[2 + 16 + 1];
+    const char *hex = "0123456789abcdef";
+    buf[0] = tag; buf[1] = ':';
+    for (int i = 0; i < 16; i++) buf[2 + i] = hex[(p >> ((15 - i) * 4)) & 0xf];
+    buf[18] = '\0';
+    return lx_ino_hash(buf) & 0x7fffffffu;
+}
+
+uint64_t file_object_ino(struct file *f) {
+    if (!f) return 0;
+    if ((f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W ||
+         f->kind == FILE_KIND_PIPE_RW) && f->pipe)
+        return lx_obj_ino('p', f->pipe);
+    if (f->kind == FILE_KIND_SOCKET && f->sock) return lx_obj_ino('s', f->sock);
+    return 0;
+}
+
 static uint64_t lx_fd_ino(struct file *f, int fd) {
     if (f) {
+        uint64_t oi = file_object_ino(f);
+        if (oi) return oi;
+        /* A DEVICE's is its node's, as stat("/dev/null") hashes the path
+         * (linux_emit_devnode_stat): it was a per-descriptor number, so
+         * fstat of /dev/null was another file than stat of it (106). */
+        {
+            char pts[24];
+            const char *dp = lx_fd_dev_node(f, pts, sizeof pts);
+            if (dp) return lx_ino_hash(dp);
+        }
         if (f->kind == FILE_KIND_DIR && f->dirpath)
             return lx_ino_hash(f->dirpath);
         if (f->kind == FILE_KIND_VFS) {
@@ -5318,6 +9377,12 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
     if (len == 0) return -ABI_EINVAL;
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_VFS) return -ABI_EBADF;
+    /* WHAT THE DESCRIPTOR MAY DO, as Linux's mmap asks it (finding 216): a
+     * file mapping needs read access, and a shared writable one O_RDWR --
+     * the mapping is the file's contents for everyone who maps it. */
+    if ((f->o_accmode & 3) == 1) return -ABI_EACCES;
+    if ((lflags & LXMAP_SHARED) && (prot & 0x2) && (f->o_accmode & 3) != 2)
+        return -ABI_EACCES;
 
     /* MAP_SHARED must actually SHARE. The copying path below gives every mapper
      * a private copy, which silently breaks cross-process shared memory --
@@ -5372,17 +9437,21 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
                 size_t fill_from = before > page_off ? before : page_off;
                 size_t fill_to   = page_off + np;
                 if (fill_from < fill_to) {
-                    size_t save_pos = f->vfs.pos;
-                    f->vfs.pos = fill_from * PAGE_SIZE;
+                    size_t save_pos = file_pos_get(f);
+                    file_pos_set(f, fill_from * PAGE_SIZE);
                     for (size_t i = fill_from; i < fill_to; i++) {
                         void *dst = shm_cache_page_ptr(sc, i);
                         if (!dst) break;
                         if (file_read(f, dst, PAGE_SIZE) <= 0) break; /* EOF: stays zero */
                     }
-                    f->vfs.pos = save_pos;
+                    file_pos_set(f, save_pos);
                 }
+                /* a descriptor that may not write: mprotect must not make
+                 * the mapping writable later (0x40, VMA_FLAG_NOWRITE) */
                 long b = shm_cache_mmap(sc, addr, alen, prot,
-                                        lx_mmap_flags(lflags), aoff);
+                                        lx_mmap_flags(lflags) |
+                                        ((f->o_accmode & 3) != 2 ? 0x40u : 0u),
+                                        aoff);
 #ifdef CHROMIUM_BOOT
                 {   /* Slice 122: cap raised 200 -> 2000 with a loud tail.
                      * The 200 cap was HIT during the bing-blank forensics and
@@ -5439,8 +9508,8 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
     uint8_t *kbuf = (uint8_t *)kmalloc(4096);
     if (!kbuf) { sys_munmap((uint64_t)base, len); return -ABI_ENOMEM; }
 
-    size_t save_pos = f->vfs.pos;
-    f->vfs.pos = offset;
+    size_t save_pos = file_pos_get(f);
+    file_pos_set(f, offset);
     uint64_t done = 0;
     while (done < len) {
         size_t want = (len - done) > 4096 ? 4096 : (size_t)(len - done);
@@ -5448,7 +9517,7 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
         if (got <= 0) break;                  /* EOF -> leave tail zeroed */
         if (copy_to_user((void *)((uint64_t)base + done), kbuf,
                          (size_t)got) != 0) {
-            kfree(kbuf); f->vfs.pos = save_pos;
+            kfree(kbuf); file_pos_set(f, save_pos);
             sys_munmap((uint64_t)base, len);
             return -ABI_EFAULT;
         }
@@ -5456,7 +9525,7 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
         if ((size_t)got < want) break;        /* short read == EOF */
     }
     kfree(kbuf);
-    f->vfs.pos = save_pos;
+    file_pos_set(f, save_pos);
 
     /* Tighten to the loader's requested protection (R-X for .text, etc.). */
     sys_mprotect((uint64_t)base, len, prot);
@@ -5509,13 +9578,89 @@ struct lx_dirent64 {
 #define LX_DT_DIR  4
 #define LX_DT_REG  8
 #define LX_DT_CHR  2      /* slice 102: /dev/dri nodes are char devices */
+#define LX_DT_LNK 10      /* a symbolic link (finding 87) */
+
+/* Linux's may_open(): a directory opens for READING. Write access, O_CREAT
+ * or O_TRUNC on one is EISDIR (O_PATH asks for no access and is exempt).
+ * Every open of a directory used to become a getdents fd, so bash's
+ * `echo x > /tmp` opened fine, ran echo, and failed at the write with
+ * "write error: Operation not permitted" -- where Linux says
+ * "/tmp: Is a directory" and runs nothing. An O_TMPFILE open carries
+ * O_DIRECTORY and write access, so it gets EISDIR too -- where it used to
+ * get a directory fd it could not write to. */
+#define LX_O_PATH_FLAG 0x200000
+static bool lx_dir_open_refused(long flags) {
+    if (flags & LX_O_PATH_FLAG) return false;
+    return (flags & ABI_O_ACCMODE) != 0 ||
+           (flags & (ABI_O_CREAT | ABI_O_TRUNC)) != 0;
+}
+
+/* Is the filesystem mounted at MNT in use, as Linux's umount judges it: a
+ * live process whose working directory or root is on it, a descriptor
+ * open on it (a file by the path it was opened by, a directory by its
+ * own), or another mount below it. "/" always is. */
+static bool umount_path_under(const char *p, const char *mnt, size_t ml) {
+    if (!p || p[0] != '/') return false;
+    if (ml == 1) return true;
+    return strncmp(p, mnt, ml) == 0 && (p[ml] == '\0' || p[ml] == '/');
+}
+
+struct umount_sub_ctx { const char *mnt; size_t ml; bool found; };
+static bool umount_sub_cb(const struct vfs_mount_info *mi, void *cookie) {
+    struct umount_sub_ctx *c = (struct umount_sub_ctx *)cookie;
+    size_t pl = strlen(mi->point);
+    if (pl > c->ml && umount_path_under(mi->point, c->mnt, c->ml)) c->found = true;
+    return !c->found;                       /* on until one is found */
+}
+
+static bool umount_target_busy(const char *mnt) {
+    size_t ml = strlen(mnt);
+    while (ml > 1 && mnt[ml - 1] == '/') ml--;
+    if (ml == 1) return true;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *p = proc_at_slot(i);
+        if (!p || p->state == PROC_UNUSED || p->state == PROC_TERMINATED) continue;
+        if (umount_path_under(p->cwd, mnt, ml)) return true;
+        if (p->fs_root[0] && umount_path_under(p->fs_root, mnt, ml)) return true;
+        struct file **fds = proc_fds(p);
+        if (!fds) continue;
+        for (int fd = 0; fd < PROC_NFDS; fd++) {
+            struct file *f = fds[fd];
+            if (!f) continue;
+            const char *op = (f->kind == FILE_KIND_DIR) ? f->dirpath : f->open_path;
+            if (umount_path_under(op, mnt, ml)) return true;
+        }
+    }
+    struct umount_sub_ctx c = { mnt, ml, false };
+    vfs_iter_mounts_info(umount_sub_cb, &c);
+    return c.found;
+}
 
 /* Open a directory as a Linux getdents64-capable fd (FILE_KIND_DIR). tobyOS
  * has no native directory fd, so we just remember the path; getdents64
  * re-opens via vfs_opendir and resumes after dir_off entries. */
+/* A FILE_KIND_DIR on a directory that is not there to probe (the removed
+ * cwd): getdents64 on it is the end of the directory. */
+static long linux_open_dir_gone(const char *kpath) {
+    struct file *f = (struct file *)kmalloc(sizeof *f);
+    if (!f) return -ABI_ENOMEM;
+    memset(f, 0, sizeof *f);
+    f->kind = FILE_KIND_DIR;
+    size_t n = strlen(kpath) + 1;
+    f->dirpath = (char *)kmalloc(n);
+    if (!f->dirpath) { kfree(f); return -ABI_ENOMEM; }
+    memcpy(f->dirpath, kpath, n);
+    int fd = fd_alloc_into(current_proc(), f);
+    if (fd < 0) { kfree(f->dirpath); kfree(f); return -ABI_EMFILE; }
+    return fd;
+}
+
 static long linux_open_dir(const char *kpath) {
     struct vfs_dir probe;
-    if (vfs_opendir(kpath, &probe) != VFS_OK) return -ABI_ENOENT;
+    /* the opendir's own error: EACCES for a directory without r (finding
+     * 188's opendir asks r alone) -- it said ENOENT for every failure */
+    int orc = vfs_opendir(kpath, &probe);
+    if (orc != VFS_OK) return vfs_err_to_abi(orc);
     vfs_closedir(&probe);
     struct file *f = (struct file *)kmalloc(sizeof *f);
     if (!f) return -ABI_ENOMEM;
@@ -5558,6 +9703,9 @@ static int lx_conn_progress(struct sock *s);
 #define LXP_POLLERR  0x008
 #define LXP_POLLHUP  0x010
 #define LXP_POLLNVAL 0x020
+#define LXP_POLLRDHUP 0x2000   /* peer shut its write side; maskable, and
+                                * produced since 2026-08-22 -- an app
+                                * waiting SOLELY on EPOLLRDHUP never woke */
 #define LX_EINTR     4
 
 static short file_poll_ready(struct file *f) {
@@ -5580,7 +9728,23 @@ static short file_poll_ready(struct file *f) {
             else if (f->pipe->count < PIPE_BUF_SZ) r |= LXP_POLLOUT;
         }
         break;
+    case FILE_KIND_PIPE_RW:                  /* a FIFO's both ends: never EOF */
+        if (f->pipe) {
+            if (f->pipe->count > 0)           r |= LXP_POLLIN;
+            if (f->pipe->count < PIPE_BUF_SZ) r |= LXP_POLLOUT;
+        }
+        break;
+    case FILE_KIND_INOTIFY:
+        if (inotify_readable(f->inotify_id)) r |= LXP_POLLIN;
+        break;
     case FILE_KIND_SOCKET:
+        /* shutdown(2) readiness: a shut read side, or a peer's SHUT_WR
+         * (rx_eof), makes the fd readable -- the read that follows returns
+         * EOF without blocking. Kept in lockstep with sock_recv_ready. */
+        if (f->sock && (f->sock->shut_rd || f->sock->rx_eof))
+            r |= LXP_POLLIN;
+        if (f->sock && f->sock->rx_eof)
+            r |= LXP_POLLRDHUP;        /* the peer's write side is gone */
         if (f->sock && f->sock->kind == SOCK_KIND_NETLINK) {
             r |= LXP_POLLOUT;                          /* requests always accepted */
             if (f->sock->count > 0) r |= LXP_POLLIN;   /* a dump reply is queued */
@@ -5605,7 +9769,7 @@ static short file_poll_ready(struct file *f) {
                 int tf = tcp_poll_flags(c);
                 if (tf & TCP_RDY_RECV) r |= LXP_POLLIN;
                 if (tf & TCP_RDY_SEND) r |= LXP_POLLOUT;
-                if (tf & TCP_RDY_HUP)  r |= LXP_POLLHUP;
+                if (tf & TCP_RDY_HUP)  r |= LXP_POLLHUP | LXP_POLLRDHUP;
                 if (tf & TCP_RDY_ERR)  r |= LXP_POLLERR;
             }
         } else {
@@ -5641,6 +9805,7 @@ static short file_poll_ready(struct file *f) {
     case FILE_KIND_DEVNULL:                  /* bit-bucket + entropy devices: */
     case FILE_KIND_DEVZERO:                  /* never block in either direction */
     case FILE_KIND_DEVRANDOM:
+    case FILE_KIND_BLKDEV:                   /* a disk, as a file is (198) */
         r |= LXP_POLLIN | LXP_POLLOUT;
         break;
     case FILE_KIND_CONSOLE:                  /* B22: real TTY input readiness */
@@ -5696,14 +9861,431 @@ struct lx_pollfd { int fd; short events; short revents; };  /* 8 bytes, Linux AB
 /* Slice 6: no longer static -- tobyfs stamps inode times from the SAME
  * anchored realtime clock CLOCK_REALTIME uses, so an on-disk mtime and a
  * userspace clock_gettime() cannot disagree. */
-uint64_t lx_realtime_ns(uint64_t mono_ns) {
-    static uint64_t s_epoch_base_ns = 0;   /* unix_ns - mono_ns at anchor time */
-    if (s_epoch_base_ns == 0) {
+/* THE ANCHOR CAN BE MOVED (finding 157): clock_settime(CLOCK_REALTIME) and
+ * settimeofday set the wall clock by moving it, so CLOCK_MONOTONIC -- the
+ * other end -- never jumps. 0 means not anchored yet; the clock is read from
+ * the lock-free time fast path, so the anchor is read and written whole. */
+static uint64_t g_epoch_base_ns;           /* unix_ns - mono_ns */
+
+/* SLEWING (finding 280): adjtime(3) and adjtimex(2) move the wall clock by
+ * an offset GRADUALLY -- at 500 ppm, as Linux's single-shot adjustment does
+ * -- so it never jumps, backward least of all. timesyncd stepped the clock
+ * for any offset of 50 ms or more, and a step back inside a timed wait made
+ * the wait read 310 ms where 360 had passed (utilgate's sleep_waits on the
+ * box). Between T0 and T1 (monotonic ns) the clock runs RATE ppb fast or
+ * slow; after T1 it has absorbed the whole offset, RATE * (T1 - T0) / 1e9.
+ * The vDSO computes the same function of the same fields (vdso_refresh);
+ * SEQ is odd while a writer changes them. */
+static struct {
+    uint32_t seq;
+    uint64_t t0, t1;
+    int64_t  rate;
+} g_slew;
+static spinlock_t g_slew_lock = SPINLOCK_INIT;
+#define LX_SLEW_PPB 500000LL
+
+static int64_t lx_slew_adj(uint64_t mono, uint64_t t0, uint64_t t1, int64_t rate) {
+    if (!t0 || mono <= t0) return 0;
+    uint64_t dm = (mono < t1 ? mono : t1) - t0;
+    return rate * (int64_t)dm / 1000000000LL;
+}
+
+static uint64_t lx_epoch_base(uint64_t mono_ns);
+
+/* The wall clock's parameters for the vDSO's data page, one consistent
+ * reading: the base (realtime - monotonic before any slew; 0 = no RTC)
+ * and the slew. The page computes lx_realtime_ns from exactly these. */
+void lx_realtime_params(uint64_t *base, uint64_t *t0, uint64_t *t1,
+                        int64_t *rate) {
+    uint64_t mono = perf_now_ns();
+    uint32_t s;
+    do {
+        s = __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE);
+        *base = lx_epoch_base(mono);
+        *t0 = g_slew.t0; *t1 = g_slew.t1; *rate = g_slew.rate;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while ((s & 1) || s != __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE));
+}
+
+/* The slew now: one consistent reading. */
+void lx_slew_snapshot(uint64_t *t0, uint64_t *t1, int64_t *rate) {
+    uint32_t s;
+    do {
+        s = __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE);
+        *t0 = g_slew.t0; *t1 = g_slew.t1; *rate = g_slew.rate;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while ((s & 1) || s != __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE));
+}
+
+static uint64_t lx_epoch_base(uint64_t mono_ns) {
+    uint64_t b = __atomic_load_n(&g_epoch_base_ns, __ATOMIC_ACQUIRE);
+    if (b == 0) {
         uint64_t secs = rtc_unix_time();
-        if (secs == 0) return mono_ns;     /* no RTC: monotonic is all we have */
-        s_epoch_base_ns = secs * 1000000000ull - mono_ns;
+        if (secs == 0) return 0;           /* no RTC: monotonic is all we have */
+        uint64_t want = secs * 1000000000ull - mono_ns, unset = 0;
+        if (want == 0) want = 1;
+        (void)__atomic_compare_exchange_n(&g_epoch_base_ns, &unset, want, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        b = __atomic_load_n(&g_epoch_base_ns, __ATOMIC_ACQUIRE);
     }
-    return s_epoch_base_ns + mono_ns;
+    return b;
+}
+
+uint64_t lx_realtime_ns(uint64_t mono_ns) {
+    uint32_t s;
+    uint64_t b;
+    int64_t adj;
+    do {
+        s = __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE);
+        b = lx_epoch_base(mono_ns);
+        adj = lx_slew_adj(mono_ns, g_slew.t0, g_slew.t1, g_slew.rate);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while ((s & 1) || s != __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE));
+    if (b == 0) return mono_ns;
+    return b + mono_ns + (uint64_t)adj;
+}
+
+/* CLOCK_MONOTONIC as Linux keeps it: the raw clock plus the slew so far.
+ * An adjtime slew moves monotonic WITH realtime -- realtime - monotonic
+ * stays as it was (Linux under adjtime, logs/b38/slewtest-wsl.txt) -- and
+ * only CLOCK_MONOTONIC_RAW is the hardware's. */
+uint64_t lx_mono_ns(uint64_t raw) {
+    uint64_t t0, t1;
+    int64_t rate;
+    lx_slew_snapshot(&t0, &t1, &rate);
+    return raw + (uint64_t)lx_slew_adj(raw, t0, t1, rate);
+}
+
+/* The raw nanoseconds from now until CLOCK_MONOTONIC has moved D: a sleep
+ * counts the slewed clock, as Linux's hrtimers do, so it is never short on
+ * it or on the wall clock -- a slew that ran the clock slow made a raw
+ * 360 ms read 359.8. The inverse of lx_mono_ns, piece by piece: before the
+ * slew, during it (at 1 + rate), after it. */
+uint64_t lx_mono_sleep_raw(uint64_t d) {
+    uint64_t raw = perf_now_ns();
+    uint64_t t0, t1;
+    int64_t rate;
+    lx_slew_snapshot(&t0, &t1, &rate);
+    if (!t0) return d;
+    int64_t total = lx_slew_adj(t1, t0, t1, rate);
+    uint64_t target = raw + (uint64_t)lx_slew_adj(raw, t0, t1, rate) + d;
+    uint64_t r;
+    if (target <= t0) {
+        r = target;
+    } else if (target < t1 + (uint64_t)total) {
+        /* t0 + delta * 1e9 / (1e9 + rate), without the 128-bit product:
+         * delta - delta * rate / (1e9 + rate), and a nanosecond up */
+        int64_t delta = (int64_t)(target - t0);
+        r = t0 + (uint64_t)(delta - delta * rate / (1000000000LL + rate)) + 1;
+    } else {
+        r = target - (uint64_t)total;
+    }
+    return r > raw ? r - raw : 0;
+}
+
+/* Fold the slew so far into the base and stop it (a writer, the lock held,
+ * SEQ odd): the clock reads the same before and after. */
+static void lx_slew_fold_locked(uint64_t mono) {
+    int64_t adj = lx_slew_adj(mono, g_slew.t0, g_slew.t1, g_slew.rate);
+    uint64_t b = __atomic_load_n(&g_epoch_base_ns, __ATOMIC_ACQUIRE);
+    if (b) __atomic_store_n(&g_epoch_base_ns, b + (uint64_t)adj, __ATOMIC_RELEASE);
+    g_slew.t0 = g_slew.t1 = 0;
+    g_slew.rate = 0;
+}
+
+/* What a slew still has to move the clock by (ns, signed). */
+static int64_t lx_slew_left(uint64_t mono) {
+    uint64_t t0, t1;
+    int64_t rate;
+    lx_slew_snapshot(&t0, &t1, &rate);
+    if (!t0) return 0;
+    int64_t total = lx_slew_adj(t1, t0, t1, rate);
+    return total - lx_slew_adj(mono, t0, t1, rate);
+}
+
+/* Start slewing the clock by OFFSET ns from now, replacing any slew still
+ * running (adjtime(3): the new delta replaces the old). The time the
+ * remaining one had not yet moved is left unmoved, as there. */
+static void lx_slew_start(int64_t offset) {
+    uint64_t mono = perf_now_ns();
+    (void)lx_epoch_base(mono);                     /* anchored first */
+    uint64_t fl = spin_lock_irqsave(&g_slew_lock);
+    __atomic_store_n(&g_slew.seq, g_slew.seq + 1, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    lx_slew_fold_locked(mono);
+    if (offset != 0) {
+        uint64_t mag = offset < 0 ? (uint64_t)-offset : (uint64_t)offset;
+        g_slew.t0 = mono ? mono : 1;
+        g_slew.t1 = g_slew.t0 + mag * (1000000000ull / (uint64_t)LX_SLEW_PPB);
+        g_slew.rate = offset < 0 ? -LX_SLEW_PPB : LX_SLEW_PPB;
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_slew.seq, g_slew.seq + 1, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&g_slew_lock, fl);
+    { extern void vdso_refresh(void); vdso_refresh(); }
+}
+
+/* THE TIME A FILE IS STAMPED WITH: the wall clock as of the last 4 ms tick,
+ * as Linux's filesystems take theirs (its coarse clock, CONFIG_HZ=250:
+ * 2000 files made in a loop on WSL's tmpfs had three mtimes, 4 ms apart,
+ * logs/b34/ext4times). So the steps of one operation, which Linux takes in
+ * one tick -- touch's create and its utimensat -- leave equal times, where
+ * the nanosecond clock left a new file's atime, mtime and ctime all
+ * different. tmpfs, ext4 and utimensat's UTIME_NOW read it. */
+#define FILE_TIME_TICK_NS 4000000ull
+uint64_t file_time_ns(void) {
+    uint64_t mono = perf_now_ns();
+    return lx_realtime_ns(mono - mono % FILE_TIME_TICK_NS);
+}
+
+/* Setting the wall clock, as Linux's settimeofday paths judge it (measured
+ * as user and as root in WSL: logs/b28/settime-wsl-*.out):
+ *   - the time is valid for setting (timespec64_valid_settod): nsec in
+ *     [0, 1e9), sec >= 0 and below TIME_SETTOD_SEC_MAX -- else EINVAL,
+ *     before any privilege is asked;
+ *   - the caller has CAP_SYS_TIME in the initial user namespace (capable(),
+ *     not ns_capable: a container's root may not set the host's clock) --
+ *     else EPERM;
+ *   - the new time is not before CLOCK_MONOTONIC (do_settimeofday64's
+ *     wall_to_monotonic test: 1970 plus the uptime) -- else EINVAL. */
+#define LX_TIME_SETTOD_SEC_MAX 8277292036LL   /* KTIME_SEC_MAX - 30 years */
+#define LCAP_SYS_TIME 25
+static struct { int minuteswest, dsttime; } g_sys_tz;   /* settimeofday's tz */
+
+static bool lx_settod_valid(int64_t sec, int64_t nsec) {
+    return nsec >= 0 && nsec < 1000000000LL && sec >= 0 &&
+           sec < LX_TIME_SETTOD_SEC_MAX;
+}
+
+static bool lx_may_set_time(void) {
+    struct proc *p = current_proc();
+    if (!p) return true;                       /* the kernel itself */
+    return !p->user_ns && userns_capable(LCAP_SYS_TIME);
+}
+
+static long lx_realtime_set(int64_t sec, int64_t nsec) {
+    uint64_t mono = perf_now_ns();
+    uint64_t want = (uint64_t)sec * 1000000000ull + (uint64_t)nsec;
+    if (want < mono) return -ABI_EINVAL;
+    uint64_t base = want - mono;
+    if (base == 0) base = 1;
+    uint64_t was = lx_realtime_ns(mono);
+    /* a step ends any slew (Linux: setting the time clears the offset) */
+    uint64_t fl = spin_lock_irqsave(&g_slew_lock);
+    __atomic_store_n(&g_slew.seq, g_slew.seq + 1, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    g_slew.t0 = g_slew.t1 = 0;
+    g_slew.rate = 0;
+    __atomic_store_n(&g_epoch_base_ns, base, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_slew.seq, g_slew.seq + 1, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&g_slew_lock, fl);
+    struct proc *p = current_proc();
+    int64_t step_ms = (int64_t)(want - was) / 1000000;
+    kprintf("[time] clock set to %lld.%09lld by pid %d (step %lld ms)\n",
+            (long long)sec, (long long)nsec, p ? p->pid : 0, (long long)step_ms);
+    /* the boot time moved with the clock (/proc/stat's btime does): so does
+     * utmp's boot record, which `who -b` reads */
+    {
+        extern void utmp_refresh(void);
+        utmp_refresh();
+    }
+    return 0;
+}
+
+/* adjtimex(2) (finding 280): struct timex as x86-64 Linux lays it out, 208
+ * bytes. The clock-changing modes need CAP_SYS_TIME; reading never does.
+ *   ADJ_OFFSET_SINGLESHOT  adjtime(3): slew by `offset` us at 500 ppm; the
+ *                          one replaced comes back in `offset`
+ *   ADJ_OFFSET_SS_READ     what is still to be slewed, changing nothing
+ *   ADJ_OFFSET             the NTP offset (ns with ADJ_NANO), slewed the
+ *                          same way here -- no PLL -- and clamped to Linux's
+ *                          MAXPHASE, 0.5 s
+ *   ADJ_SETOFFSET          a step by `time` (us, or ns with ADJ_NANO)
+ * The rest -- frequency, errors, status, time constant, tick -- is kept and
+ * given back, STA_UNSYNC until a caller clears it (TIME_ERROR, 5, then). */
+struct lx_timex {
+    int32_t modes, pad0;
+    int64_t offset, freq, maxerror, esterror;
+    int32_t status, pad1;
+    int64_t constant, precision, tolerance;
+    int64_t time_sec, time_usec;
+    int64_t tick, ppsfreq, jitter;
+    int32_t shift, pad2;
+    int64_t stabil, jitcnt, calcnt, errcnt, stbcnt;
+    int32_t tai;
+    int32_t pad3[11];
+};
+_Static_assert(sizeof(struct lx_timex) == 208, "struct timex is 208 bytes");
+#define LX_ADJ_OFFSET            0x0001
+#define LX_ADJ_FREQUENCY         0x0002
+#define LX_ADJ_MAXERROR          0x0004
+#define LX_ADJ_ESTERROR          0x0008
+#define LX_ADJ_STATUS            0x0010
+#define LX_ADJ_TIMECONST         0x0020
+#define LX_ADJ_SETOFFSET         0x0100
+#define LX_ADJ_MICRO             0x1000
+#define LX_ADJ_NANO              0x2000
+#define LX_ADJ_TICK              0x4000
+#define LX_ADJ_OFFSET_SINGLESHOT 0x8001
+#define LX_ADJ_OFFSET_SS_READ    0xa001
+#define LX_STA_UNSYNC            0x0040
+#define LX_STA_NANO              0x2000
+static struct {
+    int32_t status;
+    int64_t freq, maxerror, esterror, constant, tick;
+} g_ntp = { LX_STA_UNSYNC, 0, 16000000, 16000000, 2, 10000 };
+
+long lx_adjtimex(void *utx) {
+    struct lx_timex tx;
+    if (!utx || copy_from_user(&tx, utx, sizeof tx) != 0) return -ABI_EFAULT;
+    int modes = tx.modes;
+    bool ss_read = (modes & 0xffff) == LX_ADJ_OFFSET_SS_READ;
+    if (modes && !ss_read && !lx_may_set_time()) return -ABI_EPERM;
+    uint64_t mono = perf_now_ns();
+    int64_t left = lx_slew_left(mono);
+    if (ss_read) {
+        tx.offset = left / 1000;
+    } else if ((modes & LX_ADJ_OFFSET_SINGLESHOT) == LX_ADJ_OFFSET_SINGLESHOT) {
+        lx_slew_start(tx.offset * 1000);
+        tx.offset = left / 1000;                  /* the delta it replaced */
+    } else {
+        if (modes & LX_ADJ_NANO)  g_ntp.status |= LX_STA_NANO;
+        if (modes & LX_ADJ_MICRO) g_ntp.status &= ~LX_STA_NANO;
+        bool nano = (g_ntp.status & LX_STA_NANO) != 0;
+        if (modes & LX_ADJ_TICK) {
+            if (tx.tick < 9000 || tx.tick > 11000) return -ABI_EINVAL;
+            g_ntp.tick = tx.tick;
+        }
+        if (modes & LX_ADJ_SETOFFSET) {
+            int64_t sub = tx.time_usec;
+            if (sub < 0 || sub >= (nano ? 1000000000LL : 1000000LL))
+                return -ABI_EINVAL;
+            int64_t d = tx.time_sec * 1000000000LL + (nano ? sub : sub * 1000);
+            int64_t now = (int64_t)lx_realtime_ns(perf_now_ns());
+            int64_t want = now + d;
+            if (want < 0) return -ABI_EINVAL;
+            long r = lx_realtime_set(want / 1000000000LL, want % 1000000000LL);
+            if (r) return r;
+            left = 0;
+        }
+        if (modes & LX_ADJ_STATUS)    g_ntp.status = (g_ntp.status & LX_STA_NANO) |
+                                                     (tx.status & ~LX_STA_NANO);
+        if (modes & LX_ADJ_FREQUENCY) g_ntp.freq = tx.freq;
+        if (modes & LX_ADJ_MAXERROR)  g_ntp.maxerror = tx.maxerror;
+        if (modes & LX_ADJ_ESTERROR)  g_ntp.esterror = tx.esterror;
+        if (modes & LX_ADJ_TIMECONST) g_ntp.constant = tx.constant;
+        if (modes & LX_ADJ_OFFSET) {
+            int64_t off = nano ? tx.offset : tx.offset * 1000;
+            if (off > 500000000LL)  off = 500000000LL;      /* MAXPHASE */
+            if (off < -500000000LL) off = -500000000LL;
+            lx_slew_start(off);
+            left = off;
+        }
+        tx.offset = nano ? left : left / 1000;
+    }
+    bool nano = (g_ntp.status & LX_STA_NANO) != 0;
+    uint64_t rt = lx_realtime_ns(perf_now_ns());
+    tx.freq = g_ntp.freq;
+    tx.maxerror = g_ntp.maxerror;
+    tx.esterror = g_ntp.esterror;
+    tx.status = g_ntp.status;
+    tx.constant = g_ntp.constant;
+    tx.precision = 1;
+    tx.tolerance = 32768000;                      /* 500 ppm, scaled by 2^16 */
+    tx.time_sec = (int64_t)(rt / 1000000000ull);
+    tx.time_usec = (int64_t)(rt % 1000000000ull) / (nano ? 1 : 1000);
+    tx.tick = g_ntp.tick;
+    tx.ppsfreq = tx.jitter = 0;
+    tx.shift = 0;
+    tx.stabil = tx.jitcnt = tx.calcnt = tx.errcnt = tx.stbcnt = 0;
+    tx.tai = 0;
+    if (copy_to_user(utx, &tx, sizeof tx) != 0) return -ABI_EFAULT;
+    return (g_ntp.status & LX_STA_UNSYNC) ? 5 /* TIME_ERROR */ : 0 /* TIME_OK */;
+}
+
+/* clock_settime(2): only CLOCK_REALTIME is settable; the id is judged
+ * before the pointer, as posix_clock_realtime_set's caller does. */
+static long lx_clock_settime(int clk, const void *uts) {
+    if (clk != 0) return -ABI_EINVAL;
+    struct lx_timespec ts;
+    if (!uts || copy_from_user(&ts, uts, sizeof ts) != 0) return -ABI_EFAULT;
+    if (!lx_settod_valid(ts.tv_sec, ts.tv_nsec)) return -ABI_EINVAL;
+    if (!lx_may_set_time()) return -ABI_EPERM;
+    return lx_realtime_set(ts.tv_sec, ts.tv_nsec);
+}
+
+/* /dev/rtc0's ioctls, as Linux's rtc-dev answers them (logs/b28/
+ * rtcprobe-wsl-*.out): RTC_RD_TIME gives the RTC's time with wday, yday and
+ * isdst 0 (the core zeroes them); RTC_SET_TIME asks CAP_SYS_TIME first
+ * (EACCES), then copies (EFAULT), then rtc_valid_tm (EINVAL: a field out of
+ * range, a year before 1970), then the device's range (ERANGE); anything
+ * else is ENOTTY. The RTC holds what it is given -- UTC, unless hwclock
+ * --localtime wrote it. */
+#define LX_RTC_RD_TIME  0x80247009ul
+#define LX_RTC_SET_TIME 0x4024700aul
+struct lx_rtc_time {
+    int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst;
+};
+static bool lx_may_set_time(void);
+static long lx_rtc_ioctl(unsigned long rq, unsigned long arg) {
+    if (rq == LX_RTC_RD_TIME) {
+        struct rtc_time t;
+        rtc_read_time(&t);
+        struct lx_rtc_time lt;
+        memset(&lt, 0, sizeof lt);
+        lt.tm_sec = t.second; lt.tm_min = t.minute; lt.tm_hour = t.hour;
+        lt.tm_mday = t.day; lt.tm_mon = (int)t.month - 1; lt.tm_year = (int)t.year - 1900;
+        if (!arg || copy_to_user((void *)arg, &lt, sizeof lt) != 0) return -ABI_EFAULT;
+        return 0;
+    }
+    if (rq == LX_RTC_SET_TIME) {
+        if (!lx_may_set_time()) return -ABI_EACCES;
+        struct lx_rtc_time lt;
+        if (!arg || copy_from_user(&lt, (const void *)arg, sizeof lt) != 0) return -ABI_EFAULT;
+        static const unsigned char mdays[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+        long year = (long)lt.tm_year + 1900;
+        if (lt.tm_year < 70 || (unsigned)lt.tm_mon >= 12 || lt.tm_mday < 1 ||
+            (unsigned)lt.tm_hour >= 24 || (unsigned)lt.tm_min >= 60 ||
+            (unsigned)lt.tm_sec >= 60)
+            return -ABI_EINVAL;
+        bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        int dim = mdays[lt.tm_mon] + (lt.tm_mon == 1 && leap ? 1 : 0);
+        if (lt.tm_mday > dim) return -ABI_EINVAL;
+        struct rtc_time t = { (uint8_t)lt.tm_sec, (uint8_t)lt.tm_min, (uint8_t)lt.tm_hour,
+                              (uint8_t)lt.tm_mday, (uint8_t)(lt.tm_mon + 1),
+                              (uint16_t)(year > 65535 ? 65535 : year), 0 };
+        if (rtc_write_time(&t) != 0) return -ABI_ERANGE;
+        struct proc *p = current_proc();
+        kprintf("[rtc] set to %04ld-%02d-%02d %02d:%02d:%02d by pid %d\n", year,
+                lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec, p ? p->pid : 0);
+        return 0;
+    }
+    return -ABI_ENOTTY;
+}
+
+/* settimeofday(2): TV (a timeval) and TZ each optional. The timezone is
+ * checked after the privilege, as do_sys_settimeofday64 does; it is kept
+ * for gettimeofday to give back, and moves no clock (no RTC in local time
+ * here, so there is nothing for timekeeping_warp_clock to warp). */
+static long lx_settimeofday(const void *utv, const void *utz) {
+    int64_t tv[2] = { 0, 0 };
+    int tz[2] = { 0, 0 };
+    if (utv) {
+        if (copy_from_user(tv, utv, sizeof tv) != 0) return -ABI_EFAULT;
+        if (tv[1] < 0 || tv[1] > 1000000) return -ABI_EINVAL;
+        tv[1] *= 1000;
+    }
+    if (utz && copy_from_user(tz, utz, sizeof tz) != 0) return -ABI_EFAULT;
+    if (utv && !lx_settod_valid(tv[0], tv[1])) return -ABI_EINVAL;
+    if (!lx_may_set_time()) return -ABI_EPERM;
+    if (utz) {
+        if (tz[0] > 15 * 60 || tz[0] < -15 * 60) return -ABI_EINVAL;
+        g_sys_tz.minuteswest = tz[0];
+        g_sys_tz.dsttime = tz[1];
+    }
+    if (utv) return lx_realtime_set(tv[0], tv[1]);
+    return 0;
 }
 
 /* Slice 56: CLOCK_REALTIME minus CLOCK_MONOTONIC, for converting an absolute
@@ -5779,8 +10361,10 @@ static int linux_fast_time_syscall(long num, long a1, long a2, long *out) {
         switch ((int)a1) {
         case 0: case 5: case 8:                 /* CLOCK_REALTIME family */
             val = lx_realtime_ns(mono); break;
+        case 1: case 6: case 7: case 9:          /* MONOTONIC / BOOTTIME: */
+            val = lx_mono_ns(mono); break;       /* slewed (finding 280) */
         case 2: case 3:                          /* PROCESS/THREAD_CPUTIME */
-        case 1: case 4: case 6: case 7: case 9:  /* MONOTONIC / BOOTTIME */
+        case 4:                                  /* MONOTONIC_RAW */
             val = mono; break;
         default:
             return 0;                            /* unknown id: normal path -> EINVAL */
@@ -5798,7 +10382,12 @@ static int linux_fast_time_syscall(long num, long a1, long a2, long *out) {
 #ifdef CHROMIUM_BOOT
         clkchk_probe(mono);
 #endif
-        if (a1 == 0) { *out = 0; return 1; }     /* tz (a2) ignored, matches slow path */
+        if (a2) {                                /* tz: settimeofday's, as Linux's sys_tz */
+            int tz[2] = { g_sys_tz.minuteswest, g_sys_tz.dsttime };
+            if (copy_to_user_nofault((void *)a2, tz, sizeof tz) != 0)
+                return 0;
+        }
+        if (a1 == 0) { *out = 0; return 1; }
         uint64_t ns = lx_realtime_ns(mono);
         int64_t tv[2] = { (int64_t)(ns / 1000000000ull),
                           (int64_t)((ns / 1000ull) % 1000000ull) };
@@ -5820,9 +10409,28 @@ static int linux_fast_time_syscall(long num, long a1, long a2, long *out) {
     }
 }
 
+static long lx_do_poll_in(struct lx_pollfd *fds, uint64_t ufds,
+                          unsigned long nfds, long timeout_ms);
+
+/* poll(2) over NFDS entries: more than the soft RLIMIT_NOFILE is EINVAL,
+ * Linux's rule -- the cap was a fixed 256, a quarter of the descriptors a
+ * process can hold. Up to 256 the entries sit on the stack, as they did;
+ * more go on the heap. */
 static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
-    if (nfds > LX_POLL_MAXFDS) return -ABI_EINVAL;
-    struct lx_pollfd fds[LX_POLL_MAXFDS];
+    if (nfds > (unsigned long)proc_nofile(current_proc())) return -ABI_EINVAL;
+    if (nfds <= LX_POLL_MAXFDS) {
+        struct lx_pollfd fds[LX_POLL_MAXFDS];
+        return lx_do_poll_in(fds, ufds, nfds, timeout_ms);
+    }
+    struct lx_pollfd *fds = (struct lx_pollfd *)kmalloc(nfds * sizeof *fds);
+    if (!fds) return -ABI_ENOMEM;
+    long r = lx_do_poll_in(fds, ufds, nfds, timeout_ms);
+    kfree(fds);
+    return r;
+}
+
+static long lx_do_poll_in(struct lx_pollfd *fds, uint64_t ufds,
+                          unsigned long nfds, long timeout_ms) {
     if (nfds && copy_from_user(fds, (const void *)(uintptr_t)ufds,
                                nfds * sizeof(fds[0])) != 0)
         return -ABI_EFAULT;
@@ -5892,7 +10500,7 @@ static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
                 return -ABI_EFAULT;
             return nready;
         }
-        if (self && self->pending_signals) return -LX_EINTR;
+        if (self && SIG_SHOULD_EINTR(self)) return -LX_EINTR;
         g_lx_poll_iters++;
         if (self) g_lx_poll_last_pid = self->pid;
         /* B14: drive RX so inbound TCP segments (handshakes completing on the
@@ -5945,20 +10553,29 @@ static long lx_do_select(int nfds, uint64_t urd, uint64_t uwr, uint64_t uex,
             if (uex && nbytes && copy_to_user((void *)(uintptr_t)uex, oex, nbytes)) return -ABI_EFAULT;
             return nready;
         }
-        if (self && self->pending_signals) return -LX_EINTR;
+        if (self && SIG_SHOULD_EINTR(self)) return -LX_EINTR;
         if (saw_sock) net_poll();              /* B14: pump RX (see lx_do_poll) */
         poll_wait_block();   /* slice 43: BLOCK, don't busy-spin */
     }
 }
 
 /* ---- epoll ---- */
-#define EPOLL_MAX 64
-struct epoll_entry { int fd; uint32_t events; uint64_t data; bool used; };
+/* 2026-08-22: 64 -> 512. The 65th EPOLL_CTL_ADD answered ENOMEM, which
+ * capped every epoll-driven server at 64 connections -- an arbitrary wall
+ * nothing advertises. 512 entries is ~12 KiB per instance (kmalloc'd). */
+#define EPOLL_MAX 512
+/* EPOLLONESHOT is real since 2026-08-22 (it used to re-fire forever);
+ * EPOLLET is served as level -- see the comment at the scan for why an
+ * emulated edge would LOSE wakeups where level only adds spurious ones. */
+struct epoll_entry { int fd; uint32_t events; uint64_t data; bool used;
+                     uint32_t last_cond; };
 struct epoll_inst  { struct epoll_entry e[EPOLL_MAX]; };
 struct lx_epoll_event { uint32_t events; uint64_t data; } __attribute__((packed)); /* 12 B */
 #define LX_EPOLL_CTL_ADD 1
 #define LX_EPOLL_CTL_DEL 2
 #define LX_EPOLL_CTL_MOD 3
+#define LX_EPOLLET      0x80000000u
+#define LX_EPOLLONESHOT 0x40000000u
 
 static long lx_epoll_create(void) {
     struct file *f = (struct file *)kmalloc(sizeof(*f));
@@ -5990,7 +10607,7 @@ static long lx_epoll_ctl(int epfd, int op, int fd, uint64_t uevent) {
             if (!ei->e[i].used && free_slot < 0) free_slot = i;
         }
         if (free_slot < 0) return -ABI_ENOMEM;
-        ei->e[free_slot] = (struct epoll_entry){ fd, ev.events, ev.data, true };
+        ei->e[free_slot] = (struct epoll_entry){ fd, ev.events, ev.data, true, 0 };
 #ifdef CHROMIUM_BOOT
         /* [epreg] what chrome's IO threads actually poll on. The renderer's
          * IO threads block in epoll_wait forever after the bootstrap thread
@@ -6011,7 +10628,10 @@ static long lx_epoll_ctl(int epfd, int op, int fd, uint64_t uevent) {
     for (int i = 0; i < EPOLL_MAX; i++) {
         if (!ei->e[i].used || ei->e[i].fd != fd) continue;
         if (op == LX_EPOLL_CTL_DEL) { ei->e[i].used = false; return 0; }
-        if (op == LX_EPOLL_CTL_MOD) { ei->e[i].events = ev.events; ei->e[i].data = ev.data; return 0; }
+        if (op == LX_EPOLL_CTL_MOD) { ei->e[i].events = ev.events;
+                                      ei->e[i].data = ev.data;
+                                      ei->e[i].last_cond = 0;  /* re-arm edges */
+                                      return 0; }
     }
     return -2 /* ENOENT */;
 }
@@ -6034,14 +10654,30 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
             struct file *f = fd_lookup(ei->e[i].fd);
             if (f && f->kind == FILE_KIND_SOCKET) saw_sock = true;
             short cond = file_poll_ready(f);
-            uint32_t want = ei->e[i].events | LXP_POLLERR | LXP_POLLHUP;
+            uint32_t evbits = ei->e[i].events & ~(LX_EPOLLET | LX_EPOLLONESHOT);
+            /* A ONESHOT entry that already fired is DISARMED -- it reports
+             * nothing (not even ERR/HUP) until EPOLL_CTL_MOD re-arms it. */
+            if (evbits == 0 && (ei->e[i].events & LX_EPOLLONESHOT)) continue;
+            uint32_t want = evbits | LXP_POLLERR | LXP_POLLHUP;
             uint32_t rev  = (uint32_t)cond & want;
-            if (!rev) continue;
+            /* EPOLLET is served as LEVEL, deliberately. A scan-based
+             * tracker cannot see a drain-and-refill that happens BETWEEN
+             * two epoll_wait calls -- which is precisely every real ET
+             * app's loop (wake, drain, handle, re-wait) -- so honest
+             * edge-tracking here would go silent forever after the first
+             * cycle: a LOST wakeup. Level-triggering only adds spurious
+             * wakeups, which the epoll contract permits and every caller
+             * already tolerates. ONESHOT below is real. */
+            if (!rev) { ei->e[i].last_cond = 0; continue; }
+            ei->e[i].last_cond = rev;
             struct lx_epoll_event out = { rev, ei->e[i].data };
             if (copy_to_user((void *)(uintptr_t)(uevents + (uint64_t)n * sizeof(out)),
                              &out, sizeof(out)) != 0)
                 return -ABI_EFAULT;
             n++;
+            /* ONESHOT: disarm after one report; EPOLL_CTL_MOD re-arms. */
+            if (ei->e[i].events & LX_EPOLLONESHOT)
+                ei->e[i].events &= (LX_EPOLLET | LX_EPOLLONESHOT);
         }
         if (n > 0 || timeout_ms == 0 ||
             (!infinite && perf_now_ns() >= deadline)) {
@@ -6062,7 +10698,7 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
 #endif
             return n;
         }
-        if (self && self->pending_signals) return -LX_EINTR;
+        if (self && SIG_SHOULD_EINTR(self)) return -LX_EINTR;
         /* B14: epoll over sockets must pump RX while blocked (a full scan
          * before yielding would otherwise never see the handshake complete). */
         if (saw_sock) net_poll();
@@ -6116,6 +10752,15 @@ static inline bool lx_sock_networked(struct sock *s) {
 
 #define LX_MSG_DONTWAIT  0x40         /* recv/send flag: never block this call */
 #define LX_MSG_PEEK      0x02         /* recv flag: read without dequeuing */
+
+/* Close-on-exec request bits (2026-08-22). Same value, many names: Linux
+ * defines O_CLOEXEC = SOCK_CLOEXEC = EFD_CLOEXEC = SFD_CLOEXEC =
+ * TFD_CLOEXEC = IN_CLOEXEC = EPOLL_CLOEXEC = 02000000 octal. memfd is the
+ * odd one out (MFD_CLOEXEC = 1), and the fcntl F_SETFD bit is FD_CLOEXEC=1. */
+#define LX_O_CLOEXEC     0x80000
+#define LX_FD_CLOEXEC    1
+#define LX_F_DUPFD          0
+#define LX_F_DUPFD_CLOEXEC  1030
 
 #define LX_SOCK_DEF_ACCEPT_MS  3000   /* fallback accept() wait (cooperative) */
 #define LX_SOCK_DEF_CONNECT_MS 5000   /* fallback connect() wait */
@@ -6254,10 +10899,27 @@ static long lx_socket(int domain, int type, int proto) {
         if (nfd < 0) { sock_close(ns); return -ABI_EMFILE; }
         return nfd;
     }
-    /* We only implement IPv4. musl's getaddrinfo opens an AF_INET6 DNS socket
-     * first and falls back to AF_INET *only* on EAFNOSUPPORT -- returning
-     * EINVAL there made the fallback never happen (wget: "bad address"). */
-    if (domain == AF_INET6) return -LXE_EAFNOSUPPORT;
+    /* AF_INET6 (2026-08-23): UDP and TCP are real now -- the v6 socket is
+     * the same pool entry as v4 with is_v6 set, and each call site parses
+     * sockaddr_in6 for it. Anything else keeps EAFNOSUPPORT, and that
+     * errno choice is load-bearing: musl/glibc getaddrinfo falls back to
+     * AF_INET *only* on EAFNOSUPPORT -- EINVAL here once made the
+     * fallback never happen (wget: "bad address"). */
+    if (domain == AF_INET6) {
+        int t6 = type & 0xff;
+        int k6;
+        if (t6 == SOCK_DGRAM)       k6 = SOCK_KIND_UDP;
+        else if (t6 == SOCK_STREAM) k6 = SOCK_KIND_TCP;
+        else return -LXE_EAFNOSUPPORT;
+        if (!cap_check(current_proc(), CAP_NET, "lx_socket6")) return -ABI_EACCES;
+        struct sock *s6 = sock_alloc(k6);
+        if (!s6) return -ABI_EMFILE;
+        s6->is_v6    = 1;
+        s6->nonblock = (type & SOCK_NONBLOCK) != 0;
+        int fd6 = lx_sock_install(s6);
+        if (fd6 < 0) { sock_close(s6); return -ABI_EMFILE; }
+        return fd6;
+    }
     if (domain != AF_INET) return -ABI_EINVAL;
     int t = type & 0xff;                /* strip SOCK_NONBLOCK/SOCK_CLOEXEC */
     int kind;
@@ -6280,8 +10942,11 @@ static long lx_socket(int domain, int type, int proto) {
  * AF_UNIX socketpairs (SOCK_SEQPACKET on Linux). This is in-process IPC, not
  * networking -- NO CAP_NET. Creates a connected pair of in-memory message
  * endpoints (see sock_unix_* in socket.c) and writes the two fds to sv[2].
- * SOCK_STREAM/DGRAM/SEQPACKET are all treated as message channels; the
- * SOCK_CLOEXEC/NONBLOCK type bits are ignored. No SCM_RIGHTS (fd passing) yet. */
+ * SOCK_STREAM/DGRAM/SEQPACKET are all treated as message channels.
+ * 2026-08-22: SOCK_NONBLOCK/SOCK_CLOEXEC used to be parsed and DISCARDED here
+ * -- unlike lx_socket and lx_accept, which honour them -- so a library that
+ * relied on the type bits instead of a follow-up fcntl got BLOCKING endpoints
+ * that leaked across exec. Both bits are honoured now. */
 static long lx_socketpair(int domain, int type, int proto, uint64_t usv) {
     (void)proto;
     if (domain != AF_UNIX) return -LXE_EAFNOSUPPORT;
@@ -6292,11 +10957,20 @@ static long lx_socketpair(int domain, int type, int proto, uint64_t usv) {
     struct sock *a = 0, *b = 0;
     if (sock_unix_pair(&a, &b) != 0) return -ABI_EMFILE;   /* pool exhausted */
     a->sotype = b->sotype = (uint8_t)t;         /* slice 80: SEQPACKET stays SEQPACKET */
+    a->nonblock = b->nonblock = (type & SOCK_NONBLOCK) != 0;
 
     int fd0 = lx_sock_install(a);
     if (fd0 < 0) { sock_close(a); sock_close(b); return -ABI_EMFILE; }
     int fd1 = lx_sock_install(b);
-    if (fd1 < 0) { sock_close(b); return -ABI_EMFILE; }    /* fd0/a leak on rare OOM */
+    /* one slot for two ends -- an ordinary EMFILE under RLIMIT_NOFILE, no
+     * longer only a rare OOM: the first end goes too, as on Linux, where
+     * socketpair gives both or neither */
+    if (fd1 < 0) { sock_close(b); (void)sys_close(fd0); return -ABI_EMFILE; }
+
+    if (type & LX_O_CLOEXEC) {                  /* SOCK_CLOEXEC, both ends */
+        fd_cloexec_set(current_proc(), fd0, 1);
+        fd_cloexec_set(current_proc(), fd1, 1);
+    }
 
     int fds[2] = { fd0, fd1 };
     if (copy_to_user((void *)usv, fds, sizeof fds) != 0) return -ABI_EFAULT;
@@ -6356,6 +11030,68 @@ static void lx_addr_writeback(uint64_t uaddr, uint64_t ualen,
     if (ualen) (void)copy_to_user((void *)(uintptr_t)ualen, &len, 4);
 }
 
+/* ---- AF_INET6 address plumbing (2026-08-23) --------------------------
+ *
+ * sockaddr_in6 = { u16 family; u16 port(BE); u32 flowinfo; u8 addr[16];
+ * u32 scope_id } == 28 bytes. flowinfo and scope_id are accepted and
+ * ignored -- one interface, so there is no link-local ambiguity for a
+ * scope id to resolve. */
+struct __attribute__((packed)) lx_sockaddr_in6 {
+    uint16_t fam;
+    uint16_t port_be;
+    uint32_t flowinfo;
+    uint8_t  addr[16];
+    uint32_t scope;
+};
+
+static long lx_sin6_parse(uint64_t uaddr, uint32_t alen,
+                          struct ipv6_addr *ip, uint16_t *port_be) {
+    struct lx_sockaddr_in6 sa;
+    memset(&sa, 0, sizeof sa);
+    if (!uaddr || alen < 24) return -ABI_EFAULT;   /* need through addr[16] */
+    uint32_t rd = alen > sizeof sa ? (uint32_t)sizeof sa : alen;
+    if (copy_from_user(&sa, (const void *)(uintptr_t)uaddr, rd) != 0)
+        return -ABI_EFAULT;
+    if (sa.fam != AF_INET6) return -ABI_EINVAL;
+    memcpy(ip->bytes, sa.addr, 16);
+    *port_be = sa.port_be;
+    return 0;
+}
+
+static bool lx_v6_is_mapped(const struct ipv6_addr *a) {
+    for (int i = 0; i < 10; i++) if (a->bytes[i]) return false;
+    return a->bytes[10] == 0xff && a->bytes[11] == 0xff;
+}
+
+/* Send one datagram from a v6 socket: explicit sockaddr_in6 at uaddr, else
+ * the connect()-ed peer. A v4-mapped destination (::ffff:a.b.c.d) rides the
+ * v4 path -- sock_recvfrom6_to spells v4 sources the same way, so the two
+ * dual-stack directions agree. `k` is already a kernel buffer. */
+static long lx_udp6_sendk(struct sock *s, const void *k, size_t len,
+                          uint64_t uaddr) {
+    struct ipv6_addr d6; uint16_t dp6;
+    if (uaddr) {
+        /* sendto's addrlen is not delivered this deep (same contract as
+         * lx_udp_dest); assume a full sockaddr_in6. */
+        if (lx_sin6_parse(uaddr, sizeof(struct lx_sockaddr_in6),
+                          &d6, &dp6) != 0)
+            return -ABI_EINVAL;
+    } else if (s->peer_port) {
+        d6 = s->peer6; dp6 = s->peer_port;
+    } else {
+        return -ABI_EINVAL;
+    }
+    if (!lx_sock_networked(s)) return -LXE_ENETUNREACH;
+    long n;
+    if (lx_v6_is_mapped(&d6)) {
+        uint32_t v4; memcpy(&v4, &d6.bytes[12], 4);
+        n = sock_sendto(s, k, len, v4, dp6);
+    } else {
+        n = sock_sendto6(s, k, len, &d6, dp6);
+    }
+    return (n < 0) ? -LXE_EAGAIN : n;
+}
+
 static long lx_bind(int fd, uint64_t uaddr, uint32_t alen) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
@@ -6369,6 +11105,31 @@ static long lx_bind(int fd, uint64_t uaddr, uint32_t alen) {
         long pr = lx_sun_parse(uaddr, alen, nm, sizeof nm, &abs);
         if (pr) return pr;
         if (!nm[0]) return -ABI_EINVAL;             /* autobind unsupported */
+        if (!abs) {
+            /* A NAME IN THE FILESYSTEM IS A NODE, as Linux's bind makes one
+             * (finding 193): the path resolved as any path is, an S_IFSOCK
+             * node made there -- 0777 less the umask, the binder's --
+             * EADDRINUSE when the name is taken, by a socket or anything
+             * else; ENOENT, EACCES as creating a file there would say. The
+             * name was a string in a table: `ls` saw nothing, and "sock"
+             * and "./sock" were different names. */
+            char kp[VFS_PATH_MAX];
+            int rr = resolve_kernel_path(nm, kp, sizeof kp);
+            if (rr) return rr;
+            struct vfs_stat est;
+            if (vfs_stat(kp, &est) == VFS_OK) return -LXE_EADDRINUSE;
+            struct proc *bp = current_proc();
+            uint32_t um = bp ? (bp->umask & 0777u) : 022u;
+            int vr = vfs_mksock(kp, 0777u & ~um);
+            if (vr == VFS_ERR_EXIST) return -LXE_EADDRINUSE;
+            if (vr != VFS_OK) return vfs_err_to_abi(vr);
+            int rc = sock_unix_bind_path(s, kp, nm);
+            if (rc != 0) {
+                (void)vfs_unlink(kp);
+                return rc == -98 ? -LXE_EADDRINUSE : -ABI_EINVAL;
+            }
+            return 0;
+        }
         int rc = sock_unix_bind_name(s, nm, abs);
         if (rc == -98) return -LXE_EADDRINUSE;
         return rc == 0 ? 0 : -ABI_EINVAL;
@@ -6387,6 +11148,18 @@ static long lx_bind(int fd, uint64_t uaddr, uint32_t alen) {
         if (nl.fam != AF_NETLINK) return -ABI_EINVAL;
         s->nl_pid = nl.pid ? nl.pid : (uint32_t)(current_proc()->pid);
         return 0;
+    }
+    /* AF_INET6: record the address, claim the port. Same empty-netns rule
+     * as v4 below: :: (any) binds locally, a specific address needs an
+     * interface to be bound to. */
+    if (s->is_v6) {
+        struct ipv6_addr a6; uint16_t p6;
+        long pr = lx_sin6_parse(uaddr, alen, &a6, &p6);
+        if (pr) return pr;
+        if (!lx_sock_networked(s) && !ipv6_addr_is_zero(&a6))
+            return -LXE_EADDRNOTAVAIL;
+        s->local6 = a6;
+        return sock_bind(s, p6) == 0 ? 0 : -LXE_EADDRINUSE;
     }
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
@@ -6429,11 +11202,21 @@ static int lx_conn_progress(struct sock *s) {
     }
     int flags = tcp_poll_flags(s->tcp);
     if ((flags & TCP_RDY_ERR) || st == TCP_CLOSED) {
+        /* An async ICMPv6 verdict (no-route etc.) names the REAL errno;
+         * only a genuine RST-or-teardown defaults to ECONNREFUSED. */
+        int e = tcp_icmp_err(s->tcp);
+        if (!e) e = LXE_ECONNREFUSED;
         s->connecting = 0;
-        s->so_error   = LXE_ECONNREFUSED;
-        return -LXE_ECONNREFUSED;
+        s->so_error   = e;
+        return -e;
     }
-    if (s->conn_deadline && pit_ticks() >= s->conn_deadline) {
+    /* 2026-08-22: the deadline is in perf_now_ns() NANOSECONDS now. It was
+     * pit_hz()*ms ticks -- and under TCG the guest only RECEIVES ~1/15th of
+     * the programmed 1 kHz PIT IRQs, so every "5 s" connect deadline was
+     * really ~75 s (measured: blocking connect to a silent port classified
+     * at 75651 ms). perf_now_ns is TSC-backed and does not depend on IRQ
+     * delivery -- the same reason the timerfd path uses it. */
+    if (s->conn_deadline && perf_now_ns() >= s->conn_deadline) {
         s->connecting = 0;
         s->so_error   = LXE_ETIMEDOUT;
         return -LXE_ETIMEDOUT;
@@ -6448,7 +11231,8 @@ static long lx_listen(int fd, int backlog) {
         return sock_unix_listen(s) == 0 ? 0 : -ABI_EINVAL;
     if (s->kind != SOCK_KIND_TCP) return -LXE_EOPNOTSUPP;
     if (s->local_port == 0)       return -ABI_EINVAL;   /* must bind first */
-    struct tcp_conn *lsn = tcp_listen(s->local_port, backlog);
+    struct tcp_conn *lsn = tcp_listen_reuse(s->local_port, backlog,
+                                            s->reuseaddr != 0);
     if (!lsn) return -LXE_EADDRINUSE;
     s->tcp = lsn;
     s->tcp_listening = true;
@@ -6482,17 +11266,49 @@ static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen, int flags) {
     /* Non-blocking listener: report EAGAIN rather than sitting in tcp_accept
      * for the whole timeout when no handshake is queued. */
     if (s->nonblock && !tcp_can_accept(s->tcp)) return -LXE_EAGAIN;
-    uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : LX_SOCK_DEF_ACCEPT_MS;
-    struct tcp_conn *child = tcp_accept(s->tcp, to);
-    if (!child) return -LXE_EAGAIN;
+    struct tcp_conn *child;
+    if (s->recv_timeout_ms) {
+        /* SO_RCVTIMEO applies to accept on Linux; expiry is EAGAIN. */
+        child = tcp_accept(s->tcp, s->recv_timeout_ms);
+        if (!child) return -LXE_EAGAIN;
+    } else {
+        /* A BLOCKING accept waits indefinitely. The 3 s default that used
+         * to sit here (LX_SOCK_DEF_ACCEPT_MS) made every classic server
+         * loop -- Python sock.accept(), sshd, inetd shapes -- take a
+         * spurious EAGAIN, which a blocking socket must never return.
+         * Wait in 500 ms slices so a signal can break in as EINTR. */
+        for (;;) {
+            child = tcp_accept(s->tcp, 500);
+            if (child) break;
+            struct proc *me = current_proc();
+            if (me && SIG_SHOULD_EINTR(me)) return -LXE_EINTR;
+        }
+    }
     struct sock *ns = sock_alloc(SOCK_KIND_TCP);
     if (!ns) { tcp_close(child); return -ABI_EMFILE; }
     ns->tcp = child;
     ns->local_port = s->local_port;
     ns->nonblock   = (flags & SOCK_NONBLOCK) != 0;
+    /* TCP6 (2026-08-23): the accepted socket inherits the LISTENER's
+     * family, as Linux does -- a v6 listener's children are AF_INET6 even
+     * for a v4 client (whose peer then reports as ::ffff:a.b.c.d). */
+    ns->is_v6      = s->is_v6;
     int nfd = lx_sock_install(ns);
     if (nfd < 0) { tcp_close(child); sock_close(ns); return -ABI_EMFILE; }
-    {
+    if (s->is_v6) {
+        struct lx_sockaddr_in6 sa6;
+        memset(&sa6, 0, sizeof sa6);
+        sa6.fam     = AF_INET6;
+        sa6.port_be = tcp_remote_port_be(child);
+        if (tcp_conn_is6(child)) {
+            memcpy(sa6.addr, tcp_remote6(child)->bytes, 16);
+        } else {                       /* dual-stack v4 client: mapped */
+            uint32_t rip = tcp_remote_ip_be(child);
+            sa6.addr[10] = 0xff; sa6.addr[11] = 0xff;
+            memcpy(&sa6.addr[12], &rip, 4);
+        }
+        lx_addr_writeback(uaddr, ualen, &sa6, (uint32_t)sizeof sa6);
+    } else {
         struct sockaddr_in sa;
         memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET;        /* peer ip/port not exposed; family only */
@@ -6505,6 +11321,14 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
     if (!uaddr || alen < 2) return -ABI_EFAULT;
+
+    /* TCP destination, resolved by whichever family arm runs below; the
+     * connect machinery at the bottom is family-free apart from which
+     * starter it calls. */
+    bool dst_use6 = false;
+    struct ipv6_addr dst6;
+    uint32_t dst4 = 0; uint16_t dstp = 0;
+    memset(&dst6, 0, sizeof dst6);
 
     uint16_t fam = 0;
     if (copy_from_user(&fam, (const void *)(uintptr_t)uaddr, sizeof fam) != 0)
@@ -6531,8 +11355,61 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
         if (nlen > sizeof(name) - 1) nlen = sizeof(name) - 1;
         memcpy(name, src, nlen);
         name[nlen] = '\0';                        /* strcmp stops at any embedded NUL */
+        if (!abstract && name[0] && !sock_unix_is_x_socket(name)) {
+            /* THROUGH THE NODE, as Linux's connect goes (finding 193): the
+             * path resolved, links followed -- ENOENT when nothing is
+             * there, ECONNREFUSED when it is not a socket or nothing is
+             * listening on it, EACCES without write permission on it. The
+             * in-kernel X server's socket keeps its own way in. */
+            char kp[VFS_PATH_MAX], fin[VFS_PATH_MAX];
+            int rr = resolve_kernel_path(name, kp, sizeof kp);
+            if (rr) return rr;
+            struct vfs_stat nst;
+            int sr = vfs_stat(kp, &nst);
+            const char *node = kp;
+            if (sr == VFS_OK && nst.type == VFS_TYPE_SYMLINK) {
+                sr = vfs_follow_link(kp, fin, sizeof fin);
+                if (sr == VFS_OK) { node = fin; sr = vfs_stat(fin, &nst); }
+            }
+            if (sr != VFS_OK) return vfs_err_to_abi(sr);
+            if ((nst.mode & 0170000u) != 0140000u) return -LXE_ECONNREFUSED;
+            if (vfs_perm_check(node, VFS_WANT_WRITE) != VFS_OK) return -ABI_EACCES;
+            int rc = sock_unix_connect_named(s, node, false);
+            return rc == 0 ? 0 : -LXE_ECONNREFUSED;
+        }
         int rc = sock_unix_connect_named(s, name, abstract);
         return rc == 0 ? 0 : -LXE_ECONNREFUSED;
+    }
+
+    /* AF_INET6 (UDP + TCP since 2026-08-23). UDP: remember the peer;
+     * send()/recv()/write() then default to it. TCP: resolve the
+     * destination and fall into the SAME nonblock/blocking machinery as
+     * v4 -- a v4-mapped destination (::ffff:a.b.c.d) rides the v4 engine
+     * while the socket keeps its v6 reporting. The empty-netns denial
+     * applies exactly as for v4 -- this kernel has no per-namespace
+     * loopback, so an empty namespace refuses ::1 too. */
+    if (fam == AF_INET6) {
+        if (!s->is_v6) return -ABI_EINVAL;
+        struct ipv6_addr a6; uint16_t p6;
+        long pr = lx_sin6_parse(uaddr, alen, &a6, &p6);
+        if (pr) return pr;
+        if (!lx_sock_networked(s)) return -LXE_ENETUNREACH;
+        if (s->kind == SOCK_KIND_UDP) {
+            s->peer6     = a6;
+            s->peer_port = p6;
+            return 0;
+        }
+        if (s->kind != SOCK_KIND_TCP) return -ABI_EINVAL;
+        s->peer6 = a6;                 /* getpeername's mapped spelling */
+        s->peer_port = p6;
+        if (lx_v6_is_mapped(&a6)) {
+            memcpy(&dst4, &a6.bytes[12], 4);
+        } else {
+            dst6 = a6;
+            dst_use6 = true;
+        }
+        dstp = p6;
+        goto tcp_start;
     }
 
     struct sockaddr_in sa;
@@ -6570,6 +11447,10 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
         return 0;
     }
 
+    dst4 = sa.sin_addr;
+    dstp = sa.sin_port;
+
+tcp_start:;
     uint32_t to = s->send_timeout_ms ? s->send_timeout_ms : LX_SOCK_DEF_CONNECT_MS;
 
     /* Non-blocking connect: put the SYN on the wire and return EINPROGRESS at
@@ -6584,19 +11465,70 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
             return pr < 0 ? pr : -LXE_EALREADY;
         }
         if (s->tcp) return -LXE_EISCONN;
-        struct tcp_conn *nc = tcp_connect_nb(sa.sin_addr, sa.sin_port);
+        struct tcp_conn *nc = dst_use6 ? tcp_connect6_nb(&dst6, dstp)
+                                       : tcp_connect_nb(dst4, dstp);
         if (!nc) return -LXE_ECONNREFUSED;
         s->tcp        = nc;
         s->connecting = 1;
         s->so_error   = 0;
-        uint32_t hz = pit_hz(); if (!hz) hz = 100;
-        s->conn_deadline = pit_ticks() + ((uint64_t)hz * to) / 1000u;
+        s->conn_deadline = perf_now_ns() + (uint64_t)to * 1000000ull;
         return -LXE_EINPROGRESS;
     }
 
-    struct tcp_conn *c = tcp_connect(sa.sin_addr, sa.sin_port, to);
-    if (!c) return -LXE_ECONNREFUSED;
-    s->tcp = c;
+    /* BLOCKING connect, via the same machinery as the non-blocking path so
+     * the outcome is CLASSIFIED: an RST is ECONNREFUSED, silence is
+     * ETIMEDOUT. The old tcp_connect() call collapsed both into
+     * ECONNREFUSED after 5 s -- "the peer refused" and "the peer never
+     * answered" are different diagnoses and software acts on the
+     * difference (retry policy, error messages, failover). */
+    if (s->connecting) return -LXE_EALREADY;
+    if (s->tcp) return -LXE_EISCONN;
+    struct tcp_conn *nc = dst_use6 ? tcp_connect6_nb(&dst6, dstp)
+                                   : tcp_connect_nb(dst4, dstp);
+    if (!nc) return -LXE_ECONNREFUSED;           /* no slot / no route */
+    s->tcp        = nc;
+    s->connecting = 1;
+    s->so_error   = 0;
+    s->conn_deadline = perf_now_ns() + (uint64_t)to * 1000000ull;
+    for (;;) {
+        struct net_dev *nd = net_default();
+        if (nd && nd->rx_drain) nd->rx_drain(nd);
+        net_poll();                              /* pump the SYN-ACK in */
+        int pr = lx_conn_progress(s);
+        if (pr == 1) return 0;
+        if (pr < 0)  return pr;                  /* refused or timed out; the
+                                                  * conn is torn down by close,
+                                                  * same as the nb path */
+        struct proc *me = current_proc();
+        if (me && SIG_SHOULD_EINTR(me)) return -LXE_EINTR;
+        sched_yield();
+    }
+}
+
+/* shutdown(2), real since 2026-08-22. how: 0=SHUT_RD 1=SHUT_WR 2=SHUT_RDWR.
+ * The old `return 0` meant no half-close existed at all -- every client in
+ * the "send request, shutdown(SHUT_WR), read to EOF" shape hung forever.
+ * TCP WR: send FIN now, keep receiving (tcp_shutdown_tx). AF_UNIX WR: the
+ * peer reads EOF once its ring drains (rx_eof) but can still SEND to us --
+ * severing the peer link (what full close does) would kill both directions,
+ * which is exactly what half-close is not. */
+static long lx_shutdown(int fd, int how) {
+    struct sock *s = lx_sock_of(fd);
+    if (!s) return -LXE_ENOTSOCK;
+    if (how < 0 || how > 2) return -ABI_EINVAL;
+    bool rd = (how == 0 || how == 2);
+    bool wr = (how == 1 || how == 2);
+    if (s->kind == SOCK_KIND_TCP) {
+        if (!s->tcp || s->tcp_listening) return -LXE_ENOTCONN;
+        if (wr && !s->shut_tx) tcp_shutdown_tx(s->tcp);
+    } else if (s->kind == SOCK_KIND_UNIX) {
+        if (wr && !s->shut_tx) sock_unix_shutdown_tx(s);
+    } else if (s->kind == SOCK_KIND_UDP) {
+        if (!s->peer_port) return -LXE_ENOTCONN;
+    }
+    if (wr) s->shut_tx = 1;
+    if (rd) sock_shutdown_rd(s);
+    poll_event_notify();                       /* pollers re-derive readiness */
     return 0;
 }
 
@@ -6625,7 +11557,32 @@ static long lx_send(int fd, uint64_t ubuf, size_t len, uint64_t uaddr) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
 
+    /* After shutdown(SHUT_WR) a send is EPIPE, and POSIX raises SIGPIPE
+     * first -- same contract as writing a readerless pipe (sys_write). */
+    if (s->shut_tx) {
+        struct proc *me = current_proc();
+        if (me) signal_send_to_pid(me->pid, SIGPIPE);
+        return -ABI_EPIPE;
+    }
+
+    if (s->kind == SOCK_KIND_UDP && s->is_v6) {
+        if (s->so_error) { int e = s->so_error; s->so_error = 0; return -e; }
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k6 = len ? kmalloc(len) : 0;
+        if (len && !k6) return -ABI_ENOMEM;
+        long rv6;
+        if (len && copy_from_user(k6, (const void *)(uintptr_t)ubuf, len) != 0)
+            rv6 = -ABI_EFAULT;
+        else
+            rv6 = lx_udp6_sendk(s, k6, len, uaddr);
+        if (k6) kfree(k6);
+        return rv6;
+    }
+
     if (s->kind == SOCK_KIND_UDP) {
+        /* A pending async error (ICMP unreachable for an earlier send)
+         * is delivered on the NEXT operation and cleared, per Linux. */
+        if (s->so_error) { int e = s->so_error; s->so_error = 0; return -e; }
         uint32_t dip; uint16_t dport;
         if (!lx_udp_dest(s, uaddr, &dip, &dport)) return -ABI_EINVAL;
         /* Slice 12: no interface, no route. Checked here rather than only in
@@ -6729,6 +11686,9 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
 
+    /* shutdown(SHUT_RD): reads report EOF from now on. */
+    if (s->shut_rd) return 0;
+
     /* This call must not block if the socket is in non-blocking mode OR the
      * caller passed MSG_DONTWAIT for this one call. Both matter here: chrome's
      * AddressTrackerLinux keeps its netlink socket BLOCKING and drives the
@@ -6769,7 +11729,41 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
         if (!sock_recv_ready(s)) return -LXE_EAGAIN;
     }
 
+    if (s->kind == SOCK_KIND_UDP && s->is_v6) {
+        if (s->so_error) { int e = s->so_error; s->so_error = 0; return -e; }
+        if (len == 0) return 0;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k6 = kmalloc(len);
+        if (!k6) return -ABI_ENOMEM;
+        struct ipv6_addr s6; uint16_t sp6 = 0;
+        memset(&s6, 0, sizeof s6);
+        uint32_t to6 = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
+        long n = sock_recvfrom6_to(s, k6, len, &s6, &sp6, to6);
+        long rv6;
+        if (n == EINTR_RET) rv6 = -LXE_EINTR;
+        else if (n <= 0 && s->so_error) {
+            /* the wait ended because an ICMPv6 error landed */
+            int e = s->so_error; s->so_error = 0;
+            kfree(k6);
+            return -e;
+        }
+        else if (n < 0)     rv6 = -LXE_EAGAIN;
+        else if (n == 0 && to6) rv6 = -LXE_EAGAIN;     /* timeout, no datagram */
+        else if (copy_to_user((void *)(uintptr_t)ubuf, k6, (size_t)n) != 0)
+            rv6 = -ABI_EFAULT;
+        else rv6 = n;
+        kfree(k6);
+        if (rv6 >= 0 && uaddr) {
+            struct lx_sockaddr_in6 sa; memset(&sa, 0, sizeof sa);
+            sa.fam = AF_INET6; sa.port_be = sp6;
+            memcpy(sa.addr, s6.bytes, 16);
+            lx_addr_writeback(uaddr, ualen, &sa, (uint32_t)sizeof sa);
+        }
+        return rv6;
+    }
+
     if (s->kind == SOCK_KIND_UDP) {
+        if (s->so_error) { int e = s->so_error; s->so_error = 0; return -e; }
         if (len == 0) return 0;
         if (len > SYS_MAX_RW) len = SYS_MAX_RW;
         void *k = kmalloc(len);
@@ -6853,8 +11847,14 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
 #endif
     kfree(k);
     if (rv >= 0 && uaddr) {              /* connected: report family only */
-        struct sockaddr_in sa; memset(&sa, 0, sizeof sa); sa.sin_family = AF_INET;
-        lx_addr_writeback(uaddr, ualen, &sa, (uint32_t)sizeof sa);
+        if (s->is_v6) {
+            struct lx_sockaddr_in6 sa6; memset(&sa6, 0, sizeof sa6);
+            sa6.fam = AF_INET6;
+            lx_addr_writeback(uaddr, ualen, &sa6, (uint32_t)sizeof sa6);
+        } else {
+            struct sockaddr_in sa; memset(&sa, 0, sizeof sa); sa.sin_family = AF_INET;
+            lx_addr_writeback(uaddr, ualen, &sa, (uint32_t)sizeof sa);
+        }
     }
     return rv;
 }
@@ -6871,6 +11871,14 @@ static long lx_setsockopt(int fd, int level, int optname, uint64_t uval, uint32_
         uint32_t on = 0;
         if (uval && olen >= 4) (void)copy_from_user(&on, (const void *)(uintptr_t)uval, 4);
         s->passcred = (on != 0);
+        return 0;
+    }
+    /* SO_REUSEADDR: stored AND acted on (2026-08-22) -- listen() lets a
+     * reuse socket take a port held only by dying conns. */
+    if (optname == SO_REUSEADDR) {
+        uint32_t on = 0;
+        if (uval && olen >= 4) (void)copy_from_user(&on, (const void *)(uintptr_t)uval, 4);
+        s->reuseaddr = (on != 0);
         return 0;
     }
     if ((optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) && uval && olen >= 16) {
@@ -6931,6 +11939,61 @@ static long lx_sockaddr_out(struct sock *s, uint64_t uaddr, uint64_t ualen,
         return 0;
     }
 
+    /* AF_INET6 (UDP + TCP since 2026-08-23). */
+    if (s->is_v6) {
+        struct lx_sockaddr_in6 sa6;
+        memset(&sa6, 0, sizeof sa6);
+        sa6.fam = AF_INET6;
+        if (peer) {
+            if (s->kind == SOCK_KIND_TCP) {
+                if (!s->tcp) return -LXE_ENOTCONN;
+                if (tcp_conn_is6(s->tcp)) {
+                    memcpy(sa6.addr, tcp_remote6(s->tcp)->bytes, 16);
+                } else {           /* dual-stack: v4 conn, mapped spelling */
+                    uint32_t rip = tcp_remote_ip_be(s->tcp);
+                    sa6.addr[10] = 0xff; sa6.addr[11] = 0xff;
+                    memcpy(&sa6.addr[12], &rip, 4);
+                }
+                sa6.port_be = tcp_remote_port_be(s->tcp);
+            } else {
+                if (!s->peer_port) return -LXE_ENOTCONN;
+                memcpy(sa6.addr, s->peer6.bytes, 16);
+                sa6.port_be = s->peer_port;
+            }
+        } else {
+            /* RFC 3484 source discovery: glibc connect()s a UDP socket and
+             * reads the local name to learn which source the route picks.
+             * An explicit bind wins; otherwise answer what ipv6_send would
+             * actually stamp for the connected peer (loopback: the peer
+             * itself), so the sort sees a real address, not ::. */
+            bool tcp_conn_up = (s->kind == SOCK_KIND_TCP && s->tcp &&
+                                !s->tcp_listening);
+            bool udp_peered  = (s->kind == SOCK_KIND_UDP && s->peer_port &&
+                                ipv6_addr_is_zero(&s->local6));
+            if (tcp_conn_up && tcp_conn_is6(s->tcp)) {
+                memcpy(sa6.addr, ipv6_src_for(tcp_remote6(s->tcp))->bytes, 16);
+            } else if (tcp_conn_up ||
+                       (udp_peered && lx_v6_is_mapped(&s->peer6))) {
+                /* Riding the v4 engine (mapped peer): our v4 address in
+                 * the mapped spelling, so the probe sees a real source. */
+                sa6.addr[10] = 0xff; sa6.addr[11] = 0xff;
+                memcpy(&sa6.addr[12], &g_my_ip, 4);
+            } else if (udp_peered) {
+                memcpy(sa6.addr, ipv6_src_for(&s->peer6)->bytes, 16);
+            } else {
+                memcpy(sa6.addr, s->local6.bytes, 16);
+            }
+            /* A TCP socket's real local port lives on the connection (the
+             * ephemeral one picked at connect), same rule as v4 below. */
+            sa6.port_be = (s->kind == SOCK_KIND_TCP && s->tcp &&
+                           !s->tcp_listening)
+                            ? tcp_local_port_be(s->tcp)
+                            : s->local_port;
+        }
+        lx_addr_writeback(uaddr, ualen, &sa6, (uint32_t)sizeof sa6);
+        return 0;
+    }
+
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
@@ -6975,12 +12038,42 @@ static long lx_getsockopt(int fd, int level, int optname,
                           uint64_t uval, uint64_t ulen_ptr) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
-    if (level != SOL_SOCKET || !uval || !ulen_ptr) return 0;
+    if (level != SOL_SOCKET) {
+        /* Options at other levels (SOL_TCP/SOL_IP/...) are not tracked.
+         * This used to `return 0` WITHOUT WRITING optval -- "success" with
+         * the caller's stack garbage as the answer, a plausible
+         * __stack_chk_fail generator. Answer ZERO of the caller's size
+         * instead: every untracked option reads as disabled/default, which
+         * is both defined and true (setsockopt discarded it). */
+        if (uval && ulen_ptr) {
+            uint32_t zl = 0;
+            if (copy_from_user(&zl, (const void *)(uintptr_t)ulen_ptr, 4) != 0)
+                return -ABI_EFAULT;
+            if (zl > 64) zl = 64;
+            uint8_t zeros[64];
+            memset(zeros, 0, sizeof zeros);
+            if (zl && copy_to_user((void *)(uintptr_t)uval, zeros, zl) != 0)
+                return -ABI_EFAULT;
+            (void)copy_to_user((void *)(uintptr_t)ulen_ptr, &zl, 4);
+        }
+        return 0;
+    }
+    if (!uval || !ulen_ptr) return 0;
 
     uint32_t ulen = 0;
     if (copy_from_user(&ulen, (const void *)(uintptr_t)ulen_ptr, 4) != 0)
         return -ABI_EFAULT;
 
+    /* SO_REUSEADDR reads back what setsockopt stored (it read 0 before,
+     * which made set-then-verify code conclude the option was broken). */
+    if (optname == SO_REUSEADDR) {
+        uint32_t v = s->reuseaddr ? 1u : 0u;
+        uint32_t n4 = ulen < 4 ? ulen : 4;
+        if (n4 && copy_to_user((void *)(uintptr_t)uval, &v, n4) != 0)
+            return -ABI_EFAULT;
+        (void)copy_to_user((void *)(uintptr_t)ulen_ptr, &n4, 4);
+        return 0;
+    }
     /* SO_RCVTIMEO/SO_SNDTIMEO answer with a struct timeval {sec, usec}. */
     if (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) {
         uint32_t ms = (optname == SO_RCVTIMEO) ? s->recv_timeout_ms
@@ -7051,7 +12144,12 @@ static long lx_getsockopt(int fd, int level, int optname,
  * struct iovec { void *iov_base; size_t iov_len; }        (16 bytes)
  * We implement the data path (gather/scatter + msg_name for UDP); ancillary
  * data (msg_control / SCM_RIGHTS) is not supported and is reported cleared. */
-#define LX_MSG_IOV_MAX 16
+/* 2026-08-22: 16 -> 64, and past the cap is a LOUD -EMSGSIZE rather than
+ * a silent truncation. A writev-heavy client (X11 batching, some TLS
+ * stacks) whose extra iovecs were dropped LOST DATA with a success
+ * return, which is unfindable from userspace. 64 covers every observed
+ * real caller; anything larger gets an errno it can act on. */
+#define LX_MSG_IOV_MAX 64
 
 struct lx_msghdr {
     uint64_t msg_name;
@@ -7073,7 +12171,7 @@ static long lx_read_msghdr(uint64_t umsg, struct lx_msghdr *mh,
     if (!umsg || copy_from_user(mh, (const void *)(uintptr_t)umsg, sizeof *mh) != 0)
         return -ABI_EFAULT;
     uint64_t n = mh->msg_iovlen;
-    if (n > LX_MSG_IOV_MAX) n = LX_MSG_IOV_MAX;
+    if (n > LX_MSG_IOV_MAX) return -90;   /* -EMSGSIZE: refuse, never drop */
     if (n && (!mh->msg_iov ||
               copy_from_user(iov, (const void *)(uintptr_t)mh->msg_iov,
                              (size_t)n * sizeof *iov) != 0))
@@ -7276,6 +12374,9 @@ static long lx_sendmsg(int fd, uint64_t umsg, int flags) {
          * use either -- answer both). */
         long n = total ? sock_netlink_send(s, k, total) : 0;
         rv = (n < 0) ? -ABI_EINVAL : n;
+    } else if (s->kind == SOCK_KIND_UDP && s->is_v6) {
+        uint64_t naddr = (mh.msg_namelen >= 24) ? mh.msg_name : 0;
+        rv = lx_udp6_sendk(s, k, total, naddr);
     } else if (s->kind == SOCK_KIND_UDP) {
         uint32_t dip; uint16_t dport;
         uint64_t naddr = (mh.msg_namelen >= 8) ? mh.msg_name : 0;
@@ -7336,6 +12437,8 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
 
     long n;
     uint32_t sip = 0; uint16_t sport = 0;
+    struct ipv6_addr s6src;                     /* v6 source, if is_v6 */
+    memset(&s6src, 0, sizeof s6src);
     if (s->kind == SOCK_KIND_NETLINK) {
         /* glibc reads netlink with recvmsg, NOT recv: __check_pf/getifaddrs
          * (sysdeps/unix/sysv/linux/check_pf.c make_request) is the caller, and
@@ -7367,7 +12470,10 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
             if (!sock_recv_ready(s)) { kfree(k); return -LXE_EAGAIN; }
         }
         uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
-        n = sock_recvfrom_to(s, k, total, &sip, &sport, to);
+        if (s->is_v6)
+            n = sock_recvfrom6_to(s, k, total, &s6src, &sport, to);
+        else
+            n = sock_recvfrom_to(s, k, total, &sip, &sport, to);
         if (n == EINTR_RET)        { kfree(k); return -LXE_EINTR; }
         if (n < 0)                 { kfree(k); return -LXE_EAGAIN; }
         if (n == 0 && to)          { kfree(k); return -LXE_EAGAIN; }
@@ -7472,6 +12578,13 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
         namelen_out = sizeof nla;
         if (mh.msg_name && mh.msg_namelen >= sizeof nla)
             (void)copy_to_user((void *)(uintptr_t)mh.msg_name, &nla, sizeof nla);
+    } else if (s->kind == SOCK_KIND_UDP && s->is_v6 && mh.msg_name &&
+               mh.msg_namelen >= sizeof(struct lx_sockaddr_in6)) {
+        struct lx_sockaddr_in6 sa6; memset(&sa6, 0, sizeof sa6);
+        sa6.fam = AF_INET6; sa6.port_be = sport;
+        memcpy(sa6.addr, s6src.bytes, 16);
+        (void)copy_to_user((void *)(uintptr_t)mh.msg_name, &sa6, sizeof sa6);
+        namelen_out = sizeof sa6;
     } else if (mh.msg_name && mh.msg_namelen >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET; sa.sin_addr = sip; sa.sin_port = sport;
@@ -7488,23 +12601,111 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
     return n;
 }
 
-/* access(2)/faccessat(2) family: resolve the path and report existence. We do
- * not enforce per-file R/W/X bits (tobyOS files in /bin are all executable and
- * the VFS doesn't model Unix mode bits here), so any existing path is
- * accessible -- exactly what PATH search / `test -e` / shell rc-probing need.
+/* access(2)/faccessat(2) family: resolve the path and ANSWER THE QUESTION
+ * THAT WAS ASKED.
+ *
+ * The mode argument used to be ignored entirely, under a comment saying the
+ * VFS did not model Unix mode bits. That was true when it was written and
+ * is not any more -- the bits are in struct vfs_stat, and `ls -l` prints
+ * them. So `access(f, X_OK)` said YES for a plain 0644 file, and bash's
+ * `test -x` (which is access(2) underneath) called every regular file
+ * executable. Found because tsh's own `test -x` was taught to read the
+ * mode bits and immediately disagreed with the bash running beside it.
+ *
+ * Same rule the shell's test_access_ok uses: a filesystem carrying no
+ * permission information at all is reported accessible, root reads and
+ * writes anything, and root still needs SOME execute bit to execute.
+ *
  * AT_FDCWD and absolute paths are honoured (resolve_user_path also handles
- * cwd-relative); a non-AT_FDCWD dirfd-relative path is resolved against the cwd
- * (best-effort -- bash/coreutils use AT_FDCWD). */
+ * cwd-relative); a non-AT_FDCWD dirfd-relative path is resolved against the
+ * cwd (best-effort -- bash/coreutils use AT_FDCWD). */
 /* Defined next to sys_stat: the single table of synthesised /dev nodes. */
-static uint32_t dev_synth_mode(const char *kpath);
 
-static long lx_faccess(const char *upath) {
-    char kpath[ABI_PATH_MAX];
-    if (resolve_user_path(upath, kpath, sizeof kpath) != 0)
-        return -ABI_EFAULT;
-    if (dev_synth_mode(kpath)) return 0;   /* synthesised /dev node */
+#define LX_R_OK 4
+#define LX_W_OK 2
+#define LX_X_OK 1
+
+/* The access(2) rule, on an ALREADY-RESOLVED kernel path.
+ *
+ * Split out of lx_faccess so that sys_execve() can ask the same question and
+ * get the same answer. It could not before, and the gap was visible: execve
+ * checked NO execute bit at all, so `touch f; ./f` as root ran a mode-0644
+ * file. bash's execve succeeded, bash fell back to treating the empty file
+ * as a shell script, and the whole thing exited 0 -- where real bash on
+ * Linux prints "Permission denied" and exits 126. tsh was right and its own
+ * userspace check was the only thing enforcing it (Oils POSIX case 1409).
+ *
+ * Two implementations of one question is how you find out which is lying,
+ * so there is one. */
+long lx_access_kpath(const char *kpath, int mode);
+long lx_access_kpath(const char *kpath, int mode) {
+    /* A synthesised /dev node: readable and writable by anyone who can open
+     * it (a pty slave belongs to its session, whatever the table says), but
+     * EXECUTE follows the mode like anything else -- `/dev/null` as a
+     * command is "Permission denied", 126, on Linux. */
+    {
+        uint32_t dm = dev_synth_mode(kpath);
+        if (dm && (dm & 0xF000u) == 0x6000u) {
+            /* a disk's node is root's and the disk group's, 0660, and
+             * access asks of it what it asks of a file (finding 198) */
+            struct vfs_stat bst = { .type = VFS_TYPE_FILE, .uid = 0, .gid = 6,
+                                    .mode = VFS_MODE_VALID | (dm & 07777u) };
+            int want = 0;
+            if ((unsigned)mode & 4) want |= VFS_WANT_READ;
+            if ((unsigned)mode & 2) want |= VFS_WANT_WRITE;
+            if ((unsigned)mode & 1) want |= VFS_WANT_EXEC;
+            if (!want) return 0;
+            return vfs_perm_check_st(&bst, want) == VFS_OK ? 0 : -ABI_EACCES;
+        }
+        if (dm) {
+            if (!((unsigned)mode & LX_X_OK)) return 0;
+            return (dm & 0111u) ? 0 : -ABI_EACCES;
+        }
+    }
+    /* THROUGH A LINK, as access(2) looks: what it names is what is asked
+     * about -- `test -w lnk` judged the link's own 0777, and a dangling
+     * link "existed" (batch 31) */
     struct vfs_stat vs;
-    return (vfs_stat(kpath, &vs) == VFS_OK) ? 0 : -ABI_ENOENT;
+    {
+        int sr = vfs_stat_follow(kpath, &vs);
+        if (sr != VFS_OK) return sr == VFS_ERR_NOENT ? -ABI_ENOENT : vfs_err_to_abi(sr);
+    }
+
+    unsigned want = (unsigned)mode & 7u;
+    if (want == 0) return 0;               /* F_OK: existence only */
+
+    unsigned perm = vs.mode & 0777u;
+    if (!(vs.mode & VFS_MODE_VALID) && perm == 0) return 0;
+
+    struct proc *me = current_proc();
+    uint32_t uid = me ? me->uid : 0;
+    uint32_t gid = me ? me->gid : 0;
+
+    if (uid == 0) {
+        if (!(want & LX_X_OK)) return 0;
+        return (perm & 0111u) ? 0 : -ABI_EACCES;
+    }
+    /* the group bits for a member of the file's group by a supplementary
+     * group too, as the VFS's own check counts them (finding 174) */
+    bool in_group = vs.gid == gid;
+    for (int i = 0; me && !in_group && i < me->ngroups && i < PROC_NGROUPS_MAX; i++)
+        if ((uint32_t)me->groups[i] == vs.gid) in_group = true;
+    unsigned bits;
+    if      (vs.uid == uid) bits = (perm >> 6) & 7u;
+    else if (in_group)      bits = (perm >> 3) & 7u;
+    else                    bits = perm & 7u;
+    return ((bits & want) == want) ? 0 : -ABI_EACCES;
+}
+
+static int trailing_slash_dir(const char *uraw, char *kpath, size_t cap);
+static long lx_faccess(const char *upath, int mode) {
+    char kpath[ABI_PATH_MAX];
+    {   int rr_ = resolve_user_path(upath, kpath, sizeof kpath);
+        if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        rr_ = trailing_slash_dir(upath, kpath, sizeof kpath);
+        if (rr_ != 0) return rr_;
+    }
+    return lx_access_kpath(kpath, mode);
 }
 
 /* ------------------------------------------------------------------ *
@@ -8355,8 +13556,12 @@ static long lx_process_vm_rw(int pid, uint64_t liov_u, unsigned long liovcnt,
     if (!tgt || tgt->state == PROC_UNUSED || tgt->state == PROC_EMBRYO)
         return -ABI_ESRCH;
 
-    if (me->uid != 0 && me->uid != tgt->uid &&
-        !userns_capable(LCAP_SYS_ADMIN))
+    /* ptrace_may_access's rule: the same user, host root, or CAP_SYS_PTRACE
+     * over the target's user namespace. Finding 257: any CAP_SYS_ADMIN was
+     * enough -- and every process holds it in its own `unshare -U`, which
+     * let anyone read and rewrite root's processes. */
+    if (!(userns_is_initial(me) && me->uid == 0) && me->uid != tgt->uid &&
+        !userns_capable_over(LCAP_SYS_PTRACE, tgt->user_ns))
         return -ABI_EPERM;
 
     /* A thread shares its leader's address space; the mm owner is where the
@@ -8388,9 +13593,17 @@ static long lx_process_vm_rw(int pid, uint64_t liov_u, unsigned long liovcnt,
         uint64_t n = lrem < rrem ? lrem : rrem;
         if (n > page_left) n = page_left;
 
-        uint64_t saved = vmm_set_editor_root(tcr3);
-        uint64_t rphys = vmm_translate(rva & ~(uint64_t)(PAGE_SIZE - 1));
-        vmm_set_editor_root(saved);
+        uint64_t rphys;
+        if (write) {
+            /* a page of the target's own, and one it could write itself
+             * (finding 256: through to a frame its parent still held, and
+             * into read-only pages) */
+            rphys = vmm_frame_for_write(tgt, rva, false);
+        } else {
+            uint64_t saved = vmm_set_editor_root(tcr3);
+            rphys = vmm_translate(rva & ~(uint64_t)(PAGE_SIZE - 1));
+            vmm_set_editor_root(saved);
+        }
         if (!rphys) break;            /* unmapped: a partial transfer is legal */
         uint8_t *rk = (uint8_t *)pmm_phys_to_virt(rphys) +
                       (rva & (PAGE_SIZE - 1));
@@ -8446,6 +13659,204 @@ static long lx_membarrier(int cmd, unsigned int flags)
     default:
         return -ABI_EINVAL;
     }
+}
+
+/* ---- extended attributes: Linux's rules (finding 225) --------------------
+ *
+ * What a caller may do with a name is decided here, before the filesystem
+ * (vfs_xattr) is asked, in the order Linux's VFS and security hooks ask it,
+ * for a kernel with SELinux built in and no policy loaded -- the oracle's
+ * (WSL 6.6), measured by logs/b33/xattrprobe: trusted.* needs CAP_SYS_ADMIN
+ * (a get without it is ENODATA, a list leaves it out); user.* is a regular
+ * file's or a directory's (EPERM on a link, ENODATA to read one), and a
+ * sticky directory's only for its owner; both then need the file's own
+ * permission. security.selinux is its owner's to set (or CAP_FOWNER's),
+ * any other security.* name CAP_SYS_ADMIN's, and anyone may read them;
+ * security.capability and the ACL names must hold a value of their kind
+ * (EINVAL), and ACLs are not kept (ENOTSUP for a good one); an unknown
+ * namespace is ENOTSUP, after the file's permission. The first store took
+ * user.* alone: chcon's security.selinux was ENOTSUP for everyone. */
+static bool xa_prefix(const char *name, const char *pfx) {
+    return strncmp(name, pfx, strlen(pfx)) == 0;
+}
+
+/* a struct vfs_cap_data, revision 2 (20 bytes) or 3 (24) */
+static bool xa_valid_caps(const uint8_t *v, size_t sz) {
+    if (sz < 4) return false;
+    uint32_t magic = (uint32_t)v[0] | (uint32_t)v[1] << 8 |
+                     (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24;
+    uint32_t rev = magic & 0xFF000000u;
+    return (rev == 0x02000000u && sz == 20) || (rev == 0x03000000u && sz == 24);
+}
+
+/* a posix_acl_xattr: version 2, then 8-byte entries */
+static bool xa_valid_acl(const uint8_t *v, size_t sz) {
+    if (sz < 4 || (sz - 4) % 8) return false;
+    return v[0] == 2 && v[1] == 0 && v[2] == 0 && v[3] == 0;
+}
+
+/* CAP over the file ST: the caller's namespace must name its owner and
+ * group (finding 257: the bare capability, which `unshare -U` hands to
+ * anyone, set security.capability on root's files) */
+static bool fowner_cap(int cap, const struct vfs_stat *st) {
+    return userns_capable_wrt_ids(cap, st->uid, st->gid);
+}
+
+/* OP (XA_GET, XA_SET, XA_REMOVE) of NAME on the node ST at KPATH, VAL/SZ
+ * the value to set: 0, or the errno */
+static long xattr_policy(const char *kpath, const struct vfs_stat *st, int op,
+                         const char *name, const uint8_t *val, size_t sz) {
+    struct proc *p = current_proc();
+    bool write = op != XA_GET;
+    bool admin = userns_is_initial(p) && userns_capable(LCAP_SYS_ADMIN);
+    bool owner = p && (uint32_t)p->uid == st->uid;
+    uint32_t fmt = st->mode & 0170000u;
+    bool reg = st->type == VFS_TYPE_FILE && (fmt == 0 || fmt == 0100000u);
+    bool dir = st->type == VFS_TYPE_DIR;
+    if (xa_prefix(name, "security.")) {
+        if (!write) return 0;
+        if (strcmp(name, "security.capability") == 0) {
+            if (op == XA_SET && !xa_valid_caps(val, sz)) return -ABI_EINVAL;
+            return fowner_cap(LCAP_SETFCAP, st) ? 0 : -ABI_EPERM;
+        }
+        if (strcmp(name, "security.selinux") == 0)
+            return (owner || fowner_cap(LCAP_FOWNER, st)) ? 0 : -ABI_EPERM;
+        return admin ? 0 : -ABI_EPERM;
+    }
+    if (xa_prefix(name, "system.")) {
+        bool acl = strcmp(name, "system.posix_acl_access") == 0 ||
+                   strcmp(name, "system.posix_acl_default") == 0;
+        if (!acl) return -ABI_ENOTSUP;
+        if (!write) return -ABI_ENODATA;           /* no ACL is kept */
+        if (op == XA_SET && !xa_valid_acl(val, sz)) return -ABI_EINVAL;
+        if (!(owner || fowner_cap(LCAP_FOWNER, st))) return -ABI_EPERM;
+        return -ABI_ENOTSUP;
+    }
+    if (xa_prefix(name, "trusted.")) {
+        if (!admin) return write ? -ABI_EPERM : -ABI_ENODATA;
+    } else if (xa_prefix(name, "user.")) {
+        if (!reg && !dir) return write ? -ABI_EPERM : -ABI_ENODATA;
+        if (dir && (st->mode & 01000u) && write && !owner &&
+            !fowner_cap(LCAP_FOWNER, st)) return -ABI_EPERM;
+    }
+    int pc = vfs_perm_check_st(st, write ? VFS_WANT_WRITE : VFS_WANT_READ);
+    if (pc != VFS_OK) return vfs_err_to_abi(pc);
+    (void)kpath;
+    if (!xa_prefix(name, "trusted.") && !xa_prefix(name, "user."))
+        return -ABI_ENOTSUP;                       /* no such namespace */
+    return 0;
+}
+
+/* The twelve calls: N the Linux number, the arguments as Linux takes them */
+static long lx_xattr(long n, long a1, long a2, long a3, long a4, long a5) {
+    enum { LXA_SET = 188, LXA_GET = 191, LXA_LIST = 194, LXA_REMOVE = 197 };
+    int form = (int)((n - LXA_SET) % 3);           /* 0 plain, 1 l*, 2 f* */
+    long base = n - form;
+    int op = base == LXA_SET ? XA_SET : base == LXA_GET ? XA_GET
+           : base == LXA_LIST ? XA_LIST : XA_REMOVE;
+    char xname[XATTR_NAME_MAX + 2];       /* room to see a 256th byte */
+    uint8_t *val = 0;
+    size_t sz = op == XA_LIST ? (size_t)a3 : (size_t)a4;
+    /* setxattr and removexattr read the name (and the value, the flags)
+     * before the path; getxattr after it -- Linux's order */
+    bool early = op == XA_SET || op == XA_REMOVE;
+    if (op == XA_SET && ((int)a5 & ~(XA_CREATE | XA_REPLACE))) return -ABI_EINVAL;
+    long name_err = 0;                             /* get's: after the path */
+    xname[0] = 0;
+    if (op != XA_LIST) {
+        long xnl = strncpy_from_user(xname, (const char *)a2, sizeof xname);
+        if (xnl < 0) return -ABI_EFAULT;
+        if (xnl == 0 || (size_t)xnl > XATTR_NAME_MAX) name_err = -ABI_ERANGE;
+        if (early && name_err) return name_err;
+    }
+    if (op == XA_SET) {
+        if (sz > XATTR_SIZE_MAX) return -ABI_E2BIG;
+        if (sz) {
+            val = kmalloc(sz);
+            if (!val) return -ABI_ENOMEM;
+            if (copy_from_user(val, (const void *)(uintptr_t)a3, sz)) {
+                kfree(val);
+                return -ABI_EFAULT;
+            }
+        }
+    }
+    long r;
+    char kpath[ABI_PATH_MAX];
+    if (form == 2) {
+        struct file *xf = fd_lookup((int)a1);
+        const char *fp = xf ? xf->open_path : 0;
+        if (xf && !fp && xf->kind == FILE_KIND_DIR) fp = xf->dirpath;
+        if (!xf) r = -ABI_EBADF;
+        else if (!fp) r = -ABI_ENOTSUP;            /* pathless kind (pipe, socket) */
+        else if (strlen(fp) >= sizeof kpath) r = -ABI_ENAMETOOLONG;
+        else { memcpy(kpath, fp, strlen(fp) + 1); r = 0; }
+    } else {
+        r = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+        if (r == 0 && form == 0) {                 /* follow a final link */
+            struct vfs_stat ls;
+            for (int hops = 0; r == 0 && vfs_stat(kpath, &ls) == VFS_OK &&
+                               ls.type == VFS_TYPE_SYMLINK; hops++) {
+                char nx[ABI_PATH_MAX];
+                int fr;
+                if (hops >= 40) r = -ABI_ELOOP;
+                /* a dangling link names nothing: ENOENT, as chdir says */
+                else if ((fr = vfs_follow_link(kpath, nx, sizeof nx)) != VFS_OK)
+                    r = fr == VFS_ERR_LOOP ? -ABI_ELOOP : -ABI_ENOENT;
+                else memcpy(kpath, nx, strlen(nx) + 1);
+            }
+        }
+    }
+    struct vfs_stat st;
+    if (r == 0) {
+        int sr = vfs_stat(kpath, &st);
+        if (sr != VFS_OK) r = sr == VFS_ERR_NOENT ? -ABI_ENOENT : vfs_err_to_abi(sr);
+    }
+    if (r == 0 && name_err) r = name_err;
+    if (r == 0 && op != XA_LIST) r = xattr_policy(kpath, &st, op, xname, val, sz);
+    if (r != 0) { if (val) kfree(val); return r; }
+
+    if (op == XA_SET) {
+        r = vfs_xattr(kpath, XA_SET, xname, val, sz, (int)a5);
+        if (val) kfree(val);
+        return r;
+    }
+    if (op == XA_REMOVE) return vfs_xattr(kpath, XA_REMOVE, xname, 0, 0, 0);
+    if (op == XA_GET) {
+        if (sz == 0) return vfs_xattr(kpath, XA_GET, xname, 0, 0, 0);
+        if (sz > XATTR_SIZE_MAX) sz = XATTR_SIZE_MAX;
+        uint8_t *gb = kmalloc(sz);
+        if (!gb) return -ABI_ENOMEM;
+        long gr = vfs_xattr(kpath, XA_GET, xname, gb, sz, 0);
+        if (gr > 0 && copy_to_user((void *)(uintptr_t)a3, gb, (size_t)gr)) gr = -ABI_EFAULT;
+        kfree(gb);
+        return gr;
+    }
+    /* the list: every name the caller may see -- trusted.* for
+     * CAP_SYS_ADMIN alone -- its size when SZ is 0 */
+    long need = vfs_xattr(kpath, XA_LIST, 0, 0, 0, 0);
+    if (need < 0) return need == -ABI_ENOTSUP ? 0 : need;
+    if (need == 0) return 0;
+    char *lb = kmalloc((size_t)need);
+    if (!lb) return -ABI_ENOMEM;
+    long got = vfs_xattr(kpath, XA_LIST, 0, lb, (size_t)need, 0);
+    if (got < 0) { kfree(lb); return got; }
+    struct proc *p = current_proc();
+    bool admin = userns_is_initial(p) && userns_capable(LCAP_SYS_ADMIN);
+    size_t keep = 0;
+    for (long o = 0; o < got; ) {
+        size_t l = strlen(lb + o) + 1;
+        if (admin || !xa_prefix(lb + o, "trusted.")) {
+            memmove(lb + keep, lb + o, l);
+            keep += l;
+        }
+        o += (long)l;
+    }
+    if (keep > XATTR_LIST_MAX) r = -ABI_E2BIG;
+    else if (sz == 0) r = (long)keep;
+    else if (sz < keep) r = -ABI_ERANGE;
+    else r = copy_to_user((void *)(uintptr_t)a2, lb, keep) ? -ABI_EFAULT : (long)keep;
+    kfree(lb);
+    return r;
 }
 
 static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long a5) {
@@ -8596,11 +14007,14 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char kpath[ABI_PATH_MAX];
         bool got_kp = (resolve_user_path((const char *)a1, kpath, sizeof kpath) == 0);
         if (got_kp) {
-            struct vfs_stat vs;
-            if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR)
-                return linux_open_dir(kpath);
+            if (open_dir_path(kpath, (a2 & LX_O_NOFOLLOW) != 0)) {
+                if (lx_dir_open_refused((long)a2)) return -ABI_EISDIR;
+                long dfd = linux_open_dir(kpath);
+                fd_note_open(dfd, a2);       /* status, O_CLOEXEC (235) */
+                return dfd;
+            }
         }
-        long ofd = do_syscall(SYS_OPEN, a1, a2, a3, 0, 0);
+        long ofd = do_syscall(SYS_OPEN, a1, a2, a3, 0, 0);   /* notes it */
 #ifdef CHROMIUM_BOOT
         /* [lopen] path->fd, so [libmap]'s per-mapping fd can be resolved to a
          * FILE PATH offline (match a [libmap] fd=N line to the most recent
@@ -8622,17 +14036,20 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * openat(proc_fd, "self/fd/", O_DIRECTORY|...) -- proc_util.cc:79 --
          * and PCHECKs the result, which was fatal while we resolved against
          * the cwd.
-         * LIMITATION: only the DIRECTORY arm below opens by resolved kernel
-         * path. A dirfd-relative open of a non-directory still falls through
-         * to SYS_OPEN with the raw user pointer, i.e. cwd-relative. Nothing
-         * exercised needs it; wire a by-kpath file open when something does. */
+         * Phase G: FILES open by the resolved kernel path too
+         * (sys_open_resolved). The old fall-through used the raw user
+         * pointer -- cwd-relative -- which surfaced the moment the root
+         * became writable: openat(dfd_of_/data, "x", O_CREAT) created /x. */
         char kpath[ABI_PATH_MAX];
         bool got_kp = (resolve_user_path_at((int)a1, (const char *)a2,
                                             kpath, sizeof kpath) == 0);
         if (got_kp) {
-            struct vfs_stat vs;
-            if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR)
-                return linux_open_dir(kpath);
+            if (open_dir_path(kpath, (a3 & LX_O_NOFOLLOW) != 0)) {
+                if (lx_dir_open_refused((long)a3)) return -ABI_EISDIR;
+                long dfd = linux_open_dir(kpath);
+                fd_note_open(dfd, a3);       /* status, O_CLOEXEC (235) */
+                return dfd;
+            }
 #ifdef CHROMIUM_BOOT
             /* SQLite WAL -shm: memfd pre-size still busy-loops (mmap/lock).
              * ENOENT forces rollback-journal fallback (ServerCertificate path). */
@@ -8650,7 +14067,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             }
 #endif
         }
-        long ofd = do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
+        if (got_kp) {                       /* "f/" (finding 218) */
+            int sr = open_trailing_slash((const char *)a2, kpath, sizeof kpath, (int)a3);
+            if (sr) return sr;
+        }
+        long ofd = got_kp ? sys_open_resolved(kpath, (int)a3, (int)a4)
+                          : do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
+        fd_note_open(ofd, a3);               /* status, O_CLOEXEC (235) */
 #ifdef CHROMIUM_BOOT
         if (ofd >= 0 && got_kp) {
             static int lo = 0;
@@ -8669,10 +14092,26 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * way; ENOSYS here was the only thing between a successfully captured
          * SwiftShader frame and /data/shot.png (slice 38 iter 3). */
         return do_syscall(SYS_OPEN, a1, 0x241, a2, 0, 0);
-    case LX_fchown:                    /* (fd, owner, group) */
-        /* Single-user OS: ownership is a no-op; report success so file
-         * writers that chown their output don't error out. */
-        return 0;
+    case LX_fchown: {                  /* (fd, owner, group) */
+        /* The file the descriptor was opened on, found by its stamped
+         * path as fchmod finds it (the NAME, not the inode). It was a
+         * no-op that said 0, from when ownership meant nothing here; a
+         * descriptor with no path (a pipe, a socket) still says 0. */
+        struct file *ff = fd_lookup((int)a1);
+        if (!ff) return -ABI_EBADF;
+        const char *kp = (ff->kind == FILE_KIND_DIR && ff->dirpath)
+                       ? ff->dirpath : ff->open_path;
+        if (!kp || !kp[0]) return 0;
+        uint32_t uid = (uint32_t)a2, gid = (uint32_t)a3;
+        if (uid != 0xFFFFFFFFu) { bool mok = false; uid = userns_v2k_uid(uid, &mok);
+               if (!mok) return -ABI_EINVAL; }
+        if (gid != 0xFFFFFFFFu) { bool mok = false; gid = userns_v2k_gid(gid, &mok);
+               if (!mok) return -ABI_EINVAL; }
+        int rc = vfs_lchown(kp, uid, gid);
+        if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
+        if (rc == VFS_ERR_PERM || rc == VFS_ERR_NOTPERM) return -ABI_EPERM;
+        return vfs_err_to_abi(rc);
+    }
     case LX_sched_getparam: {          /* (pid, struct sched_param *) */
         int zero = 0;
         if (a2 && copy_to_user((void *)a2, &zero, sizeof zero) != 0)
@@ -8683,32 +14122,72 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return 0;
     case LX_dup:    return do_syscall(SYS_DUP, a1, 0, 0, 0, 0);
     /* B12: shell pipelines wire stage fds with dup2/dup3 and create the pipe
-     * with pipe or pipe2. dup3's flags (O_CLOEXEC) and pipe2's flags
-     * (O_CLOEXEC/O_NONBLOCK) are accepted but not tracked -- short-lived
-     * pipeline stages exec immediately, so CLOEXEC is moot and the blocking
-     * pipe semantics already give correct EOF/EPIPE. dup3 requires
-     * oldfd != newfd (EINVAL otherwise), unlike dup2. */
+     * with pipe or pipe2. dup3 requires oldfd != newfd (EINVAL otherwise),
+     * unlike dup2. CLOEXEC is tracked for real now (2026-08-22): the old
+     * "short-lived pipeline stages exec immediately, so CLOEXEC is moot"
+     * reasoning was exactly backwards -- exec is the moment the flag acts,
+     * and dropping it leaked every marked descriptor into the new image. */
     case LX_dup2:   return do_syscall(SYS_DUP2, a1, a2, 0, 0, 0);
-    case LX_dup3:
+    case LX_dup3: {
         if (a1 == a2) return -ABI_EINVAL;
-        return do_syscall(SYS_DUP2, a1, a2, 0, 0, 0);
+        if (a3 & ~(uint64_t)LX_O_CLOEXEC) return -ABI_EINVAL;
+        long r = do_syscall(SYS_DUP2, a1, a2, 0, 0, 0);
+        if (r >= 0 && (a3 & LX_O_CLOEXEC))
+            fd_cloexec_set(current_proc(), (int)r, 1);
+        return r;
+    }
     case LX_pipe:   return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
-    case LX_pipe2:  return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
+    case LX_pipe2: {
+        long r = do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
+        if (r == 0 && (a2 & (LX_O_CLOEXEC | ABI_O_NONBLOCK))) {
+            /* sys_pipe just wrote the two fds into the user's int[2];
+             * read them back to mark them -- close-on-exec, and
+             * O_NONBLOCK, which pipe2 dropped */
+            int ufds[2];
+            if (copy_from_user(ufds, (const void *)a1, sizeof ufds) == 0) {
+                for (int k = 0; k < 2; k++) {
+                    if (a2 & LX_O_CLOEXEC) fd_cloexec_set(current_proc(), ufds[k], 1);
+                    struct file *pf = fd_lookup(ufds[k]);
+                    if (pf && (a2 & ABI_O_NONBLOCK)) pf->pipe_nonblock = true;
+                }
+            }
+        }
+        return r;
+    }
 
     /* ---- Track C: eventfd/eventfd2 (libcurl multi-handle wakeup fd) ---- */
     case LX_eventfd:   return lx_eventfd((unsigned int)a1, 0);
-    case LX_eventfd2:  return lx_eventfd((unsigned int)a1, (unsigned int)a2);
-    case 319:          /* memfd_create(name, flags) */
-        return lx_memfd_create((const char *)a1, (unsigned int)a2);
+    case LX_eventfd2: {
+        long efd = lx_eventfd((unsigned int)a1, (unsigned int)a2);
+        if (efd >= 0 && (a2 & LX_O_CLOEXEC))     /* EFD_CLOEXEC */
+            fd_cloexec_set(current_proc(), (int)efd, 1);
+        return efd;
+    }
+    case 319: {        /* memfd_create(name, flags) -- MFD_CLOEXEC is bit 0 */
+        long mfd = lx_memfd_create((const char *)a1, (unsigned int)a2);
+        if (mfd >= 0 && (a2 & 1u))
+            fd_cloexec_set(current_proc(), (int)mfd, 1);
+        return mfd;
+    }
 
     /* ---- B14: BSD sockets (FILE_KIND_SOCKET fds; poll/epoll-ready) ---- */
-    case LX_socket:      return lx_socket((int)a1, (int)a2, (int)a3);
+    case LX_socket: {
+        long sfd = lx_socket((int)a1, (int)a2, (int)a3);
+        if (sfd >= 0 && (a2 & LX_O_CLOEXEC))     /* SOCK_CLOEXEC */
+            fd_cloexec_set(current_proc(), (int)sfd, 1);
+        return sfd;
+    }
     case LX_bind:        return lx_bind((int)a1, (uint64_t)a2, (uint32_t)a3);
     case LX_listen:      return lx_listen((int)a1, (int)a2);
     case LX_accept:      return lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3, 0);
     /* accept4's 4th arg carries SOCK_NONBLOCK/SOCK_CLOEXEC for the NEW fd
      * (they are not inherited from the listener). */
-    case LX_accept4:     return lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3, (int)a4);
+    case LX_accept4: {
+        long afd = lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3, (int)a4);
+        if (afd >= 0 && (a4 & LX_O_CLOEXEC))     /* SOCK_CLOEXEC */
+            fd_cloexec_set(current_proc(), (int)afd, 1);
+        return afd;
+    }
     case LX_connect:     return lx_connect((int)a1, (uint64_t)a2, (uint32_t)a3);
     case LX_sendto:      return lx_send((int)a1, (uint64_t)a2, (size_t)a3, (uint64_t)a5);
     /* recvfrom(fd, buf, len, flags, src_addr, addrlen). a4 is FLAGS and was
@@ -8717,12 +14196,48 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_recvfrom:    return lx_recv((int)a1, (uint64_t)a2, (size_t)a3, (uint64_t)a5, 0, (int)a4);
     case LX_sendmsg:     return lx_sendmsg((int)a1, (uint64_t)a2, (int)a3);
     case LX_recvmsg:     return lx_recvmsg((int)a1, (uint64_t)a2, (int)a3);
+    /* sendmmsg/recvmmsg (2026-08-22): batched forms glibc's parallel
+     * resolver and several runtimes probe. struct mmsghdr is the 56-byte
+     * msghdr plus u32 msg_len, padded to 64. Loops over the proven
+     * single-message arms; partial success reports the count, as Linux. */
+    case 307: {                        /* sendmmsg(fd, *mmsg, vlen, flags) */
+        unsigned vlen = (unsigned)a3;
+        if (!a2 || vlen == 0) return 0;
+        if (vlen > 64) vlen = 64;
+        unsigned done = 0;
+        for (; done < vlen; done++) {
+            uint64_t mp = a2 + (uint64_t)done * 64;
+            long r = lx_sendmsg((int)a1, mp, (int)a4);
+            if (r < 0) return done ? (long)done : r;
+            uint32_t ml = (uint32_t)r;
+            (void)copy_to_user((void *)(uintptr_t)(mp + 56), &ml, 4);
+        }
+        return (long)done;
+    }
+    case 299: {                        /* recvmmsg(fd, *mmsg, vlen, flags, *ts) */
+        unsigned vlen = (unsigned)a3;
+        if (!a2 || vlen == 0) return 0;
+        if (vlen > 64) vlen = 64;
+        unsigned done = 0;
+        for (; done < vlen; done++) {
+            uint64_t mp = a2 + (uint64_t)done * 64;
+            /* Only the FIRST message may block; the rest are whatever is
+             * already queued (Linux semantics -- a batch never waits to
+             * fill itself). */
+            int fl = (int)a4 | (done ? LX_MSG_DONTWAIT : 0);
+            long r = lx_recvmsg((int)a1, mp, fl);
+            if (r < 0) { if (done) break; return r; }
+            uint32_t ml = (uint32_t)r;
+            (void)copy_to_user((void *)(uintptr_t)(mp + 56), &ml, 4);
+        }
+        return (long)done;
+    }
     case LX_setsockopt:  return lx_setsockopt((int)a1, (int)a2, (int)a3, (uint64_t)a4, (uint32_t)a5);
     case LX_getsockopt:  return lx_getsockopt((int)a1, (int)a2, (int)a3, (uint64_t)a4, (uint64_t)a5);
     case LX_getsockname: return lx_getsockname((int)a1, (uint64_t)a2, (uint64_t)a3);
     case LX_getpeername: return lx_getpeername((int)a1, (uint64_t)a2, (uint64_t)a3);
     case LX_socketpair:  return lx_socketpair((int)a1, (int)a2, (int)a3, (uint64_t)a4);
-    case LX_shutdown:    return 0;       /* half-close not modelled; close() tears down */
+    case LX_shutdown:    return lx_shutdown((int)a1, (int)a2);  /* real half-close (2026-08-22) */
 
     /* gettimeofday(2): fill timeval from the monotonic clock (no RTC epoch; the
      * value increases, which is what chrome's timestamp deltas need). tz ign. */
@@ -8735,7 +14250,20 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                            (long)((ns / 1000ull) % 1000000ull) };
             if (copy_to_user((void *)a1, tv, sizeof tv) != 0) return -ABI_EFAULT;
         }
+        if (a2) {                     /* tz: settimeofday's (Linux's sys_tz) */
+            int tz[2] = { g_sys_tz.minuteswest, g_sys_tz.dsttime };
+            if (copy_to_user((void *)a2, tz, sizeof tz) != 0) return -ABI_EFAULT;
+        }
         return 0;
+    case LX_settimeofday:          /* (tv, tz) -- finding 157 */
+        return lx_settimeofday((const void *)a1, (const void *)a2);
+    case LX_clock_settime:         /* (clockid, tp) -- finding 157 */
+        return lx_clock_settime((int)a1, (const void *)a2);
+    case LX_adjtimex:              /* (struct timex *) -- finding 280 */
+        return lx_adjtimex((void *)a1);
+    case LX_clock_adjtime:         /* (clockid, struct timex *) */
+        if ((int)a1 != 0) return -ABI_EINVAL;   /* CLOCK_REALTIME only */
+        return lx_adjtimex((void *)a2);
 
     /* ---- B13: poll / select / epoll (readiness multiplexing) ---- */
     case LX_poll:                  /* poll(fds, nfds, timeout_ms) */
@@ -8771,8 +14299,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return lx_do_select((int)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4, ms);
     }
     case LX_epoll_create:          /* epoll_create(size) -- size ignored */
-    case LX_epoll_create1:         /* epoll_create1(flags) -- flags ignored */
         return lx_epoll_create();
+    case LX_epoll_create1: {       /* epoll_create1(flags) -- EPOLL_CLOEXEC */
+        long epfd = lx_epoll_create();
+        if (epfd >= 0 && (a1 & LX_O_CLOEXEC))
+            fd_cloexec_set(current_proc(), (int)epfd, 1);
+        return epfd;
+    }
     case LX_epoll_ctl:             /* epoll_ctl(epfd, op, fd, *event) */
         return lx_epoll_ctl((int)a1, (int)a2, (int)a3, (uint64_t)a4);
     case LX_epoll_wait:            /* epoll_wait(epfd, *events, maxevents, timeout) */
@@ -8789,6 +14322,40 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_getcwd: return do_syscall(SYS_GETCWD, a1, a2, 0, 0, 0);
     case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
     case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
+
+    case 81: {                         /* fchdir(fd) */
+        /* Absent from the kernel AND from libtoby before 2026-08-26, so it
+         * fell through to the ENOSYS logger. Not exotic: the
+         * openat(dirfd)+fchdir idiom is what find, tar, rsync, git and
+         * glibc's nftw(3) use to walk a tree without rebuilding path strings,
+         * so anything doing a real directory traversal was getting -ENOSYS.
+         *
+         * The path comes from the handle's stamped open_path (set for every
+         * open in sys_open), which carries one FIDELITY LIMIT worth stating:
+         * Linux's fchdir follows the INODE, so it still works if the
+         * directory is renamed after the open, and this follows the NAME.
+         * Closing that needs a cwd held as a vnode reference rather than a
+         * string, which is a change to how every path in this kernel is
+         * resolved -- out of scope for adding one syscall. Everything else,
+         * including EBADF vs ENOTDIR ordering, is real. */
+        struct file *f = fd_lookup((int)a1);
+        if (!f) return -ABI_EBADF;
+        /* A DIRECTORY handle keeps its path in `dirpath`, not `open_path`.
+         * The Linux open path routes directories through linux_open_dir(),
+         * which builds a FILE_KIND_DIR handle and RETURNS EARLY -- it never
+         * reaches the file_set_open_path() call near the end of
+         * sys_open_resolved. A first cut checked only open_path and so
+         * returned EBADF for every real directory; the gate caught it
+         * (`FAIL fchdir: returned errno=9`). Plain files still come from
+         * open_path, which is what makes the ENOTDIR half below work. */
+        const char *kp = (f->kind == FILE_KIND_DIR && f->dirpath)
+                       ? f->dirpath : f->open_path;
+        /* The fd IS valid (fd_lookup succeeded), so EBADF would be a lie: a
+         * handle with no path -- a pipe, a socket -- is simply not a
+         * directory, which is what Linux reports for it. */
+        if (!kp || !kp[0]) return -ABI_ENOTDIR;
+        return chdir_kpath(kp);
+    }
 
     /* ---- the *at / hint batch, all forwards onto machinery already here ----
      *
@@ -8883,6 +14450,35 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                   (long)how.mode, 0);
     }
 
+    case 436: {                        /* close_range(first, last, flags) */
+        /* glibc's closefrom(3) and every "close inherited fds before exec"
+         * loop in modern daemons. CLOSE_RANGE_CLOEXEC (0x4) marks instead
+         * of closing. CLOSE_RANGE_UNSHARE (0x2) detaches the caller's fd
+         * table from other threads first -- honoured as the no-op it is for
+         * a non-thread (its table is already private) and REFUSED for a
+         * thread, whose table here is structurally the leader's: closing
+         * shared fds while claiming to have unshared would be the lie. */
+        unsigned first = (unsigned)a1, last = (unsigned)a2, crf = (unsigned)a3;
+        if (first > last) return -ABI_EINVAL;
+        if (crf & ~0x6u) return -ABI_EINVAL;
+        struct proc *me = current_proc();
+        if (!me) return -ABI_EPERM;
+        if ((crf & 0x2u) && me->is_thread) return -ABI_EINVAL;
+        struct file **tab = proc_fds(me);
+        if (!tab) return -ABI_EPERM;
+        unsigned hi = last >= PROC_NFDS ? PROC_NFDS - 1 : last;
+        for (unsigned i = first; i <= hi; i++) {
+            if (!tab[i]) continue;
+            if (crf & 0x4u) {
+                fd_cloexec_set(me, (int)i, 1);
+            } else {
+                file_close(tab[i]);
+                tab[i] = 0;
+                fd_cloexec_set(me, (int)i, 0);
+            }
+        }
+        return 0;
+    }
 
     /* chmod/fchmodat. Slice 86: these used to validate the path and then
      * throw the mode away, on the belief that the VFS did not model
@@ -8897,15 +14493,36 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         const char *up = (const char *)(LX_chmod == n ? a1 : a2);
         uint32_t    md = (uint32_t)(LX_chmod == n ? a2 : a3) & 07777u;
         char kpath[ABI_PATH_MAX];
-        if (resolve_user_path(up, kpath, sizeof kpath) != 0) return -ABI_EFAULT;
+        /* fchmodat's path is relative to its dirfd, as every *at's is */
+        int prr = LX_chmod == n ? resolve_user_path(up, kpath, sizeof kpath)
+                                : resolve_user_path_at((int)a1, up, kpath, sizeof kpath);
+        if (prr != 0) return -ABI_EFAULT;
         struct vfs_stat vs;
         if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
         int rc = vfs_chmod(kpath, md);
         if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
-        return (rc == VFS_ERR_PERM) ? -ABI_EACCES : 0;
+        /* a non-owner's chmod is EPERM; any other failure is its own
+         * errno (it was EACCES, and 0 -- success -- for the rest) */
+        if (rc == VFS_ERR_PERM || rc == VFS_ERR_NOTPERM) return -ABI_EPERM;
+        return vfs_err_to_abi(rc);
     }
-    case LX_fchmod:
-        return fd_lookup((int)a1) ? 0 : -ABI_EBADF;
+    case LX_fchmod: {
+        /* fchmod(fd, mode) changes the file the descriptor was opened on --
+         * found by its stamped path (dirpath for a directory handle), with
+         * fchdir's limit: the NAME, not the inode. It was a no-op that said
+         * 0, so a program that opens and then fchmods (install -m, cp -p,
+         * git's objects) kept whatever mode its open gave. A descriptor with
+         * no path (a pipe, a socket) keeps saying 0, as Linux does for one. */
+        struct file *ff = fd_lookup((int)a1);
+        if (!ff) return -ABI_EBADF;
+        const char *kp = (ff->kind == FILE_KIND_DIR && ff->dirpath)
+                       ? ff->dirpath : ff->open_path;
+        if (!kp || !kp[0]) return 0;
+        int rc = vfs_chmod(kp, (uint32_t)a2 & 07777u);
+        if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
+        if (rc == VFS_ERR_PERM || rc == VFS_ERR_NOTPERM) return -ABI_EPERM;
+        return vfs_err_to_abi(rc);
+    }
     case LX_unlink: return do_syscall(SYS_UNLINK, a1, 0, 0, 0, 0);
 
     /* ==================================================================
@@ -8925,46 +14542,57 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     /* rmdir(2). tobyfs_unlink already removes EMPTY directories and refuses
      * non-empty ones (VFS_ERR_INVAL), so the only thing rmdir adds over
      * unlink is POSIX's type check: rmdir on a non-directory is ENOTDIR. */
-    case LX_rmdir: {
-        char kpath[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, kpath, sizeof kpath) != 0)
-            return -ABI_EFAULT;
-        struct vfs_stat vs;
-        if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
-        if (vs.type != VFS_TYPE_DIR)        return -ABI_ENOTDIR;
-        int rc = vfs_unlink(kpath);
-        if (rc == VFS_OK)        return 0;
-        if (rc == VFS_ERR_INVAL) return -ABI_ENOTEMPTY;   /* non-empty dir */
-        if (rc == VFS_ERR_PERM)  return -ABI_EACCES;
-        if (rc == VFS_ERR_ROFS)  return -ABI_EROFS;
-        return -ABI_EIO;
-    }
+    case LX_rmdir:
+        return rmdir_path((const char *)a1);
 
-    /* chown/lchown/fchownat. vfs_chown() is real, so these are too. We do not
-     * follow symlinks differently for lchown -- the VFS resolves links at
-     * lookup and has no O_NOFOLLOW-style stat -- which only matters for a
-     * chown aimed AT a symlink itself, a case nothing in the census hits. */
+    /* chown/lchown/fchownat. chown follows a symbolic link in the last
+     * component and lchown changes the link itself, as fchownat does with
+     * AT_SYMLINK_NOFOLLOW (0x100); fchownat's path is relative to its
+     * dirfd, and AT_EMPTY_PATH (0x1000) with "" is the dirfd's own file.
+     * All three were one call that changed whatever node the name was --
+     * the link, for a link -- and fchownat ignored its dirfd and flags. */
     case LX_chown: case LX_lchown: case LX_fchownat: {
         const char *up = (n == LX_fchownat) ? (const char *)a2
                                             : (const char *)a1;
         uint32_t uid = (uint32_t)((n == LX_fchownat) ? a3 : a2);
         uint32_t gid = (uint32_t)((n == LX_fchownat) ? a4 : a3);
+        int atfl = n == LX_fchownat ? (int)a5 : 0;
+        if (atfl & ~(0x100 | 0x1000)) return -ABI_EINVAL;
+        bool nofollow = n == LX_lchown || (atfl & 0x100);
         char kpath[ABI_PATH_MAX];
-        if (resolve_user_path(up, kpath, sizeof kpath) != 0) return -ABI_EFAULT;
+        if (n == LX_fchownat) {
+            char probe[2];
+            if (strncpy_from_user(probe, up, sizeof probe) < 0) return -ABI_EFAULT;
+            if (!probe[0]) {
+                if (!(atfl & 0x1000)) return -ABI_ENOENT;
+                struct file *ff = fd_lookup((int)a1);
+                if (!ff) return -ABI_EBADF;
+                const char *kp = (ff->kind == FILE_KIND_DIR && ff->dirpath)
+                               ? ff->dirpath : ff->open_path;
+                if (!kp || !kp[0] || strlen(kp) >= sizeof kpath) return 0;
+                memcpy(kpath, kp, strlen(kp) + 1);
+                nofollow = true;
+            } else if (resolve_user_path_at((int)a1, up, kpath, sizeof kpath) != 0) {
+                return -ABI_EFAULT;
+            }
+        } else if (resolve_user_path(up, kpath, sizeof kpath) != 0) {
+            return -ABI_EFAULT;
+        }
         struct vfs_stat vs;
-        if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
-        /* (uid_t)-1 means "leave unchanged" in POSIX. Note this uses the
-         * on-disk (host) id directly, which is right: nothing is being
-         * translated in that case. */
-        if (uid == 0xFFFFFFFFu) uid = vs.uid;
-        else { bool mok = false; uid = userns_v2k_uid(uid, &mok);   /* slice 11 */
+        int src = nofollow ? vfs_stat(kpath, &vs) : vfs_stat_follow(kpath, &vs);
+        if (src != VFS_OK) return vfs_err_to_abi(src);
+        /* (uid_t)-1 means "leave unchanged" in POSIX, and goes through as
+         * that: vfs_lchown keeps the id and lets anyone ask for no change
+         * (it was swapped for the file's own id here, which made a
+         * non-owner's chown(f, -1, -1) an EPERM). */
+        if (uid != 0xFFFFFFFFu) { bool mok = false; uid = userns_v2k_uid(uid, &mok);   /* slice 11 */
                if (!mok) return -ABI_EINVAL; }
-        if (gid == 0xFFFFFFFFu) gid = vs.gid;
-        else { bool mok = false; gid = userns_v2k_gid(gid, &mok);
+        if (gid != 0xFFFFFFFFu) { bool mok = false; gid = userns_v2k_gid(gid, &mok);
                if (!mok) return -ABI_EINVAL; }
-        int rc = vfs_chown(kpath, uid, gid);
+        int rc = nofollow ? vfs_lchown(kpath, uid, gid) : vfs_chown(kpath, uid, gid);
         if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
-        return (rc == VFS_ERR_PERM) ? -ABI_EPERM : 0;
+        if (rc == VFS_ERR_PERM || rc == VFS_ERR_NOTPERM) return -ABI_EPERM;
+        return vfs_err_to_abi(rc);
     }
 
     /* truncate(2) by path -- REAL as of slice 6.
@@ -8976,8 +14604,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * VFS_ERR_ROFS on filesystems that still cannot. */
     case LX_truncate: {
         char kpath[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, kpath, sizeof kpath) != 0)
-            return -ABI_EFAULT;
+        {   int rr_ = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
         if ((long)a2 < 0) return -ABI_EINVAL;
         struct vfs_stat vs;
         if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
@@ -8998,8 +14627,34 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * support it (FAT, and most FUSE mounts) -- so portable callers take
      * their existing copy-instead fallback. -ENOSYS would instead say "this
      * kernel has no link syscall", which is a different and wronger claim. */
-    case LX_link: case LX_linkat:
-        return -ABI_EPERM;
+    /* Phase G: hard links are REAL where the filesystem has inode
+     * indirection (tobyfs: name -> ino dirents + the on-disk nlink that
+     * sat unreported since the format was born). Elsewhere (ramfs/tmpfs
+     * are node-per-path) the honest answer is EPERM -- the errno Linux
+     * itself uses for "filesystem does not support hard links", and the
+     * one tar/coreutils degrade gracefully on. EXDEV for cross-mount. */
+    case LX_link: case LX_linkat: {
+        bool at = (n == LX_linkat);
+        char kold[ABI_PATH_MAX], knew[ABI_PATH_MAX];
+        long orr = at ? resolve_user_path_at((int)a1, (const char *)a2,
+                                             kold, sizeof kold)
+                      : resolve_user_path((const char *)a1, kold, sizeof kold);
+        long nrr = at ? resolve_user_path_at((int)a3, (const char *)a4,
+                                             knew, sizeof knew)
+                      : resolve_user_path((const char *)a2, knew, sizeof knew);
+        /* the walk's own error -- EACCES for a directory not searchable
+         * (finding 188), ENAMETOOLONG -- not always ENOENT */
+        if (orr != 0) return orr;
+        if (nrr != 0) return nrr;
+        /* "f/" and "x/" as Linux's (finding 223) */
+        orr = trailing_slash_dir(at ? (const char *)a2 : (const char *)a1, kold, sizeof kold);
+        if (orr != 0) return orr;
+        nrr = new_name_slash(at ? (const char *)a4 : (const char *)a2, knew);
+        if (nrr != 0) return nrr;
+        long lr = vfs_link(kold, knew);
+        if (lr == VFS_ERR_ROFS) return -ABI_EPERM;
+        return vfs_err_to_abi(lr);
+    }
 
     /* umask(2). Returns the PREVIOUS mask, always succeeds. The mask is
      * applied at file/directory creation (see sys_open/SYS_MKDIR). */
@@ -9009,6 +14664,27 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (up) up->umask = (uint32_t)a1 & 07777u;
         return (long)old;
     }
+
+    /* ---- extended attributes (Phase E; Linux's rules, finding 225) ------
+     * Twelve entry points over vfs_xattr: the plain forms follow a final
+     * link, the l* forms take the link itself, the f* forms the open
+     * file's path -- the calls cp -a makes (fgetxattr/flistxattr on the
+     * source fd, fsetxattr on the destination fd). Which names a caller may
+     * touch is xattr_policy's, asked before the filesystem as Linux's VFS
+     * and security hooks ask it. */
+    case LX_setxattr: case LX_lsetxattr: case LX_fsetxattr:
+    case LX_getxattr: case LX_lgetxattr: case LX_fgetxattr:
+    case LX_listxattr: case LX_llistxattr: case LX_flistxattr:
+    case LX_removexattr: case LX_lremovexattr: case LX_fremovexattr:
+        return lx_xattr(n, a1, a2, a3, a4, a5);
+
+    /* mknod(2)/mknodat(2): sys_mknod_user, Linux's order of answers -- a
+     * file, a FIFO, a socket, or (CAP_MKNOD) a device node that opens the
+     * device its numbers name (finding 214). */
+    case LX_mknod:                      /* Linux's order of answers (214) */
+        return sys_mknod_user(-100, (const char *)a1, (uint32_t)a2, (uint64_t)a3);
+    case LX_mknodat:
+        return sys_mknod_user((int)a1, (const char *)a2, (uint32_t)a3, (uint64_t)a4);
 
     /* The utime family: utime(132), utimes(235), futimesat(261),
      * utimensat(280). busybox `touch` walks utimensat -> futimesat -> utimes
@@ -9029,69 +14705,51 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * real means adding times to vfs_stat + a ->utimes op across tobyfs/
      * ext2/ext4/fat32, which is its own slice. */
     case LX_utime: case LX_utimes: case LX_futimesat: case LX_utimensat: {
+        /* All four through do_utimensat (batch 26): utime's utimbuf
+         * (actime, modtime), utimes' and futimesat's timeval pairs, and
+         * utimensat's timespec pairs with UTIME_NOW/UTIME_OMIT and
+         * AT_SYMLINK_NOFOLLOW; NULL times is now for both. A NULL path for
+         * utimensat is the descriptor itself (futimens), by its path. */
         const char *up = (n == LX_futimesat || n == LX_utimensat)
                          ? (const char *)a2 : (const char *)a1;
-        /* utimensat(dirfd, NULL, ...) legally means "the dirfd itself". */
+        uint64_t tp = (n == LX_utimensat || n == LX_futimesat) ? (uint64_t)a3 : (uint64_t)a2;
+        bool nofollow = n == LX_utimensat && ((int)a4 & 0x100);
+        if (n == LX_utimensat && ((int)a4 & ~0x100)) return -ABI_EINVAL;
+        char kpath[ABI_PATH_MAX];
         if (up) {
-            char kpath[ABI_PATH_MAX];
-            if (resolve_user_path(up, kpath, sizeof kpath) != 0)
-                return -ABI_EFAULT;
-            struct vfs_stat vs;
-            if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
-            /* Slice 5: a read-only mount must refuse this even though we do
-             * not persist timestamps. The slice-1 "accept and succeed" stub
-             * was reporting success on a ro mount, which let `touch` claim it
-             * had modified a read-only filesystem -- a stub may decline to do
-             * work, but it must not contradict a mount flag. */
-            if (vfs_path_mount_flags(kpath) & VFS_MNT_RDONLY)
-                return -ABI_EROFS;
-            /* Slice 6: actually STORE the timestamp. Slice 1 could not --
-             * struct vfs_stat had no time fields and no filesystem had a
-             * ->utimes -- so this accepted-and-discarded. Both now exist.
-             *
-             * A NULL times argument means "now" for every one of the four
-             * variants, which is the case `touch` uses. The layouts differ:
-             * utimensat/futimesat take timespec (sec,nsec) pairs, utimes/utime
-             * take timeval/utimbuf, but all start with seconds -- and seconds
-             * is the resolution the on-disk inode has, so read that and let
-             * the sub-second part go. */
-            uint64_t mt = 0, at = 0;
-            uint64_t tp = (n == LX_utimensat || n == LX_futimesat)
-                        ? (uint64_t)a3 : (uint64_t)a2;
-            if (tp) {
-                struct { int64_t a_sec, a_sub, m_sec, m_sub; } tv;
-                if (copy_from_user(&tv, (const void *)(uintptr_t)tp,
-                                   sizeof tv) != 0)
-                    return -ABI_EFAULT;
-                at = (uint64_t)tv.a_sec;
-                mt = (uint64_t)tv.m_sec;
-            }
-            if (!mt && !at) {
-                uint64_t nowsec = lx_realtime_ns(perf_now_ns()) / 1000000000ull;
-                mt = at = nowsec;
-            }
-            int urc = vfs_utimes(kpath, mt, at);
-            if (urc == VFS_OK) return 0;
-            /* VFS_ERR_ROFS here means "this filesystem cannot store times"
-             * (e.g. the read-only initrd ramfs), not a caller error. Report
-             * success so `touch`/`cp -p` on such a mount still work, exactly
-             * as they did before -- but only AFTER genuinely trying. */
-            if (urc == VFS_ERR_ROFS) return 0;
-            return vfs_err_to_abi(urc);
+            int rr = resolve_user_path(up, kpath, sizeof kpath);
+            if (rr) return rr;
         } else if (n == LX_utimensat) {
-            if (!fd_lookup((int)a1) && (int)a1 != -100 /*AT_FDCWD*/)
-                return -ABI_EBADF;
-        }
-        {   /* Say it once per boot so the limitation is discoverable in a log
-             * rather than only in this comment. */
-            static int warned = 0;
-            if (!warned) {
-                warned = 1;
-                kprintf("[linux] utime family: accepted but NOT persisted "
-                        "(vfs_stat carries no timestamps) -- see slice 1\n");
+            struct file *ff = fd_lookup((int)a1);
+            if (!ff) return -ABI_EBADF;
+            const char *kp = (ff->kind == FILE_KIND_DIR && ff->dirpath) ? ff->dirpath : ff->open_path;
+            if (!kp || !kp[0]) return 0;           /* a pipe or a socket: nothing to set */
+            size_t kl = strlen(kp);
+            if (kl >= sizeof kpath) return -ABI_ENAMETOOLONG;
+            memcpy(kpath, kp, kl + 1);
+            nofollow = true;                       /* the open file itself */
+        } else
+            return -ABI_EFAULT;
+        int64_t as = 0, ms = 0;
+        long ans = 0, mns = 0;
+        if (tp) {
+            if (n == LX_utime) {
+                struct { int64_t ac, mo; } ub;
+                if (copy_from_user(&ub, (const void *)(uintptr_t)tp, sizeof ub) != 0) return -ABI_EFAULT;
+                as = ub.ac; ms = ub.mo;
+            } else {
+                struct { int64_t a_s, a_sub, m_s, m_sub; } tv;
+                if (copy_from_user(&tv, (const void *)(uintptr_t)tp, sizeof tv) != 0) return -ABI_EFAULT;
+                as = tv.a_s; ms = tv.m_s;
+                if (n == LX_utimensat) { ans = (long)tv.a_sub; mns = (long)tv.m_sub; }
+                else {
+                    if (tv.a_sub < 0 || tv.a_sub > 999999 || tv.m_sub < 0 || tv.m_sub > 999999)
+                        return -ABI_EINVAL;
+                    ans = (long)tv.a_sub * 1000; mns = (long)tv.m_sub * 1000;
+                }
             }
         }
-        return 0;
+        return do_utimensat(kpath, tp != 0, as, ans, ms, mns, nofollow);
     }
 
     /* sync(2)/syncfs(2). Real: walk the block registry and flush each cache.
@@ -9102,6 +14760,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         /* bcache.h is not included here; mirror the local-extern idiom
          * reg_sync_disks() already uses further down this file. */
         extern void bcache_sync(struct blk_dev *dev);
+        sync_all_mounts();          /* each filesystem's own (finding 278) */
         size_t nd = blk_count();
         for (size_t i = 0; i < nd; i++) {
             struct blk_dev *d = blk_get(i);
@@ -9110,24 +14769,39 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return 0;
     }
 
-    /* getrusage(2)/times(2). Both report the process CPU time the scheduler
-     * already accumulates in p->cpu_ns.
-     *
-     * LIMITATION, stated: the kernel tracks ONE total, not a user/system
-     * split, so the whole figure is reported as user time and system time is
-     * zero. That is why bash's `times` builtin previously printed garbage --
-     * it read uninitialised stack after the -ENOSYS -- and why it will now
-     * print a real user figure and 0m0.000s system. */
+    /* getrusage(2)/times(2): user and system time, the process's (its
+     * thread group's) and its reaped children's -- proc_cputimes splits
+     * the scheduler's exact total by its user/system tick sample, as
+     * Linux's cputime_adjust does. It used to be the one total as user
+     * time, and `who` was not looked at: RUSAGE_CHILDREN answered the
+     * caller's own time, so bash's `time` of an external command printed
+     * the SHELL's time (logs/b13). */
     case LX_getrusage: {
         /* struct rusage: two timevals (ru_utime, ru_stime) then 14 longs. */
         struct { long us, uu, ss, su; long rest[14]; } ru;
         struct proc *rp = current_proc();
-        uint64_t ns = rp ? rp->cpu_ns : 0;
+        uint64_t un = 0, sn = 0, mnf = 0, mjf = 0;
+        long who = (long)(int)a1;
+        if (rp) {
+            if (who == 0) {                                          /* SELF */
+                proc_group_cputimes(rp, &un, &sn);
+                proc_group_faults(rp, &mnf, &mjf);
+            } else if (who == -1) {                              /* CHILDREN */
+                un = rp->cutime_ns; sn = rp->cstime_ns;
+                mnf = rp->cmin_flt; mjf = rp->cmaj_flt;
+            } else if (who == 1) {                                 /* THREAD */
+                proc_cputimes(rp, &un, &sn);
+                mnf = rp->min_flt; mjf = rp->maj_flt;
+            } else return -ABI_EINVAL;
+        }
         for (unsigned i = 0; i < sizeof(ru.rest)/sizeof(ru.rest[0]); i++)
             ru.rest[i] = 0;
-        ru.us = (long)(ns / 1000000000ull);
-        ru.uu = (long)((ns % 1000000000ull) / 1000ull);
-        ru.ss = 0; ru.su = 0;
+        ru.rest[4] = (long)mnf;              /* ru_minflt (finding 205) */
+        ru.rest[5] = (long)mjf;              /* ru_majflt */
+        ru.us = (long)(un / 1000000000ull);
+        ru.uu = (long)((un % 1000000000ull) / 1000ull);
+        ru.ss = (long)(sn / 1000000000ull);
+        ru.su = (long)((sn % 1000000000ull) / 1000ull);
         if (a2 && copy_to_user((void *)a2, &ru, sizeof ru) != 0)
             return -ABI_EFAULT;
         return 0;
@@ -9137,9 +14811,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * in CLOCKS-PER-SEC units; glibc/musl report USER_HZ == 100. */
         struct { long ut, st, cut, cst; } tms;
         struct proc *tp = current_proc();
-        uint64_t ns = tp ? tp->cpu_ns : 0;
-        tms.ut  = (long)(ns / 10000000ull);        /* ns -> 1/100 s */
-        tms.st  = 0; tms.cut = 0; tms.cst = 0;
+        uint64_t un = 0, sn = 0;
+        if (tp) proc_group_cputimes(tp, &un, &sn);
+        tms.ut  = (long)(un / 10000000ull);        /* ns -> 1/100 s */
+        tms.st  = (long)(sn / 10000000ull);
+        tms.cut = tp ? (long)(tp->cutime_ns / 10000000ull) : 0;
+        tms.cst = tp ? (long)(tp->cstime_ns / 10000000ull) : 0;
         if (a1 && copy_to_user((void *)a1, &tms, sizeof tms) != 0)
             return -ABI_EFAULT;
         /* Return value is ticks since an arbitrary epoch; use boot time. */
@@ -9156,7 +14833,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (cap < have) return -ABI_EINVAL;
         if (have && a2) {
             for (int i = 0; i < have; i++) {
-                uint32_t g = (uint32_t)cp->groups[i];
+                /* as the caller's user namespace numbers it: one with no
+                 * mapping is the overflow gid, 65534 (finding 236) */
+                uint32_t g = userns_cur_gid((uint32_t)cp->groups[i]);
                 if (copy_to_user((void *)(uintptr_t)(a2 + (uint64_t)i * 4),
                                  &g, 4) != 0)
                     return -ABI_EFAULT;
@@ -9168,15 +14847,28 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         struct proc *cp = current_proc();
         int cnt = (int)a1;
         if (!cp) return -ABI_EPERM;
-        if (cp->uid != 0) return -ABI_EPERM;  /* privileged operation */
+        /* Linux's may_setgroups (finding 241: only "is the host uid 0"):
+         * CAP_SETGID in the caller's namespace, and that namespace's gid_map
+         * written with setgroups allowed. The ids are the namespace's,
+         * translated -- one it has no name for is EINVAL -- and checked all
+         * before any is kept. */
+        if (userns_is_initial(cp) ? cp->uid != 0
+                                  : !(userns_capable(LCAP_SETGID) &&
+                                      userns_may_setgroups(cp)))
+            return -ABI_EPERM;
         if (cnt < 0 || cnt > PROC_NGROUPS_MAX) return -ABI_EINVAL;
+        int kg[PROC_NGROUPS_MAX];
         for (int i = 0; i < cnt; i++) {
             uint32_t g = 0;
+            bool gok = false;
             if (!a2 || copy_from_user(&g, (const void *)(uintptr_t)
                                       (a2 + (uint64_t)i * 4), 4) != 0)
                 return -ABI_EFAULT;
-            cp->groups[i] = (int)g;
+            uint32_t k = userns_v2k_gid(g, &gok);
+            if (!gok) return -ABI_EINVAL;
+            kg[i] = (int)k;
         }
+        for (int i = 0; i < cnt; i++) cp->groups[i] = kg[i];
         cp->ngroups = cnt;
         return 0;
     }
@@ -9233,8 +14925,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         }
 
         char ksrc[ABI_PATH_MAX], ktgt[ABI_PATH_MAX], kfs[32];
-        if (resolve_user_path((const char *)a2, ktgt, sizeof ktgt) != 0)
-            return -ABI_EFAULT;
+        {   int rr_ = resolve_user_path((const char *)a2, ktgt, sizeof ktgt);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
         /* `source` is a device NAME (e.g. "ide0:master.p1"), not a path, so it
          * is copied verbatim rather than path-resolved. For a bind mount it IS
          * a path and gets resolved below. */
@@ -9277,30 +14970,42 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             }
         }
         /* Linux MS_* -> our VFS_MNT_*. Only the ones with teeth are carried;
-         * the rest (MS_RELATIME &c.) are accepted and ignored. */
+         * the rest are accepted and ignored. MS_RELATIME is the default,
+         * a mount without the other two (finding 266: when a read moves
+         * atime -- they were ignored too). */
         uint32_t vflags = 0;
         if (msflags & 0x1u)  vflags |= VFS_MNT_RDONLY;   /* MS_RDONLY */
         if (msflags & 0x2u)  vflags |= VFS_MNT_NOSUID;   /* MS_NOSUID */
         if (msflags & 0x4u)  vflags |= VFS_MNT_NODEV;    /* MS_NODEV  */
         if (msflags & 0x8u)  vflags |= VFS_MNT_NOEXEC;   /* MS_NOEXEC */
+        if (msflags & 0x400u) vflags |= VFS_MNT_NOATIME;        /* MS_NOATIME */
+        if (msflags & 0x800u) vflags |= VFS_MNT_NODIRATIME;     /* MS_NODIRATIME */
+        if ((msflags & 0x1000000u) && !(msflags & 0x400u))
+            vflags |= VFS_MNT_STRICTATIME;                      /* MS_STRICTATIME */
 
-        /* MS_BIND: make an existing subtree visible at a second point. We have
-         * no per-mount subtree redirection, so a bind is honest only when the
-         * source is itself a mount point -- we re-register that mount's ops
-         * and data at the new location. Anything else would need path
-         * rewriting the VFS cannot express, so refuse rather than pretend. */
+        /* MS_BIND: make an existing subtree, or a file, visible at a second
+         * point (vfs_bind; finding 241 -- only a mount's root could be). Both
+         * ends must exist, and be both directories or neither (ENOTDIR); a
+         * source that is a link is what it names. */
         if (msflags & 0x1000u) {                          /* MS_BIND */
             char kbind[ABI_PATH_MAX];
-            if (resolve_user_path((const char *)a1, kbind, sizeof kbind) != 0)
-                return -ABI_EFAULT;
+            {   int rr_ = resolve_user_path((const char *)a1, kbind, sizeof kbind);
+                if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+            }
             /* Slice 9: MS_UNBINDABLE means what it says. A propagation flag that
              * is stored and never enforced is the same class of lie as a no-op
              * syscall returning success, so the refusal is real and tested. */
             if (vfs_mount_is_unbindable(kbind)) return -ABI_EINVAL;
-            const struct vfs_ops *bops = 0; void *bdata = 0;
-            if (vfs_mount_lookup(kbind, &bops, &bdata) != VFS_OK)
-                return -ABI_EINVAL;
-            int rc = vfs_mount_flags(ktgt, bops, bdata, vflags);
+            struct vfs_stat bs, ts;
+            if (vfs_stat(kbind, &bs) == VFS_OK && bs.type == VFS_TYPE_SYMLINK) {
+                char nx[ABI_PATH_MAX];
+                if (vfs_follow_link(kbind, nx, sizeof nx) != VFS_OK) return -ABI_ENOENT;
+                memcpy(kbind, nx, strlen(nx) + 1);
+            }
+            if (vfs_stat(kbind, &bs) != VFS_OK) return -ABI_ENOENT;
+            if (vfs_stat_follow(ktgt, &ts) != VFS_OK) return -ABI_ENOENT;
+            if ((bs.type == VFS_TYPE_DIR) != (ts.type == VFS_TYPE_DIR)) return -ABI_ENOTDIR;
+            int rc = vfs_bind(ktgt, kbind, vflags);
             return (rc == VFS_OK) ? 0 : vfs_err_to_abi(rc);
         }
 
@@ -9328,6 +15033,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                             sizeof kopts);
             int rc = tmpfs_mount_at(ktgt, kopts[0] ? kopts : 0);
             if (rc != VFS_OK) return vfs_err_to_abi(rc);
+            /* the name it was mounted as, which /proc/mounts and df show
+             * ("tmpfs" stood in for every one; Linux's says what was given) */
+            if (ksrc[0]) (void)vfs_mount_set_source(ktgt, ksrc);
             if (vflags) {
                 const struct vfs_ops *vops = 0; void *vdata = 0;
                 if (vfs_mount_lookup(ktgt, &vops, &vdata) == VFS_OK)
@@ -9338,6 +15046,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         }
         if (strcmp(kfs, "proc")    == 0 || strcmp(kfs, "cgroup2") == 0 ||
             strcmp(kfs, "sysfs")   == 0) {
+            /* A proc shows the caller's pid namespace: mounting one takes
+             * CAP_SYS_ADMIN over the user namespace that owns it, as
+             * Linux's (finding 241) -- the root of an `unshare -r` may not
+             * mount one of the initial pid namespace, the first child of an
+             * `unshare -rpf` may of its own. */
+            if (kfs[0] == 'p' && !userns_covers(mp->user_ns, pid_ns_owner(mp->pid_ns)))
+                return -ABI_EPERM;
             int rc = (kfs[0] == 'p') ? procfs_mount_at(ktgt)
                    : (kfs[0] == 's') ? sysfs_mount_at(ktgt)
                                      : cgroup_mount_at(ktgt);
@@ -9370,8 +15085,22 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             return -ABI_ENODEV;
         }
 
-        struct blk_dev *dev = blk_find(ksrc);
+        /* THE SOURCE BY ITS /dev NODE, as Linux's mount(2) takes it --
+         * /dev/sda1, or a link to one -- or by the driver's own name, as
+         * before (finding 198). A source that is there but no disk is
+         * ENOTBLK. */
+        struct blk_dev *dev = devfs_blk_by_path(ksrc, 0, 0);
         if (!dev) {
+            char lt[VFS_PATH_MAX];
+            struct vfs_stat lst;
+            if (vfs_stat(ksrc, &lst) == VFS_OK && lst.type == VFS_TYPE_SYMLINK &&
+                vfs_follow_link(ksrc, lt, sizeof lt) == VFS_OK)
+                dev = devfs_blk_by_path(lt, 0, 0);
+        }
+        if (!dev) dev = blk_find(ksrc);
+        if (!dev) {
+            struct vfs_stat nst;
+            if (vfs_stat_follow(ksrc, &nst) == VFS_OK) return -ABI_ENOTBLK;
             kprintf("[mount] no block device '%s'\n", ksrc);
             return -ABI_ENOENT;
         }
@@ -9379,7 +15108,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         switch (which) {
         case FS_TOBY: rc = tobyfs_mount(ktgt, dev); break;
         case FS_EXT2: rc = ext2_mount(ktgt, dev);   break;
-        case FS_EXT4: rc = ext4_mount(ktgt, dev);   break;
+        case FS_EXT4:                   /* read-only asked: as the driver's (271) */
+            rc = ext4_mount_ro(ktgt, dev, (vflags & VFS_MNT_RDONLY) != 0);
+            break;
         default:      rc = fat32_mount(ktgt, dev);  break;
         }
         if (rc != VFS_OK) return vfs_err_to_abi(rc);
@@ -9397,11 +15128,30 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 
     case LX_umount2: {                        /* (target, flags) */
         struct proc *mp = current_proc();
+        /* THE FLAGS, AS LINUX JUDGES THEM: only MNT_FORCE, MNT_DETACH,
+         * MNT_EXPIRE and UMOUNT_NOFOLLOW, and MNT_EXPIRE with neither of
+         * the others -- else EINVAL, before the permission check, as
+         * Linux's ksys_umount does. They were not looked at. A force or
+         * a lazy unmount is an ordinary one here (nothing holds a mount
+         * busy); MNT_EXPIRE's "mark, then unmount on the second call" has
+         * no marks to keep, so it unmounts. */
+        {
+            long fl = a2;
+            if (fl & ~0xFL) return -ABI_EINVAL;
+            if ((fl & 4) && (fl & 3)) return -ABI_EINVAL;
+        }
         if (!mp || !userns_capable(LCAP_SYS_ADMIN)) return -ABI_EPERM;
         if (!userns_owns_mnt_ns(mp)) return -ABI_EPERM;   /* see LX_mount */
         char ktgt[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, ktgt, sizeof ktgt) != 0)
-            return -ABI_EFAULT;
+        {   int rr_ = resolve_user_path((const char *)a1, ktgt, sizeof ktgt);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
+        /* A MOUNT IN USE IS EBUSY, as Linux's umount says ("target is
+         * busy"), unless MNT_DETACH asks for it lazily: once mount(8)
+         * could reach this, the boot harness's `umount /tmp` -- run from
+         * a shell whose cwd was /tmp -- took /tmp away from every test
+         * after it (batch 31's textgate). */
+        if (!((long)a2 & 2) && umount_target_busy(ktgt)) return -ABI_EBUSY;
         int rc = vfs_unmount(ktgt);
         return (rc == VFS_OK) ? 0 : vfs_err_to_abi(rc);
     }
@@ -9409,27 +15159,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     /* chroot(2). Sets the per-process filesystem root applied in
      * resolve_user_path(); see the fs_root note in proc.h for why this is NOT
      * folded into the cap sandbox_root. */
-    case LX_chroot: {
-        struct proc *cp = current_proc();
-        /* Slice 11: CAP_SYS_CHROOT. No ownership requirement, because chroot
-         * changes only the CALLER's own path resolution -- it grants no
-         * authority over anything outside the caller. */
-        if (!cp || !userns_capable(LCAP_SYS_CHROOT)) return -ABI_EPERM;
-        char knew[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, knew, sizeof knew) != 0)
-            return -ABI_EFAULT;
-        struct vfs_stat st;
-        if (vfs_stat(knew, &st) != VFS_OK) return -ABI_ENOENT;
-        if (st.type != VFS_TYPE_DIR)         return -ABI_ENOTDIR;
-        size_t n = strlen(knew);
-        if (n >= sizeof(cp->fs_root))        return -ABI_ENAMETOOLONG;
-        /* "/" means "no chroot": storing it would double every prefix. */
-        if (n == 1 && knew[0] == '/') cp->fs_root[0] = '\0';
-        else { memcpy(cp->fs_root, knew, n); cp->fs_root[n] = '\0'; }
-        kprintf("[chroot] pid=%d root='%s'\n", cp->pid,
-                cp->fs_root[0] ? cp->fs_root : "/");
-        return 0;
-    }
+    case LX_chroot:                     /* Linux's order of answers (214) */
+        return sys_chroot_user((const char *)a1);
 
     /* pivot_root(new_root, put_old) -- IMPLEMENTED IN SLICE 9.
      *
@@ -9449,10 +15180,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * the ownership rule so a user-ns caller cannot pivot someone else's. */
         if (!userns_owns_mnt_ns(pv)) return -ABI_EPERM;
         char knew[ABI_PATH_MAX], kold[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, knew, sizeof knew) != 0)
-            return -ABI_EFAULT;
-        if (resolve_user_path((const char *)a2, kold, sizeof kold) != 0)
-            return -ABI_EFAULT;
+        {   int rr_ = resolve_user_path((const char *)a1, knew, sizeof knew);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
+        {   int rr_ = resolve_user_path((const char *)a2, kold, sizeof kold);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
         int rc = vfs_pivot_root(knew, kold);
         return (rc == VFS_OK) ? 0 : vfs_err_to_abi(rc);
     }
@@ -9476,7 +15209,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!p) return -ABI_EINVAL;
         bool had_bkl = bkl_held();
         if (had_bkl) bkl_exit();
-        while (!p->pending_signals) {
+        /* POSIX: pause() returns only when a signal is CAUGHT (a handler
+         * runs) or terminates the process. A signal being ignored is not a
+         * reason to return -- so if only ignorable ones ever arrive, pause
+         * blocks forever, which is correct. Previously any pending signal
+         * woke it, so an ignored SIGCHLD from a reaped child returned EINTR
+         * out of a pause() that should have kept sleeping. */
+        while (!sig_should_eintr(p)) {
             sti();
             struct percpu *me_cpu = smp_this_cpu();
             if (me_cpu && __atomic_load_n(&me_cpu->ready_head, __ATOMIC_ACQUIRE))
@@ -9509,7 +15248,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * it wrong and callers test the neighbouring signal. */
     case LX_rt_sigpending: {
         struct proc *p = current_proc();
-        uint64_t lset = p ? ((uint64_t)p->sigstate.pending >> 1) : 0;
+        uint64_t lset = p ? sig_mask_to_linux((uint64_t)p->sigstate.pending) : 0;
         if (a1 && copy_to_user((void *)a1, &lset, sizeof lset) != 0)
             return -ABI_EFAULT;
         return 0;
@@ -9526,8 +15265,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (a1 && copy_from_user(&umask_in, (const void *)a1,
                                  sizeof umask_in) != 0)
             return -ABI_EFAULT;
-        uint32_t newmask = (uint32_t)(umask_in << 1);   /* -> tobyOS numbering */
-        uint32_t saved   = p->sigstate.mask;
+        uint64_t newmask = sig_mask_from_linux(umask_in);   /* -> tobyOS numbering */
+        uint64_t saved   = p->sigstate.mask;
         p->sigstate.mask = newmask;
         bool had_bkl = bkl_held();
         if (had_bkl) bkl_exit();
@@ -9551,6 +15290,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!tf) return -ABI_ENOMEM;
         int fd = fd_alloc_into(current_proc(), tf);
         if (fd < 0) { file_close(tf); return -ABI_EMFILE; }
+        if (a2 & LX_O_CLOEXEC)                /* TFD_CLOEXEC */
+            fd_cloexec_set(current_proc(), fd, 1);
         return fd;
     }
     case LX_timerfd_settime: {   /* (fd, flags, new_value, old_value) */
@@ -9593,7 +15334,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         uint64_t lmask = 0;
         if (a2 && copy_from_user(&lmask, (const void *)a2, sizeof lmask) != 0)
             return -ABI_EFAULT;
-        uint64_t kmask = lmask << 1;          /* Linux -> tobyOS numbering */
+        uint64_t kmask = sig_mask_from_linux(lmask);   /* Linux -> tobyOS numbering */
         if ((int)a1 >= 0) {                   /* update an existing signalfd */
             struct file *sf = fd_lookup((int)a1);
             if (!sf || sf->kind != FILE_KIND_SIGNALFD) return -ABI_EBADF;
@@ -9605,31 +15346,138 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!sf) return -ABI_ENOMEM;
         int fd = fd_alloc_into(current_proc(), sf);
         if (fd < 0) { file_close(sf); return -ABI_EMFILE; }
+        if (flags & LX_O_CLOEXEC)             /* SFD_CLOEXEC */
+            fd_cloexec_set(current_proc(), fd, 1);
         return fd;
     }
 
-    /* waitid(idtype, id, infop, options, rusage). Mapped onto the existing
-     * wait4 machinery: P_PID(1)/P_ALL(0) cover everything real callers use
-     * (posix_spawn's reaper, and glibc's system()). The siginfo_t out-param
-     * is what distinguishes it from wait4 -- callers read si_pid/si_status
-     * from it rather than decoding a status word. */
+    /* waitid(idtype, id, infop, options, rusage) -- K2 (2026-09-30).
+     *
+     * This used to call the NATIVE sys_waitpid with a KERNEL stack address
+     * as its status pointer: put_user refused it with EFAULT after
+     * proc_wait had already reaped the child, every idtype but P_PID became
+     * pid -1 (ENOENT, since native waitpid(-1) did not exist), the options
+     * were handed over as native flags, and every event was reported as
+     * CLD_EXITED -- even "WNOHANG, nothing yet". Measured on the box:
+     * P_ALL -> -2, P_PID|WNOWAIT -> -14 and the child gone, P_PGID -> -2.
+     *
+     * Now its own implementation, on the same primitives as LX_wait4:
+     *   idtype  P_ALL(0), P_PID(1), P_PGID(2; id 0 = the caller's group);
+     *           P_PIDFD(3) -> EINVAL (this kernel has no pidfds)
+     *   options WEXITED 4, WSTOPPED 2, WCONTINUED 8 (at least one), WNOHANG
+     *           1, WNOWAIT 0x01000000 (report, leave the child waitable),
+     *           and the __W* flags Linux accepts; anything else EINVAL
+     *   infop   si_signo SIGCHLD, si_code CLD_EXITED 1 / CLD_KILLED 2 /
+     *           CLD_TRAPPED 4 / CLD_STOPPED 5 / CLD_CONTINUED 6, si_pid in
+     *           the caller's pid namespace, si_uid, si_status = exit code
+     *           or signal. Written field by field exactly as Linux's
+     *           waitid() does -- all six are zero when WNOHANG finds
+     *           nothing (return 0) or nothing matches (-ECHILD). */
     case LX_waitid: {
-        int idtype = (int)a1;
-        int pid    = (idtype == 1 /*P_PID*/) ? (int)a2 : -1;
-        int status = 0;
-        long r = sys_waitpid(pid, &status, (int)a4);
-        if (r < 0) return r;
-        if (a3) {                              /* siginfo_t */
-            uint8_t si[128];
-            memset(si, 0, sizeof si);
-            *(int32_t *)&si[0]  = 17;                  /* si_signo = SIGCHLD */
-            *(int32_t *)&si[8]  = 1;                   /* si_code = CLD_EXITED */
-            *(int32_t *)&si[16] = (int32_t)r;          /* si_pid    */
-            *(int32_t *)&si[24] = (status >> 8) & 0xff;/* si_status */
-            if (copy_to_user((void *)a3, si, sizeof si) != 0)
+        int idtype = (int)a1, id = (int)a2;
+        long opt = (long)a4;
+        void *uinfo = (void *)a3;
+        enum { W_NOHANG = 1, W_STOPPED = 2, W_EXITED = 4, W_CONTINUED = 8,
+               W_NOWAIT = 0x01000000 };
+        const long w_known = W_NOHANG | W_STOPPED | W_EXITED | W_CONTINUED |
+                             W_NOWAIT | 0x20000000L /* __WNOTHREAD */ |
+                             0x40000000L /* __WALL */ | 0x80000000L /* __WCLONE */;
+        if ((opt & ~w_known) || !(opt & (W_EXITED | W_STOPPED | W_CONTINUED)))
+            return -ABI_EINVAL;
+        if (idtype < 0 || idtype > 3 || idtype == 3) return -ABI_EINVAL;
+        struct proc *self = current_proc();
+        if (!self) return -ABI_ECHILD;
+        extern struct proc g_proc[];
+        int want_pid = 0, want_pgid = 0;
+        if (idtype == 1) {
+            if (id <= 0) return -ABI_EINVAL;
+            want_pid = pid_knr(id);
+            if (!want_pid) want_pid = -1;       /* matches nothing: ECHILD */
+        } else if (idtype == 2) {
+            if (id < 0) return -ABI_EINVAL;
+            want_pgid = id ? id : proc_pgid_of(self);
+        }
+        /* The six fields Linux writes, and nothing else of siginfo_t. */
+        int32_t si_signo = 0, si_code = 0, si_pid = 0, si_uid = 0,
+                si_status = 0;
+        long ret;
+        for (;;) {
+            bool any = false;
+            struct proc *hit = 0;
+            int code = 0;
+            for (int i = 0; i < PROC_MAX && !hit; i++) {
+                struct proc *q = &g_proc[i];
+                if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+                    q->is_thread || !wait_child_of(self, q)) continue;
+                if (want_pid && q->pid != want_pid) continue;
+                if (want_pgid && proc_pgid_of(q) != want_pgid) continue;
+                any = true;
+                if ((opt & W_EXITED) && q->state == PROC_TERMINATED) {
+                    hit = q;
+                    code = q->term_sig > 0 ? 2 : 1;       /* KILLED : EXITED */
+                } else if ((opt & W_STOPPED) && q->state == PROC_STOPPED &&
+                           !q->stop_reported) {
+                    hit = q; code = 5;                    /* CLD_STOPPED */
+                } else if ((opt & W_CONTINUED) && q->cont_pending) {
+                    hit = q; code = 6;                    /* CLD_CONTINUED */
+                } else if (q->ptrace_stopped && q->tracer_pid == self->pid &&
+                           (opt & W_STOPPED)) {
+                    hit = q; code = 4;                    /* CLD_TRAPPED */
+                }
+            }
+            if (!any) { ret = -ABI_ECHILD; break; }
+            if (hit) {
+                si_signo = 17;                            /* SIGCHLD */
+                si_code  = code;
+                si_pid   = pid_vnr_of_kpid(hit->pid);
+                if (!si_pid) si_pid = hit->pid;
+                si_uid   = (int32_t)userns_cur_uid(hit->uid);
+                if (code == 1)      si_status = hit->exit_code & 0xff;
+                else if (code == 2) si_status = hit->term_sig;
+                else if (code == 5) si_status = hit->stop_sig > 0 ? hit->stop_sig
+                                                                  : SIGSTOP;
+                else if (code == 6) si_status = SIGCONT;
+                else                si_status = ptrace_stop_signal(hit);
+                if (!(opt & W_NOWAIT)) {
+                    if (code == 1 || code == 2) (void)proc_wait(hit->pid);
+                    else if (code == 5) hit->stop_reported = true;
+                    else if (code == 6) hit->cont_pending = false;
+                }
+                ret = 0;
+                break;
+            }
+            if (opt & W_NOHANG) { ret = 0; break; }
+            if (self->pending_signals & ~SLEEP_UNINTERRUPTING) {
+                ret = -ABI_EINTR;
+                break;
+            }
+            if (opt & (W_STOPPED | W_CONTINUED)) {
+                sched_yield();          /* stops/continues are polled, as in wait4 */
+            } else {
+                /* Any child's exit (or ptrace-stop) wakes a PROC_WAIT_ANY
+                 * waiter -- see wakeup_waiters. */
+                self->wait_pid = PROC_WAIT_ANY;
+                self->state    = PROC_BLOCKED;
+                sched_yield();
+                self->wait_pid = -1;
+            }
+        }
+        if (uinfo) {
+            int32_t z = 0;
+            if (put_user_u32((uint32_t *)uinfo + 0, (uint32_t)si_signo) ||
+                put_user_u32((uint32_t *)uinfo + 1, (uint32_t)z)        ||
+                put_user_u32((uint32_t *)uinfo + 2, (uint32_t)si_code)  ||
+                put_user_u32((uint32_t *)uinfo + 4, (uint32_t)si_pid)   ||
+                put_user_u32((uint32_t *)uinfo + 5, (uint32_t)si_uid)   ||
+                put_user_u32((uint32_t *)uinfo + 6, (uint32_t)si_status))
                 return -ABI_EFAULT;
         }
-        return 0;
+        if (ret == 0 && si_signo && a5) {        /* rusage: none is kept */
+            uint8_t ru[144];
+            memset(ru, 0, sizeof ru);
+            if (copy_to_user((void *)a5, ru, sizeof ru) != 0) return -ABI_EFAULT;
+        }
+        return ret;
     }
 
     /* preadv/pwritev: the vectored positional pair. Implemented as a loop of
@@ -9662,8 +15510,29 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * to obtain the fd they operate on -- so the whole subsystem was
      * unreachable. Flags (IN_NONBLOCK/IN_CLOEXEC) are accepted and ignored,
      * matching how pipe2/dup3 treat theirs here. */
-    case LX_inotify_init1:
-        return sys_inotify_init();
+    case LX_inotify_init:              /* legacy form: no flags argument */
+        a1 = 0;
+        /* fall through */
+    case LX_inotify_init1: {
+        /* Real fd since 2026-08-22. The old arm returned sys_inotify_init's
+         * raw instance INDEX: the first caller got 0 == stdin, registered
+         * "watches" that were counter values, and then blocked forever on
+         * a descriptor that was its own terminal. */
+        if (a1 & ~(uint64_t)(LX_O_CLOEXEC | 0x800)) return -ABI_EINVAL;
+        long id = sys_inotify_init();
+        if (id < 0) return id;
+        struct file *nf = (struct file *)kmalloc(sizeof *nf);
+        if (!nf) { inotify_release((int)id); return -ABI_ENOMEM; }
+        memset(nf, 0, sizeof *nf);
+        nf->kind = FILE_KIND_INOTIFY;
+        nf->inotify_id = (int)id;
+        int nfd = fd_alloc_into(current_proc(), nf);
+        if (nfd < 0) { kfree(nf); inotify_release((int)id); return -ABI_EMFILE; }
+        if (a1 & 0x800) inotify_set_nonblock((int)id, true);  /* IN_NONBLOCK */
+        if (a1 & LX_O_CLOEXEC)                                 /* IN_CLOEXEC */
+            fd_cloexec_set(current_proc(), nfd, 1);
+        return nfd;
+    }
 
     /* epoll_pwait2 is epoll_pwait with a timespec instead of an int ms.
      * Convert and delegate to the proven arm. */
@@ -9688,29 +15557,136 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_rename:                 /* (oldpath, newpath) */
         return sys_rename((const char *)a1, (const char *)a2);
     case LX_renameat:               /* (olddirfd, oldpath, newdirfd, newpath) */
-    case LX_renameat2:              /* (..., flags) -- AT_FDCWD + flags ignored */
-        return sys_rename((const char *)a2, (const char *)a4);
+    case LX_renameat2: {            /* (..., flags) */
+        /* EACH PATH FROM ITS OWN DIRFD, AND THE FLAGS AS LINUX TAKES THEM
+         * (batch 31). Both dirfds were ignored -- a relative path resolved
+         * from the cwd -- and so were the flags: RENAME_NOREPLACE replaced,
+         * and RENAME_EXCHANGE did a plain rename that destroyed the
+         * target. NOREPLACE is EEXIST for a target that is there; EXCHANGE
+         * swaps the two (below); WHITEOUT, which no filesystem here can do,
+         * is EINVAL, as a Linux filesystem without it says; so are unknown
+         * flags and NOREPLACE with EXCHANGE. */
+        long fl = (n == LX_renameat2) ? (long)a5 : 0;
+        if (fl & ~7L) return -ABI_EINVAL;
+        if ((fl & 1) && (fl & 2)) return -ABI_EINVAL;
+        if (fl & 4) return -ABI_EINVAL;
+        char ko[ABI_PATH_MAX], kn[ABI_PATH_MAX];
+        int rr = resolve_user_path_at((int)a1, (const char *)a2, ko, sizeof ko);
+        if (rr) return rr;
+        rr = resolve_user_path_at((int)a3, (const char *)a4, kn, sizeof kn);
+        if (rr) return rr;
+        /* A MOUNT POINT IS BUSY (finding 241): Linux's EXDEV compares the
+         * mounts the two names' DIRECTORIES are on, so `mv tgt tgt.x` of a
+         * bind's mount point is EBUSY there -- here the mount point's own
+         * path resolved into the bind, said EXDEV, and mv copied the bind's
+         * contents out and removed them from its source. */
+        if (strcmp(ko, "/") && vfs_mount_lookup(ko, 0, 0) == VFS_OK) return -ABI_EBUSY;
+        if (strcmp(kn, "/") && vfs_mount_lookup(kn, 0, 0) == VFS_OK) return -ABI_EBUSY;
+        /* two filesystems are EXDEV before anything the flags ask, as
+         * Linux's: mv's NOREPLACE try onto another disk must learn to copy
+         * (it said EEXIST, and mv reported the wrong failure) */
+        if (!vfs_same_mount(ko, kn)) return -ABI_EXDEV;
+        if (fl & 1) {
+            struct vfs_stat ns;
+            if (vfs_stat(kn, &ns) == VFS_OK) return -ABI_EEXIST;
+        }
+        if (fl & 2) {
+            /* RENAME_EXCHANGE: both names must be there (ENOENT), on one
+             * filesystem (EXDEV), neither inside the other (EINVAL). Done
+             * as three renames through a name of the kernel's own beside
+             * the first, all under the BKL: no other system call runs
+             * between them unless a driver sleeps for I/O (the RAM
+             * filesystems never do; a disk's wait could show another
+             * caller the middle, which Linux's swap never shows). A step
+             * that fails puts back what had moved. */
+            struct vfs_stat as, bs;
+            if (vfs_stat(ko, &as) != VFS_OK || vfs_stat(kn, &bs) != VFS_OK)
+                return -ABI_ENOENT;
+            if (strcmp(ko, kn) == 0) return 0;
+            size_t ol = strlen(ko), nl2 = strlen(kn);
+            if ((strncmp(kn, ko, ol) == 0 && kn[ol] == '/') ||
+                (strncmp(ko, kn, nl2) == 0 && ko[nl2] == '/'))
+                return -ABI_EINVAL;
+            char tmp[ABI_PATH_MAX];
+            struct proc *xp = current_proc();
+            int k = 0;
+            struct vfs_stat ts;
+            do {
+                int w = ksnprintf(tmp, sizeof tmp, "%s.~xchg.%d.%d~", ko,
+                                  xp ? xp->pid : 0, k);
+                if (w <= 0 || (size_t)w >= sizeof tmp) return -ABI_ENAMETOOLONG;
+            } while (vfs_stat(tmp, &ts) == VFS_OK && ++k < 100);
+            int r = vfs_rename(ko, tmp);
+            if (r != VFS_OK) return vfs_err_to_abi(r);
+            r = vfs_rename(kn, ko);
+            if (r != VFS_OK) { (void)vfs_rename(tmp, ko); return vfs_err_to_abi(r); }
+            r = vfs_rename(tmp, kn);
+            if (r != VFS_OK) {
+                (void)vfs_rename(ko, kn);
+                (void)vfs_rename(tmp, ko);
+                return vfs_err_to_abi(r);
+            }
+            return 0;
+        }
+        return vfs_err_to_abi(vfs_rename(ko, kn));
+    }
     case LX_unlinkat:               /* (dirfd, path, flags) -- AT_FDCWD; tobyfs
                                      * unlink removes files AND empty dirs, so it
                                      * serves AT_REMOVEDIR too. */
+        if ((long)a3 & 0x200)       /* AT_REMOVEDIR: rmdir(2)'s rules, errnos */
+            return rmdir_path((const char *)a2);
         return do_syscall(SYS_UNLINK, a2, 0, 0, 0, 0);
-    case LX_fsync:                  /* tobyfs writes are journalled + write-through
-                                     * (bcache flushes on commit), so a successful
-                                     * write is already durable -- report success. */
-    case LX_fdatasync:
-        return 0;
-    case LX_flock:                  /* single-process chrome: advisory locks are a
-                                     * no-op that must SUCCEED (leveldb/SQLite hold
-                                     * a LOCK file and bail if locking errors). */
-        return 0;
+    case LX_fsync:
+    case LX_fdatasync: {
+        /* This used to `return 0` outright, without so much as looking
+         * at the fd. Two things were wrong with that, and only one of
+         * them is the one you would guess:
+         *
+         *   - fsync(-1) and fsync(999) returned SUCCESS. POSIX says
+         *     EBADF, and a program that checks fsync's return to decide
+         *     whether its data is safe was being lied to about the
+         *     cheapest possible failure.
+         *   - the durability itself was an accident rather than a
+         *     guarantee. It happened to hold -- ext4, ext2 and fat32
+         *     write straight through blk_write(), and tobyfs defers into
+         *     the write-back cache but flushes it on every journal
+         *     commit -- so no data was being lost. But nothing in the
+         *     VFS enforced it; it rested on all four drivers
+         *     independently continuing to behave that way, which is the
+         *     same shape of unwritten assumption that made an open
+         *     handle's cached inode go stale.
+         *
+         * So: validate the fd, and ask the filesystem to flush. Drivers
+         * with no device answer OK, because for them there is nothing
+         * durability could mean. */
+        struct file *f = fd_lookup((int)a1);
+        if (!f) return -ABI_EBADF;
+        /* a directory, a memfd and a disk have nothing more to write; what
+         * has no sync of its own at all -- a pipe, a socket, a terminal,
+         * /dev/null -- is EINVAL, as Linux's (finding 215: every one was
+         * 0) */
+        if (f->kind == FILE_KIND_DIR || f->kind == FILE_KIND_MEMFD ||
+            f->kind == FILE_KIND_BLKDEV)
+            return 0;
+        if (f->kind != FILE_KIND_VFS) return -ABI_EINVAL;
+        return vfs_err_to_abi(vfs_file_sync(&f->vfs));
+    }
+    case LX_flock: {                /* real since 2026-08-22 (src/flock.c).
+                                     * The old no-op satisfied leveldb/SQLite's
+                                     * "locking must not error" check while
+                                     * excluding nobody; now a second process
+                                     * really is kept out of the LOCK file. */
+        struct file *lf = fd_lookup((int)a1);
+        if (!lf) return -ABI_EBADF;
+        return fl_flock(lf, current_proc(), (int)a2);
+    }
 
     /* ---- process control (B8): the shell forks, execs, and waits ---- */
     case LX_fork:
     case LX_vfork: {
         /* LX_vfork / CLONE_VFORK → share-until-exec. Plain fork → CoW copy. */
-        long fr = (n == LX_vfork) ? sys_fork_share()
-                                  : do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
-        fr = lx_child_pid_ret(fr);
+        long fr = (n == LX_vfork) ? sys_fork_share() : sys_fork();
+        fr = lx_child_pid_ret(fr);          /* translated here, once (207) */
 #ifdef CHROMIUM_BOOT
         {   static int pf = 0;
             if (pf < 200) { pf++;
@@ -9816,10 +15792,30 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             uint64_t cstk = (uint64_t)a2;
             if (nsme && cstk && cstk < UACCESS_USER_END)
                 nsme->clone_child_stack = cstk;
+            /* Phase F: stage CHILD_SETTID/CLEARTID for the process-fork
+             * path -- glibc's fork() itself is clone(CHILD_SETTID|
+             * CHILD_CLEARTID, ..., ctid=&THREAD_SELF->tid) and trusts the
+             * kernel to stamp the CHILD's tid there. This arm dropped
+             * both on the floor, so forked children ran with the parent's
+             * cached tid (see proc.h set_child_tid for the blast radius). */
+            if (nsme) {
+                nsme->clone_child_settid =
+                    (cfl & 0x01000000u /* CLONE_CHILD_SETTID  */) ? (uint64_t)a4 : 0;
+                nsme->clone_child_cleartid =
+                    (cfl & 0x00200000u /* CLONE_CHILD_CLEARTID */) ? (uint64_t)a4 : 0;
+            }
             long cr = share ? sys_fork_share()
-                            : do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
-            if (nsme) { nsme->clone_ns_flags = 0; nsme->clone_child_stack = 0; }
+                            : sys_fork();    /* translated below, once (207) */
+            if (nsme) { nsme->clone_ns_flags = 0; nsme->clone_child_stack = 0;
+                        nsme->clone_child_settid = 0;
+                        nsme->clone_child_cleartid = 0; }
             cr = lx_child_pid_ret(cr);       /* see lx_child_pid_ret */
+            /* CLONE_PARENT_SETTID: the parent-side stamp, written here in
+             * the parent's own address space. */
+            if (cr > 0 && (cfl & 0x00100000u /* CLONE_PARENT_SETTID */) && a3) {
+                uint32_t pv = (uint32_t)cr;
+                (void)copy_to_user((void *)(uintptr_t)a3, &pv, sizeof pv);
+            }
 #ifdef CHROMIUM_BOOT
             { static int crl = 0; if (crl < 200) { crl++;
                 struct proc *me = current_proc();
@@ -9838,16 +15834,44 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         void *ustatus = (void *)a2;
         int   options = (int)a3;
         int   pid;                     /* the kpid we operate on internally */
-        if (vpid <= 0) {               /* "any child" -- sh -c forks exactly one */
+        if (vpid <= 0) {
+            /* Any child (-1), any in our own group (0), or any in group
+             * -vpid. Which one is decided by who has an event, not by pid
+             * order -- see proc_wait_any. The child picked is then handled
+             * by the single-child code below, which answers it at once. */
             struct proc *self = current_proc();
-            pid = self ? proc_any_child(self->pid) : -1;
-            if (pid < 0) return -ABI_ECHILD;
+            if (!self) return -ABI_ECHILD;
+            if (vpid == -2147483647 - 1) return -ABI_ESRCH;
+            int pgid = vpid == 0 ? proc_pgid_of(self)
+                     : vpid < -1 ? -vpid : 0;
+            for (;;) {
+                pid = proc_wait_any(pgid, options);
+                if (pid == PROC_WAIT_INTR) return -ABI_EINTR;
+                if (pid < 0) return -ABI_ECHILD;
+                if (pid > 0) break;
+                if (options & 0x1 /* WNOHANG */) return 0;
+                /* WUNTRACED/WCONTINUED: poll, as the single-child arm does. */
+                if (self->pending_signals & ~SLEEP_UNINTERRUPTING)
+                    return -ABI_EINTR;
+                sched_yield();
+            }
         } else {
             /* Translate the caller's number, and require the target to be
              * visible from the caller's namespace -- otherwise a process could
              * wait on (and learn the exit code of) something outside it. */
             pid = pid_knr(vpid);
             if (!pid) return -ABI_ECHILD;
+            /* ONLY ONE'S OWN CHILD (or a tracee), as the native waitpid and
+             * Linux. Any visible pid was accepted, and proc_wait_info reaps
+             * whatever it is given: a Linux program could collect its
+             * SIBLING, and the sibling's parent then got ECHILD for its own
+             * child. Measured (tools/agent/probes/b12/wsib.c, a static
+             * Linux ELF): the second child's waitpid(sibling, WNOHANG)
+             * "REAPED THE SIBLING", 3 of 3 on the guest; on Linux it is
+             * ECHILD and the parent collects its child (signal 9). */
+            struct proc *self = current_proc();
+            struct proc *c = proc_lookup(pid);
+            if (self && c && !waitpid_may_wait(self, c)) return -ABI_ECHILD;
         }
         /* Capture the caller-visible number NOW: proc_wait() reaps the child,
          * and reaping releases its vpid mapping, so translating afterwards
@@ -9864,8 +15888,55 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * wakes on termination -- while the child traces itself and parks. Seen
          * exactly that way, with the tracer silent forever after
          * "[ptrace] pid=3 TRACEME". */
+        /* WUNTRACED (0x2) / WCONTINUED (0x8): job-control stops and
+         * continues are reported, once each, without reaping -- the
+         * yield-poll shape every blocking primitive in this kernel uses.
+         * This is what lets a shell's foreground wait see ^Z, and its
+         * notifier see the bg-resume. */
+        if (options & (0x2 | 0x8)) {
+            for (;;) {
+                struct proc *c = proc_lookup(pid);
+                if (!c) return -ABI_ECHILD;
+                /* DEATH OUTRANKS EVERYTHING: a stale cont_pending on a
+                 * child that has since died must not report "continued"
+                 * for a corpse. */
+                if (c->state == PROC_TERMINATED) {
+                    c->cont_pending = false;
+                    break;                                /* reap below */
+                }
+                if ((options & 0x2) &&
+                    c->state == PROC_STOPPED && !c->stop_reported) {
+                    c->stop_reported = true;
+                    kprintf("[wait4] pid=%d report STOP sig=%d\n",
+                            pid, c->stop_sig);
+                    if (ustatus) {
+                        uint32_t st = ((uint32_t)(c->stop_sig > 0 ?
+                                       c->stop_sig : SIGSTOP) << 8) | 0x7fu;
+                        if (put_user_u32(ustatus, st) != 0) return -ABI_EFAULT;
+                    }
+                    return rvpid;     /* stopped: report, do NOT reap */
+                }
+                if ((options & 0x8) && c->cont_pending) {
+                    c->cont_pending = false;
+                    kprintf("[wait4] pid=%d report CONT\n", pid);
+                    if (ustatus) {
+                        if (put_user_u32(ustatus, 0xffffu) != 0)
+                            return -ABI_EFAULT;   /* Linux WIFCONTINUED */
+                    }
+                    return rvpid;
+                }
+                if (options & 0x1 /* WNOHANG */) return 0;
+                struct proc *self = current_proc();
+                /* SIGCHLD (and the rest of the ignorable set) must not
+                 * EINTR the very wait that serves it. */
+                if (self && (self->pending_signals & ~SLEEP_UNINTERRUPTING))
+                    return -ABI_EINTR;
+                sched_yield();
+            }
+        }
         if (!(options & 0x1 /* WNOHANG */)) {
             int pr = proc_wait_or_ptrace(pid);
+            if (pr == PROC_WAIT_INTR) return -ABI_EINTR;
             if (pr == 1) {
                 struct proc *c = proc_lookup(pid);
                 if (ustatus) {
@@ -9882,7 +15953,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (!c) return -ABI_ECHILD;
             if (c->state != PROC_TERMINATED) return 0;
         }
-        int code = proc_wait(pid);
+        struct proc_exit_info xi;
+        memset(&xi, 0, sizeof xi);
+        int code = proc_wait_info(pid, &xi);
         if (code < 0) {
 #ifdef CHROMIUM_BOOT
             /* Slice 83: crashpad's DoubleForkAndExec REQUIRES
@@ -9899,9 +15972,32 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         }
         if (ustatus) {
             /* Linux wait status: normal exit -> (code & 0xff) << 8, with the
-             * low 7 bits zero so WIFEXITED is true / WEXITSTATUS == code. */
-            uint32_t wstatus = ((uint32_t)code & 0xff) << 8;
+             * low 7 bits zero so WIFEXITED is true / WEXITSTATUS == code.
+             * K3: killed by a signal -> the signal number in the low 7 bits
+             * (WIFSIGNALED, WTERMSIG), as Linux reports it. This used to say
+             * exit(128 + sig) for every signal death, so no Linux program --
+             * bash's "Killed" report, Python's returncode -9, a supervisor
+             * restarting on a crash -- could tell one from exit(137). No
+             * path here dumps core, so the 0x80 core bit is never set. */
+            uint32_t wstatus = xi.term_sig > 0
+                             ? ((uint32_t)xi.term_sig & 0x7f)
+                             : ((uint32_t)code & 0xff) << 8;
             if (put_user_u32(ustatus, wstatus) != 0) return -ABI_EFAULT;
+        }
+        if (a4) {
+            /* THE CHILD'S RUSAGE: its user and system time with its own
+             * children's (Linux fills it from RUSAGE_BOTH). It was not
+             * written at all, so a caller read whatever it had there. */
+            struct { long us, uu, ss, su; long rest[14]; } ru;
+            memset(&ru, 0, sizeof ru);
+            ru.us = (long)(xi.utime_ns / 1000000000ull);
+            ru.uu = (long)((xi.utime_ns % 1000000000ull) / 1000ull);
+            ru.ss = (long)(xi.stime_ns / 1000000000ull);
+            ru.su = (long)((xi.stime_ns % 1000000000ull) / 1000ull);
+            ru.rest[4] = (long)xi.min_flt;   /* ru_minflt (finding 205) */
+            ru.rest[5] = (long)xi.maj_flt;   /* ru_majflt */
+            if (copy_to_user((void *)a4, &ru, sizeof ru) != 0)
+                return -ABI_EFAULT;
         }
 #ifdef CHROMIUM_BOOT
         { static int w4 = 0; if (w4 < 16) { w4++;
@@ -9919,13 +16015,26 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * kill(2). */
         return rvpid;
     }
-    /* Job control: tobyOS has a single global foreground pid, not POSIX
-     * process groups, so accept these as no-ops/identity so the shell's
-     * setup doesn't abort. */
-    case LX_setpgid: return 0;
-    case LX_getpgid:
-    case LX_getpgrp:
-    case LX_setsid:  return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
+    /* Job control: REAL process groups now (they were accept-and-lie
+     * stubs -- bash's `set -m` was told its groups existed and none did). */
+    case LX_setpgid: return lx_do_setpgid(a1, a2);
+    case LX_getpgid: return lx_do_getpgid(a1);
+    case LX_getpgrp: return lx_do_getpgid(0);
+    case LX_setsid: {
+        /* A new session and group led by the caller, with no controlling
+         * terminal; EPERM for a group leader (proc_setsid). It only moved
+         * the pgid, and always said yes. */
+        long r = proc_setsid(current_proc());
+        if (r < 0) return r;
+        return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
+    }
+    case 124: {                         /* getsid(pid) */
+        /* in the caller's numbers, both ways (finding 226) */
+        int tk = a1 ? pid_knr((int)a1) : 0;
+        struct proc *t = a1 ? (tk ? proc_lookup(tk) : 0) : current_proc();
+        if (!t) return -ABI_ESRCH;
+        return t->sid > 0 ? pid_vnr_of_kpid(t->sid) : t->sid;
+    }
 
     /* ---- readlink (B20): backs readlink(/proc/self/exe), realpath, etc. ---- */
     case LX_readlink:                  /* (path, buf, bufsz) */
@@ -9935,10 +16044,18 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char *ubuf        = is_at ? (char *)a3       : (char *)a2;
         size_t bufsz      = is_at ? (size_t)a4       : (size_t)a3;
         char kpath[ABI_PATH_MAX], ktmp[ABI_PATH_MAX];
-        int rr = resolve_user_path(upath, kpath, sizeof kpath);
+        /* readlinkat's path from its dirfd; it was the cwd (batch 31) */
+        int rr = is_at ? resolve_user_path_at((int)a1, upath, kpath, sizeof kpath)
+                       : resolve_user_path(upath, kpath, sizeof kpath);
+        if (rr) return rr;
+        rr = trailing_slash_dir(upath, kpath, sizeof kpath);
         if (rr) return rr;
         if (!ubuf || bufsz == 0) return -ABI_EINVAL;
-        size_t cap = bufsz < sizeof(ktmp) ? bufsz : sizeof(ktmp);
+        /* The whole target is read, and as much as the buffer holds is
+         * returned: Linux returns bufsz when the target fills it, which is
+         * how glibc's realpath knows to grow its buffer (finding 227: this
+         * read bufsz-1 bytes and returned that). */
+        size_t cap = sizeof(ktmp);
         /* Slice 86: ktmp used to be left uninitialised and its length taken
          * with a plain strlen(). vfs_readlink's static-table path always
          * terminates, but the per-mount readlink op (procfs /proc/self/exe,
@@ -10031,20 +16148,19 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         int is_at = (n == LX_symlinkat);
         const char *utarget = (const char *)a1;
         const char *ulink   = is_at ? (const char *)a3 : (const char *)a2;
-        char ktarget[ABI_PATH_MAX], klink[ABI_PATH_MAX];
-        if (strncpy_from_user(ktarget, utarget, sizeof ktarget) < 0)
-            return -ABI_EFAULT;
-        int rr = resolve_user_path(ulink, klink, sizeof klink);
+        char ktarget[ABI_PATH_MAX + 1], klink[ABI_PATH_MAX];
+        int tr = user_path_in(ktarget, utarget);
+        if (tr) return tr;
+        if (!ktarget[0]) return -ABI_ENOENT;     /* as Linux's (223) */
+        /* symlinkat's link path is relative to NEWDIRFD; it was the cwd */
+        int rr = is_at ? resolve_user_path_at((int)a2, ulink, klink, sizeof klink)
+                       : resolve_user_path(ulink, klink, sizeof klink);
+        if (rr) return rr;
+        rr = new_name_slash(ulink, klink);
         if (rr) return rr;
         int rc = vfs_symlink(klink, ktarget);
-        switch (rc) {
-        case VFS_OK:               return 0;
-        case VFS_ERR_EXIST:        return -ABI_EEXIST;
-        case VFS_ERR_NAMETOOLONG:  return -ABI_ENAMETOOLONG;
-        case VFS_ERR_NOSPC:        return -ABI_ENOSPC;
-        case VFS_ERR_INVAL:        return -ABI_EINVAL;
-        default:                   return -ABI_EIO;
-        }
+        /* every error as itself -- EACCES, EROFS, ENOENT were EIO */
+        return rc == VFS_OK ? 0 : vfs_err_to_abi(rc);
     }
 
     /* ---- stat family: translate tobyOS vfs_stat -> Linux struct stat ---- */
@@ -10053,6 +16169,15 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
         if (rr) return rr;
+        rr = trailing_slash_dir((const char *)a1, kpath, sizeof kpath);
+        if (rr) return rr;
+        if (n == LX_stat) {                /* stat follows; lstat does not */
+            struct file *ff = 0;
+            int fdn = -1;
+            long fr = lx_stat_follow_first(kpath, sizeof kpath, &ff, &fdn);
+            if (fr) return fr;
+            if (ff) return lx_emit_fd_stat(ff, fdn, (void *)a2);
+        }
         {   /* slice 104: DRM nodes stat as char devices, by path too. */
             int dmin = lx_dev_dri_minor(kpath);
             if (dmin >= 0 && lxdrm_available()) {
@@ -10060,6 +16185,14 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 return linux_emit_chrdev_stat(DRM_CHR_MAJOR, (uint32_t)dmin,
                                               lx_ino_hash(kpath), (void *)a2);
             }
+        }
+        /* 2026-08-22: synthesised /dev nodes answer here too. The
+         * dev_synth fix (slice 103/104) covered statx, newfstatat and
+         * access -- and the handoff CLAIMED it covered stat -- but raw
+         * syscalls 4/6 never got the arm, so an assembler-level or
+         * Go-style direct stat("/dev/null") still saw ENOENT. */
+        {   uint32_t dm = dev_synth_mode(kpath);
+            if (dm) return linux_emit_devnode_stat(kpath, (void *)a2);
         }
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
@@ -10075,31 +16208,26 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char probe[2] = {0,0};
         if (upath) (void)strncpy_from_user(probe, upath, sizeof probe);
         if (!upath || probe[0] == '\0') {
-            /* AT_EMPTY_PATH-style: fall through to fstat on a1. */
+            /* AT_EMPTY_PATH-style: fstat on a1 (lx_emit_fd_stat; glibc's
+             * fstat() comes this way -- slice 103's DRM answer included). */
             struct file *f = fd_lookup((int)a1);
             if (!f) return -ABI_EBADF;
-            struct vfs_stat vs = { .type = VFS_TYPE_FILE, .size = f->vfs.size,
-                                   .uid = f->vfs.uid, .gid = f->vfs.gid,
-                                   .mode = f->vfs.mode };
-            /* Slice 103: a DRM fd must report S_IFCHR here too. glibc's
-             * fstat() goes through newfstatat(fd,"",AT_EMPTY_PATH), not
-             * LX_fstat -- so the slice-99 char-device fix never applied
-             * to libdrm, whose drmGetDevice2 checks S_ISCHR FIRST and
-             * returns -EINVAL before touching sysfs. MEASURED: the
-             * [gpupath] trace showed libdrm making ZERO sysfs accesses,
-             * which is only possible if it bailed at this stat. */
-            if (f->kind == FILE_KIND_DRM)
-                return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
-                                              lx_fd_ino(f, (int)a1),
-                                              (void *)a3);
-            if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
-            return linux_emit_stat(&vs, lx_fd_ino(f, (int)a1), (void *)a3);
+            return lx_emit_fd_stat(f, (int)a1, (void *)a3);
         }
         /* Relative paths resolve against DIRFD -- chrome's sandbox stats
          * "self/task/" through a /proc dirfd (thread_helpers.cc:41). */
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path_at((int)a1, upath, kpath, sizeof kpath);
         if (rr) return rr;
+        rr = trailing_slash_dir(upath, kpath, sizeof kpath);
+        if (rr) return rr;
+        if (!((int)a4 & 0x100)) {          /* no AT_SYMLINK_NOFOLLOW */
+            struct file *ff = 0;
+            int fdn = -1;
+            long fr = lx_stat_follow_first(kpath, sizeof kpath, &ff, &fdn);
+            if (fr) return fr;
+            if (ff) return lx_emit_fd_stat(ff, fdn, (void *)a3);
+        }
         {   /* slice 104: see the LX_stat note. */
             int dmin = lx_dev_dri_minor(kpath);
             if (dmin >= 0 && lxdrm_available()) {
@@ -10113,15 +16241,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * only to LX_stat would never run for a C program -- exactly the trap
          * slice 103 hit with DRM fds. */
         {   uint32_t dm = dev_synth_mode(kpath);
-            if (dm) {
-                (void)dm;
-                /* major 1 minor 3 is /dev/null's real Linux identity; the
-                 * other synthesised nodes share the shape, and nothing in
-                 * tree keys off the exact minor. What matters to callers is
-                 * S_ISCHR, which linux_emit_chrdev_stat sets. */
-                return linux_emit_chrdev_stat(1, 3, lx_ino_hash(kpath),
-                                              (void *)a3);
-            }
+            if (dm) return linux_emit_devnode_stat(kpath, (void *)a3);
         }
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
@@ -10135,28 +16255,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!f) return -ABI_EBADF;
         { static int n; if (f->kind == FILE_KIND_DRM && n < 12) { n++;
             kprintf("[drmstat] LX_fstat on DRM fd=%d\n", (int)a1); } }
-        struct vfs_stat vs;
-        if (f->kind == FILE_KIND_DRM)         /* slice 99: S_IFCHR 226:128 */
-            return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
-                                          lx_fd_ino(f, (int)a1), (void *)a2);
-        if (f->kind == FILE_KIND_DIR && f->dirpath) {
-            if (vfs_stat(f->dirpath, &vs) != VFS_OK)
-                vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
-        } else if (f->kind == FILE_KIND_VFS) {
-            vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = f->vfs.size,
-                                    .uid = f->vfs.uid, .gid = f->vfs.gid,
-                                    .mode = f->vfs.mode };
-        } else if (f->kind == FILE_KIND_MEMFD) {
-            /* Chrome fstats the memfd to size its mapping + CHECK st_size. */
-            vs = (struct vfs_stat){ .type = VFS_TYPE_FILE,
-                                    .size = (size_t)memfd_size(f->memfd),
-                                    .mode = 0777 };
-        } else {
-            /* console/pipe/socket: report a minimal regular-file stat. */
-            vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = 0,
-                                    .mode = 0666 };
-        }
-        return linux_emit_stat(&vs, lx_fd_ino(f, (int)a1), (void *)a2);
+        return lx_emit_fd_stat(f, (int)a1, (void *)a2);
     }
     case LX_getdents64: {              /* (fd, void *dirp, count) */
         struct file *f = fd_lookup((int)a1);
@@ -10167,39 +16266,110 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         /* Slice 102: /dev/dri is synthetic (no VFS directory behind it),
          * so emit its nodes here. libdrm iterates this to name the
          * device's card/render nodes -- see the open path. */
-        if (strcmp(f->dirpath, "/dev/dri") == 0) {
+        /* Synthetic /dev directories (2026-08-22: /dev itself and /dev/snd
+         * join the slice-102 /dev/dri arm; /dev/snd could be OPENED but not
+         * LISTED before -- the fall-through hit vfs_opendir and ENOENT). */
+        {
             static const char *const dri_names[] = { "card0", "renderD128" };
-            size_t written = 0;
-            uint32_t emitted = 0;
-            while (f->dir_off + emitted < 2) {
-                const char *nm = dri_names[f->dir_off + emitted];
-                size_t namelen = strlen(nm);
-                size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;
-                if (written + reclen > cap) break;
-                struct lx_dirent64 de;
-                memset(&de, 0, reclen);
-                de.d_ino    = 100 + f->dir_off + emitted;
-                de.d_off    = (int64_t)(f->dir_off + emitted + 1);
-                de.d_reclen = (uint16_t)reclen;
-                de.d_type   = LX_DT_CHR;
-                memcpy(de.d_name, nm, namelen);
-                if (copy_to_user(ubuf + written, &de, reclen) != 0)
-                    return -ABI_EFAULT;
-                written += reclen;
-                emitted++;
+            static const char *const snd_names[] = { "controlC0", "pcmC0D0p" };
+            static const char *const dev_names[] =
+                { "null", "zero", "full", "tty", "console", "random",
+                  "urandom", "ptmx", "pts", "shm", "dri", "snd", "fb0",
+                  "input" };
+            static const uint8_t dev_types[] =
+                { LX_DT_CHR, LX_DT_CHR, LX_DT_CHR, LX_DT_CHR, LX_DT_CHR,
+                  LX_DT_CHR, LX_DT_CHR, LX_DT_CHR, LX_DT_DIR, LX_DT_DIR,
+                  LX_DT_DIR, LX_DT_DIR, LX_DT_CHR, LX_DT_DIR };
+            const char *const *names = 0;
+            const uint8_t *types = 0;
+            uint32_t cnt = 0;
+            if (strcmp(f->dirpath, "/dev/dri") == 0) {
+                names = dri_names; cnt = 2;
+            } else if (strcmp(f->dirpath, "/dev/snd") == 0) {
+                names = snd_names; cnt = 2;
             }
-            f->dir_off += emitted;
-            return (long)written;
+            /* /dev ITSELF is devfs now (see devfs.c) and lists through the
+             * VFS below, from the same table stat answers from. This fixed
+             * list named `dri` and `snd` on machines without them, and
+             * `console`, `fb0`, `input` that no stat would confirm. */
+            (void)dev_names; (void)dev_types;
+            if (names) {
+                size_t written = 0;
+                uint32_t emitted = 0;
+                /* "." and ".." first (finding 187), then the nodes */
+                while (f->dir_off + emitted < cnt + 2) {
+                    uint32_t vi = f->dir_off + emitted;
+                    const char *nm = vi == 0 ? "." : vi == 1 ? ".."
+                                   : names[vi - 2];
+                    size_t namelen = strlen(nm);
+                    size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;
+                    if (written + reclen > cap) break;
+                    struct lx_dirent64 de;
+                    memset(&de, 0, reclen);
+                    de.d_ino    = vi == 0 ? lx_ino_hash(f->dirpath)
+                                : vi == 1 ? lx_ino_hash("/dev")
+                                          : 100 + vi - 2;
+                    de.d_off    = (int64_t)(vi + 1);
+                    de.d_reclen = (uint16_t)reclen;
+                    de.d_type   = vi < 2 ? LX_DT_DIR
+                                : types ? types[vi - 2] : LX_DT_CHR;
+                    memcpy(de.d_name, nm, namelen);
+                    if (copy_to_user(ubuf + written, &de, reclen) != 0)
+                        return -ABI_EFAULT;
+                    written += reclen;
+                    emitted++;
+                }
+                f->dir_off += emitted;
+                return (long)written;
+            }
         }
         struct vfs_dir d;
-        if (vfs_opendir(f->dirpath, &d) != VFS_OK) return -ABI_ENOENT;
+        if (vfs_opendir(f->dirpath, &d) != VFS_OK) {
+            /* a directory removed while open (or the removed cwd, finding
+             * 200) has no entries left: end of directory, as Linux's */
+            struct vfs_stat gst;
+            if (vfs_stat(f->dirpath, &gst) != VFS_OK) return 0;
+            return -ABI_ENOENT;
+        }
         struct vfs_dirent ent;
-        uint32_t idx = 0, emitted = 0;
+        uint32_t emitted = 0;
         size_t   written = 0;
         bool     toosmall = false;
+        char     child[VFS_PATH_MAX];
+        /* "." and ".." are entries 0 and 1, then the directory's own, each
+         * with the inode stat would give it and its type whole (finding
+         * 187: no dots, d_ino an index, no block devices or sockets) */
+        while (f->dir_off + emitted < 2) {
+            uint32_t vi = f->dir_off + emitted;
+            const char *nm = vi == 0 ? "." : "..";
+            size_t reclen = (19 + strlen(nm) + 1 + 7) & ~(size_t)7;
+            if (written + reclen > cap) { if (written == 0) toosmall = true; break; }
+            struct lx_dirent64 de;
+            memset(&de, 0, reclen);
+            if (vi == 0) {
+                de.d_ino = readdir_ino(f->dirpath, true);
+            } else {
+                readdir_parent(f->dirpath, child, sizeof child);
+                de.d_ino = readdir_ino(child, true);
+            }
+            de.d_off    = (int64_t)(vi + 1);
+            de.d_reclen = (uint16_t)reclen;
+            de.d_type   = LX_DT_DIR;
+            memcpy(de.d_name, nm, strlen(nm));
+            if (copy_to_user(ubuf + written, &de, reclen) != 0) {
+                vfs_closedir(&d);
+                return -ABI_EFAULT;
+            }
+            written += reclen;
+            emitted++;
+        }
         /* Skip the entries already returned by earlier getdents64 calls. */
-        while (idx < f->dir_off && vfs_readdir(&d, &ent) == VFS_OK) idx++;
-        while (vfs_readdir(&d, &ent) == VFS_OK) {
+        {   /* without reading the way there where the driver can (277) */
+            uint32_t skip = f->dir_off > 2 ? f->dir_off - 2 : 0;
+            if (skip) (void)vfs_seekdir(&d, skip);
+        }
+        while (!toosmall && f->dir_off + emitted >= 2 &&
+               vfs_readdir(&d, &ent) == VFS_OK) {
             size_t namelen = 0;
             while (namelen < VFS_NAME_MAX && ent.name[namelen]) namelen++;
             size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;  /* hdr=19, 8-align */
@@ -10209,10 +16379,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             }
             struct lx_dirent64 de;
             memset(&de, 0, reclen);
-            de.d_ino    = (uint64_t)(f->dir_off + emitted + 1);
+            de.d_ino    = ent.ino ? ent.ino     /* the entry's own (277) */
+                        : readdir_join(child, sizeof child, f->dirpath, ent.name)
+                        ? readdir_ino(child, true)
+                        : (uint64_t)(f->dir_off + emitted + 1);
             de.d_off    = (int64_t)(f->dir_off + emitted + 1);
             de.d_reclen = (uint16_t)reclen;
-            de.d_type   = (ent.type == VFS_TYPE_DIR) ? LX_DT_DIR : LX_DT_REG;
+            de.d_type   = vfs_entry_dt(ent.type, ent.mode);
             memcpy(de.d_name, ent.name, namelen);
             de.d_name[namelen] = '\0';
             if (copy_to_user(ubuf + written, &de, reclen) != 0) {
@@ -10229,12 +16402,24 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     }
 
     /* ---- identities ---- */
-    case LX_getpid:  return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
+    case LX_getpid: {
+        /* Linux: getpid() returns the TGID -- the same number in every
+         * thread. This returned the TID for a thread (the documented
+         * phase-3 open item), which broke any raise()/tgkill(getpid(),
+         * gettid()) pairing and every pid-keyed cache inside a threaded
+         * app. gettid (which really is per-thread) is untouched. */
+        struct proc *gp = current_proc();
+        if (!gp) return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
+        struct proc *ld = gp->is_thread ? proc_lookup(gp->tgid) : gp;
+        return pid_vnr(ld ? ld : gp);
+    }
     case LX_getppid: return do_syscall(SYS_GETPPID, 0, 0, 0, 0, 0);
     case LX_gettid:  return do_syscall(ABI_SYS_GETTID, 0, 0, 0, 0, 0);
-    case LX_getuid:
+    /* the REAL ids for getuid/getgid (finding 206): they said the
+     * effective ones, as geteuid/getegid do */
+    case LX_getuid:  return do_syscall(ABI_SYS_GETRUID, 0, 0, 0, 0, 0);
     case LX_geteuid: return do_syscall(SYS_GETUID, 0, 0, 0, 0, 0);
-    case LX_getgid:
+    case LX_getgid:  return do_syscall(ABI_SYS_GETRGID, 0, 0, 0, 0, 0);
     case LX_getegid: return do_syscall(SYS_GETGID, 0, 0, 0, 0, 0);
 
     /* setfsuid/setfsgid: tobyOS has a single (root) identity, so there is no
@@ -10352,8 +16537,30 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (p) p->clear_child_tid = (uint64_t)a1;
         return p ? p->pid : 0;
     }
-    case LX_set_robust_list:
+    case LX_set_robust_list: {        /* (head, len) */
+        /* Real since Phase F (2026-08-22); was `return 0` -- glibc believed
+         * the kernel would stamp FUTEX_OWNER_DIED at death, and no one ever
+         * did. futex_robust_exit (thread.c) is the walk this registers. */
+        if ((size_t)a2 != 24) return -ABI_EINVAL;
+        struct proc *rp = current_proc();
+        if (!rp) return -ABI_EINVAL;
+        rp->robust_list_head = a1;
         return 0;
+    }
+    case 274: {                       /* get_robust_list (pid, head**, len*) */
+        struct proc *rp = current_proc();
+        if ((int)a1 != 0) {
+            int k = pid_knr((int)a1);
+            rp = k ? proc_lookup(k) : 0;
+        }
+        if (!rp) return -ABI_ESRCH;
+        uint64_t h = rp->robust_list_head, len24 = 24;
+        if (copy_to_user((void *)(uintptr_t)a2, &h, sizeof h) != 0)
+            return -ABI_EFAULT;
+        if (copy_to_user((void *)(uintptr_t)a3, &len24, sizeof len24) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
 
     /* B25: glibc 2.41 startup/pthread/malloc gap-fills (previously -ENOSYS).
      *
@@ -10386,44 +16593,62 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_shmctl:
         return sys_shmctl((int)a1, (int)a2, (void *)(uintptr_t)a3);
 
-    /* prlimit64(pid, resource, *new, *old) and the legacy getrlimit/setrlimit.
-     * glibc reads RLIMIT_STACK at startup (to size the main+default thread
-     * stacks) and RLIMIT_NOFILE elsewhere. We don't enforce limits, so report
-     * sane values and accept any set as a no-op. */
-    case LX_prlimit64: {
-        int      resource = (int)a2;
-        uint64_t oldp     = (uint64_t)a4;
-        if (oldp) {
-            struct { uint64_t cur, max; } rl;
-            rl.max = ~0ULL;                 /* RLIM64_INFINITY */
-            switch (resource) {
-            case 3:  rl.cur = 0x800000ULL; break;          /* RLIMIT_STACK 8 MiB */
-            case 7:  rl.cur = PROC_NFDS; rl.max = PROC_NFDS; break; /* RLIMIT_NOFILE (== fd table) */
-            default: rl.cur = ~0ULL; break;                /* AS/DATA/...: inf   */
-            }
-            if (copy_to_user((void *)(uintptr_t)oldp, &rl, sizeof rl) != 0)
+    /* Phase H: the other two SysV IPC families (src/sysvipc.c). shm has
+     * existed since MIT-SHM; sem and msg fell through to the census.
+     * PostgreSQL/Apache serialize on semaphore sets with SEM_UNDO. */
+    case LX_semget:
+        return sysv_semget((int)a1, (int)a2, (int)a3);
+    case LX_semop:
+        return sysv_semop((int)a1, (uint64_t)a2, (int)a3, 0);
+    case LX_semtimedop: {
+        uint64_t deadline = 0;
+        if (a4) {
+            struct lx_timespec ts;
+            if (copy_from_user(&ts, (const void *)(uintptr_t)a4,
+                               sizeof ts) != 0)
                 return -ABI_EFAULT;
+            deadline = perf_now_ns() + (uint64_t)ts.tv_sec * 1000000000ull
+                     + (uint64_t)ts.tv_nsec;
+            if (deadline == 0) deadline = 1;
         }
-        return 0;                            /* a3 (new limit) accepted as no-op */
+        return sysv_semop((int)a1, (uint64_t)a2, (int)a3, deadline);
     }
+    case LX_semctl:
+        return sysv_semctl((int)a1, (int)a2, (int)a3, (uint64_t)a4);
+    case LX_msgget:
+        return sysv_msgget((int)a1, (int)a2);
+    case LX_msgsnd:
+        return sysv_msgsnd((int)a1, (uint64_t)a2, (size_t)a3, (int)a4);
+    case LX_msgrcv:
+        return sysv_msgrcv((int)a1, (uint64_t)a2, (size_t)a3, (long)a4,
+                           (int)a5);
+    case LX_msgctl:
+        return sysv_msgctl((int)a1, (int)a2, (uint64_t)a3);
+
+    /* prlimit64(pid, resource, *new, *old) and the legacy getrlimit and
+     * setrlimit, over each process's own table (include/tobyos/rlimit.h).
+     * They reported one fixed table and took any set as a no-op, so
+     * `ulimit -n 128` changed nothing a later `ulimit -n` printed. glibc
+     * reads RLIMIT_STACK at startup (the main and default thread stacks). */
+    case LX_prlimit64:
+        return sys_prlimit((int)a1, (int)a2, (uint64_t)a3, (uint64_t)a4);
     case LX_getrlimit: {                     /* (resource, *rlim) */
-        int      resource = (int)a1;
-        uint64_t out      = (uint64_t)a2;
-        if (out) {
-            struct { uint64_t cur, max; } rl;
-            rl.max = ~0ULL;
-            switch (resource) {
-            case 3:  rl.cur = 0x800000ULL; break;
-            case 7:  rl.cur = 1024; rl.max = 4096; break;
-            default: rl.cur = ~0ULL; break;
-            }
-            if (copy_to_user((void *)(uintptr_t)out, &rl, sizeof rl) != 0)
-                return -ABI_EFAULT;
-        }
+        /* the resource is judged first, then the pointer -- even a NULL
+         * one, EFAULT (Linux's getrlimit) */
+        struct tobyos_rlim old;
+        long r = proc_prlimit(current_proc(), current_proc(), (int)a1, 0, &old);
+        if (r) return r;
+        if (copy_to_user((void *)(uintptr_t)a2, &old, sizeof old) != 0)
+            return -ABI_EFAULT;
         return 0;
     }
-    case LX_setrlimit:
-        return 0;
+    case LX_setrlimit: {                     /* (resource, *rlim) */
+        /* the pointer first: EFAULT before any EINVAL (Linux's setrlimit) */
+        struct tobyos_rlim nw;
+        if (copy_from_user(&nw, (const void *)(uintptr_t)a2, sizeof nw) != 0)
+            return -ABI_EFAULT;
+        return proc_prlimit(current_proc(), current_proc(), (int)a1, &nw, 0);
+    }
 
     /* clone3(*cl_args, size): the modern thread-spawn entry glibc 2.41 tries
      * FIRST for pthread_create (falling back to clone on -ENOSYS). Translate
@@ -10508,7 +16733,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 if (nsme) nsme->clone_ns_flags = nsf;
                 if (nsme && c3stk && c3stk < UACCESS_USER_END)
                     nsme->clone_child_stack = c3stk;
-                fr3 = do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+                fr3 = sys_fork();    /* translated below, once (207) */
             }
             if (nsme) { nsme->clone_ns_flags = 0;   /* fork may have bailed early */
                         nsme->clone_child_stack = 0; }
@@ -10580,6 +16805,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 #endif
             return memfd_ftruncate(tf->memfd, (uint64_t)a2);   /* allocates pages */
         }
+        /* not open for writing: EINVAL, as Linux's (finding 216) */
+        if (tf && tf->kind == FILE_KIND_VFS && (tf->o_accmode & 3) == 0)
+            return -ABI_EINVAL;
         if (tf && tf->kind == FILE_KIND_VFS && (long)a2 >= 0) {
             /* Slice 6: PERSIST it. Setting tf->vfs.size alone (slice 8's
              * behaviour, kept for memfd above) never reached the inode, so
@@ -10628,13 +16856,16 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             return lxdrm_ioctl(f, (unsigned long)a2, (unsigned long)a3);
         if (f->kind == FILE_KIND_SND)                 /* audio slice 3 */
             return lxsnd_ioctl(f, (unsigned long)a2, (unsigned long)a3);
+        if (f->kind == FILE_KIND_RTC)                 /* finding 157 */
+            return lx_rtc_ioctl((unsigned long)a2, (unsigned long)a3);
         /* Slice 12 cut 4: the SIOC* interface ioctls. Answered for the
          * SOCKET's network namespace, matching every other network operation
          * here -- and note libc's if_nametoindex() opens an AF_UNIX socket for
          * this, so it must NOT be restricted to AF_INET fds. */
         if (f->kind == FILE_KIND_SOCKET && f->sock)
             return rtnl_sock_ioctl(f->sock->net_ns,
-                                   userns_capable(LCAP_NET_ADMIN),
+                                   userns_capable_over(LCAP_NET_ADMIN,
+                                       net_ns_owner(f->sock->net_ns)),   /* 257 */
                                    (unsigned long)a2, (unsigned long)a3);
         return -ABI_ENOTTY;
     }
@@ -10681,7 +16912,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
              * spins -- ever ran. */
             {   static unsigned char am[PROC_MAX];
                 struct proc *me = current_proc();
-                int mp = me ? (me->is_thread ? me->tgid : me->pid) : 0;
+                int mp = proc_pid_slot(me ? (me->is_thread ? me->tgid : me->pid) : 0);
                 if (mp >= 0 && mp < PROC_MAX && am[mp] < 80) { am[mp]++;
                     kprintf("[amap] pid=%d mmap hint=0x%lx len=0x%lx prot=0x%x fl=0x%x -> 0x%lx\n",
                             me ? me->pid : -1, (unsigned long)a1,
@@ -10705,7 +16936,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 #ifdef CHROMIUM_BOOT
         {   static unsigned char um[PROC_MAX];
             struct proc *me = current_proc();
-            int mp = me ? (me->is_thread ? me->tgid : me->pid) : 0;
+            int mp = proc_pid_slot(me ? (me->is_thread ? me->tgid : me->pid) : 0);
             if (mp >= 0 && mp < PROC_MAX && um[mp] < 80) { um[mp]++;
                 kprintf("[amap] pid=%d munmap  addr=0x%lx len=0x%lx -> %ld\n",
                         me ? me->pid : -1, (unsigned long)a1,
@@ -10741,7 +16972,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         uint64_t t = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
         uint64_t ns = t;
         if ((int)a2 & 1) {                 /* TIMER_ABSTIME */
-            uint64_t now = perf_now_ns();
+            /* the deadline is on the CLOCK named: realtime's on the wall
+             * clock (it was compared with the monotonic one), the others'
+             * on the slewed monotonic clock; SYS_NANOSLEEP takes the
+             * difference as a CLOCK_MONOTONIC duration (finding 280) */
+            uint64_t raw = perf_now_ns();
+            uint64_t now = ((int)a1 == 0 || (int)a1 == 8) ? lx_realtime_ns(raw)
+                                                          : lx_mono_ns(raw);
             ns = (t > now) ? (t - now) : 0;
         }
         return do_syscall(SYS_NANOSLEEP, (long)ns, 0, 0, 0, 0);
@@ -10758,9 +16995,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         {   static uint32_t cgt_count[PROC_MAX];
             static uint8_t  cgt_dumped[PROC_MAX];
             struct proc *me = current_proc();
-            if (me && me->pid > 0 && me->pid < PROC_MAX &&
-                !cgt_dumped[me->pid] && ++cgt_count[me->pid] > 150000) {
-                cgt_dumped[me->pid] = 1;
+            int ms = me ? proc_pid_slot_live(me->pid) : -1;   /* by slot */
+            if (ms > 0 && !cgt_dumped[ms] && ++cgt_count[ms] > 150000) {
+                cgt_dumped[ms] = 1;
                 extern void bt_dump_self(const char *why);
                 bt_dump_self("clock_gettime-storm");
             }
@@ -10793,10 +17030,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             val = mono;
             break;
         case 1:  /* CLOCK_MONOTONIC       */
-        case 4:  /* CLOCK_MONOTONIC_RAW   */
         case 6:  /* CLOCK_MONOTONIC_COARSE*/
         case 7:  /* CLOCK_BOOTTIME        */
         case 9:  /* CLOCK_BOOTTIME_ALARM  */
+            val = lx_mono_ns(mono);         /* slewed, as Linux's (finding 280) */
+            break;
+        case 4:  /* CLOCK_MONOTONIC_RAW   */
             val = mono;
             break;
         default:
@@ -10834,8 +17073,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return (long)len;
     }
 
-    case LX_getpriority:  return 20;         /* nice 0 (kernel returns 20-nice) */
-    case LX_setpriority:  return 0;          /* accept */
+    case LX_getpriority:  return nice_get((int)a1, (int)a2);    /* 20 - nice */
+    case LX_setpriority:  return nice_set((int)a1, (int)a2, (long)(int)a3);
 
     /* ==================================================================
      * Linux slice 2 -- credential transitions.
@@ -11016,20 +17255,49 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 
     case LX_statfs:                          /* (path, buf) */
     case LX_fstatfs: {                        /* (fd, buf) -- buf is a2 in both */
+        /* Phase H: REAL numbers. This arm fabricated a 4 GiB tmpfs for
+         * every mount since it was written -- df agreed with nothing,
+         * and "is there room?" preflights (pip, package managers)
+         * happily started writes a full /data could not take. */
         struct lx_statfs {
             long f_type, f_bsize, f_blocks, f_bfree, f_bavail;
             long f_files, f_ffree; unsigned long f_fsid;
             long f_namelen, f_frsize, f_flags, f_spare[4];
         } sf;
+        struct vfs_statfs vs;
+        char kpath[ABI_PATH_MAX];
+        if (n == LX_statfs) {
+            int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+            if (rr != 0) return rr;            /* EACCES too (finding 188) */
+            rr = statfs_follow(kpath, sizeof kpath);       /* finding 244 */
+            if (rr != 0) return rr;
+            /* a name that is not there is ENOENT, as the native statfs
+             * says: vfs_statfs answers for anything inside a mount
+             * (finding 215: statfs("/nonexistent") succeeded) */
+            struct vfs_stat est;
+            int esr = vfs_stat(kpath, &est);
+            if (esr != VFS_OK) return vfs_err_to_abi(esr);
+        } else {
+            struct file *f = fd_lookup((int)a1);
+            if (!f) return -ABI_EBADF;
+            const char *p = f->open_path;
+            if (!p && f->kind == FILE_KIND_DIR) p = f->dirpath;
+            if (!p) p = "/";       /* pathless kind: root numbers */
+            size_t pl = strlen(p);
+            if (pl >= sizeof kpath) return -ABI_ENAMETOOLONG;
+            memcpy(kpath, p, pl + 1);
+        }
+        int rc = vfs_statfs(kpath, &vs);
+        if (rc != VFS_OK) return vfs_err_to_abi(rc);
         memset(&sf, 0, sizeof sf);
-        sf.f_type    = 0x01021994;           /* TMPFS_MAGIC */
-        sf.f_bsize   = 4096;
-        sf.f_frsize  = 4096;
-        sf.f_blocks  = 1L << 20;             /* 4 GiB of 4 KiB blocks */
-        sf.f_bfree   = sf.f_bavail = 3L << 18;
-        sf.f_files   = 1L << 20;
-        sf.f_ffree   = 1L << 19;
-        sf.f_namelen = 255;
+        sf.f_type    = (long)vs.type_magic;
+        sf.f_bsize   = (long)vs.bsize;
+        sf.f_frsize  = (long)vs.bsize;
+        sf.f_blocks  = (long)vs.blocks;
+        sf.f_bfree   = sf.f_bavail = (long)vs.bfree;
+        sf.f_files   = (long)vs.files;
+        sf.f_ffree   = (long)vs.ffree;
+        sf.f_namelen = (long)vs.namelen;
         if (a2 && copy_to_user((void *)a2, &sf, sizeof sf) != 0)
             return -ABI_EFAULT;
         return 0;
@@ -11045,33 +17313,20 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!upath || probe[0] == '\0') {      /* AT_EMPTY_PATH: statx the fd */
             struct file *f = fd_lookup((int)a1);
             if (!f) return -ABI_EBADF;
-            struct vfs_stat vs = { .type = VFS_TYPE_FILE, .size = f->vfs.size,
-                                   .uid = f->vfs.uid, .gid = f->vfs.gid,
-                                   .mode = f->vfs.mode };
-            /* Slice 103: same char-device answer for statx -- glibc may
-             * use either. See the newfstatat note above. */
-            if (f->kind == FILE_KIND_DRM) {
-                struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0,
-                                        .mode = 0666 };
-                long src = linux_emit_statx(&cvs, lx_fd_ino(f, (int)a1),
-                                            (void *)a5);
-                if (src == 0) {
-                    /* Patch mode to S_IFCHR and fill rdev in place: the
-                     * generic emitter only knows FILE/DIR. */
-                    uint16_t m = (uint16_t)(0x2000u | 0666u);
-                    uint32_t rmaj = DRM_CHR_MAJOR, rmin = f->dir_off;
-                    (void)copy_to_user((uint8_t *)a5 + 0x1c, &m, sizeof m);
-                    (void)copy_to_user((uint8_t *)a5 + 0x80, &rmaj, sizeof rmaj);
-                    (void)copy_to_user((uint8_t *)a5 + 0x84, &rmin, sizeof rmin);
-                }
-                return src;
-            }
-            if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
-            return linux_emit_statx(&vs, lx_fd_ino(f, (int)a1), (void *)a5);
+            return lx_emit_fd_statx(f, (int)a1, (void *)a5);
         }
         char kpath[ABI_PATH_MAX];
-        int rr = resolve_user_path(upath, kpath, sizeof kpath);
+        int rr = resolve_user_path_at((int)a1, upath, kpath, sizeof kpath);
         if (rr) return rr;
+        rr = trailing_slash_dir(upath, kpath, sizeof kpath);
+        if (rr) return rr;
+        if (!((int)a3 & 0x100)) {          /* no AT_SYMLINK_NOFOLLOW */
+            struct file *ff = 0;
+            int fdn = -1;
+            long fr = lx_stat_follow_first(kpath, sizeof kpath, &ff, &fdn);
+            if (fr) return fr;
+            if (ff) return lx_emit_fd_statx(ff, fdn, (void *)a5);
+        }
         {   /* Slice 104: DRM nodes stat as char devices here too -- and
              * TRACE it. glibc's stat() compiles to statx on modern
              * builds, so this branch was the blind spot that hid
@@ -11079,8 +17334,24 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             int dmin = lx_dev_dri_minor(kpath);
             if (dmin >= 0 && lxdrm_available()) {
                 gputrace("statx", kpath, 0);
-                return linux_emit_chrdev_stat(DRM_CHR_MAJOR, (uint32_t)dmin,
-                                              lx_ino_hash(kpath), (void *)a5);
+                /* 2026-08-22: was linux_emit_chrdev_stat, which writes a
+                 * struct lx_stat -- a DIFFERENT SHAPE from statx -- so a
+                 * 256-byte statx buffer got a stat-sized record and every
+                 * field past st_mode was garbage. The handoff carried it as
+                 * a known latent defect; same emit-then-stamp pattern as
+                 * the fd-based DRM arm above. */
+                struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0,
+                                        .mode = 0666 };
+                long src = linux_emit_statx(&cvs, lx_ino_hash(kpath),
+                                            (void *)a5);
+                if (src == 0 && a5) {
+                    uint16_t m = (uint16_t)(0x2000u | 0666u);
+                    uint32_t rmaj = DRM_CHR_MAJOR, rmin = (uint32_t)dmin;
+                    (void)copy_to_user((uint8_t *)a5 + 0x1c, &m, sizeof m);
+                    (void)copy_to_user((uint8_t *)a5 + 0x80, &rmaj, sizeof rmaj);
+                    (void)copy_to_user((uint8_t *)a5 + 0x84, &rmin, sizeof rmin);
+                }
+                return src;
             }
         }
         /* Synthesised /dev nodes -- and THIS is the arm that matters, for the
@@ -11101,13 +17372,21 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                  * verified working end-to-end and this is not its slice, but
                  * it is noted in the handoff.) */
                 struct vfs_stat dvs = { .type = VFS_TYPE_FILE, .size = 0,
-                                        .uid = 0, .gid = 0,
+                                        .uid = 0,
+                                        .gid = ((dm & 0xF000u) == 0x6000u) ? 6u : 0u,
                                         .mode = dm & 0xFFFu };
+                dvs.atime = dvs.mtime = dvs.ctime = dev_boot_time();   /* 202 */
+                {   uint64_t pt[3];             /* a pty slave's (finding 190) */
+                    if (pts_node_times(kpath, 0, &dvs.uid, &dvs.gid, pt)) {
+                        dvs.atime = pt[0]; dvs.mtime = pt[1]; dvs.ctime = pt[2];
+                    }
+                }
                 long src = linux_emit_statx(&dvs, lx_ino_hash(kpath),
                                             (void *)a5);
                 if (src == 0 && a5) {
-                    uint16_t m = (uint16_t)(0x2000u | (dm & 0xFFFu));
-                    uint32_t rmaj = 1, rmin = 3;      /* /dev/null's identity */
+                    uint16_t m = (uint16_t)((dm & 0xF000u) | (dm & 0xFFFu));
+                    uint32_t rmaj = 0, rmin = 0;      /* the node's own */
+                    (void)devfs_node_mode(kpath, &rmaj, &rmin);
                     (void)copy_to_user((uint8_t *)a5 + 0x1c, &m, sizeof m);
                     (void)copy_to_user((uint8_t *)a5 + 0x80, &rmaj, sizeof rmaj);
                     (void)copy_to_user((uint8_t *)a5 + 0x84, &rmin, sizeof rmin);
@@ -11150,12 +17429,23 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return 0;
     }
     case LX_inotify_add_watch: {
-        /* No real file-change events, but hand back a monotonic watch descriptor
-         * so callers (fontconfig, dir watching) proceed rather than erroring. */
-        static int g_lx_inotify_wd;
-        return ++g_lx_inotify_wd;
+        /* Real since 2026-08-22. The previous arm returned a bare counter
+         * and registered NOTHING -- fontconfig, glib file monitors and
+         * every watcher "succeeded" and then waited forever on events no
+         * machinery could produce. */
+        struct file *inf = fd_lookup((int)a1);
+        if (!inf || inf->kind != FILE_KIND_INOTIFY) return -ABI_EINVAL;
+        char kpath[ABI_PATH_MAX];
+        {   int rr_ = resolve_user_path((const char *)a2, kpath, sizeof kpath);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
+        return sys_inotify_add_watch(inf->inotify_id, kpath, (uint32_t)a3);
     }
-    case LX_inotify_rm_watch:  return 0;
+    case LX_inotify_rm_watch: {
+        struct file *inf = fd_lookup((int)a1);
+        if (!inf || inf->kind != FILE_KIND_INOTIFY) return -ABI_EINVAL;
+        return sys_inotify_rm_watch(inf->inotify_id, (int)a2);
+    }
 
     /* ---- misc ---- */
     case LX_uname: {
@@ -11168,8 +17458,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * own hostname here and nowhere else is involved. */
         char u[6 * 65];
         memset(u, 0, sizeof u);
-        const char *vals[6] = { "Linux", uts_nodename(), "5.0.0-tobyos",
-                                "#1 tobyOS Linux-ABI", "x86_64",
+        /* the release and version /proc/sys/kernel says (finding 253): this
+         * said 5.0.0-tobyos and "#1 tobyOS Linux-ABI" where the files said
+         * 6.1.0-tobyos and nothing */
+        const char *vals[6] = { "Linux", uts_nodename(), "6.1.0-tobyos",
+                                "#1 SMP " TOBYOS_BUILD_DATE, "x86_64",
                                 uts_domainname() };
         for (int i = 0; i < 6; i++) {
             size_t l = strlen(vals[i]);
@@ -11259,7 +17552,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (sig == SIGKILL || sig == SIGSTOP) return -ABI_EINVAL;
         struct proc *p = current_proc();
         if (!p) return -ABI_EPERM;
-        struct sigaction *cur = &p->sigstate.actions[sig];
+        struct sigaction *cur = &sig_actions_of(p)[sig];   /* thread-group table */
         if (a3) {                       /* report old action in Linux layout */
             struct lx_sigaction old;
             memset(&old, 0, sizeof old);
@@ -11268,7 +17561,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             old.sa_restorer = p->sigstate.restorer;
             /* Slice 3: sa_mask crosses the same signo vs signo-1 boundary as
              * rt_sigprocmask -- convert out of tobyOS numbering. */
-            old.sa_mask     = (uint64_t)cur->sa_mask >> 1;
+            old.sa_mask     = sig_mask_to_linux((uint64_t)cur->sa_mask);
             if (copy_to_user((void *)a3, &old, sizeof old) != 0)
                 return -ABI_EFAULT;
         }
@@ -11277,7 +17570,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (copy_from_user(&na, (const void *)a2, sizeof na) != 0)
                 return -ABI_EFAULT;
             cur->sa_handler = (void (*)(int))(uintptr_t)na.sa_handler;
-            cur->sa_mask    = (sigset_t)(na.sa_mask << 1);  /* Linux -> tobyOS */
+            cur->sa_mask    = (sigset_t)sig_mask_from_linux(na.sa_mask);  /* Linux -> tobyOS */
             cur->sa_flags   = (int)na.sa_flags;
             if ((na.sa_flags & LX_SA_RESTORER) && na.sa_restorer)
                 p->sigstate.restorer = na.sa_restorer;
@@ -11315,7 +17608,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         struct proc *p = current_proc();
         if (!p) return -ABI_EINVAL;
         if (a3) {                       /* oldset: tobyOS -> Linux numbering */
-            uint64_t old = (uint64_t)p->sigstate.mask >> 1;
+            uint64_t old = sig_mask_to_linux((uint64_t)p->sigstate.mask);
             if (copy_to_user((void *)a3, &old, sizeof old) != 0)
                 return -ABI_EFAULT;
         }
@@ -11323,8 +17616,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             uint64_t lset = 0;
             if (copy_from_user(&lset, (const void *)a2, sizeof lset) != 0)
                 return -ABI_EFAULT;
-            uint32_t kset = (uint32_t)(lset << 1);   /* Linux -> tobyOS */
-            kset &= ~(uint32_t)(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
+            uint64_t kset = sig_mask_from_linux(lset);   /* Linux -> tobyOS */
+            kset &= ~(uint64_t)(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
             switch ((int)a1) {
             case 0: p->sigstate.mask |= kset; break;   /* SIG_BLOCK   */
             case 1: p->sigstate.mask &= ~kset; break;  /* SIG_UNBLOCK */
@@ -11338,10 +17631,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return sys_sigreturn();
     case LX_kill:                      /* (pid, sig) */
         return sys_kill((int)a1, (int)a2);
-    case LX_tkill:                     /* (tid, sig) */
-        return sys_kill((int)a1, (int)a2);
-    case LX_tgkill:                    /* (tgid, tid, sig) -> signal the tid */
-        return sys_kill((int)a2, (int)a3);
+    case LX_tkill:                     /* (tid, sig): thread-directed */
+        return sys_tgkill(0, (int)a1, (int)a2);
+    case LX_tgkill:                    /* (tgid, tid, sig): thread-directed,
+                                        * and the tgid is CHECKED now -- it
+                                        * was accepted and ignored. */
+        return sys_tgkill((int)a1, (int)a2, (int)a3);
 
     /* Slice 90: the two signal syscalls chrome's crash path needs. Both were
      * -ENOSYS, which is why a faulting thread could never finish reporting:
@@ -11359,7 +17654,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * (signo-1); tobyOS's SIGMASK(s) is (1u << s), i.e. bit == signo
          * (see signal.h and oom.c's `1u << 9` for SIGKILL). Shift the
          * caller's set into OUR numbering once, here. */
-        uint64_t kset = uset << 1;
+        uint64_t kset = sig_mask_from_linux(uset);
         /* Deadline: NULL timeout means wait forever. */
         bool have_to = (a3 != 0);
         uint64_t deadline = 0;
@@ -11389,10 +17684,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
              * handler), so clear the bit before returning the number. */
             uint64_t hit = p->pending_signals & kset;
             if (hit) {
-                int signo = 0;      /* bit index IS the signal number here */
-                for (int i = 0; i < 64; i++)
-                    if (hit & (1ull << i)) { signo = i; break; }
-                p->pending_signals &= ~(1ull << signo);
+                /* the lowest signal pending, 1..64 (signal 64 rides bit
+                 * 0, finding 195) */
+                int signo = 0;
+                for (int i = 1; i < SIG_MAX; i++)
+                    if (hit & SIGMASK(i)) { signo = i; break; }
+                p->pending_signals &= ~SIGMASK(signo);
                 if (a2) {   /* siginfo_t: kernel-origin, minimal but valid */
                     uint8_t si[128];
                     memset(si, 0, sizeof si);
@@ -11404,7 +17701,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             }
             if (have_to && perf_now_ns() >= deadline)
                 RTSTW_RET(-ABI_EAGAIN);     /* Linux: EAGAIN on timeout */
-            if (p->pending_signals)         /* a signal we are NOT waiting for */
+            /* A signal we are NOT waiting for -- but only one that would
+             * actually be ACTED ON. An ignored SIGCHLD arriving mid-wait is
+             * not an interruption (see sig_should_eintr). Signals we ARE
+             * waiting for never reach here: the `hit` branch above consumes
+             * them. */
+            if (sig_should_eintr(p))
                 RTSTW_RET(EINTR_RET);
             sti();
             {
@@ -11480,37 +17782,28 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     }
 
     case LX_access:                 /* (path, mode) */
-        return lx_faccess((const char *)a1);
+        return lx_faccess((const char *)a1, (int)a2);
     case LX_faccessat:              /* (dirfd, path, mode) */
     case LX_faccessat2:             /* (dirfd, path, mode, flags) */
-        return lx_faccess((const char *)a2);
+        return lx_faccess((const char *)a2, (int)a3);
 
     /* Known-optional: libc/busybox probe these and fall back cleanly on
      * -ENOSYS. Handled explicitly (quietly) so they don't spam the log. */
     case LX_fcntl: {            /* (fd, cmd, arg) */
+        /* F_GETFL and F_SETFL: the status flags as Linux's file keeps them
+         * (fcntl_getfl, finding 235). The access mode was the first answer
+         * here: Chromium's PlatformSharedMemoryRegion::Create CHECKs that a
+         * writable region's dup reports O_RDWR, and the old blanket 0 made
+         * every fd look O_RDONLY (base::ImmediateCrash). */
         if ((int)a2 == 3 /* F_GETFL */) {
-            /* Return the fd's access mode. Chromium's shared-memory
-             * PlatformSharedMemoryRegion::Create dups the region fd and CHECKs
-             * fcntl(F_GETFL) reports the expected mode (O_RDWR for a writable
-             * region); the old blanket-0 made every fd look O_RDONLY, so the
-             * writable-region check failed -> base::ImmediateCrash. Status flags
-             * (O_APPEND/O_NONBLOCK) aren't tracked; the access mode is what the
-             * check reads. */
             struct file *ff = fd_lookup((int)a1);
             if (!ff) return -ABI_EBADF;
-            /* O_NONBLOCK IS tracked for sockets now, and it must read back:
-             * the standard way to go non-blocking is F_GETFL, OR the bit in,
-             * F_SETFL -- if F_GETFL never reports it, code that checks its own
-             * work (or re-derives flags later) sees a blocking socket. */
-            if (ff->kind == FILE_KIND_SOCKET && ff->sock && ff->sock->nonblock)
-                return ff->o_accmode | SOCK_NONBLOCK;
-            return ff->o_accmode;
+            return fcntl_getfl(ff);
         }
         if ((int)a2 == 4 /* F_SETFL */) {
             struct file *ff = fd_lookup((int)a1);
             if (!ff) return -ABI_EBADF;
-            if (ff->kind == FILE_KIND_SOCKET && ff->sock)
-                ff->sock->nonblock = ((unsigned long)a3 & SOCK_NONBLOCK) != 0;
+            fcntl_setfl(ff, (uint32_t)a3);
             return 0;
         }
         if ((int)a2 == 1033 /* F_ADD_SEALS */) {
@@ -11550,18 +17843,24 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             struct file *ff = fd_lookup((int)a1);
             if (!ff) return -ABI_EBADF;
             int minfd = (int)a3;
-            if (minfd < 0 || minfd >= PROC_NFDS) return -ABI_EINVAL;
             struct proc *p = current_proc();
             if (!p) return -ABI_EPERM;
+            /* from at or past the soft RLIMIT_NOFILE: EINVAL; none free
+             * between it and the limit: EMFILE (Linux's f_dupfd) */
+            int lim = proc_nofile(p);
+            if (minfd < 0 || minfd >= lim) return -ABI_EINVAL;
             struct file **tab = proc_fds(p);
             if (!tab) return -ABI_EPERM;
             int nfd = -1;
-            for (int i = minfd; i < PROC_NFDS; i++)
+            for (int i = minfd; i < lim; i++)
                 if (!tab[i]) { nfd = i; break; }
             if (nfd < 0) return -ABI_EMFILE;
             struct file *cl = file_clone(ff);
             if (!cl) return -ABI_ENOMEM;
             tab[nfd] = cl;
+            /* The duplicate's own FD_CLOEXEC starts from the command, never
+             * from a stale bit left in this slot by a previous tenant. */
+            fd_cloexec_set(p, nfd, (int)a2 == LX_F_DUPFD_CLOEXEC);
 #ifdef CHROMIUM_BOOT
             { static int c = 0; if (c < 24) { c++;
                 kprintf("[fcntl] F_DUPFD%s fd=%d min=%d -> %d (kind=%d)\n",
@@ -11570,10 +17869,232 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 #endif
             return nfd;
         }
-        return 0;               /* F_GETFD/F_SETFD/F_SETFL/CLOEXEC: best-effort no-op */
+        /* POSIX record locks: real since 2026-08-22 (src/flock.c). The
+         * previous blanket `return 0` told SQLite and every multi-process
+         * database "you hold the lock" with no exclusion behind it --
+         * silent corruption instead of contention, the worst available
+         * failure. OFD variants (36-38) share the handler; their owner is
+         * approximated as the process, which errs toward extra conflicts,
+         * never missing ones. */
+        if ((int)a2 == 5 || (int)a2 == 6 || (int)a2 == 7 ||
+            (int)a2 == 36 /* F_OFD_GETLK */ || (int)a2 == 37 ||
+            (int)a2 == 38) {
+            struct file *ff = fd_lookup((int)a1);
+            if (!ff) return -ABI_EBADF;
+            struct lx_flock kfl;
+            if (!a3 || copy_from_user(&kfl, (const void *)a3, sizeof kfl) != 0)
+                return -ABI_EFAULT;
+            int cmd = (int)a2 >= 36 ? (int)a2 - 31 : (int)a2;  /* 36-38 -> 5-7 */
+            long lr = fl_fcntl(ff, current_proc(), cmd, &kfl);
+            if (lr == 0 && cmd == 5 &&
+                copy_to_user((void *)a3, &kfl, sizeof kfl) != 0)
+                return -ABI_EFAULT;
+            return lr;
+        }
+        /* F_GETFD/F_SETFD: real since 2026-08-22 -- close-on-exec is
+         * tracked per-descriptor (proc.h fd_cloexec) and acted on by
+         * execve. The years of `return 0` here meant every descriptor
+         * leaked into every exec'd image. */
+        if ((int)a2 == 1 /* F_GETFD */) {
+            if (!fd_lookup((int)a1)) return -ABI_EBADF;
+            return fd_cloexec_get(current_proc(), (int)a1) ? LX_FD_CLOEXEC : 0;
+        }
+        if ((int)a2 == 2 /* F_SETFD */) {
+            if (!fd_lookup((int)a1)) return -ABI_EBADF;
+            fd_cloexec_set(current_proc(), (int)a1,
+                           ((unsigned long)a3 & LX_FD_CLOEXEC) != 0);
+            return 0;
+        }
+        /* EVERY OTHER COMMAND STILL HAS TO CHECK THE DESCRIPTOR EXISTS.
+         *
+         * "no-op" is not "always succeeds". Answering 0 for a CLOSED fd
+         * told every caller that the descriptor was open, and the real bash
+         * in the initrd uses exactly that to decide whether a redirection
+         * needs saving:
+         *
+         *     exec 6< file        bash: redirection error: cannot duplicate
+         *                               fd: Bad file descriptor
+         *
+         * bash asked whether fd 6 was in use, was told yes, tried to stash it
+         * with F_DUPFD -- which correctly said EBADF -- and gave up. Every
+         * `exec N<file` and `exec N>&1` above the fd the shell happened to
+         * open next failed, which is the shape `./configure` scripts are made
+         * of. It also made the conformance oracle wrong on three cases where
+         * tsh had the right answer all along. */
+        if (!fd_lookup((int)a1)) return -ABI_EBADF;
+        /* A COMMAND LINUX HAS, still answered 0 (owners, signals, leases,
+         * notifications, write hints) -- and F_GETPIPE_SZ/F_SETPIPE_SZ, a
+         * pipe's capacity, which is fixed here. Any other is EINVAL, as
+         * Linux's (finding 235): it was 0, "done". */
+        switch ((int)a2) {
+        case 1031: case 1032: {          /* F_SETPIPE_SZ, F_GETPIPE_SZ */
+            struct file *pf = fd_lookup((int)a1);
+            if (pf->kind != FILE_KIND_PIPE_R && pf->kind != FILE_KIND_PIPE_W &&
+                pf->kind != FILE_KIND_PIPE_RW) return -ABI_EBADF;
+            return (long)PIPE_BUF_SZ;          /* 65536, as Linux's default */
+        }
+        case 8: case 9: case 10: case 11: case 15: case 16:
+        case 1024: case 1025: case 1026: case 1029:
+        case 1035: case 1036: case 1037: case 1038:
+            return 0;
+        default:
+            return -ABI_EINVAL;
+        }
     }
-    case LX_sendfile:           /* cat/cp fall back to a read/write loop */
+    /* ---- the kernel copy family (2026-08-22): sendfile was an honest
+     * ENOSYS and copy_file_range/splice were census gaps -- but coreutils
+     * 9.x cp and Go use copy_file_range UNCONDITIONALLY, and nginx-shaped
+     * servers treat sendfile as the primary path. One shared loop serves
+     * all three; offset-form arguments require a seekable (VFS) side. ---- */
+    case LX_sendfile:                  /* sendfile(out_fd, in_fd, *off, count) */
+        return lx_copy_fds((int)a2, (uint64_t)a3, (int)a1, 0, (size_t)a4);
+    case 326:                          /* copy_file_range(fin,*offin,fout,*offout,len,fl) */
+        return lx_copy_fds((int)a1, (uint64_t)a2, (int)a3, (uint64_t)a4,
+                           (size_t)a5);
+    case 275: {                        /* splice(fin,*offin,fout,*offout,len,fl) */
+        struct file *sfi = fd_lookup((int)a1), *sfo = fd_lookup((int)a3);
+        if (!sfi || !sfo) return -ABI_EBADF;
+        bool in_pipe  = (sfi->kind == FILE_KIND_PIPE_R || sfi->kind == FILE_KIND_PIPE_RW);
+        bool out_pipe = (sfo->kind == FILE_KIND_PIPE_W || sfo->kind == FILE_KIND_PIPE_RW);
+        if (!in_pipe && !out_pipe) return -ABI_EINVAL;  /* one side MUST be a pipe */
+        return lx_copy_fds((int)a1, (uint64_t)a2, (int)a3, (uint64_t)a4,
+                           (size_t)a5);
+    }
+
+    /* ---- POSIX interval timers (222-226): timer_create(2) family.
+     * glibc's librt wrappers had nothing to land on. ptimer.c fires them
+     * from the alarm sweep on the same perf_now_ns clock. ---- */
+    case 222: {                        /* timer_create(clockid, *sevp, *timerid) */
+        int signo = SIGALRM;
+        if (a2) {
+            struct { uint64_t sival; int32_t signo; int32_t notify; } sev;
+            if (copy_from_user(&sev, (const void *)a2, sizeof sev) != 0)
+                return -ABI_EFAULT;
+            if (sev.notify == 1 /* SIGEV_NONE */) signo = 0;
+            else if (sev.signo > 0 && sev.signo < SIG_MAX) signo = sev.signo;
+            else return -ABI_EINVAL;
+        }
+        struct proc *tp = current_proc();
+        if (!tp) return -ABI_EPERM;
+        extern long ptimer_create(int, int);
+        long tid = ptimer_create(tp->is_thread ? tp->tgid : tp->pid, signo);
+        if (tid < 0) return tid;
+        int tid32 = (int)tid;          /* kernel timer_t is an int */
+        if (!a3 || copy_to_user((void *)a3, &tid32, sizeof tid32) != 0) {
+            extern long ptimer_delete(int, int);
+            (void)ptimer_delete((int)tid, tp->is_thread ? tp->tgid : tp->pid);
+            return -ABI_EFAULT;
+        }
+        return 0;
+    }
+    case 223: {                        /* timer_settime(id, flags, *new, *old) */
+        struct proc *tp = current_proc();
+        if (!tp) return -ABI_EPERM;
+        int owner = tp->is_thread ? tp->tgid : tp->pid;
+        int64_t its[4];                /* interval.s, interval.ns, value.s, value.ns */
+        if (!a3 || copy_from_user(its, (const void *)a3, sizeof its) != 0)
+            return -ABI_EFAULT;
+        uint64_t iv = (uint64_t)its[0] * 1000000000ull + (uint64_t)its[1];
+        uint64_t vv = (uint64_t)its[2] * 1000000000ull + (uint64_t)its[3];
+        if (vv && (a2 & 1) /* TIMER_ABSTIME */) {
+            /* Absolute CLOCK_REALTIME deadline -> relative, the same rebase
+             * the futex path does. */
+            extern uint64_t lx_realtime_ns(uint64_t);
+            uint64_t now_rt = lx_realtime_ns(perf_now_ns());
+            vv = (vv > now_rt) ? vv - now_rt : 1;
+        }
+        uint64_t orem = 0, oiv = 0;
+        extern long ptimer_settime(int, int, uint64_t, uint64_t,
+                                   uint64_t *, uint64_t *);
+        long rc = ptimer_settime((int)a1, owner, vv, iv, &orem, &oiv);
+        if (rc < 0) return rc;
+        if (a4) {
+            int64_t old[4] = { (int64_t)(oiv / 1000000000ull),
+                               (int64_t)(oiv % 1000000000ull),
+                               (int64_t)(orem / 1000000000ull),
+                               (int64_t)(orem % 1000000000ull) };
+            if (copy_to_user((void *)a4, old, sizeof old) != 0)
+                return -ABI_EFAULT;
+        }
+        return 0;
+    }
+    case 224: {                        /* timer_gettime(id, *curr) */
+        struct proc *tp = current_proc();
+        if (!tp) return -ABI_EPERM;
+        uint64_t rem = 0, iv = 0;
+        extern long ptimer_gettime(int, int, uint64_t *, uint64_t *);
+        long rc = ptimer_gettime((int)a1,
+                                 tp->is_thread ? tp->tgid : tp->pid, &rem, &iv);
+        if (rc < 0) return rc;
+        int64_t its[4] = { (int64_t)(iv / 1000000000ull),
+                           (int64_t)(iv % 1000000000ull),
+                           (int64_t)(rem / 1000000000ull),
+                           (int64_t)(rem % 1000000000ull) };
+        if (!a2 || copy_to_user((void *)a2, its, sizeof its) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
+    case 225: {                        /* timer_getoverrun(id) */
+        struct proc *tp = current_proc();
+        if (!tp) return -ABI_EPERM;
+        extern long ptimer_overrun(int, int);
+        return ptimer_overrun((int)a1, tp->is_thread ? tp->tgid : tp->pid);
+    }
+    case 226: {                        /* timer_delete(id) */
+        struct proc *tp = current_proc();
+        if (!tp) return -ABI_EPERM;
+        extern long ptimer_delete(int, int);
+        return ptimer_delete((int)a1, tp->is_thread ? tp->tgid : tp->pid);
+    }
+
+    /* Authoritative refusals (2026-08-22). These four were named by the
+     * census contract comments as "explicit ENOSYS arms" -- and DIDN'T
+     * EXIST, so the first workload to probe io_uring or bpf would have
+     * turned the gate red while the comment a reader consults said that
+     * cannot happen. Answering "no" authoritatively is a supported
+     * answer; falling through the dispatcher is a coverage gap. Both
+     * families have universal userspace fallbacks (liburing probes,
+     * systemd degrades). */
+    case 321:                          /* bpf */
+    case 425: case 426: case 427:      /* io_uring_{setup,enter,register} */
         return -ABI_ENOSYS;
+
+    case LX_execveat:
+        /* Authoritative ENOSYS by DESIGN, not neglect (Phase E). glibc's
+         * fexecve() probes execveat once and permanently falls back to
+         * execve("/proc/self/fd/N") -- and that path genuinely works now:
+         * procfs stats fd links as symlinks, describe_fd_target() answers
+         * with the handle's stamped open_path, and the resolver follows
+         * it to the real binary. Implementing execveat directly would
+         * mean refactoring sys_execve's user-pointer contract for a call
+         * whose only mainstream consumer has a working fallback. */
+        return -ABI_ENOSYS;
+
+    case 219:                          /* restart_syscall */
+        /* Re-issued by the kernel after a stop/cont interrupted a
+         * restartable call. There is no restart-block machinery here;
+         * EINTR is the honest degradation -- callers already handle it,
+         * where a census fall-through read as "unknown syscall". */
+        return -ABI_EINTR;
+
+    case 129: {                        /* rt_sigqueueinfo(pid, sig, *info) */
+        /* glibc's sigqueue(3): the caller's si_code and si_value travel
+         * with the signal (finding 215: they were dropped, and it was a
+         * kill). Linux's rule on the code: one that is not negative, or is
+         * SI_TKILL's, would pass for the kernel's or tgkill's own, so only
+         * a process signalling itself may give it (EPERM otherwise). The
+         * pending signal keeps one siginfo -- this kernel queues no second
+         * instance of a signal already pending. */
+        uint8_t ib[48];
+        if (!a3 || copy_from_user(ib, (const void *)(uintptr_t)a3, sizeof ib) != 0)
+            return -ABI_EFAULT;
+        int code = *(const int32_t *)(ib + 8);
+        uint64_t value = *(const uint64_t *)(ib + 24);
+        struct proc *qp = current_proc();
+        if ((code >= 0 || code == SI_TKILL) && (!qp || pid_vnr(qp) != (int)a1))
+            return -ABI_EPERM;
+        return signal_queue((int)a1, (int)a2, code, value);
+    }
 
     default: {
         /* First-hit-detailed, deduped gap-list logger (see lx_scname note).
@@ -13000,6 +19521,10 @@ static void win32_stash_wndproc(const struct win32_win *w) {
 #define WM_LBUTTONUP    0x0202
 #define WM_RBUTTONDOWN  0x0204
 #define WM_RBUTTONUP    0x0205
+#define WM_MOUSEWHEEL   0x020A
+/* Win32's quantum of wheel travel; a detent is exactly one of these and
+ * apps divide by it, so it must be 120 and not our own step size. */
+#define WHEEL_DELTA     120
 
 /* MK_* wParam button-state bits for mouse messages. */
 #define MK_LBUTTON      0x0001
@@ -13435,6 +19960,18 @@ static bool win32_event_to_msg(int fd, const struct gui_event *ev,
         m->message = WM_KEYDOWN;
         m->wParam  = (uint64_t)ev->key;
         m->lParam  = 1;
+        return true;
+    case GUI_EV_WHEEL:
+        /* WM_MOUSEWHEEL: the delta is the HIGH word of wParam, in
+         * multiples of WHEEL_DELTA (120) -- one detent == 120, sign
+         * matching ours (+ = away from the user). lParam carries SCREEN
+         * coordinates for this message, but the compositor only hands us
+         * client ones; passing them through is the same approximation the
+         * other mouse arms above already make. */
+        m->message = WM_MOUSEWHEEL;
+        m->wParam  = ((uint64_t)(uint16_t)(int16_t)(ev->wheel * WHEEL_DELTA) << 16)
+                   | (uint64_t)(ev->button & 0x07);
+        m->lParam  = ((uint64_t)(uint16_t)ev->x) | ((uint64_t)(uint16_t)ev->y << 16);
         return true;
     case GUI_EV_CLOSE:
         m->message = WM_CLOSE;
@@ -17208,12 +23745,19 @@ static void win32_put_filetime(uint64_t uft, uint64_t unix_secs) {
     (void)copy_to_user((void *)(uintptr_t)(uft + 4), &hi, 4);
 }
 static long w32_GetSystemTimeAsFileTime(uint64_t *a) {
-    if (a[0]) win32_put_filetime(a[0], rtc_unix_time());
+    if (a[0]) win32_put_filetime(a[0], lx_realtime_ns(perf_now_ns()) / 1000000000ull);
     return 0;
 }
 static long w32_GetSystemTime(uint64_t *a) {     /* SYSTEMTIME: 8 WORDs */
-    struct rtc_time t; rtc_read_time(&t);
-    uint16_t st[8] = { t.year, t.month, t.weekday, t.day, t.hour, t.minute, t.second, 0 };
+    /* The wall clock (finding 157: the one timesyncd sets), not the CMOS --
+     * which also gave wDayOfWeek as the RTC counts it, Sunday 1, where
+     * Windows counts Sunday 0 -- with its milliseconds. */
+    uint64_t ns = lx_realtime_ns(perf_now_ns());
+    struct civil_time ct;
+    civil_from_unix((int64_t)(ns / 1000000000ull), &ct);
+    uint16_t st[8] = { (uint16_t)ct.year, (uint16_t)(ct.mon + 1), (uint16_t)ct.wday,
+                       (uint16_t)ct.mday, (uint16_t)ct.hour, (uint16_t)ct.min,
+                       (uint16_t)ct.sec, (uint16_t)(ns / 1000000ull % 1000ull) };
     if (a[0]) (void)copy_to_user((void *)(uintptr_t)a[0], st, sizeof(st));
     return 0;
 }
@@ -17750,7 +24294,7 @@ static void win32_fill_stat(uint64_t out, const struct vfs_stat *vs) {
     uint16_t mode = (vs->type==VFS_TYPE_DIR) ? 0x4000|0x1FF : 0x8000|0x1B6;  /* S_IFDIR / S_IFREG */
     memcpy(&b[6],&mode,2);
     int32_t sz=(int32_t)vs->size; memcpy(&b[20],&sz,4);
-    int64_t mt=(int64_t)rtc_unix_time(); memcpy(&b[24],&mt,8); memcpy(&b[32],&mt,8); memcpy(&b[40],&mt,8);
+    int64_t mt=(int64_t)(lx_realtime_ns(perf_now_ns()) / 1000000000ull); memcpy(&b[24],&mt,8); memcpy(&b[32],&mt,8); memcpy(&b[40],&mt,8);
     (void)copy_to_user((void*)(uintptr_t)out,b,sizeof(b));
 }
 static long w32_stat64i32(uint64_t *a){
@@ -18691,11 +25235,28 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
         struct proc *ftp = current_proc();
         if (ftp && ftp->personality == ABI_PERS_LINUX && !ftp->pending_signals) {
             long frv;
+            /* Finding 169: these ways out honour need_resched as the normal
+             * one does. A proc that lives on clock_gettime, stale futex
+             * WAITs or empty-queue yields spends its slice in here, and
+             * otherwise rotated only when a tick caught it in ring 3: on
+             * the EliteDesk three raw clock_gettime loops left a spawn at
+             * 15-18 ms where three CPU loops leave 1.8. No BKL is held, and
+             * sched_rotate needs none to switch. */
+#define FAST_EXIT_RESCHED()                                           \
+            do {                                                      \
+                if (ftp->need_resched && !ftp->is_idle) {             \
+                    uint8_t why = ftp->need_resched;                  \
+                    ftp->need_resched = 0;                            \
+                    if (why == NEED_RESCHED_SLICE) sched_rotate();    \
+                    else sched_yield();                               \
+                }                                                     \
+            } while (0)
             if (linux_fast_time_syscall(num, a1, a2, &frv)) {
                 { extern volatile uint64_t g_lx_fast_time; g_lx_fast_time++; }
                 ftp->syscall_count++;
                 perf_inc_total_syscalls();
                 wdog_kick_proc(ftp->pid);
+                FAST_EXIT_RESCHED();
                 cli();      /* match the normal return: mask before the .S unwind */
                 return frv;
             }
@@ -18713,6 +25274,7 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
                     ftp->syscall_count++;
                     perf_inc_total_syscalls();
                     wdog_kick_proc(ftp->pid);
+                    FAST_EXIT_RESCHED();
                     cli();
                     return frv;
                 }
@@ -18729,10 +25291,12 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
                     ftp->syscall_count++;
                     perf_inc_total_syscalls();
                     wdog_kick_proc(ftp->pid);
+                    FAST_EXIT_RESCHED();
                     cli();
                     return 0;
                 }
             }
+#undef FAST_EXIT_RESCHED
         }
     }
 
@@ -18801,6 +25365,84 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * only syscall is the Win32 marshalling gate. The native path (the common
      * case, personality 0) is completely unchanged. */
     long rv;
+#ifdef SYSDIAG_REGCHECK
+    /* 2026-08-26, against the wake-after-death flake. The captured fire panics
+     * at the `caller->cursys_nat = -1` store BELOW, with r12 (the compiler's
+     * cached `caller`) == 0, faulting on NULL+0x510. The source has `if
+     * (caller)` on both sides; the compiler correctly elides the second test
+     * because a local cannot change across a call -- so the C is right and the
+     * MACHINE STATE is what went wrong. In the same dump rbx, which holds
+     * `num` for the call, contained a kernel pointer that looks like &g_proc[N]
+     * instead of a small integer. Two callee-saved registers wrong at once.
+     *
+     * That leaves two possibilities and one sample cannot separate them:
+     *   (a) the callee-saved set was CORRUPTED across the call (a bad context
+     *       restore -- the flake's recorded mechanism), or
+     *   (b) control reached that store without ever loading a valid `caller`.
+     *
+     * THIS SEPARATES THEM. `caller_onstack` is volatile, so the compiler must
+     * keep it in memory on this frame while `caller` stays in a callee-saved
+     * register. If the two disagree after the call, the REGISTER changed while
+     * the stack copy survived -- (a), decisively. If they agree, it is (b).
+     * cpu_before/after says whether the proc migrated, i.e. whether a context
+     * switch was even involved.
+     *
+     * Deliberately behind a flag: this is one compare on every syscall, and it
+     * must not ship. It also must not "fix" anything -- reading the fresh
+     * pointer here would paper over the corruption and hide the bug. */
+    struct proc *const volatile caller_onstack = caller;
+    /* NOT smp_current_cpu_idx() -- that is the LAPIC MMIO read described
+     * below. It survived an earlier cut of this instrument only because it sat
+     * in a never-taken branch and the compiler could sink it; the stack check
+     * further down is unconditional, so nothing on this path may depend on
+     * that staying true. gs:[cpu_idx] is the same answer for a single load. */
+    unsigned cpu_before;
+    __asm__ volatile ("movl %%gs:%c1, %0"
+                      : "=r"(cpu_before)
+                      : "i"(__builtin_offsetof(struct percpu, cpu_idx)));
+
+    /* HYPOTHESIS 2, tested in the same run so one night settles both.
+     *
+     * If it is NOT a dual-schedule, the next suspect is this CPU running the
+     * current proc on ANOTHER proc's syscall stack. percpu.syscall_rsp is what
+     * syscall_entry.S loads into RSP on every entry ("mov rsp, gs:[0]"), and
+     * do_switch is supposed to keep it == current->kstack_top (signal.h states
+     * that invariant outright, and the syscall_regs mirror depends on it). If
+     * it ever lags the running proc, two procs' frames overlap on one stack
+     * and each overwrites the other's saved USER registers -- which is exactly
+     * what "a user stack address arrived as a syscall number" looks like from
+     * outside, and would corrupt callee-saved registers on the way back out.
+     *
+     * Exact compare is correct: entry only LOADS syscall_rsp, it never
+     * modifies it, so at this point it must still equal kstack_top. Threads
+     * have their own kstack and do_switch stamps the thread's, so a thread is
+     * not a false positive. */
+    if (caller) {
+        /* Read syscall_rsp the way syscall_entry.S itself does -- a single
+         * gs-relative load at percpu offset 0 (percpu.h pins it there for
+         * exactly this reason). NOT smp_this_cpu(): its fast path is this same
+         * load, but if the gs self-pointer ever reads NULL it falls back to
+         * &g_percpu[smp_current_cpu_idx()], and smp_current_cpu_idx() is a
+         * LAPIC MMIO read -- "a VM exit / device-model dispatch, ~1000x a plain
+         * load under TCG" per its own comment. Unconditionally, on EVERY
+         * syscall, that measured ~60x slower: the first cut of this check
+         * produced 10 s of guest time in 600 s of wall clock and the harness
+         * scored the boot DEAD. It was never hung, only crawling. */
+        uint64_t srsp;
+        __asm__ volatile ("movq %%gs:0, %0" : "=r"(srsp));
+        const uint64_t ktop = (uint64_t)(uintptr_t)caller->kstack_top;
+        if (srsp != ktop) {
+            static int stack_logged;
+            if (stack_logged < 8) {
+                stack_logged++;
+                kprintf("[sysdiag] SYSCALL-STACK MISMATCH pid=%d '%s' cpu=%u "
+                        "syscall_rsp=0x%lx kstack_top=0x%lx num=%ld\n",
+                        caller->pid, caller->name, cpu_before,
+                        (unsigned long)srsp, (unsigned long)ktop, num);
+            }
+        }
+    }
+#endif
     if (caller && caller->personality == ABI_PERS_LINUX)
         rv = linux_syscall(num, a1, a2, a3, a4, a5);
     else if (caller && caller->personality == ABI_PERS_WIN32)
@@ -18809,10 +25451,63 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
         /* Slice 64c: stamp the NATIVE syscall so BKL hold time attributes
          * to it (chromewin's GUI/blit calls live here). */
         if (caller) caller->cursys_nat = (int32_t)num;
+        /* PTRACE SYSCALL STOPS ON THE NATIVE PATH: the same two calls
+         * linux_syscall makes, at the same two points, gated so an untraced
+         * process pays one predictable branch. The number and result are
+         * NATIVE ones; the tracer picks its name table from the target's
+         * ELF.
+         *
+         * HISTORY, in full, because this was turned on, reverted, and is on
+         * again, and the next reader deserves the story rather than a
+         * warning. Enabled 2026-09-01. `strace` on the real 4-core EliteDesk
+         * then wedged the box -- still answering ping and completing TCP
+         * handshakes off the NIC interrupt, never running another service
+         * tick. Reverted 2026-09-02 with the diagnosis "the stop yields
+         * under the BKL". The diagnosis was right and the revert was aimed
+         * at the wrong place: the yield lives in the SHARED ptrace_stop() in
+         * src/ptrace.c, and the Linux path had been making these exact
+         * calls from the same lock state since the ptrace slice -- `strace
+         * /bin/arch`, a Linux-personality target, wedged the same hardware
+         * the same way. ptrace_stop now drops the BKL around its yield
+         * (3c523d2), and a tracer's exit detaches the tracees it left parked
+         * (a4ad8a9); eighty cumulative Linux traces on the box proved both.
+         * With the hazard fixed where it lived, nothing about this branch
+         * differs from the Linux one above it, and it is proven the same
+         * way: native traces on the EliteDesk, in a loop, with progress
+         * written to /data so a wedge names its iteration. */
+        if (caller && caller->tracer_pid && caller->ptrace_syscall)
+            ptrace_syscall_stop(caller, true, num, 0);
         rv = do_syscall(num, a1, a2, a3, a4, a5);
+        if (caller && caller->tracer_pid && caller->ptrace_syscall)
+            ptrace_syscall_stop(caller, false, num, rv);
+#ifdef SYSDIAG_REGCHECK
+        /* Check BEFORE the store that actually faulted, so the evidence is
+         * printed even on the boot where it would have panicked. */
+        if (caller != caller_onstack) {
+            kprintf("[sysdiag] CALLEE-SAVED CORRUPTION at native syscall %ld: "
+                    "caller(reg)=%p caller(stack)=%p cpu %u->%u pid=%d\n",
+                    num, (void *)caller, (void *)caller_onstack,
+                    cpu_before, smp_current_cpu_idx(),
+                    caller_onstack ? caller_onstack->pid : -1);
+            caller = (struct proc *)caller_onstack;   /* survive to keep logging */
+        }
+#endif
         if (caller) caller->cursys_nat = -1;
     }
 
+#ifdef SYSDIAG_REGCHECK
+    /* Same check for the Linux/Win32 branches, which the captured fire did not
+     * happen to take -- if the corruption is a context-restore bug it is not
+     * personality-specific, and covering only the branch that fired once would
+     * be assuming the answer. */
+    if (caller != caller_onstack) {
+        kprintf("[sysdiag] CALLEE-SAVED CORRUPTION after syscall %ld "
+                "(pers branch): caller(reg)=%p caller(stack)=%p cpu %u->%u\n",
+                num, (void *)caller, (void *)caller_onstack,
+                cpu_before, smp_current_cpu_idx());
+        caller = (struct proc *)caller_onstack;
+    }
+#endif
     perf_syscall_exit((int)num, t_sys);
     perf_zone_end(PERF_Z_SYSCALL, t_sys);
 
@@ -18839,6 +25534,23 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
         syscall_service_input();
     }
 
+    /* Finding 169: the time slice ran out inside this system call (the
+     * tick marked need_resched; it cannot switch in kernel mode). Rotate
+     * now, holding only the BKL, which sched_rotate drops for the switch --
+     * Linux's exit-to-user check. Before the signal check below, so a signal
+     * that arrives while we wait for the CPU still goes out on this return. */
+    {
+        struct proc *rp = current_proc();
+        if (rp && !rp->is_idle && rp->need_resched) {
+            /* the slice is over: rotate; the PIT wants this CPU's queue to
+             * run (pit.c): a plain yield */
+            uint8_t why = rp->need_resched;
+            rp->need_resched = 0;
+            if (why == NEED_RESCHED_SLICE) sched_rotate();
+            else sched_yield();
+        }
+    }
+
     /* Safe point #1: every syscall return runs through here. If the
      * kernel (or another proc, or the keyboard IRQ) sent us a signal
      * during the body, deliver it now -- for a caught signal this pushes a
@@ -18846,7 +25558,7 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * the handler; for a fatal default it proc_exit()s and never returns.
      * `rv` is preserved as the to-be-restored RAX for the handler case
      * (or swapped for a syscall restart when the action has SA_RESTART). */
-    signal_deliver_syscall(rv, num);
+    rv = signal_deliver_syscall(rv, num);
 
     /* Slice 88: CoW-fork STW -- a sibling must not return to user while
      * vmm_cow_fork is stripping PTE_WRITABLE. Park until tg_vm_resume. */

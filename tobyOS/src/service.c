@@ -271,9 +271,10 @@ static void backfill_pids(void) {
         for (const char *c = s->path; *c; c++) if (*c == '/') base = c + 1;
 
         /* Walk the proc table for a live process whose name == base. */
-        extern struct proc *proc_lookup(int pid);
-        for (int pid = 1; pid < 64; pid++) {
-            struct proc *p = proc_lookup(pid);
+        extern struct proc *proc_at_slot(int slot);
+        for (int ps_i = 1; ps_i < PROC_MAX; ps_i++) {   /* by slot: pids are not slots */
+            struct proc *p = proc_at_slot(ps_i);
+            int pid = p ? p->pid : 0;
             if (!p) continue;
             if (p->state == PROC_TERMINATED) continue;
             if (strcmp(p->name, base) == 0) {

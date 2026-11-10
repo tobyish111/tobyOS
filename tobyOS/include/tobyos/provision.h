@@ -32,7 +32,7 @@ bool provision_dev_mounted(struct blk_dev *dev, const char **mount_point);
  * tobyOS-data partition, tobyfs format, mount as /data when /data is
  * RAM-backed or absent. Returns ABI_PROV_OK_* or -ABI_E* (see abi.h).
  * `force` = ABI_PROV_F_FORCE semantics. */
-long provision_create_data_volume(struct blk_dev *d, bool force);
+long provision_create_data_volume(struct blk_dev *d, uint32_t flags);
 
 /* Fill a KERNEL staging buffer with up to `cap` abi_blk_info records
  * (one per registry entry, verdicts included). Returns the count.
@@ -43,6 +43,13 @@ long provision_fill_blk_list(struct abi_blk_info *out, uint32_t cap);
  * disks (blank / NTFS / FAT-MBR / foreign GPT / mounted) and asserts
  * the guard verdicts, then provisions the blank one end-to-end.
  * Prints "[PROV] ... PASS/FAIL" lines to serial. */
+/* Make /data writable by non-root sessions. A freshly formatted tobyfs
+ * root is uid 0 / mode 0755, so without this every write from a desktop
+ * session fails the permission check. Call it from EVERY site that mounts
+ * /data -- it lived only in the boot path, and the provisioning path's
+ * second mount silently skipped it. Idempotent. */
+void data_volume_relax_perms(void);
+
 void provision_selftest(void);
 
 #endif /* TOBYOS_PROVISION_H */

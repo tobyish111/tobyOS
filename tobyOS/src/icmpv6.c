@@ -14,6 +14,7 @@
 #include <tobyos/dhcpv6.h>
 #include <tobyos/eth.h>
 #include <tobyos/net.h>
+#include <tobyos/perf.h>   /* perf_now_ns: the bounded NA wait (2026-08-23) */
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 
@@ -122,7 +123,31 @@ bool icmpv6_resolve(const struct ipv6_addr *ip, uint8_t mac_out[6]) {
     const struct ipv6_addr *our = ipv6_our_linklocal();
     hdr->checksum = icmpv6_checksum(our, &sn, ns_buf, sizeof(ns_buf));
 
-    ipv6_send(&sn, IPV6_NH_ICMPV6, ns_buf, sizeof(ns_buf));
+    /* NDP travels at hop limit 255 (RFC 4861) -- receivers silently
+     * discard anything else. */
+    ipv6_send_hl(&sn, IPV6_NH_ICMPV6, ns_buf, sizeof(ns_buf), 255);
+
+    /* Bounded wait for the NA (2026-08-23). The old fire-and-forget
+     * return meant the FIRST send to every cold neighbor failed and the
+     * caller had to retry -- v4 gets away with that shape because its
+     * gateway is ARP-warm from DHCP before anything else sends, but in
+     * v6 every on-link peer starts cold. Pump the NIC and poll the
+     * cache: a live neighbor (SLIRP, a LAN host) answers in well under
+     * a millisecond, so the 200 ms cap is only ever paid to a DEAD
+     * neighbor. Pure pump+clock loop -- no hlt, no yield -- so it is
+     * safe from any context that may send (syscall or net tick). */
+    {
+        uint64_t deadline = perf_now_ns() + 200ull * 1000000ull;
+        struct net_dev *nd = net_default();
+        while (perf_now_ns() < deadline) {
+            if (nd && nd->rx_drain) nd->rx_drain(nd);
+            e = nd_lookup(ip);
+            if (e) {
+                memcpy(mac_out, e->mac, 6);
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -150,10 +175,16 @@ static void send_na(const struct ipv6_addr *dst_ip,
     na_buf[25] = 1;
     memcpy(na_buf + 26, g_my_mac, 6);
 
-    const struct ipv6_addr *our = ipv6_our_linklocal();
-    hdr->checksum = icmpv6_checksum(our, dst_ip, na_buf, sizeof(na_buf));
+    /* Checksum over the source ipv6_send will REALLY stamp (2026-08-23).
+     * This hardcoded our link-local while ipv6_send stamps the SLAAC
+     * global for a global-scope destination -- so every NA answering a
+     * global-address solicitation carried a bad checksum, the solicitor
+     * dropped it as corrupt, and re-solicited forever (observed: SLIRP
+     * NS'ing us every 3 s while holding our DNS answer). */
+    hdr->checksum = icmpv6_checksum(ipv6_src_for(dst_ip), dst_ip,
+                                    na_buf, sizeof(na_buf));
 
-    ipv6_send(dst_ip, IPV6_NH_ICMPV6, na_buf, sizeof(na_buf));
+    ipv6_send_hl(dst_ip, IPV6_NH_ICMPV6, na_buf, sizeof(na_buf), 255);
 }
 
 /* ---- Router Solicitation (SLAAC kickoff) ------------------------ */
@@ -175,7 +206,13 @@ void icmpv6_send_router_solicit(void) {
     const struct ipv6_addr *our = ipv6_our_linklocal();
     hdr->checksum = icmpv6_checksum(our, &ipv6_addr_all_routers,
                                     rs_buf, sizeof(rs_buf));
-    ipv6_send(&ipv6_addr_all_routers, IPV6_NH_ICMPV6, rs_buf, sizeof(rs_buf));
+    /* Hop limit 255 is LOAD-BEARING here: RFC 4861 receivers (SLIRP
+     * included) silently discard NDP at any other value, and the
+     * hardwired 64 this used to ride meant every RS this stack ever
+     * sent was ignored -- "SLIRP does not answer RS" (the old selftest
+     * comment) was OUR bug wearing the router's name. */
+    ipv6_send_hl(&ipv6_addr_all_routers, IPV6_NH_ICMPV6, rs_buf,
+                 sizeof(rs_buf), 255);
 }
 
 /* ---- Router Advertisement (SLAAC) ------------------------------- */
@@ -300,8 +337,10 @@ static void handle_echo_request(const struct ipv6_addr *src,
     rh->code     = 0;
     rh->checksum = 0;
 
-    const struct ipv6_addr *our = ipv6_our_linklocal();
-    rh->checksum = icmpv6_checksum(our, src, reply, len);
+    /* Same rule as send_na: checksum over what ipv6_send really stamps
+     * (the global, for a global-scope pinger), not a hardcoded
+     * link-local. */
+    rh->checksum = icmpv6_checksum(ipv6_src_for(src), src, reply, len);
 
     if (ipv6_send(src, IPV6_NH_ICMPV6, reply, len) == 0)
         kprintf("[icmpv6] echo reply sent\n");
@@ -317,9 +356,20 @@ static void handle_neighbor_solicit(const struct ipv6_addr *src,
     struct ipv6_addr target;
     memcpy(target.bytes, payload + 8, 16);
 
-    const struct ipv6_addr *our = ipv6_our_linklocal();
-    if (!ipv6_addr_equal(&target, our))
-        return;   /* not asking about us */
+    /* Answer for ANY of our unicast addresses (2026-08-23). This
+     * responder predates SLAAC and only knew the link-local -- so the
+     * stack ACQUIRED global addresses it then refused to defend: SLIRP
+     * resolved fec0::3 for us, sent the DNS answer, NS'd our global to
+     * deliver it, got silence, and retransmitted the solicitation every
+     * 3 s while our recv timed out. Same silent black hole for every
+     * inbound TCP6 segment addressed to the global. */
+    bool ours = ipv6_addr_equal(&target, ipv6_our_linklocal());
+    if (!ours && ipv6_have_global())
+        ours = ipv6_addr_equal(&target, ipv6_our_global());
+    if (!ours && ipv6_have_dhcp6())
+        ours = ipv6_addr_equal(&target, ipv6_dhcp6_addr());
+    if (!ours)
+        return;   /* genuinely not asking about us */
 
     char srcbuf[40];
     ipv6_format(srcbuf, sizeof(srcbuf), src);
@@ -394,8 +444,58 @@ void icmpv6_recv(const struct ipv6_addr *src, const struct ipv6_addr *dst,
     case ICMPV6_ROUTER_ADVERT:
         handle_router_advert(src, data, len);
         break;
-    default:
+    case ICMPV6_DEST_UNREACH: {
+        /* RFC 4443 destination unreachable, carrying the invoking packet:
+         * 4 (hdr) + 4 (unused) + inner v6 header (40) + inner L4. Route
+         * it to the socket that sent the original datagram so a
+         * connect()ed-UDP caller reads the wire's verdict as an errno
+         * instead of timing out (2026-08-23: SLIRP answers exactly this
+         * -- type 1 code 0 -- for a v6 DNS query when the host has no
+         * IPv6 resolver, and we used to throw it away unread). */
+        if (len < 56) break;                    /* need through inner L4 ports */
+        const uint8_t *in6 = data + 8;          /* inner ipv6 header */
+        struct ipv6_addr peer;
+        memcpy(peer.bytes, in6 + 24, 16);       /* inner DST = our peer */
+        uint16_t lport_be, pport_be;
+        memcpy(&lport_be, data + 48, 2);        /* inner L4 src = ours */
+        memcpy(&pport_be, data + 50, 2);        /* inner L4 dst = peer */
+        if (in6[6] == IPV6_NH_UDP) {
+            extern void sock_udp6_icmp_error(uint16_t local_port_be,
+                                             const struct ipv6_addr *peer,
+                                             uint16_t peer_port_be,
+                                             uint8_t code);
+            sock_udp6_icmp_error(lport_be, &peer, pport_be, hdr->code);
+        } else if (in6[6] == IPV6_NH_TCP) {
+            /* Kills a SYN_SENT handshake with the real errno (Linux's
+             * tcp_v6_err shape) -- SLIRP answers v6 SYNs it cannot
+             * service with exactly this, and unread it meant every such
+             * connect sat out its full timeout. */
+            extern void tcp6_icmp_error(uint16_t local_port_be,
+                                        const struct ipv6_addr *peer,
+                                        uint16_t peer_port_be, uint8_t code);
+            tcp6_icmp_error(lport_be, &peer, pport_be, hdr->code);
+        }
         break;
+    }
+    default: {
+        /* Capped: an ICMPv6 type nothing handles -- for an ERROR
+         * (type < 128) print enough of the invoking packet to see what
+         * the far side is complaining about. Silent unknowns are how
+         * "SLIRP refuses our DNS query with an error we throw away"
+         * looked exactly like "no answer" (2026-08-23). */
+        static int unk;
+        if (unk < 8) { unk++;
+            char sb[40];
+            ipv6_format(sb, sizeof(sb), src);
+            kprintf("[icmpv6] unhandled type=%u code=%u len=%u from %s "
+                    "b4-7=%02x %02x %02x %02x\n",
+                    (unsigned)hdr->type, (unsigned)hdr->code,
+                    (unsigned)len, sb,
+                    len > 4 ? data[4] : 0, len > 5 ? data[5] : 0,
+                    len > 6 ? data[6] : 0, len > 7 ? data[7] : 0);
+        }
+        break;
+    }
     }
 }
 

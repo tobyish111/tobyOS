@@ -1,0 +1,1 @@
+argv.py bare 'sq'

@@ -1,0 +1,8 @@
+# fc against a REAL interactive history -- which the hosted REPL never fed
+# until this leg (the ring and fc were both built; nothing connected them).
+# Numbering includes the runner's PS1-setup line in both shells, so the
+# columns agree by construction.
+echo one
+echo two
+fc -l
+exit 0

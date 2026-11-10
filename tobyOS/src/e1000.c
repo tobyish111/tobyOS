@@ -35,6 +35,7 @@
  *     anyway)
  */
 
+#include <tobyos/sched.h>    /* bkl_try_enter: the IRQ's receive drain */
 #include <tobyos/e1000.h>
 #include <tobyos/pci.h>
 #include <tobyos/pmm.h>
@@ -82,6 +83,7 @@
 
 /* RCTL bits. */
 #define RCTL_EN          (1u << 1)
+#define RCTL_MPE         (1u << 4)       /* multicast promiscuous */
 #define RCTL_BAM         (1u << 15)      /* broadcast accept */
 #define RCTL_BSIZE_2048  0u
 #define RCTL_SECRC       (1u << 26)      /* strip CRC */
@@ -247,6 +249,13 @@ static bool e1000_setup_rx(void) {
         RCTL_EN |
         RCTL_BAM |
         RCTL_UPE |        /* temporary debug: accept all unicast frames */
+        /* MPE (2026-08-23): the MTA below is zeroed and nothing ever
+         * programs it, so without multicast-promiscuous EVERY multicast
+         * frame died in the filter -- including all IPv6 Router
+         * Advertisements (ff02::1 -> MAC 33:33:00:00:00:01) and NDP
+         * solicited-node traffic. SLAAC could only ever pass its
+         * synthetic selftest; on the real wire the stack was RX-deaf. */
+        RCTL_MPE |
         RCTL_SECRC |
         RCTL_BSIZE_2048;
 
@@ -459,7 +468,19 @@ static void e1000_irq_handler(void *ctx) {
     if (!g_mmio) return;
     g_irq_count++;
     (void)mmio_read32(E1000_ICR);
-    e1000_rx_drain_op(0);
+    /* THE RECEIVE PATH IS THE BKL'S (finding 166). eth_recv runs IP and
+     * TCP, whose state -- a connection's receive ring above all -- tcp.c
+     * guards with the BKL alone. Run from this interrupt unguarded, it
+     * raced the reader: rx_push here against rx_pop in the SSH worker,
+     * and on the EliteDesk 4 of 40 841 KB uploads were cut off or
+     * garbled ("invalid encrypted packet_length"). With the BKL free the
+     * frames are taken now; otherwise they wait on the ring for the next
+     * drain under the BKL -- every pass of tcp_poll_until, pid 0's
+     * service tick. */
+    if (bkl_try_enter()) {
+        e1000_rx_drain_op(0);
+        bkl_exit();
+    }
 }
 
 /* ----- net_dev publication --------------------------------------- */

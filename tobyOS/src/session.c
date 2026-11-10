@@ -35,11 +35,13 @@
 #include <tobyos/slog.h>
 #include <tobyos/pit.h>
 #include <tobyos/abi/abi.h>
+#include <tobyos/utmp.h>
 
 #define LOGIN_SERVICE_NAME "login"
 #define LOGIN_PROGRAM_PATH "/bin/login"
 
 static struct {
+    uint64_t login_epoch_s;   /* since= in SYS_SESSION_INFO */
     int  id;
     bool active;
     char username[SESSION_USER_MAX];
@@ -165,6 +167,7 @@ void session_get_info(struct session_info *out) {
     out->active = g.active;
     out->uid    = g.active ? g.uid : 0;
     out->gid    = g.active ? g.gid : 0;
+    out->since_epoch_s = g.active ? g.login_epoch_s : 0;
     copy_capped(out->username, g.username, SESSION_USER_MAX);
 }
 
@@ -220,6 +223,13 @@ int session_login(const char *username, const char *password) {
      * automatically de-tagged from the new session. */
     g.id += 1;
     g.active = true;
+    /* the wall clock's seconds: lx_realtime_ns takes the monotonic now,
+     * and was called here with nothing, so the login time was whatever
+     * the register held */
+    { extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+      extern uint64_t perf_now_ns(void);
+      g.login_epoch_s = lx_realtime_ns(perf_now_ns()) / 1000000000ull; }
+    utmp_login(0, ":0", u->name, ":0", 0);
     g.uid    = u->uid;
     g.gid    = u->gid;
     copy_capped(g.username, u->name, SESSION_USER_MAX);
@@ -269,8 +279,9 @@ int session_logout(void) {
      * the current session. We start at pid 1 because pid 0 (the boot
      * idle thread / shell) must never be killed. */
     int n_killed = 0;
-    for (int pid = 1; pid < 64; pid++) {
-        struct proc *p = proc_lookup(pid);
+    for (int ps_i = 1; ps_i < PROC_MAX; ps_i++) {   /* by slot: pids are not slots */
+        struct proc *p = proc_at_slot(ps_i);
+        int pid = p ? p->pid : 0;
         if (!p) continue;
         if (p->state == PROC_TERMINATED) continue;
         if (p->session_id != sid) continue;
@@ -288,6 +299,7 @@ int session_logout(void) {
     g.username[0] = '\0';
     g.uid = 0;
     g.gid = 0;
+    utmp_logout(0);
     kprintf("[session] session %d closed (%d procs signalled)\n", sid, n_killed);
 
     {

@@ -1,11 +1,13 @@
 /* pid_ns.c -- PID namespaces (Phase 3 slice 10).
  *
- * See the long comment in nsproxy.h for the constraint that shapes everything
- * here: a pid in tobyOS IS an index into g_proc[PROC_MAX], so pids cannot be
- * reassigned. Namespace-local pids ("vpids") are therefore a TRANSLATION at the
- * syscall boundary over a stored host pid ("kpid") -- the same
- * store-global-translate-at-the-edge shape slice 2 chose for uids, and for the
- * same reason: the alternative is auditing every internal user of p->pid.
+ * See the long comment in nsproxy.h for the constraint that shaped this: a
+ * process has ONE stored pid ("kpid", the initial namespace's number), so
+ * namespace-local pids ("vpids") are a TRANSLATION at the syscall boundary --
+ * the same store-global-translate-at-the-edge shape slice 2 chose for uids,
+ * and for the same reason: the alternative is auditing every internal user
+ * of p->pid. The kpid was also the g_proc[] slot index until batch 26; it
+ * runs to PID_MAX now, so the per-namespace map is kept per SLOT (v_of_k) and
+ * a vpid's entry (k_of_v) holds the kpid itself.
  *
  * ---------------------------------------------------------------------------
  * WHY THERE ARE TWO NAMESPACE POINTERS ON struct proc
@@ -41,9 +43,15 @@ struct pid_ns {
     int             next_v;     /* rotating allocation hint */
     /* Two directions, both O(1). The vpid space is bounded by PROC_MAX because
      * the whole machine is, so a flat array is both smaller and faster than a
-     * hash -- 2 KiB per namespace. */
+     * hash -- 2 KiB per namespace. v_of_k is indexed by the process's SLOT
+     * (kslot), not its kpid; k_of_v by the vpid, holding the kpid. */
     int32_t         v_of_k[PROC_MAX];
     int32_t         k_of_v[PROC_MAX];
+    /* the user namespace that owns it (a reference; NULL the initial one):
+     * whoever mounts a proc of it must hold CAP_SYS_ADMIN there or above,
+     * as Linux's (finding 241: the root of an `unshare -r` mounted a proc
+     * of the initial pid namespace) */
+    void           *owner_user_ns;
 };
 
 /* The initial pid namespace. Deliberately has NO maps: level 0 is the IDENTITY
@@ -62,6 +70,11 @@ static inline struct pid_ns *as_ns(void *p) {
     return p ? (struct pid_ns *)p : &g_init_pid_ns;
 }
 
+/* KPID's slot while it still holds KPID, or -1 */
+static inline int kslot(int kpid) {
+    return kpid > 0 ? proc_pid_slot_live(kpid) : -1;
+}
+
 static inline struct pid_ns *proc_pidns(struct proc *p) {
     return (p && p->pid_ns) ? (struct pid_ns *)p->pid_ns : &g_init_pid_ns;
 }
@@ -70,10 +83,12 @@ static inline struct pid_ns *proc_pidns(struct proc *p) {
  * refcounting
  * =================================================================== */
 
-void *pid_ns_create(void *parent_ns) {
+void *pid_ns_create(void *parent_ns, void *owner_user_ns) {
     struct pid_ns *ns = kmalloc(sizeof(*ns));
     if (!ns) return 0;
     memset(ns, 0, sizeof(*ns));
+    ns->owner_user_ns = owner_user_ns;
+    user_ns_get(owner_user_ns);
     struct pid_ns *par = as_ns(parent_ns);
     ns->refs   = 1;
     ns->inum   = ns_inum_alloc();
@@ -105,6 +120,7 @@ void pid_ns_put(void *p) {
          * cascade. Loop rather than recurse: nesting depth is unbounded from
          * userspace, and a recursive put would be a stack-depth attack. */
         struct pid_ns *par = ns->parent;
+        user_ns_put(ns->owner_user_ns);
         kfree(ns);
         ns = par;
     }
@@ -112,15 +128,25 @@ void pid_ns_put(void *p) {
 
 uint64_t pid_ns_inum(void *p) { return as_ns(p)->inum; }
 
+void *pid_ns_owner(void *p) { return as_ns(p)->owner_user_ns; }
+
 /* ===================================================================
  * translation
  * =================================================================== */
 
 int pid_vnr_in(void *nsp, int kpid) {
     struct pid_ns *ns = as_ns(nsp);
-    if (kpid <= 0 || kpid >= PROC_MAX) return 0;
+    if (kpid <= 0 || kpid >= PID_MAX) return 0;
     if (ns->level == 0) return kpid;            /* identity */
-    return (int)ns->v_of_k[kpid];               /* 0 == not visible from here */
+    int s = kslot(kpid);
+    if (s < 0) return 0;
+    return (int)ns->v_of_k[s];                  /* 0 == not visible from here */
+}
+
+int pid_ns_last_pid(void *nsp) {
+    struct pid_ns *ns = as_ns(nsp);
+    if (ns->level == 0) return proc_last_pid();
+    return ns->next_v > 1 ? ns->next_v - 1 : 0;
 }
 
 int pid_vnr_of_kpid(int kpid) {
@@ -134,8 +160,9 @@ int pid_vnr(struct proc *target) {
 
 int pid_knr(int vpid) {
     struct pid_ns *ns = proc_pidns(current_proc());
-    if (vpid <= 0 || vpid >= PROC_MAX) return 0;
-    if (ns->level == 0) return vpid;            /* identity */
+    if (vpid <= 0) return 0;
+    if (ns->level == 0) return vpid < PID_MAX ? vpid : 0;   /* identity */
+    if (vpid >= PROC_MAX) return 0;
     return (int)ns->k_of_v[vpid];
 }
 
@@ -162,10 +189,12 @@ bool pid_ns_is_init(struct proc *p) {
  * that just exited -- the same reason Linux keeps a last_pid hint, and it
  * makes a stale vpid in a log far less likely to look like a live process. */
 static int alloc_vpid_locked(struct pid_ns *ns, int kpid, int want) {
+    int s = kslot(kpid);
+    if (s < 0) return 0;
     if (want > 0) {                                   /* caller wants vpid 1 */
         if (ns->k_of_v[want]) return 0;
         ns->k_of_v[want] = kpid;
-        ns->v_of_k[kpid] = want;
+        ns->v_of_k[s] = want;
         return want;
     }
     for (int n = 0; n < PROC_MAX - 1; n++) {
@@ -174,7 +203,7 @@ static int alloc_vpid_locked(struct pid_ns *ns, int kpid, int want) {
         if (v < 1) v = 1;
         if (ns->k_of_v[v]) continue;
         ns->k_of_v[v] = kpid;
-        ns->v_of_k[kpid] = v;
+        ns->v_of_k[s] = v;
         ns->next_v = (v + 1 >= PROC_MAX) ? 1 : v + 1;
         return v;
     }
@@ -183,10 +212,12 @@ static int alloc_vpid_locked(struct pid_ns *ns, int kpid, int want) {
 
 static void free_vpid_locked(struct pid_ns *ns, int kpid) {
     if (ns->level == 0) return;
-    int v = (int)ns->v_of_k[kpid];
+    int s = kslot(kpid);
+    if (s < 0) return;
+    int v = (int)ns->v_of_k[s];
+    ns->v_of_k[s] = 0;
     if (v <= 0 || v >= PROC_MAX) return;
     if (ns->k_of_v[v] == kpid) ns->k_of_v[v] = 0;
-    ns->v_of_k[kpid] = 0;
 }
 
 /* Register `kpid` in `ns` and every ancestor. `first` asks for vpid 1 in `ns`
@@ -243,7 +274,7 @@ long pid_ns_place_child(struct proc *child, struct proc *parent,
 
     if (clone_flags & CLONE_NEWPID) {
         struct pid_ns *base = parent ? proc_pidns(parent) : &g_init_pid_ns;
-        void *fresh = pid_ns_create(base);
+        void *fresh = pid_ns_create(base, child->user_ns);
         if (!fresh) return -ABI_ENOMEM;
         /* Drop the reference memcpy'd from the parent before overwriting. */
         pid_ns_put(child->pid_ns);

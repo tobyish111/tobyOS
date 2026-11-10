@@ -48,15 +48,43 @@ struct ktermios {
 #define TTY_ECHOE   0x0010u
 #define TTY_ECHOK   0x0020u
 #define TTY_ECHONL  0x0040u
+#define TTY_NOFLSH  0x0080u     /* no input flush on INTR, QUIT, SUSP */
+#define TTY_TOSTOP  0x0100u     /* a background write stops (SIGTTOU) */
+#define TTY_ECHOCTL 0x0200u     /* control characters echo as ^X */
+#define TTY_IEXTEN  0x8000u     /* WERASE, LNEXT, REPRINT (canonical mode) */
+#define TTY_EXTPROC 0x10000u    /* another side edits and echoes: no echo */
+/* ECHOKE: VKILL rubs the line out on screen instead of just echoing a
+ * newline. Same value as Linux, and in a Linux pty's defaults (batch 26). */
+#define TTY_ECHOKE  0x0800u
 
 /* c_iflag bits. */
 #define TTY_INLCR   0x0040u
 #define TTY_IGNCR   0x0080u
 #define TTY_ICRNL   0x0100u
+#define TTY_IUCLC   0x0200u     /* upper case in, lower case to the reader */
+#define TTY_IXON    0x0400u     /* VSTOP/VSTART stop and restart output */
+#define TTY_IXANY   0x0800u     /* any character restarts it */
+
+/* c_cflag bits. CIBAUD is the input speed, CBAUD's code IBSHIFT up; 0
+ * there means "the output speed". */
+#define TTY_CBAUD   0x100Fu
+#define TTY_B38400  0x000Fu
+#define TTY_CSIZE   0x0030u
+#define TTY_CS8     0x0030u
+#define TTY_CREAD   0x0080u
+#define TTY_PARENB  0x0100u
+#define TTY_IBSHIFT 16
+#define TTY_CIBAUD  (TTY_CBAUD << TTY_IBSHIFT)
 
 /* c_oflag bits. */
 #define TTY_OPOST   0x0001u
+#define TTY_OLCUC   0x0002u     /* lower case out as upper case */
 #define TTY_ONLCR   0x0004u
+#define TTY_OCRNL   0x0008u     /* CR out as NL */
+#define TTY_ONOCR   0x0010u     /* no CR at column 0 */
+#define TTY_ONLRET  0x0020u     /* NL does a CR's work */
+#define TTY_TABDLY  0x1800u
+#define TTY_XTABS   0x1800u     /* tab3: tabs out as spaces */
 
 /* c_cc[] indices (Linux). */
 #define TTY_VINTR   0
@@ -66,13 +94,23 @@ struct ktermios {
 #define TTY_VEOF    4
 #define TTY_VTIME   5
 #define TTY_VMIN    6
+#define TTY_VSWTC   7
+#define TTY_VSTART  8
+#define TTY_VSTOP   9
 #define TTY_VSUSP   10
+#define TTY_VEOL    11
+#define TTY_VREPRINT 12
+#define TTY_VDISCARD 13
+#define TTY_VWERASE 14
+#define TTY_VLNEXT  15
+#define TTY_VEOL2   16
 
 /* ioctl request numbers (Linux x86-64). */
 #define TTY_TCGETS      0x5401u
 #define TTY_TCSETS      0x5402u
 #define TTY_TCSETSW     0x5403u
 #define TTY_TCSETSF     0x5404u
+#define TTY_TCXONC      0x540Au
 #define TTY_TCFLSH      0x540Bu
 #define TTY_TIOCGPGRP   0x540Fu
 #define TTY_TIOCSPGRP   0x5410u

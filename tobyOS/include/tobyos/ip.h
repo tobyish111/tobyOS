@@ -39,6 +39,11 @@ struct __attribute__((packed)) ip_hdr {
  * keeps the original sender's source address. `pkt` is written in place. */
 bool ip_forward_packet(void *ns, void *ip_packet, size_t total);
 
+/* ip_send with an explicit TTL (0 = IP_DEFAULT_TTL). traceroute's whole
+ * method is a datagram per hop with TTL 1, 2, 3...; nothing native could
+ * set it before 2026-09-04. */
+bool ip_send_ttl(uint32_t dst_ip_be, uint8_t proto,
+                 const void *payload, size_t payload_len, uint8_t ttl);
 bool ip_send(uint32_t dst_ip_be, uint8_t proto,
              const void *payload, size_t payload_len);
 

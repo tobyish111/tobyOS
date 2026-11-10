@@ -30,11 +30,18 @@ static bool     g_perf_enabled   = true;
  *
  *   ns = dtsc * 1e6 / khz
  *
- * Using 64x64 math keeps accuracy for any plausible dtsc (up to
- * ~0.5 year at 3 GHz before overflow). */
+ * IN TWO STEPS: the whole milliseconds, then the cycles left over. The
+ * one-product form overflowed 64 bits at dtsc = 2^64 / 1e6 = 1.8e13
+ * cycles -- 4295 s at 4.3 GHz, ~90 min at 3.4 GHz, not the "~0.5 year"
+ * this comment claimed -- and the monotonic clock fell back to zero:
+ * the QEMU dev box's heartbeat went from up=3724s to up=437s, and an
+ * SSH session that was mid-transfer at that moment stopped moving data
+ * (logs/b12/serial-dev1.log, devoil-i3). Now good for 584 years of ns.
+ * tools/vdso/vdso.c computes the same function and must stay in step. */
 uint64_t perf_tsc_to_ns(uint64_t dtsc) {
     if (g_tsc_khz == 0) return 0;
-    return (dtsc * 1000000ull) / g_tsc_khz;
+    uint64_t ms = dtsc / g_tsc_khz, rem = dtsc % g_tsc_khz;
+    return ms * 1000000ull + rem * 1000000ull / g_tsc_khz;
 }
 
 uint64_t perf_now_ns(void) {
@@ -43,6 +50,12 @@ uint64_t perf_now_ns(void) {
 }
 
 uint32_t perf_tsc_khz(void) { return g_tsc_khz; }
+
+/* vDSO (2026-08-23): the userspace clock computes the SAME function of
+ * the TSC as perf_now_ns, so it needs the same base. Recalibration
+ * rebases this (continuity preserved above); the vdso_refresh sweep
+ * republishes within a tick. */
+uint64_t perf_boot_tsc(void) { return g_boot_tsc; }
 
 void perf_init(void) {
     if (g_tsc_khz) return;      /* already calibrated */
@@ -133,7 +146,9 @@ void perf_recalibrate_pmt(uint32_t io_port, bool ext32) {
     uint64_t now_ns = perf_now_ns();
     uint32_t old    = g_tsc_khz;
     g_tsc_khz  = (uint32_t)khz;
-    g_boot_tsc = tsc1 - (now_ns * khz) / 1000000ull;
+    /* (now_ns * khz in one product overflows past ~4290 s, as above) */
+    g_boot_tsc = tsc1 - ((now_ns / 1000000ull) * khz +
+                         (now_ns % 1000000ull) * khz / 1000000ull);
 
     kprintf("[perf] TSC recalibrated vs ACPI PM timer: %u -> %u MHz "
             "(PIT-based estimate was %lu%% of true rate)\n",

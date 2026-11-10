@@ -170,6 +170,13 @@ int fat32_mount(const char *mount_point, struct blk_dev *dev);
  * FAT32 volume. Returns 1 if it looks like FAT32 (BPB sane + 0x55AA
  * trailer + FAT32-specific fields populated), 0 otherwise. Used by
  * `mountfs` to auto-pick the right driver. Cheap (one sector read). */
+/* Write a fresh FAT32 volume over the whole device. Destructive by
+ * definition -- callers are responsible for having asked first. Returns
+ * VFS_ERR_INVAL for a device too small to be a legal FAT32 volume
+ * (more than 65524 clusters) rather than writing one that lies about its
+ * own type. */
+int fat32_format(struct blk_dev *dev);
+
 int fat32_probe(struct blk_dev *dev);
 
 /* M26E: introspection used by usb_msc and the unmount machinery to

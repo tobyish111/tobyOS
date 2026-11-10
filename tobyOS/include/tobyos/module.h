@@ -21,6 +21,9 @@ struct loaded_module {
     size_t   size;
     int    (*init)(void);
     void   (*fini)(void);
+    uint64_t *pages;      /* physical pages backing base (executable window) */
+    size_t    npages;
+    int       va_slot;    /* index into the module VA window */
     bool     initialized;
 };
 
@@ -31,6 +34,9 @@ int  module_unload(const char *name);
 int  module_load_all(void);
 void module_list(void);
 struct loaded_module *module_find(const char *name);
+/* Slot i of the module table (0..MODULE_MAX-1), for /proc/modules. NULL past
+ * the end; an unused slot has in_use == false. */
+const struct loaded_module *module_slot(int i);
 
 /* Macros for module metadata -- placed in special ELF sections. */
 #define TOBY_MODULE_INIT(fn) \

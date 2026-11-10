@@ -487,6 +487,11 @@ static bool find_s5(const uint8_t *aml, size_t len,
 /* ---- FADT parse ---------------------------------------------------- */
 
 static void parse_fadt(const struct acpi_fadt *f) {
+    /* the RTC's century register, or 0 for none (finding 157) */
+    {
+        extern void rtc_set_century_reg(int reg);
+        rtc_set_century_reg(f->century);
+    }
     g_info.sci_int        = f->sci_int;
     g_info.smi_cmd        = f->smi_cmd;
     g_info.acpi_enable    = f->acpi_enable;

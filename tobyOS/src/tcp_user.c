@@ -14,7 +14,19 @@
 
 #define MAX_USER_CONNS 32
 
-enum conn_type { CONN_NONE = 0, CONN_TCP, CONN_TLS, CONN_LISTEN };
+/* CONN_RESERVED exists because every allocator here hands out a slot and
+ * then BLOCKS -- tcp_connect waits for a handshake, tcp_accept waits up to
+ * thirty seconds for a peer. While it blocks the slot must not look free.
+ *
+ * It did. alloc_conn set only `pid` and returned the index, leaving
+ * type == CONN_NONE until the blocking call came back, so a second process
+ * allocating in that window got THE SAME SLOT. Measured: ftpd sat in
+ * accept() holding slot N; ftp connected and wrote its connection into slot
+ * N; ftpd's accept returned and overwrote it with the accepted socket. The
+ * client then had a descriptor whose owning pid was the server's, so every
+ * read returned EBADF -- which looked exactly like "the server never sent a
+ * greeting". Any two processes using userland TCP at once could hit it. */
+enum conn_type { CONN_NONE = 0, CONN_RESERVED, CONN_TCP, CONN_TLS, CONN_LISTEN };
 
 struct user_conn {
     enum conn_type type;
@@ -28,7 +40,11 @@ static struct user_conn g_uconns[MAX_USER_CONNS];
 static int alloc_conn(int pid) {
     for (int i = 0; i < MAX_USER_CONNS; i++) {
         if (g_uconns[i].type == CONN_NONE) {
-            g_uconns[i].pid = pid;
+            /* Claim it NOW, before the caller blocks. */
+            g_uconns[i].type = CONN_RESERVED;
+            g_uconns[i].tcp  = 0;
+            g_uconns[i].tls  = 0;
+            g_uconns[i].pid  = pid;
             return i;
         }
     }
@@ -38,7 +54,10 @@ static int alloc_conn(int pid) {
 static struct user_conn *get_conn(int id, int pid) {
     if (id < 0 || id >= MAX_USER_CONNS) return 0;
     struct user_conn *c = &g_uconns[id];
-    if (c->type == CONN_NONE || c->pid != pid) return 0;
+    /* A reserved slot has no connection behind it yet, so it is not a
+     * usable descriptor either. */
+    if (c->type == CONN_NONE || c->type == CONN_RESERVED || c->pid != pid)
+        return 0;
     return c;
 }
 

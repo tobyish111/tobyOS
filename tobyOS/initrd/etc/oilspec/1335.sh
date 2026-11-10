@@ -1,0 +1,2 @@
+unset ZZZ
+echo status=$?

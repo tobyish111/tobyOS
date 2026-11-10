@@ -47,8 +47,9 @@ struct regs;
 /* ---- Timeslice + anti-starvation tunables ----------------------------------
  * Quantum is counted in LAPIC-timer ticks (the per-CPU 100 Hz periodic timer,
  * 10 ms/tick). Higher-priority classes get a longer slice, but every class is
- * preemptible so nothing monopolises a core. Aging is counted in PIT ticks
- * (the global 1000 Hz wall clock, pit_ticks(), 1 ms/tick): a READY proc's
+ * preemptible so nothing monopolises a core. Aging is counted in milliseconds
+ * of the TSC clock (sched.c sched_clock_ms -- not the PIT, which loses ticks
+ * under emulation; finding 169): a READY proc's
  * effective priority climbs one level for every SCHED_AGE_STEP_TICKS it has
  * waited without running, capped at SCHED_AGE_MAX_BOOST -- enough for a starved
  * IDLE proc to eventually out-rank a running RT proc, which bounds worst-case
@@ -105,6 +106,12 @@ void sched_boost_pid(int pid);
  * spins doing `sti; hlt` until an IRQ wakes someone up. */
 void sched_yield(void);
 
+/* The end of a time slice (sched_tick, or a system call's way out with
+ * need_resched set): sched_yield that also takes a better proc waiting on
+ * another CPU's queue, so work queued on the BSP reaches a busy AP whose
+ * slice ends (finding 169). */
+void sched_rotate(void);
+
 /* Slice 39: clear the on_cpu latch of the proc this CPU last switched away
  * from. Must be the FIRST scheduler-visible action of any code that starts
  * running via proc_context_switch's resume path -- do_switch calls it after
@@ -124,6 +131,13 @@ void bkl_exit(void);
  * wait (e.g. a blocking network syscall) release the BKL across its idle
  * period and reacquire it afterwards, so it never starves the other cores. */
 bool bkl_held(void);
+
+/* Take the BKL only if nobody holds it or waits for it -- never spins. False
+ * also when this CPU holds it: in an interrupt, that is the code it
+ * interrupted, which may be halfway through the very state the handler
+ * wants. For an interrupt handler that must not run BKL-guarded code
+ * unguarded (a NIC's receive drain); release with bkl_exit. */
+bool bkl_try_enter(void);
 
 /* Allow secondary CPUs to start stealing + running user procs. Called once by
  * the BSP after its boot sequence, right before entering the GUI idle loop --

@@ -1,0 +1,4 @@
+[[ = ]]
+echo status=$?
+[[ == ]]
+echo status=$?

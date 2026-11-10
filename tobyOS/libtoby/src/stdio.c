@@ -25,18 +25,9 @@
  *
  * ---- FILE * streams ----------------------------------------------
  *
- * Each FILE * is a tiny struct:
- *
- *     fd          underlying kernel descriptor
- *     pushback    >=0 if a byte is queued by ungetc(), else -1
- *     eof         set when read sees EOF
- *     err         set on syscall failure
- *     is_static   1 for stdin/stdout/stderr (don't free in fclose)
- *
- * No buffering today -- writes go straight to write(), reads pull
- * one byte at a time from read(). This keeps the implementation
- * tiny and matches what our sample programs need. A future M25E
- * may add 4 KiB write buffers if profiling shows they're worth it. */
+ * Each FILE * is buffered -- see "FILE * layer" below for what that
+ * changes (the per-character syscalls) and what it does not (the order in
+ * which a program's output and its other effects are seen). */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,19 +48,8 @@ pid_t toby_spawn(const char *path, char *const argv[], char *const envp[],
  *  Raw write helper (used by abort path, printf, etc.)
  * ============================================================ */
 
-long __toby_raw_write(int fd, const void *buf, size_t n) {
-    /* Loop in case the kernel does a short write (it currently
-     * doesn't, but we don't want to bake that assumption in). */
-    const char *p = (const char *)buf;
-    size_t left = n;
-    while (left > 0) {
-        long r = toby_sc3(ABI_SYS_WRITE, fd, (long)(uintptr_t)p, (long)left);
-        if (r <= 0) return -1;
-        p += r;
-        left -= (size_t)r;
-    }
-    return (long)n;
-}
+/* __toby_raw_write lives with the FILE layer: it flushes pending output
+ * before writing, so an abort message lands after what was printed. */
 
 /* ============================================================
  *  do_format() -- the printf engine
@@ -365,10 +345,28 @@ static int do_format(sink_fn sink, void *ctx, const char *fmt, va_list ap) {
             else f.precision = parse_int(&fmt);
         }
 
-        /* length modifier */
-        if (*fmt == 'l' || *fmt == 'h' || *fmt == 'z' || *fmt == 'L') {
+        /* length modifier
+         *
+         * Only ONE character was consumed, so "%lld" took the first 'l' as
+         * the modifier and then read the SECOND 'l' as the conversion --
+         * which is not one, so printf emitted the format text verbatim.
+         * Any ported program using %lld (and they are everywhere) printed
+         * "%lld" where a number belonged, with no error anywhere.
+         *
+         * "ll" collapses to 'l' and "hh" to 'h': this is LP64, so long and
+         * long long are both 64-bit and are passed identically in varargs,
+         * and conv_int already works in 64-bit. On an ABI where they differ
+         * this would need its own case. */
+        /* j (intmax_t) and t (ptrdiff_t) are 64-bit too, so 'l' (batch
+         * 25: GNU truncate's "%jd bytes" printed "%jd"). */
+        if (*fmt == 'j' || *fmt == 't') {
+            f.length = 'l';
+            fmt++;
+        } else if (*fmt == 'l' || *fmt == 'h' || *fmt == 'z' || *fmt == 'L') {
             f.length = *fmt;
             fmt++;
+            if ((f.length == 'l' && *fmt == 'l') ||
+                (f.length == 'h' && *fmt == 'h')) fmt++;
         }
 
         f.conv = *fmt ? *fmt++ : 0;
@@ -451,14 +449,6 @@ static int buf_sink(void *ctx, const char *s, size_t n) {
     return 0;
 }
 
-struct fd_sink_ctx { int fd; };
-
-static int fd_sink(void *ctx, const char *s, size_t n) {
-    struct fd_sink_ctx *fs = (struct fd_sink_ctx *)ctx;
-    if (__toby_raw_write(fs->fd, s, n) < 0) return -1;
-    return 0;
-}
-
 /* ============================================================
  *  Public formatted-output API
  * ============================================================ */
@@ -491,43 +481,382 @@ int sprintf(char *out, const char *fmt, ...) {
     return n;
 }
 
-int vprintf(const char *fmt, va_list ap) {
-    struct fd_sink_ctx fs = { .fd = 1 };
-    return do_format(fd_sink, &fs, fmt, ap);
-}
-
-int printf(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    int n = vprintf(fmt, ap);
-    va_end(ap);
-    return n;
-}
-
 /* ============================================================
- *  FILE * layer
- * ============================================================ */
+ *  FILE * layer -- BUFFERED (K5, 2026-09-30)
+ * ============================================================
+ *
+ * Every FILE used to be unbuffered: fgetc() was one read(2) per byte and
+ * fputc() one write(2) per byte. Measured: xargs reading `seq 100000`
+ * (588,895 bytes) made 589,185 syscalls, and `seq` itself one write per
+ * printf. Now each stream has a buffer (BUFSIZ):
+ *
+ *   input   one read(2) fills it; fgetc/fgets/fread/ungetc serve from it.
+ *   output  stdout is LINE-buffered on a terminal and FULLY buffered
+ *           otherwise, as C specifies; stderr is unbuffered; fopen'd
+ *           streams are fully buffered. setvbuf/setbuf are real.
+ *
+ * WHAT IT DOES NOT CHANGE: the order in which this process's effects are
+ * seen. The native userland was written against unbuffered stdio -- forty
+ * programs mix printf with raw write(2) on the same descriptors, and many
+ * print, then fork or spawn or sleep or read. So pending output is written
+ * out BEFORE EVERY SYSCALL libtoby makes (the check in syscall.c's toby_sc*
+ * trampolines is one load when nothing is pending): a raw write, a read
+ * that may block, fork, exec, spawn, sleep, wait, exit and _exit all see
+ * every byte printed before them already written, exactly as before. What
+ * buffering removes is only the per-character syscalls BETWEEN them: runs
+ * of stdio calls that make no other syscall are coalesced into one write.
+ * An unbuffered stream (stderr) flushes everything pending first too, so
+ * stdout-then-stderr text keeps its order in a merged 2>&1 capture.
+ *
+ * The one real difference: output still in a buffer when the process is
+ * KILLED by a signal is lost, as on every other Unix.
+ *
+ * Threads: once pthread_create has run, each stream is locked around every
+ * operation. The lock spins with yields and gives up after a bound rather
+ * than deadlock -- a signal handler that prints to the stream its own
+ * thread is inside would otherwise hang forever (stdio is not async-signal-
+ * safe anywhere, but a garbled line beats a wedged program). */
+
+#define STREAM_BUFSZ BUFSIZ
 
 struct __libtoby_FILE {
     int  fd;
-    int  pushback;       /* -1 = none */
+    int  pushback;       /* -1 = none: ungetc's one guaranteed byte */
     int  eof;
     int  err;
-    int  is_static;      /* don't free in fclose() if 1 */
+    int  is_static;      /* stdin/stdout/stderr: never freed */
+    int  mode;           /* _IOFBF / _IOLBF / _IONBF, -1 = decide on first use */
+    int  dir;            /* 0 idle, 1 buf holds read-ahead, 2 buf holds output */
+    int  own_buf;        /* buf was malloc'd here */
+    unsigned char *buf;
+    size_t cap;
+    size_t rpos, rlen;   /* reading: buf[rpos, rlen) not yet consumed */
+    size_t wlen;         /* writing: buf[0, wlen) not yet written */
+    int  lock;
+    unsigned char one;   /* the read buffer of an unbuffered stream */
+    struct __libtoby_FILE *next;   /* every open stream (flush-all) */
 };
 
-static struct __libtoby_FILE g_stdin  = { 0, -1, 0, 0, 1 };
-static struct __libtoby_FILE g_stdout = { 1, -1, 0, 0, 1 };
-static struct __libtoby_FILE g_stderr = { 2, -1, 0, 0, 1 };
+static unsigned char g_stdin_buf[STREAM_BUFSZ];
+static unsigned char g_stdout_buf[STREAM_BUFSZ];
+
+static struct __libtoby_FILE g_stderr = {
+    .fd = 2, .pushback = -1, .is_static = 1, .mode = _IONBF,
+};
+static struct __libtoby_FILE g_stdout = {
+    .fd = 1, .pushback = -1, .is_static = 1, .mode = -1,
+    .buf = g_stdout_buf, .cap = STREAM_BUFSZ, .next = &g_stderr,
+};
+static struct __libtoby_FILE g_stdin = {
+    .fd = 0, .pushback = -1, .is_static = 1, .mode = -1,
+    .buf = g_stdin_buf, .cap = STREAM_BUFSZ, .next = &g_stdout,
+};
 
 FILE *stdin  = &g_stdin;
 FILE *stdout = &g_stdout;
 FILE *stderr = &g_stderr;
 
+/* _STDBUF_I, _STDBUF_O and _STDBUF_E, read before main as GNU's libstdbuf
+ * reads them where stdbuf(1) preloads it (finding 215: stdbuf set them
+ * and no libtoby program looked). Measured on libstdbuf
+ * (logs/b33/stdbufprobe-wsl.out): a value that starts with 0 is
+ * unbuffered and one that starts with L line-buffered; anything else must
+ * be a whole decimal number (blanks and a sign first, a '-' wrapping it
+ * round), a buffer of that many bytes. A bad value is "invalid buffering
+ * mode V for stdout", one malloc refuses "failed to allocate a N byte
+ * stdio buffer"; either way the stream keeps its own buffering. */
+static void stdbuf_one(FILE *f, const char *env, const char *name) {
+    const char *v = getenv(env);
+    if (!v) return;
+    if (v[0] == '0') { setvbuf(f, 0, _IONBF, 0); return; }
+    if (v[0] == 'L') { setvbuf(f, 0, _IOLBF, 0); return; }
+    const char *p = v;
+    while (*p == ' ' || (*p >= '\t' && *p <= '\r')) p++;
+    int neg = 0;
+    if (*p == '+' || *p == '-') neg = *p++ == '-';
+    uint64_t n = 0;
+    int digits = 0, over = 0;
+    for (; *p >= '0' && *p <= '9'; p++, digits++) {
+        unsigned d = (unsigned)(*p - '0');
+        if (n > (UINT64_MAX - d) / 10) over = 1;
+        else n = n * 10 + d;
+    }
+    if (over) n = UINT64_MAX;
+    else if (neg) n = (uint64_t)0 - n;
+    if (!digits || *p || n == 0) {
+        fprintf(stderr, "invalid buffering mode %s for %s\n", v, name);
+        return;
+    }
+    char *buf = n <= (uint64_t)SIZE_MAX ? (char *)malloc((size_t)n) : 0;
+    if (!buf) {
+        fprintf(stderr, "failed to allocate a %llu byte stdio buffer\n",
+                (unsigned long long)n);
+        return;
+    }
+    if (setvbuf(f, buf, _IOFBF, (size_t)n) != 0) free(buf);
+}
+
+void __toby_stdio_stdbuf(void) {
+    stdbuf_one(stdin, "_STDBUF_I", "stdin");
+    stdbuf_one(stdout, "_STDBUF_O", "stdout");
+    stdbuf_one(stderr, "_STDBUF_E", "stderr");
+}
+
+static struct __libtoby_FILE *g_streams = &g_stdin;
+static int g_streams_lock;
+
+/* Set when any stream may hold unwritten output; the syscall trampolines
+ * test it (see syscall.c). Cleared by a complete flush. */
+volatile int __toby_stdio_pending;
+/* 1: every syscall writes out pending output first (K5), for the native
+ * userland written against unbuffered stdio. 0: glibc's rules, for a
+ * program that asks (__toby_stdio_like_glibc) -- output waits in its
+ * buffer until it fills, a line ends on a terminal, fflush, or exit; a
+ * read from a terminal-buffered input stream writes out the line-buffered
+ * ones. GNU diff -l's own lines come after pr's pages that way, and the
+ * eager rule put them first (finding 225). */
+int __toby_stdio_eager = 1;
+
+void __toby_stdio_like_glibc(void) { __toby_stdio_eager = 0; }
+/* Set by pthread_create: from then on streams are locked. */
+volatile int __toby_stdio_threaded;
+
+static void spin_lock_bounded(int *l) {
+    for (long i = 0; __atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE); i++) {
+        if (i > 200000) return;             /* see the header: never deadlock */
+        toby_sc_raw0(ABI_SYS_YIELD);
+    }
+}
+static void spin_unlock(int *l) { __atomic_store_n(l, 0, __ATOMIC_RELEASE); }
+
+static void flock_(FILE *f) {
+    if (__toby_stdio_threaded) spin_lock_bounded(&f->lock);
+}
+static void funlock_(FILE *f) {
+    if (__toby_stdio_threaded) spin_unlock(&f->lock);
+}
+static int ftrylock_(FILE *f) {
+    if (!__toby_stdio_threaded) return 1;
+    return !__atomic_exchange_n(&f->lock, 1, __ATOMIC_ACQUIRE);
+}
+
+/* write(2) until done, WITHOUT the pending-output hook (this IS the flush).
+ * A failure leaves errno saying why, as fflush's must: it said nothing, so
+ * `uniq f > /dev/full` reported "write error" where GNU's says "write
+ * error: No space left on device" (batch 30, logs/utilgate/uniq.sh). */
+static long raw_write_all(int fd, const void *buf, size_t n) {
+    const char *p = (const char *)buf;
+    size_t left = n;
+    while (left > 0) {
+        long r = toby_sc_raw3(ABI_SYS_WRITE, fd, (long)(uintptr_t)p, (long)left);
+        if (r < 0) { errno = (int)-r; return -1; }
+        if (r == 0) { errno = EIO; return -1; }
+        p += r;
+        left -= (size_t)r;
+    }
+    return (long)n;
+}
+
+static int stream_flush_out(FILE *f) {
+    if (f->dir != 2) return 0;
+    size_t n = f->wlen;
+    f->wlen = 0;
+    f->dir = 0;
+    if (n && raw_write_all(f->fd, f->buf, n) < 0) { f->err = 1; return EOF; }
+    return 0;
+}
+
+/* Write out every stream's pending output. Streams another thread holds
+ * are skipped: that thread is inside an operation and will finish it. */
+void __toby_stdio_flush_all(void) {
+    if (!__toby_stdio_pending) return;
+    __toby_stdio_pending = 0;
+    if (__toby_stdio_threaded) spin_lock_bounded(&g_streams_lock);
+    for (FILE *f = g_streams; f; f = f->next) {
+        if (f->dir != 2) continue;
+        if (!ftrylock_(f)) { __toby_stdio_pending = 1; continue; }
+        stream_flush_out(f);
+        funlock_(f);
+    }
+    if (__toby_stdio_threaded) spin_unlock(&g_streams_lock);
+}
+
+/* glibc's flush before a read from a line-buffered or unbuffered input
+ * stream: every line-buffered output stream's pending bytes */
+static void flush_linebuffered(void) {
+    if (__toby_stdio_threaded) spin_lock_bounded(&g_streams_lock);
+    for (FILE *f = g_streams; f; f = f->next) {
+        if (f->dir != 2 || f->mode != _IOLBF) continue;
+        if (!ftrylock_(f)) continue;
+        stream_flush_out(f);
+        funlock_(f);
+    }
+    if (__toby_stdio_threaded) spin_unlock(&g_streams_lock);
+}
+
+/* The public raw helper (abort/assert paths): what is pending goes first. */
+long __toby_raw_write(int fd, const void *buf, size_t n) {
+    __toby_stdio_flush_all();
+    return raw_write_all(fd, buf, n);
+}
+
+static void stream_decide_mode(FILE *f) {
+    if (f->mode >= 0) return;
+    char tio[64];
+    f->mode = toby_sc_raw3(ABI_SYS_IOCTL, f->fd, 0x5401 /* TCGETS */,
+                           (long)(uintptr_t)tio) >= 0 ? _IOLBF : _IOFBF;
+}
+
+static void stream_get_buf(FILE *f) {
+    if (f->buf || f->mode == _IONBF) return;
+    f->buf = (unsigned char *)malloc(STREAM_BUFSZ);
+    if (!f->buf) { f->mode = _IONBF; return; }
+    f->cap = STREAM_BUFSZ;
+    f->own_buf = 1;
+}
+
+/* Leave read mode: give back to the descriptor what was read ahead but not
+ * consumed, where the descriptor can seek (a file). A pipe or terminal
+ * cannot take it back; as with every buffered stdio, it is gone. */
+static void stream_drop_read(FILE *f) {
+    if (f->dir != 1 && f->pushback < 0) return;
+    long ahead = (f->dir == 1) ? (long)(f->rlen - f->rpos) : 0;
+    if (f->pushback >= 0) ahead++;
+    if (ahead > 0)
+        (void)toby_sc_raw3(ABI_SYS_LSEEK, f->fd, -ahead, SEEK_CUR);
+    f->rpos = f->rlen = 0;
+    f->pushback = -1;
+    if (f->dir == 1) f->dir = 0;
+}
+
+static int stream_write(FILE *f, const char *s, size_t n) {
+    if (n == 0) return 0;
+    if (f->dir == 1 || f->pushback >= 0) stream_drop_read(f);
+    stream_decide_mode(f);
+    stream_get_buf(f);
+    if (f->mode == _IONBF || !f->buf) {
+        if (__toby_stdio_eager)
+            __toby_stdio_flush_all();       /* keep program order across fds */
+        if (raw_write_all(f->fd, s, n) < 0) { f->err = 1; return EOF; }
+        return 0;
+    }
+    if (f->wlen + n > f->cap) {
+        if (stream_flush_out(f) < 0) return EOF;
+        if (n >= f->cap) {
+            if (raw_write_all(f->fd, s, n) < 0) { f->err = 1; return EOF; }
+            return 0;
+        }
+    }
+    memcpy(f->buf + f->wlen, s, n);
+    f->wlen += n;
+    f->dir = 2;
+    __toby_stdio_pending = 1;
+    if (f->mode == _IOLBF && memchr(s, '\n', n)) return stream_flush_out(f);
+    return 0;
+}
+
+/* Refill: > 0 bytes available, 0 at end of file, -1 on error. */
+static long stream_fill(FILE *f) {
+    if (f->dir == 2 && stream_flush_out(f) < 0) return -1;
+    stream_decide_mode(f);
+    stream_get_buf(f);
+    unsigned char *dst = f->buf;
+    size_t want = f->cap;
+    if (f->mode == _IONBF || !f->buf) { dst = &f->one; want = 1; }
+    /* toby_sc3, not the raw form: output pending on ANY stream goes out
+     * before this process can block for input (a prompt, a coprocess) --
+     * under glibc's rules the line-buffered streams, for a read of a
+     * line-buffered or unbuffered stream (a terminal) */
+    if (!__toby_stdio_eager && (f->mode == _IOLBF || f->mode == _IONBF))
+        flush_linebuffered();
+    long r = toby_sc3(ABI_SYS_READ, f->fd, (long)(uintptr_t)dst, (long)want);
+    if (r <= 0) {
+        /* a failed read leaves errno saying why, as the write side does
+         * (finding 185): `uniq dir` said "error reading 'dir'" and no
+         * more once a directory opened as Linux's does (batch 31) */
+        if (r < 0) { f->err = 1; errno = (int)-r; }
+        else       f->eof = 1;
+        return r < 0 ? -1 : 0;
+    }
+    if (dst == &f->one) {
+        /* unbuffered: hand the byte back through pushback */
+        f->pushback = f->one;
+        return 1;
+    }
+    f->rpos = 0;
+    f->rlen = (size_t)r;
+    f->dir  = 1;
+    return r;
+}
+
+static int stream_getc(FILE *f) {
+    if (f->pushback >= 0) { int c = f->pushback; f->pushback = -1; return c; }
+    if (f->dir == 1 && f->rpos < f->rlen) return f->buf[f->rpos++];
+    long r = stream_fill(f);
+    if (r <= 0) return EOF;
+    if (f->pushback >= 0) { int c = f->pushback; f->pushback = -1; return c; }
+    return f->buf[f->rpos++];
+}
+
+static FILE *stream_new(int fd, int mode) {
+    FILE *f = (FILE *)malloc(sizeof(*f));
+    if (!f) { errno = ENOMEM; return 0; }
+    memset(f, 0, sizeof(*f));
+    f->fd = fd;
+    f->pushback = -1;
+    f->mode = mode;
+    if (__toby_stdio_threaded) spin_lock_bounded(&g_streams_lock);
+    f->next = g_streams;
+    g_streams = f;
+    if (__toby_stdio_threaded) spin_unlock(&g_streams_lock);
+    return f;
+}
+
+static void stream_unlink(FILE *f) {
+    if (__toby_stdio_threaded) spin_lock_bounded(&g_streams_lock);
+    for (FILE **pp = &g_streams; *pp; pp = &(*pp)->next)
+        if (*pp == f) { *pp = f->next; break; }
+    if (__toby_stdio_threaded) spin_unlock(&g_streams_lock);
+}
+
+/* ---- formatted output into a stream ---------------------------------- *
+ * The engine emits small pieces; collect them and hand the stream whole
+ * chunks, so fprintf(stderr, ...) -- unbuffered -- is one write for any
+ * message that fits, not one per conversion. */
+struct stream_sink_ctx {
+    FILE  *f;
+    size_t n;
+    int    bad;
+    char   chunk[512];
+};
+
+static int stream_sink(void *ctx, const char *s, size_t n) {
+    struct stream_sink_ctx *c = (struct stream_sink_ctx *)ctx;
+    while (n > 0) {
+        size_t room = sizeof c->chunk - c->n;
+        if (room == 0) {
+            if (stream_write(c->f, c->chunk, c->n) < 0) c->bad = 1;
+            c->n = 0;
+            room = sizeof c->chunk;
+        }
+        size_t take = n < room ? n : room;
+        memcpy(c->chunk + c->n, s, take);
+        c->n += take;
+        s += take;
+        n -= take;
+    }
+    return 0;
+}
+
 int vfprintf(FILE *f, const char *fmt, va_list ap) {
     if (!f) return -1;
-    struct fd_sink_ctx fs = { .fd = f->fd };
-    int n = do_format(fd_sink, &fs, fmt, ap);
-    if (n < 0) f->err = 1;
+    struct stream_sink_ctx c;
+    c.f = f; c.n = 0; c.bad = 0;
+    flock_(f);
+    int n = do_format(stream_sink, &c, fmt, ap);
+    if (c.n && stream_write(f, c.chunk, c.n) < 0) c.bad = 1;
+    funlock_(f);
+    if (n < 0 || c.bad) { f->err = 1; return -1; }
     return n;
 }
 
@@ -538,26 +867,42 @@ int fprintf(FILE *f, const char *fmt, ...) {
     return n;
 }
 
+int vprintf(const char *fmt, va_list ap) {
+    return vfprintf(stdout, fmt, ap);
+}
+
+int printf(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int n = vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
 int fputs(const char *s, FILE *f) {
     if (!f) return EOF;
     size_t n = strlen(s);
-    if (__toby_raw_write(f->fd, s, n) < 0) { f->err = 1; return EOF; }
-    return (int)n;
+    flock_(f);
+    int r = stream_write(f, s, n);
+    funlock_(f);
+    return r < 0 ? EOF : (int)n;
 }
 
 int puts(const char *s) {
-    int r = fputs(s, stdout);
-    if (r < 0) return EOF;
-    char nl = '\n';
-    if (__toby_raw_write(stdout->fd, &nl, 1) < 0) { stdout->err = 1; return EOF; }
-    return r + 1;
+    size_t n = strlen(s);
+    flock_(stdout);
+    int r = stream_write(stdout, s, n);
+    if (r >= 0) r = stream_write(stdout, "\n", 1);
+    funlock_(stdout);
+    return r < 0 ? EOF : (int)n + 1;
 }
 
 int fputc(int c, FILE *f) {
     if (!f) return EOF;
     char ch = (char)c;
-    if (__toby_raw_write(f->fd, &ch, 1) < 0) { f->err = 1; return EOF; }
-    return (unsigned char)ch;
+    flock_(f);
+    int r = stream_write(f, &ch, 1);
+    funlock_(f);
+    return r < 0 ? EOF : (unsigned char)ch;
 }
 
 int putc   (int c, FILE *f) { return fputc(c, f); }
@@ -565,32 +910,66 @@ int putchar(int c)          { return fputc(c, stdout); }
 
 int fgetc(FILE *f) {
     if (!f) return EOF;
-    if (f->pushback >= 0) { int c = f->pushback; f->pushback = -1; return c; }
-    unsigned char c;
-    long r = toby_sc3(ABI_SYS_READ, f->fd, (long)(uintptr_t)&c, 1);
-    if (r <= 0) {
-        if (r < 0) f->err = 1;
-        f->eof = 1;
-        return EOF;
-    }
+    flock_(f);
+    int c = stream_getc(f);
+    funlock_(f);
     return c;
 }
 
 int getc(FILE *f)   { return fgetc(f); }
 int getchar(void)   { return fgetc(stdin); }
 
+/* POSIX getdelim (batch 25: GNU cksum -c and others read lines of any
+ * length). */
+ssize_t getdelim(char **linep, size_t *capp, int delim, FILE *f) {
+    if (!linep || !capp || !f) { errno = EINVAL; return -1; }
+    size_t n = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (!*linep || n + 2 > *capp) {
+            size_t cap = *capp ? *capp * 2 : 128;
+            while (cap < n + 2) cap *= 2;
+            char *nb = (char *)realloc(*linep, cap);
+            if (!nb) { errno = ENOMEM; return -1; }
+            *linep = nb;
+            *capp = cap;
+        }
+        (*linep)[n++] = (char)c;
+        if (c == delim) break;
+    }
+    if (n == 0) return -1;
+    (*linep)[n] = 0;
+    return (ssize_t)n;
+}
+
+ssize_t getline(char **linep, size_t *capp, FILE *f) {
+    return getdelim(linep, capp, '\n', f);
+}
+
 char *fgets(char *s, int cap, FILE *f) {
     if (!s || cap <= 0 || !f) return 0;
+    flock_(f);
     int i = 0;
     while (i < cap - 1) {
-        int c = fgetc(f);
-        if (c == EOF) {
-            if (i == 0) return 0;
-            break;
+        if (f->pushback >= 0 || !(f->dir == 1 && f->rpos < f->rlen)) {
+            int c = stream_getc(f);             /* pushback, or a refill */
+            if (c == EOF) break;
+            s[i++] = (char)c;
+            if (c == '\n') break;
+            continue;
         }
-        s[i++] = (char)c;
-        if (c == '\n') break;
+        size_t avail = f->rlen - f->rpos, room = (size_t)(cap - 1 - i);
+        size_t take = avail < room ? avail : room;
+        unsigned char *src = f->buf + f->rpos;
+        unsigned char *nl = (unsigned char *)memchr(src, '\n', take);
+        if (nl) take = (size_t)(nl - src) + 1;
+        memcpy(s + i, src, take);
+        f->rpos += take;
+        i += (int)take;
+        if (nl) break;
     }
+    funlock_(f);
+    if (i == 0) return 0;
     s[i] = '\0';
     return s;
 }
@@ -600,29 +979,80 @@ size_t fread(void *buf, size_t sz, size_t n, FILE *f) {
     size_t total = sz * n;
     char *out = (char *)buf;
     size_t got = 0;
-    while (got < total) {
-        long r = toby_sc3(ABI_SYS_READ, f->fd,
-                          (long)(uintptr_t)(out + got),
-                          (long)(total - got));
-        if (r < 0) { f->err = 1; break; }
-        if (r == 0) { f->eof = 1; break; }
-        got += (size_t)r;
+    flock_(f);
+    if (f->dir == 2 && stream_flush_out(f) < 0) { funlock_(f); return 0; }
+    if (got < total && f->pushback >= 0) {
+        out[got++] = (char)f->pushback;
+        f->pushback = -1;
     }
+    if (f->dir == 1 && f->rpos < f->rlen) {
+        size_t avail = f->rlen - f->rpos, take = total - got;
+        if (take > avail) take = avail;
+        memcpy(out + got, f->buf + f->rpos, take);
+        f->rpos += take;
+        got += take;
+    }
+    while (got < total) {
+        size_t left = total - got;
+        stream_decide_mode(f);
+        stream_get_buf(f);
+        if (left >= f->cap || !f->buf || f->mode == _IONBF) {
+            /* big (or unbuffered) read: straight into the caller's memory */
+            long r = toby_sc3(ABI_SYS_READ, f->fd,
+                              (long)(uintptr_t)(out + got), (long)left);
+            if (r < 0) { f->err = 1; errno = (int)-r; break; }
+            if (r == 0) { f->eof = 1; break; }
+            got += (size_t)r;
+            continue;
+        }
+        long r = stream_fill(f);
+        if (r <= 0) break;
+        size_t avail = f->rlen - f->rpos, take = left < avail ? left : avail;
+        memcpy(out + got, f->buf + f->rpos, take);
+        f->rpos += take;
+        got += take;
+    }
+    funlock_(f);
     return got / sz;
 }
 
 size_t fwrite(const void *buf, size_t sz, size_t n, FILE *f) {
     if (!f || sz == 0 || n == 0) return 0;
-    size_t total = sz * n;
-    if (__toby_raw_write(f->fd, buf, total) < 0) { f->err = 1; return 0; }
-    return n;
+    flock_(f);
+    int r = stream_write(f, (const char *)buf, sz * n);
+    funlock_(f);
+    return r < 0 ? 0 : n;
 }
 
-int fflush(FILE *f) { (void)f; return 0; }   /* unbuffered today */
+int fflush(FILE *f) {
+    if (!f) {                                   /* every output stream */
+        __toby_stdio_pending = 1;
+        __toby_stdio_flush_all();
+        return 0;
+    }
+    flock_(f);
+    int r = 0;
+    if (f->dir == 2) r = stream_flush_out(f);
+    else             stream_drop_read(f);      /* POSIX: re-sync the fd */
+    funlock_(f);
+    return r;
+}
 
 int fseek(FILE *f, long off, int whence) {
     if (!f) return -1;
+    flock_(f);
+    if (f->dir == 2 && stream_flush_out(f) < 0) { funlock_(f); return -1; }
+    if (whence == SEEK_CUR) {
+        /* relative to the STREAM's position, which trails the fd's by the
+         * read-ahead still in the buffer */
+        if (f->dir == 1) off -= (long)(f->rlen - f->rpos);
+        if (f->pushback >= 0) off -= 1;
+    }
+    f->rpos = f->rlen = 0;
+    f->pushback = -1;
+    if (f->dir == 1) f->dir = 0;
     long r = toby_sc3(ABI_SYS_LSEEK, f->fd, off, whence);
+    funlock_(f);
     if (r < 0) { f->err = 1; errno = (int)(-r); return -1; }
     f->eof = 0;
     return 0;
@@ -630,7 +1060,14 @@ int fseek(FILE *f, long off, int whence) {
 
 long ftell(FILE *f) {
     if (!f) return -1;
+    flock_(f);
     long r = toby_sc3(ABI_SYS_LSEEK, f->fd, 0, SEEK_CUR);
+    if (r >= 0) {
+        if (f->dir == 1) r -= (long)(f->rlen - f->rpos);
+        if (f->pushback >= 0) r -= 1;
+        if (f->dir == 2) r += (long)f->wlen;
+    }
+    funlock_(f);
     if (r < 0) { f->err = 1; errno = (int)(-r); return -1; }
     return r;
 }
@@ -666,32 +1103,94 @@ static int fopen_mode_to_flags(const char *mode) {
 FILE *fopen(const char *path, const char *mode) {
     int flags = fopen_mode_to_flags(mode);
     if (flags < 0) { errno = EINVAL; return 0; }
-    int fd = open(path, flags, 0644);
+    int fd = open(path, flags, 0666);     /* C's fopen: 0666 less the umask */
     if (fd < 0) return 0;
-    FILE *f = (FILE *)malloc(sizeof(*f));
-    if (!f) { close(fd); errno = ENOMEM; return 0; }
-    f->fd = fd;
+    FILE *f = stream_new(fd, -1);
+    if (!f) { close(fd); return 0; }
+    return f;
+}
+
+/* fdopen(3): a stream on the open descriptor FD (finding 215; there was
+ * none, and diff closed its descriptor and opened the file again). MODE
+ * is fopen's; the descriptor's own access must allow it (EINVAL), "a"
+ * turns on its append mode, and nothing is created or truncated. */
+FILE *fdopen(int fd, const char *mode) {
+    int flags = mode ? fopen_mode_to_flags(mode) : -1;
+    if (flags < 0) { errno = EINVAL; return 0; }
+    int cur = fcntl(fd, F_GETFL);
+    if (cur < 0) return 0;                          /* EBADF */
+    int want = flags & O_ACCMODE, have = cur & O_ACCMODE;
+    if (have != O_RDWR && want != have) { errno = EINVAL; return 0; }
+    if ((flags & O_APPEND) && !(cur & O_APPEND) &&
+        fcntl(fd, F_SETFL, cur | O_APPEND) < 0)
+        return 0;
+    return stream_new(fd, -1);
+}
+
+/* freopen(3): F moved onto PATH in place (finding 215; there was none, and
+ * uniq kept its own). What F holds is written out, PATH opened as fopen
+ * would and put on F's own descriptor number, so a reopened stdout is
+ * still 1. When PATH cannot be opened F is closed, as POSIX has it. A
+ * null PATH opens F's own file again in MODE. */
+FILE *freopen(const char *path, const char *mode, FILE *f) {
+    if (!f) { errno = EINVAL; return 0; }
+    int flags = mode ? fopen_mode_to_flags(mode) : -1;
+    flock_(f);
+    if (f->dir == 2) (void)stream_flush_out(f);
+    else             stream_drop_read(f);
+    int oldfd = f->fd;
+    char self[32];
+    if (!path && oldfd >= 0) {
+        snprintf(self, sizeof self, "/proc/self/fd/%d", oldfd);
+        path = self;
+    }
+    int nfd = -1;
+    if (flags < 0) errno = EINVAL;
+    else if (!path) errno = EBADF;
+    else nfd = open(path, flags, 0666);
+    if (nfd >= 0 && oldfd >= 0 && nfd != oldfd) {
+        if (dup2(nfd, oldfd) < 0) { int e = errno; close(nfd); nfd = -1; errno = e; }
+        else { close(nfd); nfd = oldfd; }
+    }
+    if (nfd < 0) {
+        int e = errno;
+        if (oldfd >= 0) close(oldfd);
+        f->fd = -1;
+        f->err = 1;
+        funlock_(f);
+        errno = e;
+        return 0;
+    }
+    f->fd = nfd;
     f->pushback = -1;
-    f->eof = 0;
-    f->err = 0;
-    f->is_static = 0;
+    f->eof = f->err = 0;
+    f->dir = 0;
+    f->rpos = f->rlen = f->wlen = 0;
+    funlock_(f);
     return f;
 }
 
 int fclose(FILE *f) {
     if (!f) return EOF;
+    flock_(f);
+    int r = 0;
+    if (f->dir == 2) r = stream_flush_out(f);
+    else             stream_drop_read(f);   /* a seekable input's fd lands
+                                             * at the stream's position */
+    funlock_(f);
     int rc = close(f->fd);
-    if (!f->is_static) free(f);
-    return rc;
+    if (!f->is_static) {
+        stream_unlink(f);
+        if (f->own_buf) free(f->buf);
+        free(f);
+    }
+    return (r < 0 || rc < 0) ? EOF : 0;
 }
 
 void perror(const char *prefix) {
-    if (prefix && *prefix) {
-        fputs(prefix, stderr);
-        fputs(": ", stderr);
-    }
-    fputs(strerror(errno), stderr);
-    fputc('\n', stderr);
+    const char *m = strerror(errno);          /* before any call can move it */
+    if (prefix && *prefix) fprintf(stderr, "%s: %s\n", prefix, m);
+    else                   fprintf(stderr, "%s\n", m);
 }
 
 /* ============================================================
@@ -700,22 +1199,44 @@ void perror(const char *prefix) {
 
 int ungetc(int c, FILE *f) {
     if (!f || c == EOF) return EOF;
-    f->pushback = c;
+    flock_(f);
+    if (f->dir == 2) stream_flush_out(f);
+    f->pushback = (unsigned char)c;
     f->eof = 0;
-    return c;
+    funlock_(f);
+    return (unsigned char)c;
 }
 
 /* ============================================================
- *  setvbuf / setbuf -- buffering control (no-op today)
+ *  setvbuf / setbuf -- buffering control
  * ============================================================ */
 
 int setvbuf(FILE *f, char *buf, int mode, size_t size) {
-    (void)f; (void)buf; (void)mode; (void)size;
+    if (!f || (mode != _IOFBF && mode != _IOLBF && mode != _IONBF)) return -1;
+    flock_(f);
+    if (f->dir == 2) stream_flush_out(f);
+    if (f->own_buf) free(f->buf);
+    f->own_buf = 0;
+    f->buf = 0;
+    f->cap = 0;
+    f->rpos = f->rlen = 0;
+    if (f->dir == 1) f->dir = 0;
+    f->mode = mode;
+    if (mode != _IONBF) {
+        if (buf && size > 0) {
+            f->buf = (unsigned char *)buf;
+            f->cap = size;
+        } else if (size > 0) {
+            f->buf = (unsigned char *)malloc(size);
+            if (f->buf) { f->cap = size; f->own_buf = 1; }
+        }                          /* else: BUFSIZ, allocated on first use */
+    }
+    funlock_(f);
     return 0;
 }
 
 void setbuf(FILE *f, char *buf) {
-    (void)f; (void)buf;
+    (void)setvbuf(f, buf, buf ? _IOFBF : _IONBF, BUFSIZ);
 }
 
 /* ============================================================
@@ -774,13 +1295,8 @@ FILE *popen(const char *command, const char *type) {
     else         { our_fd = fds[1]; their_fd = fds[0]; }
     close(their_fd);
 
-    FILE *fp = (FILE *)malloc(sizeof(*fp));
+    FILE *fp = stream_new(our_fd, -1);
     if (!fp) { close(our_fd); return 0; }
-    fp->fd = our_fd;
-    fp->pushback = -1;
-    fp->eof = 0;
-    fp->err = 0;
-    fp->is_static = 0;
 
     for (int i = 0; i < POPEN_MAX; i++) {
         if (!g_popens[i].fp) {
@@ -834,6 +1350,10 @@ int sscanf(const char *str, const char *fmt, ...) {
         fmt++; /* skip % */
         if (*fmt == '%') { if (*s != '%') break; s++; fmt++; continue; }
 
+        /* %*: match and discard (2026-09-04; sudo's passwd parser needed it) */
+        int suppress = 0;
+        if (*fmt == '*') { suppress = 1; fmt++; }
+
         int width = 0;
         while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
 
@@ -845,49 +1365,85 @@ int sscanf(const char *str, const char *fmt, ...) {
             char *end;
             long v = strtol(s, &end, 10);
             if (end == s) goto done;
-            if (lng) { long *p = va_arg(ap, long *); *p = v; }
-            else     { int  *p = va_arg(ap, int *);  *p = (int)v; }
+            if (!suppress) {
+                if (lng) { long *p = va_arg(ap, long *); *p = v; }
+                else     { int  *p = va_arg(ap, int *);  *p = (int)v; }
+                count++;
+            }
             s = end;
-            count++;
             break;
         }
         case 'u': {
             char *end;
             unsigned long v = strtoul(s, &end, 10);
             if (end == s) goto done;
-            if (lng) { unsigned long *p = va_arg(ap, unsigned long *); *p = v; }
-            else     { unsigned int  *p = va_arg(ap, unsigned int *);  *p = (unsigned int)v; }
+            if (!suppress) {
+                if (lng) { unsigned long *p = va_arg(ap, unsigned long *); *p = v; }
+                else     { unsigned int  *p = va_arg(ap, unsigned int *);  *p = (unsigned int)v; }
+                count++;
+            }
             s = end;
-            count++;
             break;
         }
         case 'x': case 'X': {
             char *end;
             unsigned long v = strtoul(s, &end, 16);
             if (end == s) goto done;
-            if (lng) { unsigned long *p = va_arg(ap, unsigned long *); *p = v; }
-            else     { unsigned int  *p = va_arg(ap, unsigned int *);  *p = (unsigned int)v; }
+            if (!suppress) {
+                if (lng) { unsigned long *p = va_arg(ap, unsigned long *); *p = v; }
+                else     { unsigned int  *p = va_arg(ap, unsigned int *);  *p = (unsigned int)v; }
+                count++;
+            }
             s = end;
-            count++;
+            break;
+        }
+        case '[': {
+            /* scanset: %[abc], %[^abc], %[]abc], %[a-z]; width caps it */
+            fmt++;
+            int negate = 0;
+            if (*fmt == '^') { negate = 1; fmt++; }
+            unsigned char set[32] = { 0 };
+            if (*fmt == ']') { set[']' >> 3] |= (unsigned char)(1u << (']' & 7)); fmt++; }
+            while (*fmt && *fmt != ']') {
+                unsigned char lo = (unsigned char)*fmt;
+                if (fmt[1] == '-' && fmt[2] && fmt[2] != ']') {
+                    unsigned char hi = (unsigned char)fmt[2];
+                    for (unsigned c = lo; c <= hi; c++) set[c >> 3] |= (unsigned char)(1u << (c & 7));
+                    fmt += 3;
+                } else { set[lo >> 3] |= (unsigned char)(1u << (lo & 7)); fmt++; }
+            }
+            if (*fmt != ']') goto done;
+            char *p = suppress ? NULL : va_arg(ap, char *);
+            int w = 0;
+            while (*s) {
+                unsigned char c = (unsigned char)*s;
+                int in = (set[c >> 3] >> (c & 7)) & 1;
+                if (in == negate) break;
+                if (width > 0 && w >= width) break;
+                if (p) *p++ = *s;
+                s++; w++;
+            }
+            if (w == 0) goto done;
+            if (p) { *p = '\0'; count++; }
             break;
         }
         case 's': {
-            char *p = va_arg(ap, char *);
+            char *p = suppress ? NULL : va_arg(ap, char *);
             while (*s == ' ' || *s == '\t') s++;
             int w = 0;
             while (*s && *s != ' ' && *s != '\t' && *s != '\n') {
                 if (width > 0 && w >= width) break;
-                *p++ = *s++;
+                if (p) *p++ = *s;
+                s++;
                 w++;
             }
-            *p = '\0';
-            count++;
+            if (p) { *p = '\0'; count++; }
             break;
         }
         case 'c': {
-            char *p = va_arg(ap, char *);
-            *p = *s++;
-            count++;
+            char *p = suppress ? NULL : va_arg(ap, char *);
+            if (p) { *p = *s; count++; }
+            s++;
             break;
         }
         case 'n': {

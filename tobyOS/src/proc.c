@@ -2,8 +2,9 @@
  *
  * See proc.h for the high-level model. Implementation notes:
  *
- *   - Fixed-size table (PROC_MAX). PIDs are dense ints starting at 0
- *     (kernel_main). Slot index == PID for simplicity.
+ *   - Fixed-size table (PROC_MAX). Slot 0 is kernel_main, pid 0. Every
+ *     other pid comes from proc_pid_alloc, rising to PID_MAX as Linux's;
+ *     g_slot_of_pid maps it back (batch 26 -- the pid was the slot index).
  *
  *   - Address-space construction sequence in spawn_internal:
  *       a. allocate fresh PML4 (kernel half mirrored by reference)
@@ -46,10 +47,12 @@
  */
 
 #include <tobyos/proc.h>
+#include <tobyos/binfmt.h>
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
+#include <tobyos/seccomp.h>
 #include <tobyos/cgroup.h>   /* slice 16: the user-page charge funnel */
 #include <tobyos/page_fault.h>   /* page_ref_* for CoW-aware brk shrink */
 #include <tobyos/apic.h>         /* tlb_shootdown_remote */
@@ -70,6 +73,7 @@
 #include <tobyos/perf.h>
 #include <tobyos/rng.h>
 #include <tobyos/nsproxy.h>   /* nsproxy_release (slice 8) */
+#include <tobyos/spinlock.h>
 
 /* Asm helpers from proc_switch.S. */
 extern __attribute__((noreturn)) void proc_enter_user_asm(uint64_t rip,
@@ -99,12 +103,24 @@ extern __attribute__((noreturn)) void proc_enter_user_thread_asm(uint64_t rip,
  *               the top of the stack (see pack_argv_envp_on_user_stack). */
 /* 64 pages = 256 KiB. The old 8-page (32 KiB) stack was too small for
  * non-trivial ported programs (e.g. interpreters with sizable frames);
- * 256 KiB is a sane default while still tiny next to a Linux 8 MiB stack. */
+ * 256 KiB is a sane default while still tiny next to a Linux 8 MiB stack.
+ *
+ * That is the stack the PROGRAM gets. Its arguments and environment are
+ * packed at the top and the stack is grown by their size
+ * (proc_user_stack_pages), so a long argv costs memory, not stack. */
 #define USER_STACK_PAGES     64
 #define USER_STACK_BYTES     (USER_STACK_PAGES * PAGE_SIZE)
 #define USER_STACK_TOP_VA    0x0000800000000000ULL
-#define USER_STACK_TOP_PAGE  (USER_STACK_TOP_VA - USER_STACK_BYTES)
 #define USER_STACK_RSP_INIT  (USER_STACK_TOP_VA - 16)
+
+size_t proc_user_stack_pages(int argc, char **argv, int envc, char **envp) {
+    size_t bytes = 16 + 8 + (size_t)(argc + 1) * 8 + (size_t)(envc + 1) * 8
+                 + 32 * 16;                        /* auxv, with room */
+    for (int i = 0; i < argc; i++) if (argv && argv[i]) bytes += strlen(argv[i]) + 1;
+    for (int i = 0; i < envc; i++) if (envp && envp[i]) bytes += strlen(envp[i]) + 1;
+    bytes += 64;                                   /* alignment slack */
+    return USER_STACK_PAGES + (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+}
 
 /* Milestone 25A: per-proc heap region. Lives in a fresh slice of the
  * user half well clear of both the ELF (anchored at 0x400000 / runs
@@ -161,10 +177,86 @@ const char *proc_state_name(enum proc_state s) {
     return "?";
 }
 
+/* ---- pids (batch 26, finding 146) ---------------------------------------
+ *
+ * g_slot_of_pid[pid] is the slot a pid was last given to; it is never
+ * cleared, only overwritten when the number comes round again, so a key
+ * that outlives its process (a thread group's mm owner) still finds its
+ * slot. g_pid_of_slot[slot] is what the allocator gave that slot -- written
+ * only here, under g_pid_lock, so it holds while fork's memcpy of the
+ * parent passes through the child's p->pid. A lookup checks both ways. */
+static int16_t g_slot_of_pid[PID_MAX];
+static int     g_pid_of_slot[PROC_MAX];
+static int     g_pid_last;                 /* 0 before the first */
+static spinlock_t g_pid_lock = SPINLOCK_INIT;
+
+int proc_pid_slot(int pid) {
+    if (pid < 0 || pid >= PID_MAX) return -1;
+    if (pid == 0) return 0;
+    int s = g_slot_of_pid[pid];
+    return s > 0 ? s : -1;
+}
+
+int proc_pid_slot_live(int pid) {
+    int s = proc_pid_slot(pid);
+    if (s < 0) return -1;
+    return __atomic_load_n(&g_pid_of_slot[s], __ATOMIC_ACQUIRE) == pid ? s : -1;
+}
+
+int proc_last_pid(void) {
+    return __atomic_load_n(&g_pid_last, __ATOMIC_RELAXED);
+}
+
+void proc_set_last_pid(int v) {
+    if (v < 0 || v >= PID_MAX) return;
+    uint64_t f = spin_lock_irqsave(&g_pid_lock);
+    g_pid_last = v;
+    spin_unlock_irqrestore(&g_pid_lock, f);
+}
+
 struct proc *proc_lookup(int pid) {
-    if (pid < 0 || pid >= PROC_MAX) return 0;
-    struct proc *p = &g_proc[pid];
+    int s = proc_pid_slot_live(pid);
+    if (s < 0) return 0;
+    struct proc *p = &g_proc[s];
+    if (p->pid != pid) return 0;
     return (p->state == PROC_UNUSED || p->state == PROC_EMBRYO) ? 0 : p;
+}
+
+struct proc *proc_at_slot(int slot) {
+    if (slot < 0 || slot >= PROC_MAX) return 0;
+    struct proc *p = &g_proc[slot];
+    return (p->state == PROC_UNUSED || p->state == PROC_EMBRYO) ? 0 : p;
+}
+
+/* In use: a live process's pid, or the process group, session, thread
+ * group or address space it names -- Linux keeps a struct pid while any of
+ * them points at it, so `kill -- -PGID` cannot reach a stranger who took
+ * the leader's number. */
+static bool pid_in_use(int pid) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q->state == PROC_UNUSED) continue;
+        if (g_pid_of_slot[i] == pid || q->pgid == pid || q->sid == pid ||
+            q->tgid == pid || q->mm_owner == pid)
+            return true;
+    }
+    return false;
+}
+
+int proc_pid_alloc(struct proc *p) {
+    int slot = (int)(p - g_proc);
+    uint64_t f = spin_lock_irqsave(&g_pid_lock);
+    int pid = g_pid_last;
+    for (int n = 0; n < PID_MAX; n++) {
+        pid = pid + 1 >= PID_MAX ? PID_RESERVED : pid + 1;
+        if (!pid_in_use(pid)) break;
+    }
+    g_pid_last = pid;
+    g_slot_of_pid[pid] = (int16_t)slot;
+    __atomic_store_n(&g_pid_of_slot[slot], pid, __ATOMIC_RELEASE);
+    p->pid = pid;
+    spin_unlock_irqrestore(&g_pid_lock, f);
+    return pid;
 }
 
 void proc_dump_table(void) {
@@ -198,14 +290,33 @@ void proc_dump_table(void) {
  * (mongrel pid/tgid/is_thread), executed a demand-zeroed text page and
  * died at NULL, while the victim process lost the thread (the mp
  * bootstrap flake, gpuperf_viz_anim.001.log). */
+/* The search starts after the last slot claimed, and wraps -- once the
+ * pid, now only so a slot is not refilled the instant it is freed. The
+ * cursor is only a hint: the CAS below is what makes a claim exclusive.
+ * The rising pids bash relies on (a finished job's pid not reappearing in
+ * the next pipeline), and pid 1 being handed out once, are proc_pid_alloc's
+ * now (batch 26). */
+static int g_slot_next = 1;
+
 struct proc *proc_slot_claim(void) {
     /* Slot 0 is reserved for kernel_main. Search 1..PROC_MAX-1. */
-    for (int i = 1; i < PROC_MAX; i++) {
+    int start = __atomic_load_n(&g_slot_next, __ATOMIC_RELAXED);
+    if (start < 1 || start >= PROC_MAX) start = 1;
+    for (int n = 0; n < PROC_MAX - 1; n++) {
+        int i = 1 + (start - 1 + n) % (PROC_MAX - 1);
         enum proc_state expected = PROC_UNUSED;
         if (__atomic_compare_exchange_n(&g_proc[i].state, &expected,
                                         PROC_EMBRYO, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&g_slot_next, i + 1 < PROC_MAX ? i + 1 : 1,
+                             __ATOMIC_RELAXED);
+            /* The wake-after-death tombstone must not outlive the slot's
+             * previous occupant, or the new process is unwakeable. This
+             * is the ONE clearing point every creation path goes through
+             * (fork/vfork/clone/spawn memcpy AFTER claiming). */
+            g_proc[i].dying = false;
             return &g_proc[i];
+        }
     }
     return 0;
 }
@@ -222,6 +333,7 @@ void proc_slot_wipe(struct proc *p) {
 }
 
 static struct proc *alloc_slot(void) {
+    proc_reap_orphans();                /* their slots, first */
     return proc_slot_claim();
 }
 
@@ -231,6 +343,14 @@ void proc_init(void) {
     struct proc *k = &g_proc[0];
     k->pid         = 0;
     k->ppid        = 0;            /* kernel has no parent */
+    /* The umask every process spawned from pid 0 starts with -- login, SSH
+     * sessions, the desktop's programs. It was 0 (the memset), and the
+     * spawn path copies the spawner's: every user process began with umask
+     * 0000, where a Linux session begins with 0022 (bash there says 0022,
+     * here it said 0000). */
+    k->umask       = 0022u;
+    /* the console is pid 0's terminal, and every boot process's after it */
+    k->ctty_kind   = PROC_CTTY_CONSOLE;
     k->state       = PROC_RUNNING;
     k->cr3         = vmm_kernel_pml4_phys();
     k->owns_pml4   = false;
@@ -320,6 +440,17 @@ struct proc *proc_ap_idle(uint32_t cpu, uint64_t kstack_top) {
 /* ---- per-process fd table helpers --------------------------------- */
 
 static void close_all_fds(struct proc *p) {
+    /* Exit sweep: the process's fcntl record locks die with it (flock
+     * locks die with their descriptions inside file_close below), and so
+     * do its POSIX interval timers. */
+    { extern void fl_release_proc(struct proc *p);
+      fl_release_proc(p); }
+    { extern void ptimer_release_proc(int pid);
+      ptimer_release_proc(p->is_thread ? p->tgid : p->pid); }
+    /* Phase H: apply SEM_UNDO -- a crashed semaphore holder must release
+     * what it held or every sibling deadlocks (the flag's whole point). */
+    { extern void sysv_release_proc(int tgid);
+      sysv_release_proc(p->is_thread ? p->tgid : p->pid); }
     for (int i = 0; i < PROC_NFDS; i++) {
         if (p->fds[i]) {
             file_close(p->fds[i]);
@@ -337,7 +468,9 @@ static bool install_initial_fds(struct proc *p,
                                 struct file *fd1,
                                 struct file *fd2,
                                 struct file *fd3,
-                                struct file *fd4) {
+                                struct file *fd4,
+                                const struct proc_fd_map *extra,
+                                int nextra) {
     /* fd0..fd2 default to the console; fd3/fd4 are OPTIONAL preopens
      * (slice 39: chrome's --remote-debugging-pipe reads DevTools JSON on
      * fd 3 and writes it on fd 4 -- the browser-window host hands the
@@ -345,6 +478,7 @@ static bool install_initial_fds(struct proc *p,
     struct file *src[5] = { fd0, fd1, fd2, fd3, fd4 };
     for (int i = 0; i < 5; i++) {
         struct file *nf;
+        if (src[i] == PROC_FD_CLOSED) continue;     /* left closed (234) */
         if (src[i]) {
             nf = file_clone(src[i]);
         } else if (i < 3) {
@@ -357,6 +491,20 @@ static bool install_initial_fds(struct proc *p,
             return false;
         }
         p->fds[i] = nf;
+    }
+
+    /* Descriptors at chosen numbers, for `exec 3>file` and `cmd 8<<EOF`.
+     * Cloned like the fixed ones, so the caller keeps its own reference. */
+    for (int i = 0; i < nextra; i++) {
+        int fd = extra[i].fd;
+        if (fd < 0 || fd >= PROC_NFDS || !extra[i].f) continue;
+        struct file *nf = file_clone(extra[i].f);
+        if (!nf) {
+            close_all_fds(p);
+            return false;
+        }
+        if (p->fds[fd]) file_close(p->fds[fd]);
+        p->fds[fd] = nf;
     }
     return true;
 }
@@ -417,30 +565,24 @@ struct user_stack_pack {
      * sentinel is pushed. */
     const struct abi_auxv  *auxv;
     int                     auxc;
+    size_t                  stack_bytes;   /* the mapped user stack */
 };
 
 static bool pack_user_stack(const struct user_stack_pack *L,
                             uint64_t *out_rsp) {
     if (!L || L->argc < 0 || L->envc < 0 || L->auxc < 0) return false;
-    if (L->argc > ABI_ARGV_MAX || L->envc > ABI_ENVP_MAX) {
-        kprintf("[proc] argv/envp too long (%d/%d), max %d/%d\n",
-                L->argc, L->envc, ABI_ARGV_MAX, ABI_ENVP_MAX);
-        return false;
-    }
 
-    /* Total string-pool bytes (argv strings + envp strings). */
+    /* Total string-pool bytes (argv strings + envp strings). The limits
+     * were applied where the vectors were copied in (kvec_copy_in); here
+     * it is only a question of fitting the stack that was sized for them. */
     size_t pool = 0;
     for (int i = 0; i < L->argc; i++) {
         if (!L->argv[i]) return false;
-        size_t l = strlen(L->argv[i]);
-        if (l + 1 > ABI_ARG_MAX) return false;
-        pool += l + 1;
+        pool += strlen(L->argv[i]) + 1;
     }
     for (int i = 0; i < L->envc; i++) {
         if (!L->envp[i]) return false;
-        size_t l = strlen(L->envp[i]);
-        if (l + 1 > ABI_ARG_MAX) return false;
-        pool += l + 1;
+        pool += strlen(L->envp[i]) + 1;
     }
     size_t pool_padded   = (pool + 7) & ~7ULL;                  /* 8-B align */
     size_t argv_bytes    = (size_t)(L->argc + 1) * 8;           /* +NULL term */
@@ -450,7 +592,7 @@ static bool pack_user_stack(const struct user_stack_pack *L,
 
     size_t total = pad_head + pool_padded + auxv_bytes
                  + envp_bytes + argv_bytes + 8;
-    if (total + 64 > USER_STACK_BYTES) {
+    if (total + 64 > L->stack_bytes) {
         kprintf("[proc] argv+envp+auxv too large for user stack "
                 "(%lu bytes)\n", (unsigned long)total);
         return false;
@@ -519,21 +661,22 @@ static bool pack_user_stack(const struct user_stack_pack *L,
     return true;
 }
 
-/* Allocate USER_STACK_PAGES contiguous user-half pages, mapped
- * VMM_USER|VMM_WRITE|VMM_NX. Records the base page so the reaper can
- * unmap+free them later. */
-static bool build_user_stack(struct proc *p) {
-    p->user_stack_base  = USER_STACK_TOP_PAGE;
-    p->user_stack_pages = USER_STACK_PAGES;
+/* Allocate `pages` contiguous user-half pages ending at USER_STACK_TOP_VA,
+ * mapped VMM_USER|VMM_WRITE|VMM_NX. Records the base page so the reaper
+ * can unmap+free them later. */
+static bool build_user_stack(struct proc *p, size_t pages) {
+    uint64_t base = USER_STACK_TOP_VA - (uint64_t)pages * PAGE_SIZE;
+    p->user_stack_base  = base;
+    p->user_stack_pages = pages;
 
-    for (size_t i = 0; i < USER_STACK_PAGES; i++) {
+    for (size_t i = 0; i < pages; i++) {
         uint64_t phys = mm_user_page_alloc(p);      /* slice 16: charged */
         if (phys == 0) {
-            kprintf("[proc] OOM allocating user stack page %lu/%d\n",
-                    (unsigned long)i, USER_STACK_PAGES);
+            kprintf("[proc] OOM allocating user stack page %lu/%lu\n",
+                    (unsigned long)i, (unsigned long)pages);
             return false;
         }
-        if (!vmm_map(USER_STACK_TOP_PAGE + i * PAGE_SIZE, phys, PAGE_SIZE,
+        if (!vmm_map(base + i * PAGE_SIZE, phys, PAGE_SIZE,
                      VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
             kprintf("[proc] vmm_map failed for user stack page %lu\n",
                     (unsigned long)i);
@@ -545,16 +688,71 @@ static bool build_user_stack(struct proc *p) {
     return true;
 }
 
+/* ---- kernel stacks (finding 227) ----
+ * At PROC_KSTACK_SZ = 128 KiB a stack is one of the heap's large
+ * allocations, which get a private arena whose virtual range is never
+ * reused once freed (heap.c); a fork-heavy box would walk the heap window.
+ * So a freed stack goes on this list, still mapped, for the next fork. A
+ * stack beyond the list's room is freed as before.
+ *
+ * A stack handed out is all zeros: a fresh one is zeroed, and a returned
+ * one has its used part zeroed before it is listed. So when it comes back,
+ * the first non-zero word from the bottom marks how deep it was used. The
+ * deepest seen is printed when it grows, as Linux's CONFIG_DEBUG_STACK_USAGE
+ * prints its "greatest stack depth". */
+#define KSTACK_CACHE_MAX 256
+static void      *g_kstack_cache[KSTACK_CACHE_MAX];
+static int        g_kstack_cached;
+static size_t     g_kstack_deepest;
+static spinlock_t g_kstack_lock = SPINLOCK_INIT;
+
+void *proc_kstack_alloc(void) {
+    void *base = 0;
+    uint64_t fl = spin_lock_irqsave(&g_kstack_lock);
+    if (g_kstack_cached > 0) base = g_kstack_cache[--g_kstack_cached];
+    spin_unlock_irqrestore(&g_kstack_lock, fl);
+    if (base) return base;                 /* zeroed when it was listed */
+    base = kmalloc(PROC_KSTACK_SZ);
+    if (base) memset(base, 0, PROC_KSTACK_SZ);
+    return base;
+}
+
+void proc_kstack_free(struct proc *p) {
+    void *base = p->kstack_base;
+    p->kstack_base = 0;
+    p->kstack_top  = 0;
+    if (!base) return;
+
+    uint64_t *w = (uint64_t *)base;
+    size_t n = PROC_KSTACK_SZ / sizeof(uint64_t), low = 0;
+    while (low < n && w[low] == 0) low++;
+    size_t used = (n - low) * sizeof(uint64_t);
+    memset(w + low, 0, used);              /* all zeros again */
+
+    bool deeper = false, listed = false;
+    uint64_t fl = spin_lock_irqsave(&g_kstack_lock);
+    if (used > g_kstack_deepest) { g_kstack_deepest = used; deeper = true; }
+    if (g_kstack_cached < KSTACK_CACHE_MAX) {
+        g_kstack_cache[g_kstack_cached++] = base;
+        listed = true;
+    }
+    spin_unlock_irqrestore(&g_kstack_lock, fl);
+    if (!listed) kfree(base);
+    if (deeper)
+        kprintf("[kstack] %s (pid %d) used greatest stack depth: %lu of %lu bytes\n",
+                p->name, p->pid, (unsigned long)used,
+                (unsigned long)PROC_KSTACK_SZ);
+}
+
 /* Allocate + prime a kernel stack. Returns base on success (so the
  * reaper can free it). Initial layout makes the first context_switch
  * land at proc_first_user_entry. */
 static bool build_kstack(struct proc *p) {
-    void *base = kmalloc(PROC_KSTACK_SZ);
+    void *base = proc_kstack_alloc();
     if (!base) {
         kprintf("[proc] OOM allocating kstack (%d bytes)\n", PROC_KSTACK_SZ);
         return false;
     }
-    memset(base, 0, PROC_KSTACK_SZ);
     p->kstack_base = base;
     p->kstack_top  = (uint8_t *)base + PROC_KSTACK_SZ;
 
@@ -607,12 +805,138 @@ static bool build_kstack(struct proc *p) {
  * "fork" -- we always build a fresh PML4 + a fresh user-space image,
  * which keeps the model trivially correct for an MMU-only kernel
  * without a copy-on-write story. */
-static int spawn_internal(const char *path, const char *name,
-                          struct file *fd0, struct file *fd1, struct file *fd2,
-                          struct file *fd3, struct file *fd4,
-                          int argc, char **argv,
-                          int envc, char **envp,
-                          const char *cwd_override) {
+/* Kernel-side seam for the shell's `set -m`: assign PID's process group
+ * directly. The kernel shell is trusted context -- the permission checks
+ * live in the syscall path (lx_do_setpgid); the hosted /bin/tsh reaches
+ * the same state through setpgid(2) via its host.c shim. */
+int proc_set_pgid(int pid, int pgid) {
+    struct proc *t = proc_lookup(pid);
+    if (!t) return -1;
+    t->pgid = pgid;
+    return 0;
+}
+
+/* setsid(2). A process-group leader may not -- its group would be split
+ * between two sessions -- and a pgid of 0 reads as the process's own pid
+ * (see struct proc), so a process spawned by pid 0 is one until it moves:
+ * util-linux's setsid and busybox's fork first when getpgrp() == getpid(),
+ * for exactly this. The new session has no controlling terminal. */
+long proc_setsid(struct proc *p) {
+    if (!p) return -ABI_EPERM;
+    int pg = p->pgid > 0 ? p->pgid : p->pid;
+    if (pg == p->pid) return -ABI_EPERM;
+    p->sid = p->pid;
+    p->pgid = p->pid;
+    p->ctty_kind = PROC_CTTY_NONE;
+    p->ctty_index = 0;
+    p->ctty_gen = 0;
+    return p->pid;
+}
+
+/* Signal a process and everything descended from it.
+ *
+ * WHY NOT A PROCESS GROUP. The obvious way to reap an SSH session is to
+ * give its shell a process group of its own and signal that. Measured: it
+ * stalls the machine. Handing the session shell its own pgid changed the
+ * fan-out of paths that deliver to a group -- and pid 0's idle loop went
+ * with it, reproducibly, at a different session each run. A bisect that
+ * removed only proc_set_pgid and the group kill came back clean.
+ *
+ * So ancestry, not groups. The parent links are walked live and only for a
+ * root that is still running, which also means no recycled pid can be
+ * mistaken for a session member -- the failure mode that made the group
+ * version dangerous even before it stalled anything.
+ *
+ * The walk is bounded by the table size, so a corrupted parent cycle costs
+ * a bounded scan rather than a hang. Returns how many procs were signalled.
+ */
+int proc_kill_tree(int pid, int sig) {
+    struct proc *root = proc_lookup(pid);
+    if (!root) return 0;
+    int hits = 0;
+    for (int i = 1; i < PROC_MAX; i++) {
+        struct proc *p = &g_proc[i];
+        if (p->state == PROC_UNUSED || p->state == PROC_EMBRYO) continue;
+        int q = (p->pid == pid) ? pid : p->ppid;
+        int guard = 0;
+        while (q > 0 && guard++ < PROC_MAX) {
+            if (q == pid) { signal_send(p, sig); hits++; break; }
+            struct proc *pp = proc_lookup(q);
+            if (!pp) break;
+            q = pp->ppid;
+        }
+    }
+    return hits;
+}
+
+/* Kernel-side WUNTRACED-style foreground wait (see proc.h). Yield-poll,
+ * the same shape as the syscall arms; the kernel shell runs as a kernel
+ * thread, so there is no syscall boundary to deliver an EINTR across. */
+/* PID 0 WAITING ON A CHILD, once the machine is up, is the kernel shell
+ * waiting on a foreground command: it does pid 0's duties between looks
+ * (kernel.c kernel_idle_service_nested) and sleeps at most 10 ms between
+ * them, the child's exit waking it at once. A plain block stopped them all
+ * for the length of the command: an idle_stall from the watchdog at 10 s,
+ * and the network waiting (finding 67). A boot harness's wait, before the
+ * idle loop, is a block as it always was. */
+extern bool g_idle_loop_running;
+extern void kernel_idle_service_nested(void);
+#define PID0_WAIT_SLICE_NS 10000000ull
+static bool pid0_serviced_wait(const struct proc *self) {
+    return self && self->pid == 0 && g_idle_loop_running;
+}
+
+int proc_wait_fg(int pid, int *stop_sig) {
+    if (stop_sig) *stop_sig = 0;
+    struct proc *self = current_proc();
+    for (;;) {
+        struct proc *c = proc_lookup(pid);
+        if (!c) return -1;
+        if (c->state == PROC_STOPPED && !c->stop_reported) {
+            c->stop_reported = true;
+            if (stop_sig) *stop_sig = c->stop_sig > 0 ? c->stop_sig : 19;
+            return 0;
+        }
+        if (c->state == PROC_TERMINATED) return proc_wait(pid);
+        if (pid0_serviced_wait(self)) {
+            /* a stop wakes no waiter: look again within a slice */
+            kernel_idle_service_nested();
+            self->sleep_deadline_ns = perf_now_ns() + PID0_WAIT_SLICE_NS;
+            self->wait_pid = pid;
+            self->state = PROC_BLOCKED;
+            sched_yield();
+            self->sleep_deadline_ns = 0;
+            continue;
+        }
+        sched_yield();
+    }
+}
+
+/* Record argv for /proc/<pid>/cmdline, NUL-separated, capped. Shared by
+ * spawn (below) and execve (fork.c). */
+void proc_record_cmdline(struct proc *p, int argc, char **argv) {
+    size_t off = 0;
+    if (!p) return;
+    for (int i = 0; i < argc && argv && argv[i]; i++) {
+        size_t l = strlen(argv[i]);
+        if (off + l + 1 > sizeof p->cmdline) {
+            if (off + 1 >= sizeof p->cmdline) break;
+            l = sizeof p->cmdline - off - 1;
+        }
+        memcpy(p->cmdline + off, argv[i], l);
+        off += l;
+        p->cmdline[off++] = '\0';
+    }
+    p->cmdline_len = (uint16_t)off;
+}
+
+static int spawn_body(const char *path, const char *name,
+                      struct file *fd0, struct file *fd1, struct file *fd2,
+                      struct file *fd3, struct file *fd4,
+                      const struct proc_fd_map *extra, int nextra,
+                      int argc, char **argv,
+                      int envc, char **envp,
+                      const char *cwd_override, int depth) {
     if (!path) return -1;
 
     struct proc *p = alloc_slot();
@@ -622,8 +946,9 @@ static int spawn_internal(const char *path, const char *name,
     }
 
     proc_slot_wipe(p);                /* stays EMBRYO; READY at the very end */
-    p->pid       = (int)(p - g_proc);
+    proc_pid_alloc(p);
     p->wait_pid  = -1;
+    proc_record_cmdline(p, argc, argv);   /* /proc/<pid>/cmdline */
     /* Slice 64c: "not inside a syscall" is -1, but memset leaves 0, which
      * is a VALID syscall number -- BKL hold time would be misattributed to
      * read()/native-0 for every proc that never made one. */
@@ -636,6 +961,12 @@ static int spawn_internal(const char *path, const char *name,
     {
         struct proc *parent_for_ppid = current_proc();
         p->ppid = parent_for_ppid ? parent_for_ppid->pid : 0;
+        /* umask: inherited from the spawner, 0022 for a kernel spawn. The
+         * field was left ZERO for every spawned process until 2026-09-01
+         * (fork copies it, spawn never set it), which made every native
+         * mkdir a 0777 directory. */
+        p->umask = (parent_for_ppid && parent_for_ppid->pid != 0)
+                 ? parent_for_ppid->umask : 0022u;
     }
     /* Milestone 25A: per-proc heap starts empty -- proc_brk grows it. */
     p->brk_base = USER_HEAP_BASE;
@@ -657,6 +988,23 @@ static int spawn_internal(const char *path, const char *name,
     p->user_arg     = 0;
     /* Phase 1 M1.3: init signal state for new process */
     signal_init_proc(&p->sigstate);
+    /* AN IGNORED SIGNAL STAYS IGNORED IN A SPAWNED PROGRAM -- POSIX's rule
+     * for posix_spawn without POSIX_SPAWN_SETSIGDEF, and what fork + exec
+     * gives (signal_exec_reset keeps SIG_IGN). A caught one starts at its
+     * default, as it would after exec. Spawn started every signal at its
+     * default, so `trap "" USR1` in /bin/tsh -- a native shell, which
+     * spawns -- did not reach its commands: `sh -c 'kill -USR1 $$'` died
+     * (138) where bash's child lives (logs/b8/trap-ignore-*). The blocked
+     * mask is not carried over (posix_spawn would): nothing has needed it. */
+    {
+        struct proc *parent = current_proc();
+        struct sigaction *pa = (parent && parent->pid != 0)
+                             ? sig_actions_of(parent) : 0;
+        if (pa)
+            for (int i = 1; i < SIG_MAX; i++)
+                if (pa[i].sa_handler == SIG_IGN)
+                    p->sigstate.actions[i].sa_handler = SIG_IGN;
+    }
     /* Inherit session tag + user identity from the parent
      * (current_proc()). pid 0 has session_id == 0 / uid == 0 unless
      * the desktop launcher temporarily flipped them to the active
@@ -666,11 +1014,35 @@ static int spawn_internal(const char *path, const char *name,
     {
         struct proc *parent = current_proc();
         p->session_id = parent ? parent->session_id : 0;
+        /* Process group: inherited, like the session tag. A parent that
+         * predates the pgid field (or pid 0 itself) reads as leading its
+         * own group. */
+        p->pgid       = (parent && parent->pgid > 0) ? parent->pgid
+                      : (parent ? parent->pid : p->pid);
         p->uid        = parent ? parent->uid        : 0;
         p->gid        = parent ? parent->gid        : 0;
         /* Linux slice 1: umask is inherited, like uid/gid. 0022 for a
-         * parentless (kernel-spawned) proc -- the conventional default. */
+         * parentless (kernel-spawned) proc -- the conventional default --
+         * and pid 0 carries 0022 itself (proc_init). */
         p->umask      = parent ? parent->umask      : 0022u;
+        /* niceness too, and the scheduling class that goes with it */
+        p->nice       = parent ? parent->nice       : 0;
+        if (p->nice) p->prio = p->nice > 0 ? PRIO_LOW : PRIO_HIGH;
+        /* the resource limits, as fork copies them -- a spawn is a fork and
+         * an exec in one, and exec keeps them; with no parent the wiped
+         * table reads as the defaults (include/tobyos/rlimit.h) */
+        {
+            struct tobyos_rlim *rl = parent ? proc_rlim(parent) : 0;
+            if (rl) {
+                memcpy(p->rlim, rl, sizeof p->rlim);
+                p->rlim_set = true;
+            }
+        }
+        /* the session and its terminal, as fork copies them */
+        p->sid        = parent ? parent->sid        : 0;
+        p->ctty_kind  = parent ? parent->ctty_kind  : PROC_CTTY_CONSOLE;
+        p->ctty_index = parent ? parent->ctty_index : 0;
+        p->ctty_gen   = parent ? parent->ctty_gen   : 0;
         /* Linux slice 2: the rest of the credential set is inherited too.
          * A plain spawn is not a privilege transition, so real/effective/saved
          * all agree on entry -- exactly what fork(2) gives you. execve may
@@ -720,6 +1092,12 @@ static int spawn_internal(const char *path, const char *name,
             if (cn >= ABI_PATH_MAX) cn = ABI_PATH_MAX - 1;
             memcpy(p->cwd, parent->cwd, cn);
             p->cwd[cn] = '\0';
+            p->cwd_ino = parent->cwd_ino;     /* the same directory */
+            p->cwd_mtime = parent->cwd_mtime;
+            p->cwd_dev = parent->cwd_dev;
+            p->cwd_mode = parent->cwd_mode;
+            p->cwd_uid = parent->cwd_uid;
+            p->cwd_gid = parent->cwd_gid;
         } else {
             p->caps = CAP_GROUP_ALL;
             p->sandbox_root[0] = '\0';
@@ -730,8 +1108,57 @@ static int spawn_internal(const char *path, const char *name,
             if (cn >= ABI_PATH_MAX) cn = ABI_PATH_MAX - 1;
             memcpy(p->cwd, cwd_override, cn);
             p->cwd[cn] = '\0';
+            proc_note_cwd(p);
         }
     }
+    /* ---- the parent's containment, as fork's child has it (finding 207) --
+     * its namespaces (the pid one its children go to), its chroot root, its
+     * seccomp filter and no_new_privs, its cgroup, and pids.max counting it.
+     * A spawned child had none of them: every native command run inside
+     * `unshare -r` was the host's uid in the host's /proc, and one run under
+     * chroot, seccomp or a cgroup was outside it. Before the program is
+     * loaded, so its pages are charged to the right cgroup; every failure
+     * below releases what this takes (nsproxy_release). */
+    {
+        struct proc *parent = current_proc();
+        if (parent) {
+            if (cgroup_can_fork(parent) != 0) {
+                memset(p, 0, sizeof(*p));
+                p->state = PROC_UNUSED;
+                return -1;
+            }
+            p->uts_ns              = parent->uts_ns;
+            p->ipc_ns              = parent->ipc_ns;
+            p->mnt_ns              = parent->mnt_ns;
+            p->net_ns              = parent->net_ns;
+            p->user_ns             = parent->user_ns;
+            /* ROOT IN ITS USER NAMESPACE HAS THE FULL SET, as Linux's
+             * execve gives it -- a forked child has it already (it copies
+             * its parent's). spawn asked for kernel uid 0 alone, so mount,
+             * spawned by sh inside `unshare -r`, could not bind-mount
+             * there (finding 236). The checks that matter ask for the
+             * namespace (userns_capable). */
+            if (p->user_ns && p->uid != 0 &&
+                userns_k2v_uid(p->user_ns, (uint32_t)p->uid) == 0)
+                p->lcap_eff = p->lcap_perm = p->lcap_inh = ~0ull;
+            p->pid_ns              = parent->pid_ns;
+            p->pid_ns_for_children = parent->pid_ns_for_children;
+            p->seccomp_filter      = parent->seccomp_filter;
+            p->seccomp_mode        = parent->seccomp_mode;
+            p->no_new_privs        = parent->no_new_privs;
+            p->cgroup              = parent->cgroup;
+            memcpy(p->fs_root, parent->fs_root, sizeof p->fs_root);
+            nsproxy_fork_inherit(p);
+            seccomp_fork_inherit(p);
+            if (pid_ns_place_child(p, parent, 0, false) != 0) {
+                nsproxy_release(p);
+                memset(p, 0, sizeof(*p));
+                p->state = PROC_UNUSED;
+                return -1;
+            }
+        }
+    }
+
     if (name) {
         name_copy(p->name, name, PROC_NAME_MAX);
     } else {
@@ -751,8 +1178,9 @@ static int spawn_internal(const char *path, const char *name,
     }
 
     /* ---- 0. inherit fds (clone the explicit ones, default the rest) ---- */
-    if (!install_initial_fds(p, fd0, fd1, fd2, fd3, fd4)) {
+    if (!install_initial_fds(p, fd0, fd1, fd2, fd3, fd4, extra, nextra)) {
         kprintf("[proc] '%s': OOM installing initial fds\n", path);
+        nsproxy_release(p);   /* 207 */
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
         return -1;
@@ -761,20 +1189,67 @@ static int spawn_internal(const char *path, const char *name,
     /* ---- 1. read the ELF off the VFS ---- */
     void  *image      = 0;
     size_t image_size = 0;
-    int rc = vfs_read_all(path, &image, &image_size);
+    /* borrowed from the initrd where it lies there, as execve's (finding
+     * 247: a copy of the whole file first, then of each segment) -- and
+     * an image the initrd holds is what the shared text is kept for */
+    int    img_borrowed = 0;
+    int rc = vfs_read_all_ref(path, &image, &image_size, &img_borrowed);
     if (rc != VFS_OK) {
         kprintf("[proc] cannot read '%s': %s\n", path, vfs_strerror(rc));
         close_all_fds(p);
+        nsproxy_release(p);   /* 207 */
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
         return -1;
     }
 
+    /* ---- 1b. "#!": this is a script; spawn its interpreter instead ----
+     * The slot is given back exactly as the read-failure path does, and the
+     * recursion carries the interpreter's argv: [interp, optarg?, script,
+     * argv[1..]]. The strings live on this frame, which outlives the
+     * recursive call that copies them to the new process's stack. */
+    {
+        char interp[BINFMT_SHEBANG_MAX];
+        char optarg[BINFMT_SHEBANG_MAX];
+        int sb = binfmt_shebang(image, image_size, interp, sizeof interp,
+                                optarg, sizeof optarg);
+        if (sb != 0) {
+            if (!img_borrowed) kfree(image);
+            close_all_fds(p);
+            nsproxy_release(p);   /* 207 */
+            memset(p, 0, sizeof(*p));
+            p->state = PROC_UNUSED;
+            if (sb < 0) {
+                kprintf("[proc] '%s': #! with no interpreter\n", path);
+                return -1;
+            }
+            if (depth >= BINFMT_MAX_RECURSION) {
+                kprintf("[proc] '%s': #! nested more than %d deep\n",
+                        path, BINFMT_MAX_RECURSION);
+                return -1;
+            }
+            /* As many slots as there are arguments, plus the interpreter,
+             * its option and the script (it was a 64-slot stack array). */
+            int nmax = argc + 4;
+            char **nargv = (char **)kmalloc((size_t)nmax * sizeof(char *));
+            if (!nargv) return -1;
+            int nargc = binfmt_shebang_argv(interp, optarg, path, argc, argv,
+                                            nargv, nmax);
+            if (nargc < 0) { kfree(nargv); return -1; }
+            int src = spawn_body(interp, name, fd0, fd1, fd2, fd3, fd4,
+                                 extra, nextra, nargc, nargv, envc, envp,
+                                 cwd_override, depth + 1);
+            kfree(nargv);
+            return src;
+        }
+    }
+
     /* ---- 2. allocate fresh PML4 ---- */
     uint64_t pml4 = vmm_create_user_pml4();
     if (pml4 == 0) {
-        kfree(image);
+        if (!img_borrowed) kfree(image);
         close_all_fds(p);
+        nsproxy_release(p);   /* 207 */
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
         return -1;
@@ -828,7 +1303,7 @@ static int spawn_internal(const char *path, const char *name,
   if (is_pe) {
     /* ---- Windows PE/COFF image (Track C) ---- */
     int prc = pe_load_user(image, image_size, argc, argv, &pe_info);
-    kfree(image);
+    if (!img_borrowed) kfree(image);
     ok = (prc == 0);
     if (ok) {
         p->personality = ABI_PERS_WIN32;
@@ -849,7 +1324,7 @@ static int spawn_internal(const char *path, const char *name,
         p->win_tls_index    = pe_info.tls_index;
         kprintf("[proc] pid %d '%s' -> Win32 PE personality (entry=%p teb=%p)\n",
                 p->pid, p->name, (void *)pe_info.entry, (void *)pe_info.teb);
-        ok = build_user_stack(p);
+        ok = build_user_stack(p, USER_STACK_PAGES);
     }
     if (ok) {
         /* Windows entry points are entered with RSP%16==8 -- i.e. as if reached
@@ -902,7 +1377,7 @@ static int spawn_internal(const char *path, const char *name,
     uint64_t t_elf = perf_rdtsc();
     ok = elf_load_user_at(image, image_size, prog_load_base, &prog_info);
     perf_zone_end(PERF_Z_ELF_LOAD, t_elf);
-    kfree(image);                  /* segments now live in their own frames */
+    if (!img_borrowed) kfree(image);                  /* segments now live in their own frames */
 
     /* Track B: latch the ABI personality. A binary runs through the Linux
      * syscall translation layer if it's branded ELFOSABI_LINUX *or* (B10)
@@ -910,6 +1385,47 @@ static int spawn_internal(const char *path, const char *name,
      * off-the-shelf dynamic Linux binary drops-and-runs. Everything else keeps
      * the tobyOS default. */
     if (ok) {
+        /* ---- set-user-ID-on-exec, for the SPAWN path too (2026-09-06) ----
+         *
+         * This transition existed ONLY in execve (src/fork.c). spawn seeded
+         * the credential triple from the parent's effective ids above and
+         * never looked at the image, so a setuid binary launched by the
+         * shell ran UNPRIVILEGED: `sudo` from tsh reported "this binary is
+         * not setuid root" while the very same /bin/sudo worked under
+         * `busybox sh -c`, which fork+execve's it. su was equally dead.
+         * That is the native-vs-hosted inversion this arc is about, and it
+         * was invisible to every QEMU gate because those run as ROOT, and a
+         * root caller never needs the bit. Found on the EliteDesk.
+         *
+         * Rules are execve's, and they are the POSIX ones: the EFFECTIVE and
+         * SAVED ids move to the file's owner, the REAL uid is untouched (so
+         * a setuid program can still tell who invoked it -- ABI_SYS_GETRUID
+         * is what su asks), and a nosuid mount is honoured. Applied here,
+         * after a SUCCESSFUL image load, for the same reason execve does it
+         * there: a failed spawn must not hand out privilege. */
+        {
+            struct vfs_stat sst;
+            uint32_t smf = vfs_path_mount_flags(path);
+            if (!(smf & VFS_MNT_NOSUID) &&
+                vfs_stat(path, &sst) == VFS_OK && (sst.mode & VFS_MODE_VALID)) {
+                if (sst.mode & VFS_MODE_SETUID) {
+                    p->uid  = (int)sst.uid;
+                    p->suid = p->uid;
+                    if (p->uid == 0)
+                        p->lcap_eff = p->lcap_perm = p->lcap_inh = ~0ull;
+                }
+                if (sst.mode & VFS_MODE_SETGID) {
+                    p->gid  = (int)sst.gid;
+                    p->sgid = p->gid;
+                }
+            } else if (smf & VFS_MNT_NOSUID) {
+                struct vfs_stat nst;
+                if (vfs_stat(path, &nst) == VFS_OK &&
+                    (nst.mode & (VFS_MODE_SETUID | VFS_MODE_SETGID)))
+                    kprintf("[spawn] nosuid mount: ignoring set-id bits on '%s'\n",
+                            path);
+            }
+        }
         bool is_linux = elf_is_linux_abi(prog_info.osabi, has_interp,
                                          interp_path, prog_info.has_gnu_phdr);
         p->personality = is_linux ? ABI_PERS_LINUX : ABI_PERS_TOBY;
@@ -931,8 +1447,11 @@ static int spawn_internal(const char *path, const char *name,
     size_t interp_image_size = 0;
     if (ok && has_interp) {
         /* vfs_read_all uses kernel mappings, so it works regardless of
-         * the active CR3. */
-        int irc = vfs_read_all(interp_path, &interp_image, &interp_image_size);
+         * the active CR3; borrowed from the initrd where it lies there
+         * (finding 247) */
+        int interp_borrowed = 0;
+        int irc = vfs_read_all_ref(interp_path, &interp_image, &interp_image_size,
+                                   &interp_borrowed);
         if (irc != VFS_OK) {
             kprintf("[proc] PT_INTERP='%s' missing from VFS: %s\n",
                     interp_path, vfs_strerror(irc));
@@ -940,7 +1459,7 @@ static int spawn_internal(const char *path, const char *name,
         } else {
             ok = elf_load_user_at(interp_image, interp_image_size,
                                   interp_load_base, &interp_info);
-            kfree(interp_image);
+            if (!interp_borrowed) kfree(interp_image);
             if (!ok) {
                 kprintf("[proc] failed loading interpreter '%s'\n",
                         interp_path);
@@ -953,13 +1472,14 @@ static int spawn_internal(const char *path, const char *name,
         }
     }
 
-    if (ok) ok = build_user_stack(p);
+    if (ok) ok = build_user_stack(p, proc_user_stack_pages(argc, argv,
+                                                            envc, envp));
 
     /* Pack auxv (Milestone 25D). Always emit a tiny vector even for
      * static programs -- the trailing AT_NULL is harmless to libtoby
      * crt0 (which doesn't read auxv at all today) and makes the stack
      * shape uniform across static and dynamic launches. */
-    struct abi_auxv aux[20];
+    struct abi_auxv aux[24];
     int             auxc = 0;
     if (ok) {
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PHDR,   prog_info.phdr_va  };
@@ -971,18 +1491,40 @@ static int spawn_internal(const char *path, const char *name,
         aux[auxc++] = (struct abi_auxv){ ABI_AT_ENTRY,  prog_info.entry    };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PAGESZ, PAGE_SIZE          };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_FLAGS,  0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,    0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,   0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,    0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,   0                  };
+        /* Real credentials (2026-08-22; were hardcoded 0). glibc reads
+         * AT_SECURE to decide secure-mode (ignore LD_* env, etc.) and
+         * compares AT_EUID against geteuid() -- both lie if these do.
+         * Translated at the user-namespace reporting boundary, same as
+         * getuid/stat/procfs (slice 11's rule). */
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,
+                                         userns_cur_uid((uint32_t)p->ruid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,
+                                         userns_cur_uid((uint32_t)p->uid)  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,
+                                         userns_cur_gid((uint32_t)p->rgid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,
+                                         userns_cur_gid((uint32_t)p->gid)  };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP,  ABI_AT_HWCAP_X86_64_BASE };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP2, 0                };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_MINSIGSTKSZ, 2048       };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_CLKTCK, 100                };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE, 0                  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE,
+                                         (p->uid != p->ruid ||
+                                          p->gid != p->rgid) ? 1u : 0u     };
         /* AT_RANDOM: 16 bytes a Linux libc reads for its stack canary.
          * Point at the 16-byte scratch pad pack_user_stack always leaves
          * at the very top of the (zeroed) user stack -- valid + readable.
          * Slice 87: seed with CSPRNG after packing (was left zero). */
         aux[auxc++] = (struct abi_auxv){ ABI_AT_RANDOM, USER_STACK_TOP_VA - 16 };
+        /* vDSO (2026-08-23): same contract as the execve arm (fork.c) --
+         * map into the fresh address space, advertise via auxv, omit the
+         * entry entirely when unavailable. */
+        {
+            extern uint64_t vdso_map_root(uint64_t cr3);
+            uint64_t vb = vdso_map_root(p->cr3);
+            if (vb)
+                aux[auxc++] = (struct abi_auxv){ ABI_AT_SYSINFO_EHDR, vb };
+        }
     }
 
     /* Default RSP if no argv -- pack a canonical
@@ -994,6 +1536,7 @@ static int spawn_internal(const char *path, const char *name,
             .argc = argc, .argv = argv,
             .envc = envc, .envp = envp,
             .auxv = aux,  .auxc = auxc,
+            .stack_bytes = p->user_stack_pages * PAGE_SIZE,
         };
         ok = pack_user_stack(&pack, &user_rsp);
         if (ok) {
@@ -1012,6 +1555,7 @@ static int spawn_internal(const char *path, const char *name,
     if (!ok) {
         vmm_destroy_user_pml4(pml4);
         close_all_fds(p);
+        nsproxy_release(p);   /* 207 */
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
         return -1;
@@ -1030,6 +1574,7 @@ static int spawn_internal(const char *path, const char *name,
     if (!build_kstack(p)) {
         vmm_destroy_user_pml4(pml4);
         close_all_fds(p);
+        nsproxy_release(p);   /* 207 */
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
         return -1;
@@ -1053,7 +1598,7 @@ static int spawn_internal(const char *path, const char *name,
     /* Milestone 19 metric: another proc spawned. */
     perf_count_proc_spawn();
 
-    kprintf("[proc] created pid=%d ppid=%d '%s' entry=%p rsp=%p cr3=0x%lx"
+    kprintf_log("[proc] created pid=%d ppid=%d '%s' entry=%p rsp=%p cr3=0x%lx"
             " kstack=%p argc=%d envc=%d cwd='%s'\n",
             p->pid, p->ppid, p->name, (void *)p->user_entry,
             (void *)p->user_rsp, p->cr3, p->kstack_top, argc, envc,
@@ -1061,9 +1606,20 @@ static int spawn_internal(const char *path, const char *name,
     return p->pid;
 }
 
+static int spawn_internal(const char *path, const char *name,
+                          struct file *fd0, struct file *fd1, struct file *fd2,
+                          struct file *fd3, struct file *fd4,
+                          const struct proc_fd_map *extra, int nextra,
+                          int argc, char **argv,
+                          int envc, char **envp,
+                          const char *cwd_override) {
+    return spawn_body(path, name, fd0, fd1, fd2, fd3, fd4, extra, nextra,
+                      argc, argv, envc, envp, cwd_override, 0);
+}
+
 int proc_create_from_elf(const char *path, const char *name) {
     /* Default: console for fd 0/1/2, no argv, no envp, inherit cwd. */
-    return spawn_internal(path, name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    return spawn_internal(path, name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 /* Ring-0 kernel worker: no user half, no ELF, no fds. Same PCB + fake
@@ -1080,7 +1636,7 @@ int proc_create_kernel(void (*entry)(void), const char *name) {
         return -1;
     }
     proc_slot_wipe(p);                /* stays EMBRYO; READY at the end */
-    p->pid        = (int)(p - g_proc);
+    proc_pid_alloc(p);
     p->wait_pid   = -1;
     p->exit_code  = -1;
     p->ppid       = 0;
@@ -1090,6 +1646,10 @@ int proc_create_kernel(void (*entry)(void), const char *name) {
     p->is_kernel  = true;
     p->user_entry = (uint64_t)entry;      /* kernel fn, CALLed on entry */
     p->cwd[0] = '/'; p->cwd[1] = '\0';
+    /* pid 0's umask: a worker spawns too -- sshd's starts every SSH
+     * session, and with the wiped 0 every session began at umask 0000 */
+    p->umask = 0022u;
+    p->ctty_kind = PROC_CTTY_CONSOLE;     /* pid 0's, as a worker's spawns expect */
     name_copy(p->name, name ? name : "kworker", PROC_NAME_MAX);
     /* Kernel context: same ADMIN blanket as pid 0 / ap_idle so any
      * kernel-invoked VFS/net path sails through cap_check. */
@@ -1114,12 +1674,36 @@ int proc_spawn(const struct proc_spec *spec) {
     /* Milestone 19: span the whole spawn pipeline so `perf` can show
      * elf_load (inner zone) vs the spawn bookkeeping around it. */
     uint64_t t_spawn = perf_rdtsc();
+    /* spec->umask: the child inherits it as it would the spawner's own --
+     * set on the spawner for the length of the build (spawn_body copies
+     * it), so the child never runs a moment with the wrong one. */
+    struct proc *spawner = current_proc();
+    uint32_t spawner_umask = spawner ? spawner->umask : 0;
+    if (spec->set_umask && spawner) spawner->umask = spec->umask & 0777u;
+    /* spec->sig_default / sig_ignore, by the same trick: the spawner's own
+     * action is SIG_DFL or SIG_IGN for the length of the build, and an
+     * ignore is all spawn_body copies from it. Put back before the
+     * spawner returns to user mode, where its signals are delivered. */
+    struct sigaction *sa_sp = (spawner && spawner->pid != 0 &&
+                                (spec->sig_default | spec->sig_ignore))
+                            ? sig_actions_of(spawner) : 0;
+    void (*sa_saved[SIG_MAX])(int);
+    if (sa_sp)
+        for (int i = 1; i < SIG_MAX; i++) {
+            sa_saved[i] = sa_sp[i].sa_handler;
+            if (spec->sig_ignore & SIGMASK(i))       sa_sp[i].sa_handler = SIG_IGN;
+            else if (spec->sig_default & SIGMASK(i)) sa_sp[i].sa_handler = SIG_DFL;
+        }
     int pid = spawn_internal(spec->path, spec->name,
                              spec->fd0, spec->fd1, spec->fd2,
                              spec->fd3, spec->fd4,
+                             spec->extra_fds, spec->extra_nfds,
                              spec->argc, spec->argv,
                              spec->envc, spec->envp,
                              spec->cwd);
+    if (sa_sp)
+        for (int i = 1; i < SIG_MAX; i++) sa_sp[i].sa_handler = sa_saved[i];
+    if (spec->set_umask && spawner) spawner->umask = spawner_umask;
     perf_zone_end(PERF_Z_PROC_SPAWN, t_spawn);
     if (pid < 0) return pid;
 
@@ -1136,7 +1720,7 @@ int proc_spawn(const struct proc_spec *spec) {
             (void)cap_profile_apply(p, spec->sandbox_profile);
             char caps_str[96];
             cap_mask_to_string(p->caps, caps_str, sizeof(caps_str));
-            kprintf("[cap] pid=%d '%s' sandbox='%s' caps=%s root=%s\n",
+            kprintf_log("[cap] pid=%d '%s' sandbox='%s' caps=%s root=%s\n",
                     p->pid, p->name, spec->sandbox_profile, caps_str,
                     p->sandbox_root[0] ? p->sandbox_root : "(none)");
         }
@@ -1184,12 +1768,34 @@ __attribute__((noreturn)) void proc_first_user_entry(void) {
     proc_enter_user_asm(p->user_entry, p->user_rsp);
 }
 
-/* Wake any process blocked on `pid`. Marks them READY and re-enqueues
+/* Wake any process blocked on `pid` -- and its parent or tracer if that is
+ * blocked on any child (PROC_WAIT_ANY). Marks them READY and re-enqueues
  * onto the scheduler. */
+/* The process a proc belongs to: its thread group's leader's pid. */
+static int proc_tg(const struct proc *p) {
+    return p->is_thread ? p->tgid : p->pid;
+}
+
+/* Is the parent PPID (a pid) in the same process as SELF? A child is its
+ * whole process's on Linux: any of its threads may wait for it (wait4 and
+ * waitpid without __WNOTHREAD). Only the very thread that started it could
+ * here -- a waiter thread's waitpid(-1) said "no children" (script(1), batch
+ * 26). */
+static bool proc_parent_is(int ppid, const struct proc *self) {
+    if (ppid == self->pid) return true;
+    struct proc *par = ppid > 0 ? proc_lookup(ppid) : 0;
+    return par && proc_tg(par) == proc_tg(self);
+}
+
 static void wakeup_waiters(int pid) {
+    struct proc *t = proc_lookup(pid);
+    int par = t ? t->ppid : 0, tr = t ? t->tracer_pid : 0;
     for (int i = 0; i < PROC_MAX; i++) {
         struct proc *q = &g_proc[i];
-        if (q->state == PROC_BLOCKED && q->wait_pid == pid) {
+        if (q->state == PROC_BLOCKED &&
+            (q->wait_pid == pid ||
+             (q->wait_pid == PROC_WAIT_ANY && q->pid > 0 &&
+              (proc_parent_is(par, q) || q->pid == tr)))) {
             q->wait_pid = -1;
             q->state    = PROC_READY;
             sched_enqueue(q);
@@ -1228,6 +1834,9 @@ int proc_wait_or_ptrace(int pid) {
     for (;;) {
         if (child->ptrace_stopped && child->tracer_pid == self->pid) return 1;
         if (child->state == PROC_TERMINATED) return 0;
+        /* ...and a signal that acts ends it, as the native waitpid's does
+         * (see proc_wait_any). */
+        if (proc_wait_interrupted(self)) return PROC_WAIT_INTR;
         self->wait_pid = pid;
         self->state    = PROC_BLOCKED;
         sched_yield();
@@ -1241,10 +1850,36 @@ int proc_wait_or_ptrace(int pid) {
  * down (real fbdev programs draw into the mmap and exit without panning). */
 extern void fbdev_proc_exit(int pid);
 
+/* Wait until `p` is no longer loaded on any CPU.
+ *
+ * NEVER SPIN ON THIS WHILE HOLDING THE BKL. A proc that has exited stays
+ * `current` on its CPU until that CPU switches away, and that CPU reaches
+ * the switch through bkl_enter(). Spinning on on_cpu with the lock held is
+ * therefore hold-and-wait: the very CPU this loop is waiting for cannot
+ * make the progress the loop needs. Every other core then queues behind
+ * the lock, pid 0 starves, and the box is gone inside ten seconds.
+ *
+ * That is not hypothetical -- it took the EliteDesk down on the first real
+ * hardware run of the native-parity arc (2026-09-11, commit 158cb7b). A
+ * plain `while : ; do x=$(echo hi); done` under the Linux-ABI bash froze
+ * it within a handful of forks, with the reaper holding the lock here and
+ * the dead child sitting TERMINATED-but-still-on_cpu on another core.
+ * QEMU had never reproduced it in hundreds of gate boots: it needs two
+ * cores to race a dying proc's context save against a reaper.
+ *
+ * So the DECISION IS MADE HERE rather than left to callers. Holding the
+ * BKL, this yields -- sched_yield() releases the lock on the way out and
+ * re-takes it on the way back, which is the shape every other blocking
+ * primitive in this kernel uses (see LX_wait4). Without it, the old spin
+ * is still right. Four call sites had to get this correct independently
+ * (proc_reap, and thread_join/thread_detach x3); exactly one of them did,
+ * and only after it had already cost a wedged machine. */
 void proc_wait_off_cpu(struct proc *p) {
     if (!p) return;
-    while (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE))
-        __asm__ volatile("pause");
+    while (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) {
+        if (bkl_held()) sched_yield();
+        else            __asm__ volatile("pause");
+    }
 }
 
 /* Slice 89: bounded variant for group teardown. A member wedged ON-CPU
@@ -1263,6 +1898,8 @@ bool proc_wait_off_cpu_bounded(struct proc *p) {
 /* Linux exit_group(2): terminate every task in the caller's thread group.
  * A non-leader chrome thread used to call exit_group(191) and only kill
  * itself, leaving the browser zombie'd on X11 recvmsg with no GPU. */
+static void proc_fold_thread_times(struct proc *t);
+
 __attribute__((noreturn)) void proc_exit_group(int code) {
     struct proc *p = current_proc();
     if (!p) proc_exit(code);
@@ -1276,7 +1913,10 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
             if (q == p || q->state == PROC_UNUSED ||
                 q->state == PROC_EMBRYO) continue;
             if (!(q->tgid == tgid || q->pid == tgid)) continue;
+            q->dying = true;                 /* tombstone before state */
             q->exit_code = code;
+            q->term_sig  = p->term_sig;      /* K3: a thread's fatal signal
+                                              * is the process's */
             q->state = PROC_TERMINATED;
             struct proc *w = q->join_waiters;
             while (w) {
@@ -1288,8 +1928,16 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
             }
             q->join_waiters = 0;
             sched_dequeue(q);
+            /* Phase F: robust-mutex stamps before the futex state is gone. */
+            { extern void futex_robust_exit(struct proc *); futex_robust_exit(q); }
             { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
             { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
+            /* Same reason as the single-process exit path: this member may
+             * have been tracing something, and a tracee whose tracer vanishes
+             * must not stay parked forever. The group teardown terminates
+             * members here directly rather than routing each through
+             * proc_exit, so the call has to be repeated at both sites. */
+            { extern void ptrace_detach_all(int); ptrace_detach_all(q->pid); }
             /* Slice 89: a member parked in cow_fork_lock_acquire's quiesce
              * loop spins ON-CPU until vm_quiesce clears -- and the forker
              * that set it may be exactly who we just terminated, so nobody
@@ -1306,13 +1954,12 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
                 continue;      /* leak beats freeing a live thread's stack */
             }
             if (q->is_thread) {
-                if (q->kstack_base) kfree(q->kstack_base);
-                q->kstack_base = 0;
-                q->kstack_top  = 0;
+                proc_kstack_free(q);
                 /* Slice 8: this path frees the slot WITHOUT going through
                  * proc_reap, so it owes the namespace release itself -- a
                  * thread holds its own reference (sys_clone_thread takes one). */
                 nsproxy_release(q);
+                proc_fold_thread_times(q);      /* ...and its CPU time */
                 q->state = PROC_UNUSED;
             } else {
                 /* Leader: close shared fds; leave TERMINATED for wait/reap.
@@ -1337,6 +1984,73 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
     proc_exit(code);
 }
 
+/* Force-terminate every non-leader thread of leader `p` (Phase F: factored
+ * from proc_exit so sys_execve can reap the group pre-commit -- POSIX says
+ * exec from the leader kills the other threads; before this, an exec'd
+ * image ran with the old image's threads still scheduled on page tables
+ * about to be replaced). The BKL must NOT be held: the off-CPU wait spins
+ * on remote cores that may be stuck in bkl_enter. Runs on the group's live
+ * address space -- each sibling's robust-mutex list is walked before its
+ * futex state is forgotten. */
+void proc_reap_group_threads(struct proc *p, int code) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q == p || q->state == PROC_UNUSED ||
+            q->state == PROC_EMBRYO) continue;
+        if (q->tgid == p->pid && q->is_thread) {
+            /* Force-terminate the thread */
+            q->dying = true;                 /* tombstone before state */
+            q->exit_code = code;
+            q->state = PROC_TERMINATED;
+            /* Wake any joiners */
+            struct proc *w = q->join_waiters;
+            while (w) {
+                struct proc *nxt = w->next_wait;
+                w->state = PROC_READY;
+                w->next_wait = 0;
+                sched_enqueue(w);
+                w = nxt;
+            }
+            q->join_waiters = 0;
+            /* Remove it from the ready queue BEFORE freeing its stack. A
+             * force-terminated sibling that was PROC_READY is still linked
+             * in a run queue; freeing its kstack and marking the slot
+             * UNUSED without unlinking leaves the scheduler able to pop it
+             * and switch in with kstack_top == NULL -> triple fault in
+             * syscall_entry. (Measured: pid=27 is_thread=1 tgid=17,
+             * kstack_top=0x0.) */
+            sched_dequeue(q);
+            /* Phase F: the dying sibling's held robust mutexes must be
+             * stamped while the shared address space is still live. */
+            { extern void futex_robust_exit(struct proc *); futex_robust_exit(q); }
+            { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
+            { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
+            /* Same reason as the single-process exit path: this member may
+             * have been tracing something, and a tracee whose tracer vanishes
+             * must not stay parked forever. The group teardown terminates
+             * members here directly rather than routing each through
+             * proc_exit, so the call has to be repeated at both sites. */
+            { extern void ptrace_detach_all(int); ptrace_detach_all(q->pid); }
+            /* Slice 88: wait until the sibling is off-CPU before freeing
+             * its kstack -- sched_dequeue does not stop a thread still
+             * running on another core.
+             * Slice 89: release a quiesce-parked spinner first, and bound
+             * the wait (see proc_exit_group -- same hang, same fix). */
+            __atomic_store_n(&q->vm_quiesce, 0, __ATOMIC_RELEASE);
+            if (!proc_wait_off_cpu_bounded(q)) {
+                kprintf("[exitg] pid=%d never left cpu -- slot leaked, "
+                        "kstack NOT freed\n", q->pid);
+                continue;
+            }
+            /* Free the thread's kernel stack */
+            proc_kstack_free(q);
+            nsproxy_release(q);       /* slice 8 -- bypasses proc_reap */
+            proc_fold_thread_times(q);
+            q->state = PROC_UNUSED;
+        }
+    }
+}
+
 __attribute__((noreturn)) void proc_exit(int code) {
     struct proc *p = current_proc();
 
@@ -1351,6 +2065,31 @@ __attribute__((noreturn)) void proc_exit(int code) {
     }
 #endif
 
+    /* RELEASE ANY PROCESS THIS ONE WAS TRACING (2026-09-02).
+     *
+     * ptrace_detach_all() has existed since the ptrace slice, its own
+     * comment says "Called from the exit path for every process", and
+     * NOTHING CALLED IT. Dead code that reads as live -- the same shape as
+     * the ASLR/OOM/reclaim subsystems found initialised-but-never-called in
+     * the dead-subsystem audit.
+     *
+     * The consequence is a leak with a delayed fuse. A tracer that exits
+     * while its tracee sits in a ptrace stop leaves that tracee
+     * PROC_STOPPED forever: never resumed, never reaped, holding a proc
+     * slot, an address space and its descriptors, and still pointing
+     * tracer_pid at a pid that will eventually be recycled onto somebody
+     * else. Every strace run ending with its tracee stopped burns one.
+     *
+     * Measured on real hardware: twenty strace runs completed cleanly and
+     * left the box standing, and then the very next operation -- a plain
+     * file upload -- wedged it. That latency is the signature. The machine
+     * does not die on the guilty operation, it dies on whatever comes
+     * after it and needs a resource. */
+    if (p) {
+        extern void ptrace_detach_all(int tracer_pid);
+        ptrace_detach_all(p->pid);
+    }
+
     /* Share-until-exec: child _exit without exec must unblock the launcher. */
     if (p && p->vfork_parent > 0)
         vfork_child_done(p);
@@ -1358,6 +2097,15 @@ __attribute__((noreturn)) void proc_exit(int code) {
     /* Track B graphics: flush a Linux /dev/fb0 mmap to the display while this
      * process's pages are still mapped (before cli()/teardown below). */
     if (p) fbdev_proc_exit(p->is_thread ? p->tgid : p->pid);
+
+    /* Phase F: walk this thread's glibc robust-mutex list while its user
+     * memory is still mapped -- held robust mutexes get FUTEX_OWNER_DIED
+     * and one waiter woken, so the next lock() reports EOWNERDEAD instead
+     * of hanging. Same placement constraints as clear_child_tid below. */
+    if (p) {
+        extern void futex_robust_exit(struct proc *);
+        futex_robust_exit(p);
+    }
 
     /* B11: Linux pthread_join. If this thread registered a clear_child_tid
      * (via clone(CLONE_CHILD_CLEARTID) or set_tid_address), write 0 to that
@@ -1390,22 +2138,29 @@ __attribute__((noreturn)) void proc_exit(int code) {
             pid_ns_kill_members(p);
         } else {
             /* Orphans inside a namespace reparent to that namespace's init,
-             * not to the host's. Scoped to non-initial namespaces on purpose:
-             * the initial namespace has never reparented orphans in this
-             * kernel, and changing that as a side effect of a namespace slice
-             * is a behaviour change nobody asked for (recorded as an open
-             * item instead). */
+             * not to the host's.
+             *
+             * IN THE INITIAL NAMESPACE THEY ARE MARKED PROC_PPID_ORPHAN, and
+             * proc_reap_orphans() reclaims them once they exit. They used to
+             * keep the dead parent's pid, so nothing ever waited for them:
+             * every orphan became a permanent zombie. On the EliteDesk,
+             * after a day of gate runs, 254 of the 255 process slots were
+             * zombies and nothing could be spawned -- SSH answered, and every
+             * command it ran came back 127. Keeping the dead pid was also
+             * wrong on its own terms: pids are recycled slot numbers, so an
+             * unrelated new process could inherit children it never had. */
             int reaper = pid_ns_reaper_kpid(p);
-            if (reaper) {
-                for (int i = 1; i < PROC_MAX; i++) {
-                    struct proc *q = &g_proc[i];
-                    if (q == p || q->state == PROC_UNUSED ||
-                        q->state == PROC_EMBRYO) continue;
-                    if (q->ppid == p->pid) q->ppid = reaper;
-                }
+            for (int i = 1; i < PROC_MAX; i++) {
+                struct proc *q = &g_proc[i];
+                if (q == p || q->state == PROC_UNUSED ||
+                    q->state == PROC_EMBRYO) continue;
+                if (q->ppid == p->pid)
+                    q->ppid = reaper ? reaper : PROC_PPID_ORPHAN;
             }
         }
     }
+
+    /* (SIGCHLD to the parent is sent below, once this process is a zombie.) */
 
     cli();
 
@@ -1423,53 +2178,7 @@ __attribute__((noreturn)) void proc_exit(int code) {
          * bkl_enter would never leave the CPU while we hold the lock. */
         if (bkl_held()) bkl_exit();
         /* Leader exiting -- kill all threads in this group */
-        for (int i = 0; i < PROC_MAX; i++) {
-            struct proc *q = &g_proc[i];
-            if (q == p || q->state == PROC_UNUSED ||
-                q->state == PROC_EMBRYO) continue;
-            if (q->tgid == p->pid && q->is_thread) {
-                /* Force-terminate the thread */
-                q->exit_code = code;
-                q->state = PROC_TERMINATED;
-                /* Wake any joiners */
-                struct proc *w = q->join_waiters;
-                while (w) {
-                    struct proc *nxt = w->next_wait;
-                    w->state = PROC_READY;
-                    w->next_wait = 0;
-                    sched_enqueue(w);
-                    w = nxt;
-                }
-                q->join_waiters = 0;
-                /* Remove it from the ready queue BEFORE freeing its stack. A
-                 * force-terminated sibling that was PROC_READY is still linked
-                 * in a run queue; freeing its kstack and marking the slot
-                 * UNUSED without unlinking leaves the scheduler able to pop it
-                 * and switch in with kstack_top == NULL -> triple fault in
-                 * syscall_entry. (Measured: pid=27 is_thread=1 tgid=17,
-                 * kstack_top=0x0.) */
-                sched_dequeue(q);
-                { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
-                { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
-                /* Slice 88: wait until the sibling is off-CPU before freeing
-                 * its kstack -- sched_dequeue does not stop a thread still
-                 * running on another core.
-                 * Slice 89: release a quiesce-parked spinner first, and bound
-                 * the wait (see proc_exit_group -- same hang, same fix). */
-                __atomic_store_n(&q->vm_quiesce, 0, __ATOMIC_RELEASE);
-                if (!proc_wait_off_cpu_bounded(q)) {
-                    kprintf("[exitg] pid=%d never left cpu -- slot leaked, "
-                            "kstack NOT freed\n", q->pid);
-                    continue;
-                }
-                /* Free the thread's kernel stack */
-                if (q->kstack_base) kfree(q->kstack_base);
-                q->kstack_base = 0;
-                q->kstack_top  = 0;
-                nsproxy_release(q);       /* slice 8 -- bypasses proc_reap */
-                q->state = PROC_UNUSED;
-            }
-        }
+        proc_reap_group_threads(p, code);
         /* Slice 89: close under the BKL -- file_close refcounts are plain
          * ints guarded ONLY by the BKL, and this path runs with it dropped;
          * unlocked closes raced other CPUs' open/close/dup on the shared
@@ -1495,6 +2204,12 @@ __attribute__((noreturn)) void proc_exit(int code) {
         p->join_waiters = 0;
     }
 
+    /* Tombstone at the point of no return (2026-08-23): teardown ABOVE
+     * may legitimately block and be woken (lingering TCP close waits on
+     * the net tick), so the flag arms only HERE -- past this store the
+     * proc does nothing but yield away forever, and any wake is the
+     * wake-after-death bug sched_enqueue now refuses and names. */
+    p->dying       = true;
     p->state       = PROC_TERMINATED;
 
     /* Milestone 19 metric: one more process exited. */
@@ -1513,19 +2228,197 @@ __attribute__((noreturn)) void proc_exit(int code) {
      * sti+hlt and rely on IRQs to wake it). */
     sti();
 
+    /* SIGCHLD to the parent. The header of signal.c has promised this
+     * since M1 and NOTHING ever sent it. bash's job table only updates
+     * through its SIGCHLD handler; without the signal a job killed while
+     * stopped stayed "stopped" in bash's books and an interactive `exit`
+     * refused with "There are stopped jobs." forever. Default disposition
+     * is ignore, so parents that don't care see nothing.
+     *
+     * NOW, NOT BEFORE THE TEARDOWN (batch 26, finding 148). Linux signals
+     * from exit_notify, when the child is already a zombie, so a SIGCHLD
+     * handler's waitpid(WNOHANG) always finds it. This was sent before the
+     * descriptors were closed and the state set, and on the EliteDesk a
+     * parent on another CPU could take the signal, look, find its child
+     * still running -- and have used up its news: tsh then reached `wait
+     * %%` with the job "alive" and said 143 where bash says 127 (Oils
+     * 0944, 18 of 30). Here interrupts are on again, as signal_send needs
+     * (see the namespace block above), and signal_send neither locks nor
+     * yields; it touches only the parent. */
+    if (!p->is_thread && p->ppid > 0) {
+        struct proc *par = proc_lookup(p->ppid);
+        if (par) signal_send(par, SIGCHLD);
+    }
+
     sched_yield();          /* never returns: nothing puts us back ready */
     kpanic("proc_exit: sched_yield returned for terminated pid=%d", p->pid);
 }
 
+static void proc_reap(struct proc *p);
+
+/* Reclaim every orphan that has exited (see PROC_PPID_ORPHAN). Each is
+ * CLAIMED first, ppid ORPHAN -> REAPING by compare-and-swap, so two CPUs
+ * creating processes at once cannot reap the same corpse twice. An orphan
+ * still running is left alone; it is swept after it exits. */
+void proc_reap_orphans(void) {
+    for (int i = 1; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q->state != PROC_TERMINATED || q->is_thread) continue;
+        int expected = PROC_PPID_ORPHAN;
+        if (!__atomic_compare_exchange_n(&q->ppid, &expected,
+                                         PROC_PPID_REAPING, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        proc_reap(q);
+    }
+}
+
+static void u64_store_max(uint64_t *at, uint64_t v) {
+    uint64_t cur = __atomic_load_n(at, __ATOMIC_RELAXED);
+    while (cur < v &&
+           !__atomic_compare_exchange_n(at, &cur, v, false, __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED))
+        ;
+}
+
+/* NEITHER TIME MAY GO DOWN. The split below follows the tick ratio, and a
+ * tick that lands in user mode lowers the system share of a total that has
+ * hardly grown: one reading's stime came out a tick's worth BELOW the one
+ * before, and tsh's `time`, subtracting the two, printed
+ * "sys 18446744073.70" -- 2^64 ns (posixpipe, batch 37; logs/b38/
+ * cputmono.c counts the falls). Linux's cputime_adjust keeps the last
+ * pair it gave and moves the new split so that neither is below it, the
+ * total still the sum. Readers race only to the larger pair (a store of
+ * the maximum), and a reading whose total is older than the last report
+ * answers that report. */
+static void cputime_monotonic(uint64_t total, uint64_t *ut, uint64_t *st,
+                              uint64_t *rep_u, uint64_t *rep_s) {
+    uint64_t pu = __atomic_load_n(rep_u, __ATOMIC_RELAXED);
+    uint64_t ps = __atomic_load_n(rep_s, __ATOMIC_RELAXED);
+    uint64_t u = *ut, s = *st;
+    if (pu + ps > total) {
+        u = pu;
+        s = ps;
+    } else if (s < ps) {
+        s = ps;
+        u = total - ps;                 /* >= pu: total >= pu + ps */
+    } else if (u < pu) {
+        u = pu;
+        s = total - pu;                 /* >= ps, likewise */
+    }
+    u64_store_max(rep_u, u);
+    u64_store_max(rep_s, s);
+    *ut = u;
+    *st = s;
+}
+
 /* Free everything owned by a TERMINATED process and recycle the slot. */
+void proc_cputimes(const struct proc *p, uint64_t *ut, uint64_t *st) {
+    uint64_t total = p->cpu_ns;
+    if (p == current_proc() && p->last_switch_tsc)
+        total += perf_tsc_to_ns(rdtsc() - p->last_switch_tsc);
+    uint64_t u = p->utick, s = p->stick;
+    uint64_t sys;
+    if (s == 0)      sys = 0;               /* Linux: all of it is user */
+    else if (u == 0) sys = total;
+    else {
+        /* total * s / (u + s), without overflowing 64 bits */
+        uint64_t d = u + s;
+        sys = (total / d) * s + ((total % d) * s) / d;
+    }
+    *st = sys;
+    *ut = total - sys;
+    /* the last report is a memo, not the proc's state: written through
+     * the const pointer, as every reader must see it */
+    struct proc *mp = (struct proc *)p;
+    cputime_monotonic(total, ut, st, &mp->rep_utime_ns, &mp->rep_stime_ns);
+}
+
+void proc_group_faults(const struct proc *p, uint64_t *minf, uint64_t *majf) {
+    uint64_t mn = p->tg_dead_min_flt, mj = p->tg_dead_maj_flt;
+    int tgid = p->tgid ? p->tgid : p->pid;
+    for (int i = 0; i < PROC_MAX; i++) {
+        const struct proc *q = &g_proc[i];
+        if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO) continue;
+        if (q != p && (q->tgid ? q->tgid : q->pid) != tgid) continue;
+        mn += q->min_flt;
+        mj += q->maj_flt;
+    }
+    *minf = mn;
+    *majf = mj;
+}
+
+void proc_group_cputimes(const struct proc *p, uint64_t *ut, uint64_t *st) {
+    uint64_t u = p->tg_dead_utime_ns, s = p->tg_dead_stime_ns;
+    int tgid = p->tgid ? p->tgid : p->pid;
+    for (int i = 0; i < PROC_MAX; i++) {
+        const struct proc *q = &g_proc[i];
+        if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO) continue;
+        if (q != p && (q->tgid ? q->tgid : q->pid) != tgid) continue;
+        uint64_t qu, qs;
+        proc_cputimes(q, &qu, &qs);
+        u += qu;
+        s += qs;
+    }
+    /* the group's sum moves as its members' splits do, and a member that
+     * goes moves its time from its slot to the dead totals: kept
+     * monotonic the same way, on the leader */
+    struct proc *ld = (struct proc *)p;
+    if (p->tgid && p->tgid != p->pid) {
+        struct proc *l = proc_lookup(p->tgid);
+        if (l && l->state != PROC_UNUSED) ld = l;
+    }
+    cputime_monotonic(u + s, &u, &s, &ld->tg_rep_utime_ns, &ld->tg_rep_stime_ns);
+    *ut = u;
+    *st = s;
+}
+
+/* A thread's time goes to its group when it goes (Linux's __exit_signal):
+ * the leader keeps it for times(2) and for the parent that reaps it. */
+static void proc_fold_thread_times(struct proc *t) {
+    if (!t || !t->is_thread) return;
+    struct proc *l = proc_lookup(t->tgid);
+    if (!l || l == t || l->state == PROC_UNUSED) return;
+    uint64_t u, s;
+    proc_cputimes(t, &u, &s);
+    l->tg_dead_utime_ns += u;
+    l->tg_dead_stime_ns += s;
+    l->tg_dead_min_flt += t->min_flt;            /* finding 205 */
+    l->tg_dead_maj_flt += t->maj_flt;
+}
+
+/* A reaped process's times, its group's and its own reaped children's, go
+ * to its parent's cutime/cstime (Linux's wait_task_zombie). */
+static void proc_reap_account(struct proc *p) {
+    if (p->is_thread) {
+        proc_fold_thread_times(p);
+        return;
+    }
+    uint64_t u, s;
+    proc_group_cputimes(p, &u, &s);
+    struct proc *par = p->ppid > 0 ? proc_lookup(p->ppid) : 0;
+    if (!par || par == p || par->state == PROC_UNUSED) return;
+    par->cutime_ns += u + p->cutime_ns;
+    par->cstime_ns += s + p->cstime_ns;
+    uint64_t mn, mj;                             /* finding 205 */
+    proc_group_faults(p, &mn, &mj);
+    par->cmin_flt += mn + p->cmin_flt;
+    par->cmaj_flt += mj + p->cmaj_flt;
+}
+
 static void proc_reap(struct proc *p) {
     if (!p || p->state != PROC_TERMINATED) return;
+    proc_reap_account(p);
 
     /* Unlink from any ready queue before we free its stack and zero the slot.
      * The same reachable-after-teardown hazard the thread-group-exit path had. */
     sched_dequeue(p);
     { extern void futex_forget_proc(struct proc *); futex_forget_proc(p); }
     { extern void poll_forget_proc(struct proc *);  poll_forget_proc(p);  }
+
+    /* The corpse may still be loaded on another CPU; proc_wait_off_cpu
+     * knows not to spin on that while we hold the BKL. This call used to
+     * deadlock the machine -- see the header there. */
     proc_wait_off_cpu(p);
 
     /* SLICE 16: return this process's whole memory charge to its cgroup.
@@ -1598,9 +2491,7 @@ static void proc_reap(struct proc *p) {
             mmap_cleanup_proc(proc_mm_pid(p));
         }
     }
-    if (p->kstack_base) {
-        kfree(p->kstack_base);
-    }
+    proc_kstack_free(p);
 
     /* Slice 8: drop this process's namespace references. Must happen before
      * the memset below, which would otherwise lose the pointers and leak the
@@ -1628,23 +2519,63 @@ static void proc_reap(struct proc *p) {
 #endif
     memset(p, 0, sizeof(*p));
     p->state = PROC_UNUSED;
-    kprintf("[proc] reaped pid=%d, slot recycled\n", pid);
+    kprintf_log("[proc] reaped pid=%d, slot recycled\n", pid);
 }
 
-/* Find a child of `ppid` for Linux wait4(-1) ("wait for any child"). Prefers
- * an already-TERMINATED child (so a ready reap returns immediately); otherwise
- * returns the first live child so the caller can block on it. Returns the
- * child pid, or -1 if `ppid` has no children. */
-int proc_any_child(int ppid) {
-    int live = -1;
-    for (int i = 0; i < PROC_MAX; i++) {
-        struct proc *q = &g_proc[i];
-        if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
-            q->ppid != ppid) continue;
-        if (q->state == PROC_TERMINATED) return q->pid;   /* reap-ready */
-        if (live < 0) live = q->pid;
+/* Would wait4(pid, options) on this one child report without blocking?
+ * Exactly the events LX_wait4's single-child path reports, so that a child
+ * picked here is answered at once when the caller hands its pid on. */
+static bool wait_any_ready(struct proc *self, struct proc *q, int options) {
+    if (q->state == PROC_TERMINATED) return true;
+    if (options & (0x2 | 0x8))                   /* WUNTRACED | WCONTINUED */
+        return ((options & 0x2) && q->state == PROC_STOPPED &&
+                !q->stop_reported) ||
+               ((options & 0x8) && q->cont_pending);
+    if (options & 0x1) return false;             /* WNOHANG reaps only */
+    return q->ptrace_stopped && q->tracer_pid == self->pid;
+}
+
+/* wait4 with pid <= 0 (see proc.h). THIS USED TO PICK ONE CHILD AND WAIT FOR
+ * IT: the first child that had exited, else the first one alive. A shell that
+ * had started `sleep 3 &` and then ran `cat` in the foreground waited for the
+ * sleep -- the lower pid -- and got cat back three seconds late, after the
+ * sleep had been reaped in its place. Linux waits for whichever child has
+ * an event first, and so does this: every matching child is looked at on
+ * every pass, and the caller sleeps with wait_pid = PROC_WAIT_ANY, which
+ * wakeup_waiters answers for any child's exit or ptrace-stop. */
+int proc_wait_any(int pgid, int options) {
+    struct proc *self = current_proc();
+    if (!self) return -1;
+    for (;;) {
+        bool any = false;
+        for (int i = 0; i < PROC_MAX; i++) {
+            struct proc *q = &g_proc[i];
+            if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+                q->is_thread || !proc_parent_is(q->ppid, self)) continue;
+            if (pgid > 0 && (q->pgid > 0 ? q->pgid : q->pid) != pgid) continue;
+            any = true;
+            if (wait_any_ready(self, q, options)) return q->pid;
+        }
+        if (!any) return -1;
+        /* WNOHANG, or the stop/continue mode, which LX_wait4 polls. */
+        if (options & (0x1 | 0x2 | 0x8)) return 0;
+        /* A SIGNAL THAT ACTS ENDS THE BLOCK. A signal woke this sleep and
+         * the loop went straight back to it, so the signal landed only
+         * when some child had an event: `bash -c 'trap "echo bye" EXIT;
+         * sleep 4' & kill -TERM $!` ran the EXIT trap and died after the
+         * sleep, where Linux's bash does both at once (logs/b15 p4 h1, and
+         * WSL: waited=0), and a bash with no trap at all could not be
+         * killed while it waited (h11). The native waitpid's single-child
+         * arm has done this since batch 12; wait(-1) and both of LX_wait4's
+         * blocking arms never did. */
+        if (proc_wait_interrupted(self)) return PROC_WAIT_INTR;
+        self->wait_pid = PROC_WAIT_ANY;
+        self->state    = PROC_BLOCKED;
+        sched_yield();
+        /* A signal wakes us without clearing it; a stale PROC_WAIT_ANY
+         * would let a later child's exit wake an unrelated sleep. */
+        self->wait_pid = -1;
     }
-    return live;
 }
 
 int proc_wait_info(int pid, struct proc_exit_info *out) {
@@ -1662,20 +2593,38 @@ int proc_wait_info(int pid, struct proc_exit_info *out) {
     uint64_t wait_start_ns = perf_now_ns();
 
     while (child->state != PROC_TERMINATED) {
+        if (pid0_serviced_wait(self)) {           /* see proc_wait_fg */
+            kernel_idle_service_nested();
+            if (child->state == PROC_TERMINATED) break;
+            self->sleep_deadline_ns = perf_now_ns() + PID0_WAIT_SLICE_NS;
+        }
         self->wait_pid = pid;
         self->state    = PROC_BLOCKED;
         sched_yield();
+        self->sleep_deadline_ns = 0;
         /* When we resume here, the child should be TERMINATED (or some
          * other event woke us spuriously -- loop again). */
     }
 
     int code = child->exit_code;
+    self->last_reap_term_sig = child->term_sig;   /* proc_last_term_sig */
 
     /* Milestone 19: capture per-proc metrics BEFORE reap wipes them. */
     if (out) {
         out->pid           = child->pid;
         out->exit_code     = code;
+        out->term_sig      = child->term_sig;
         out->cpu_ns        = child->cpu_ns;
+        {
+            uint64_t u, s;
+            proc_group_cputimes(child, &u, &s);
+            out->utime_ns = u + child->cutime_ns;
+            out->stime_ns = s + child->cstime_ns;
+            uint64_t mn, mj;                     /* finding 205 */
+            proc_group_faults(child, &mn, &mj);
+            out->min_flt = mn + child->cmin_flt;
+            out->maj_flt = mj + child->cmaj_flt;
+        }
         out->syscall_count = child->syscall_count;
         out->wall_ns       = perf_now_ns() - wait_start_ns;
         size_t n = strlen(child->name);
@@ -1692,6 +2641,37 @@ int proc_wait(int pid) {
     /* Back-compat wrapper: callers that don't care about metrics
      * still get the exit code. */
     return proc_wait_info(pid, 0);
+}
+
+/* PID 0'S WAIT THAT ^C CAN END -- the kernel shell's `wait` builtin. A job
+ * it waits for is not the terminal's, so a ^C interrupts the SHELL, and
+ * bash's `wait` returns 130 with the job still running. INTR is asked
+ * between slices of pid 0's serviced wait (pid0_serviced_wait); -2 when it
+ * said stop and the child is still alive, unreaped. Anyone else -- and pid
+ * 0 before the idle loop runs -- waits as proc_wait does. */
+int proc_wait_intr(int pid, bool (*intr)(void)) {
+    struct proc *self = current_proc();
+    if (!intr || !pid0_serviced_wait(self)) return proc_wait(pid);
+    for (;;) {
+        struct proc *ch = proc_lookup(pid);
+        if (!ch) return -1;
+        if (ch->state == PROC_TERMINATED) return proc_wait(pid);
+        if (intr()) return -2;
+        kernel_idle_service_nested();
+        if (ch->state == PROC_TERMINATED) continue;
+        if (intr()) return -2;
+        self->sleep_deadline_ns = perf_now_ns() + PID0_WAIT_SLICE_NS;
+        self->wait_pid = pid;
+        self->state = PROC_BLOCKED;
+        sched_yield();
+        self->sleep_deadline_ns = 0;
+        self->wait_pid = -1;        /* no stale wake when we leave early */
+    }
+}
+
+int proc_last_term_sig(void) {
+    struct proc *self = current_proc();
+    return self ? self->last_reap_term_sig : 0;
 }
 
 /* ===================================================================
@@ -1798,12 +2778,9 @@ uint64_t proc_brk(struct proc *p, uint64_t new_brk) {
             uint64_t phys = vmm_translate(va) & ~((uint64_t)PAGE_SIZE - 1);
             vmm_unmap(va, PAGE_SIZE);
             if (!phys) continue;
-            int refs = page_ref_get(phys);
-            if (refs > 1) {
-                page_ref_dec(phys);
-                continue;
-            }
-            if (refs == 1) page_ref_dec(phys);
+            /* Someone else still holds it unless we were the last owner --
+             * one atomic step (page_ref_dec_old). */
+            if (page_ref_dec_old(phys) > 1) continue;
             if (n_doom == BRK_FREE_MAX) {
                 if (tlb_shootdown_remote_sync())
                     for (int i = 0; i < n_doom; i++) pmm_free_page(doomed[i]);

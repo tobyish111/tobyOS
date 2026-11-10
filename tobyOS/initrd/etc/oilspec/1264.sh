@@ -1,0 +1,1 @@
+type -p FOO BAR NOT_FOUND

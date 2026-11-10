@@ -48,8 +48,23 @@ void ipv6_format(char *buf, size_t cap, const struct ipv6_addr *a);
 /* Core */
 void ipv6_init(void);
 void ipv6_recv(const void *frame, size_t len);
+/* The source address ipv6_send will stamp for dst (loopback: dst
+ * itself) -- for checksums over the real pseudo-header. */
+const struct ipv6_addr *ipv6_src_for(const struct ipv6_addr *dst);
+/* L4 pseudo-header checksum (RFC 8200 §8.1); returns 0xFFFF for a
+ * computed zero, per the UDP rule. Shared by icmpv6/udp6 paths. */
+uint16_t ipv6_l4_checksum(const struct ipv6_addr *src,
+                          const struct ipv6_addr *dst,
+                          uint8_t next_header,
+                          const void *payload, size_t len);
 int  ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
                const void *payload, size_t payload_len);
+/* Explicit-hop-limit form. NDP (RS/NS/NA) MUST go out at 255 -- RFC 4861
+ * makes receivers silently discard anything else, which is exactly how
+ * every Router Solicitation this stack ever sent was ignored (hop limit
+ * was a hardwired 64; found 2026-08-23 chasing SLIRP's missing RA). */
+int  ipv6_send_hl(const struct ipv6_addr *dst, uint8_t next_header,
+                  const void *payload, size_t payload_len, uint8_t hop_limit);
 const struct ipv6_addr *ipv6_our_linklocal(void);
 bool ipv6_is_up(void);
 

@@ -1,0 +1,68 @@
+# Vim
+*.swp
+
+# Emacs temp files
+*~
+
+# Python
+*.pyc
+__pycache__
+.mypy_cache/
+# Python build support
+build/temp.*
+
+# R
+.RData
+.Rhistory
+Rplots.pdf
+
+# Ninja
+build.ninja
+.ninja_*
+
+# GDB
+.gdbinit
+
+tags
+.vagrant
+
+# clangd
+/.cache/
+/compile_commands.json
+
+# Our own temp dirs
+_bin/
+_build/
+_chroot/
+_devbuild/
+_gen
+_release/
+_soil-jobs/
+_test/
+_tmp/
+!opy/_regtest/src/_devbuild/
+
+# TODO: should get rid of these in favor of wedges
+_cache/
+_deps/
+
+# Our Python extensions.  We need these at the top level to statically link
+# "import libc" in the "OVM tarball".
+fanos.so
+fastfunc.so
+fastlex.so
+libc.so
+line_input.so
+posix_.so
+yajl.so
+
+# my own stuff
+local.sh  
+NOTES*.txt
+TODO*.txt
+zulip-env.sh
+
+# node.js for SQL formatter
+package-lock.json
+package.json
+node_modules/

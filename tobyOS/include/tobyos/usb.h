@@ -243,12 +243,29 @@ _Static_assert(sizeof(struct usb_hub_desc) >= 7,
  * into context structures and TRB ring base pointers.
  */
 
+/* Longest string-descriptor text we keep. Real product strings run well
+ * under this; anything longer is truncated rather than dropped. */
+#define USB_STRING_MAX  40
+
 struct usb_device {
     /* Stable identifiers. */
     uint8_t  slot_id;          /* xHCI slot, 1..MaxSlots */
     uint8_t  port_id;          /* 1-based root-hub port number */
     uint8_t  speed;            /* USB-IF speed code (1=FS, 2=LS, 3=HS, 4=SS) */
     uint8_t  bus_address;      /* 0 until Address Device completes */
+
+    /* Device-descriptor facts kept past enumeration so /sys/bus/usb can
+     * publish them (2026-08-24). Everything here is copied out of the
+     * 18-byte GET_DESCRIPTOR(DEVICE); the three strings come from
+     * GET_DESCRIPTOR(STRING) and stay EMPTY when the device exposes no
+     * such index or the fetch fails -- sysfs then omits the attribute
+     * entirely, because an invented product name is worse than none. */
+    uint16_t bcd_usb;
+    uint16_t bcd_device;
+    uint8_t  num_configs;
+    char     manufacturer[USB_STRING_MAX];
+    char     product[USB_STRING_MAX];
+    char     serial[USB_STRING_MAX];
 
     /* M26B hub topology. For root-hub-attached devices these are all
      * zero; for hub-downstream devices they record the path through

@@ -34,7 +34,7 @@
  * SYSCALL entry preamble has finished):
  *
  *      kstack_top -> [user RSP]            \  16-byte
- *                    [alignment pad]       /  pair (mod16==0 here)
+ *                    [pad / IRETQ selector] /  pair (mod16==0 here)
  *                    [rcx = user RIP]      \
  *                    [r11 = user RFLAGS]    |
  *                    [rdi]                  |
@@ -49,6 +49,8 @@
  *                    [r13]                  |
  *                    [r14]                  |
  *                    [r15]                 /
+ *                    [sig_r11]             \  the user's real r11/rcx,
+ *                    [sig_rcx]             /  for sys_sigreturn's IRETQ exit
  *      rsp here -> ----- (mod16==0, ready for `call`) -----
  *
  * The first-time iretq into ring 3 (was enter_user_mode here) lives in
@@ -111,7 +113,9 @@ syscall_entry:
     mov gs:[8], rsp                             /* save user RSP -> scratch */
     mov rsp, gs:[0]                             /* swap to kernel syscall stack */
     push qword ptr gs:[8]                       /* user RSP -> kstack */
-    sub rsp, 8                                  /* 16-B alignment pad */
+    push 0                                      /* 16-B alignment pad -- AND the
+                                                 * return selector: non-zero
+                                                 * means "IRETQ", see below */
 
     /* Save the regs we'll touch in the body. We need to preserve
      *   rcx, r11    -- SYSRETQ reads these to return to user
@@ -141,6 +145,8 @@ syscall_entry:
     push r13
     push r14
     push r15
+    push 0                  /* sig_r11 -- the user's REAL r11, filled in */
+    push 0                  /* sig_rcx -- and rcx, by sys_sigreturn only */
 
     /* Translate the user-side syscall ABI into the SysV C ABI:
      *
@@ -180,6 +186,15 @@ syscall_entry:
      * with rsp at the block base and rax = 0 (the child's fork() return). */
 .global syscall_return_unwind
 syscall_return_unwind:
+    /* WHICH WAY OUT? The pad slot doubles as the selector. Zero -- every
+     * ordinary syscall, and a fork child -- takes SYSRETQ below. Non-zero is
+     * sys_sigreturn resuming an interrupted context, and that context may
+     * have been cut by the timer IRQ in the middle of user code where
+     * rcx/r11 are live; SYSRETQ would overwrite them with RIP/RFLAGS. So
+     * that path restores every register and returns through IRETQ. */
+    cmp qword ptr [rsp + 128], 0
+    jne .Lsigreturn_iret
+    add rsp, 16             /* the two sig slots, unused on this path */
     pop r15
     pop r14
     pop r13
@@ -216,6 +231,44 @@ syscall_return_unwind:
      * by syscall_dispatch before returning, so no IRQ lands in this window. */
     swapgs
     sysretq                 /* CPL3, RIP <- rcx, RFLAGS <- r11 */
+
+    /* IRETQ return for sys_sigreturn. rsp = block base:
+     *   [rsp+0]   sig_rcx     [rsp+8]   sig_r11
+     *   [rsp+16]  r15 ... [rsp+104] rdi   (the 12 general registers)
+     *   [rsp+112] r11 = resume RFLAGS      [rsp+120] rcx = resume RIP
+     *   [rsp+128] pad (non-zero)            [rsp+136] user RSP
+     * rax already holds sys_sigreturn's return value (the resumed rax).
+     * The IRETQ frame -- RIP, CS, RFLAGS, RSP, SS ascending -- is built in
+     * place over the rdi..user_rsp slots, whose values have all been read
+     * by then; rcx/r11 serve as scratch and are loaded last from the two
+     * sig slots. IF was cleared by syscall_dispatch and comes back from
+     * the frame's RFLAGS, as it does on every IRQ exit. */
+.Lsigreturn_iret:
+    mov r15, [rsp + 16]
+    mov r14, [rsp + 24]
+    mov r13, [rsp + 32]
+    mov r12, [rsp + 40]
+    mov rbp, [rsp + 48]
+    mov rbx, [rsp + 56]
+    mov r9,  [rsp + 64]
+    mov r8,  [rsp + 72]
+    mov r10, [rsp + 80]
+    mov rdx, [rsp + 88]
+    mov rsi, [rsp + 96]
+    mov rdi, [rsp + 104]
+    mov rcx, [rsp + 120]            /* resume RIP */
+    mov r11, [rsp + 112]            /* resume RFLAGS */
+    mov [rsp + 104], rcx            /* frame: RIP */
+    mov qword ptr [rsp + 112], 0x23 /* frame: CS  = USER_CS | RPL 3 */
+    mov [rsp + 120], r11            /* frame: RFLAGS */
+    mov rcx, [rsp + 136]
+    mov [rsp + 128], rcx            /* frame: RSP */
+    mov qword ptr [rsp + 136], 0x1b /* frame: SS  = USER_DS | RPL 3 */
+    mov rcx, [rsp + 0]              /* the user's real rcx */
+    mov r11, [rsp + 8]              /* the user's real r11 */
+    lea rsp, [rsp + 104]            /* rsp -> the IRETQ frame */
+    swapgs
+    iretq
 
 /* ============================================================== */
 /* fork_child_return_asm -- a fork child's first descent to ring 3 */

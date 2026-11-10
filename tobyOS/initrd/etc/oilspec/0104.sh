@@ -1,0 +1,5 @@
+echo $(( 0x12A ))
+echo $(( 0x0A ))
+echo $(( 0777 ))
+echo $(( 0010 ))
+echo $(( 24#ag7 ))

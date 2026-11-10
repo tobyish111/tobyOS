@@ -7,6 +7,7 @@
 #include <tobyos/ipv6.h>
 
 /* ICMPv6 types */
+#define ICMPV6_DEST_UNREACH       1
 #define ICMPV6_ECHO_REQUEST     128
 #define ICMPV6_ECHO_REPLY       129
 #define ICMPV6_ROUTER_SOLICIT   133

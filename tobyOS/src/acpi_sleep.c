@@ -5,6 +5,7 @@
  */
 
 #include <tobyos/power.h>
+#include <tobyos/cputelem.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/pit.h>
@@ -166,44 +167,84 @@ void power_reboot(void) {
     for (;;) __asm__ volatile("hlt");
 }
 
-/* CPU frequency scaling */
+/* CPU frequency scaling.
+ *
+ * 2026-08-24 (slice 4): these three had NO callers, and every one of them
+ * touched a P-state MSR with no gate at all. Dead code is exactly where
+ * that survives -- nothing exercised it, so nothing exposed it. The swap
+ * arc already paid for this lesson once: WIRING A DEAD SUBSYSTEM ARMS THE
+ * BUGS IN EVERYTHING IT CALLS, so they are fixed here BEFORE anything
+ * wires them, not after.
+ *
+ * What was wrong:
+ *   - rdmsr/wrmsr on IA32_PERF_CTL and IA32_PERF_STATUS with no check
+ *     that the CPU implements them. There is no exception-fixup table in
+ *     this kernel, so on a part without SpeedStep that is a #GP in ring 0,
+ *     and the wrmsr is the worse half.
+ *   - the P-state targets were INVENTED: 0x1D00 was commented "typical
+ *     max ratio for QEMU", 0x0600 "typical min ratio". On the EliteDesk's
+ *     i5-4590 the real base ratio is 33 (0x21), so "performance" would
+ *     have requested 2.9 GHz on a 3.3 GHz part and "saver" 600 MHz on a
+ *     part whose efficiency floor is 800 MHz.
+ *
+ * Both are now answered from MSR_PLATFORM_INFO via cpufreq_msr_*, which
+ * gates itself on CPUID and sanity-checks what it reads. When that says
+ * the machine has no readable P-state information, these decline rather
+ * than guess. */
 void cpufreq_init(void) {
-    kprintf("[cpufreq] init: reading current P-state\n");
+    const struct cpufreq_msr_info *fi = cpufreq_msr_get();
+    if (fi->present) {
+        kprintf("[cpufreq] P-state control available: base %u kHz, "
+                "min %u kHz\n", fi->base_khz, fi->min_khz);
+    } else {
+        kprintf("[cpufreq] P-state control unavailable: %s\n",
+                fi->why ? fi->why : "unknown");
+    }
 }
 
 void cpufreq_set_governor(enum power_plan plan) {
+    const struct cpufreq_msr_info *fi = cpufreq_msr_get();
+    if (!fi->present || fi->bus_khz == 0) {
+        kprintf("[cpufreq] refusing to set a P-state: %s\n",
+                fi->why ? fi->why : "no P-state information");
+        return;
+    }
     g_power.current_plan = plan;
+
+    /* Real ratios for THIS part, not a guess about a typical one. */
+    uint32_t base_ratio = fi->base_khz / fi->bus_khz;
+    uint32_t min_ratio  = fi->min_khz  / fi->bus_khz;
+    uint32_t ratio;
+    switch (plan) {
+    case PLAN_PERFORMANCE: ratio = base_ratio; break;
+    case PLAN_SAVER:       ratio = min_ratio;  break;
+    case PLAN_BALANCED:
+    default:               ratio = min_ratio + (base_ratio - min_ratio) / 2;
+                           break;
+    }
+    if (ratio < min_ratio) ratio = min_ratio;
+    if (ratio > base_ratio) ratio = base_ratio;
 
     uint64_t perf_ctl = rdmsr(MSR_IA32_PERF_CTL);
     perf_ctl &= ~0xFFFFULL;
-
-    switch (plan) {
-    case PLAN_PERFORMANCE:
-        /* Request maximum P-state */
-        perf_ctl |= 0x1D00; /* typical max ratio for QEMU */
-        break;
-    case PLAN_SAVER:
-        /* Request minimum P-state */
-        perf_ctl |= 0x0600; /* typical min ratio */
-        break;
-    case PLAN_BALANCED:
-    default:
-        /* Mid-range P-state */
-        perf_ctl |= 0x1000;
-        break;
-    }
-
+    perf_ctl |= ((uint64_t)ratio & 0xFFu) << 8;
     wrmsr(MSR_IA32_PERF_CTL, perf_ctl);
-    kprintf("[cpufreq] governor set to %s\n",
+    kprintf("[cpufreq] governor set to %s (ratio %u => %u kHz)\n",
             plan == PLAN_PERFORMANCE ? "performance" :
-            plan == PLAN_SAVER ? "saver" : "balanced");
+            plan == PLAN_SAVER ? "saver" : "balanced",
+            ratio, ratio * fi->bus_khz);
 }
 
+/* 0 means "not knowable on this machine" -- callers must not read that as
+ * a real 0 MHz. Note this reports the CURRENT CORE's ratio: IA32_PERF_STATUS
+ * is per-core, so on an SMP box the answer belongs to whichever CPU ran
+ * this call, which is why /sys does not publish it per-cpu. */
 uint32_t cpufreq_get_mhz(void) {
+    const struct cpufreq_msr_info *fi = cpufreq_msr_get();
+    if (!fi->present) return 0;
     uint64_t status = rdmsr(MSR_IA32_PERF_STATUS);
     uint32_t ratio = (status >> 8) & 0xFF;
-    /* Assume 100 MHz bus clock (standard for modern Intel) */
-    return ratio * 100;
+    return ratio * (fi->bus_khz / 1000u);
 }
 
 /* Battery */

@@ -1,0 +1,2 @@
+umask -p
+echo status=$?

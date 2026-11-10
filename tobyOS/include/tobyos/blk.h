@@ -69,6 +69,13 @@ enum blk_dev_class {
     BLK_CLASS_WRAPPER   = 3,
 };
 
+/* The table a partition came from (finding 248). GPT is 0, so every
+ * partition made before MBR tables were read keeps its meaning. */
+enum blk_part_scheme {
+    BLK_SCHEME_GPT = 0,
+    BLK_SCHEME_MBR = 1,
+};
+
 struct blk_dev {
     const char         *name;
     const struct blk_ops *ops;
@@ -89,6 +96,8 @@ struct blk_dev {
     uint32_t            partition_index; /* 1-based GPT slot index (partition only) */
     uint8_t             type_guid[BLK_GUID_BYTES];   /* GPT type GUID */
     char                partition_label[BLK_PART_LABEL_MAX];
+    uint8_t             scheme;          /* enum blk_part_scheme (partition only) */
+    uint8_t             mbr_type;        /* the MBR entry's type byte (MBR only) */
 
     /* ---- M26E additions: removable-storage lifecycle ----
      *
@@ -110,6 +119,21 @@ struct blk_dev {
      * by the disk-manager confirm flow so "which physical drive am I
      * about to format" is never a guess. */
     char                model[41];
+
+    /* 2026-08-25: is this device REMOVABLE media (a USB stick), as opposed
+     * to an internal disk? Set true by usb_msc at registration; false
+     * everywhere else, which is the safe default for a field older drivers
+     * never touch.
+     *
+     * This exists for exactly one decision. The provisioning guard refuses
+     * any disk carrying a foreign filesystem, with no override -- correct
+     * for automatic behaviour, and wrong when the OWNER says "reformat my
+     * USB stick", which is a thing every operating system lets its owner
+     * do. The explicit-erase path (ABI_PROV_F_ERASE) is gated on this so
+     * that permission can never extend to an internal disk: the one that
+     * holds somebody's Windows install is not removable, and no flag the
+     * user can pass will make it so. */
+    bool                removable;
 };
 
 /* ---- block-device registry (milestone 21, expanded in 23A) -------
@@ -144,6 +168,15 @@ struct blk_dev *blk_get(size_t idx);
  *         partition_scan_disk(d);
  *     } */
 struct blk_dev *blk_iter_next(size_t *cookie, enum blk_dev_class class);
+
+/* May boot mount D by itself (/fat, /usb, /ext, the boot log's stick)?
+ * Not a partition of an MBR table: those are nodes in /dev and mount by
+ * hand, as on Linux, but they are most often another system's media, and
+ * boot never wrote to them before tables of that kind were read (finding
+ * 248). */
+static inline bool blk_boot_may_mount(const struct blk_dev *d) {
+    return d->scheme != BLK_SCHEME_MBR;
+}
 
 /* Convenience: first DISK / first PARTITION -- preferred over
  * blk_get_first() once partitions exist, because blk_get_first()
@@ -220,6 +253,34 @@ struct blk_dev *blk_partition_wrap(struct blk_dev *parent,
                                    uint32_t partition_index,
                                    const uint8_t type_guid[BLK_GUID_BYTES],
                                    const char *label);
+
+/* Finding 281: a partition entry that went with its disk takes the
+ * geometry of the table the disk has now. 0, or -1 when it cannot. */
+int blk_partition_rewrap(struct blk_dev *d, uint64_t offset_lba,
+                         uint64_t size_lba, uint32_t partition_index,
+                         const uint8_t type_guid[BLK_GUID_BYTES],
+                         const char *label);
+
+/* ---- writes that go around a cache (finding 278) ----
+ *
+ * A filesystem that keeps blocks of its device in memory must hear of a
+ * write that reaches the device some other way -- a disk written as a
+ * file, /dev/sdb or /dev/sdb1 (blkdev_rw) -- or it reads back what it
+ * held, not what the device now has. Linux keeps the two in one page
+ * cache for the device; here the writer tells each watcher, which drops
+ * what it held of the range. A range is given on the DISK under the
+ * device (a partition's parent, its offset added), so a write to the
+ * whole disk reaches a watcher of a partition on it, and the reverse. */
+typedef void (*blk_write_watch_fn)(void *ctx, struct blk_dev *disk,
+                                   uint64_t lba, uint64_t count);
+bool blk_watch_add(blk_write_watch_fn fn, void *ctx);
+void blk_watch_remove(blk_write_watch_fn fn, void *ctx);
+/* COUNT sectors at LBA of DEV were written past any cache: tell the
+ * watchers. */
+void blk_notify_write(struct blk_dev *dev, uint64_t lba, uint64_t count);
+/* The disk DEV lies on (DEV itself for a disk), *OFF set to where DEV's
+ * sector 0 is on it. */
+struct blk_dev *blk_disk_of(struct blk_dev *dev, uint64_t *off);
 
 /* M26E: mark a disk + every partition that lives on it as no longer
  * backed by hardware. After this returns, blk_read/blk_write on any of

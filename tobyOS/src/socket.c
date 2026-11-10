@@ -8,6 +8,7 @@
  */
 
 #include <tobyos/socket.h>
+#include <tobyos/ip.h>      /* raw sockets send straight over IP */
 #include <tobyos/udp.h>
 #include <tobyos/tcp.h>
 #include <tobyos/net.h>
@@ -24,6 +25,7 @@
 #include <tobyos/cap.h>
 #include <tobyos/pit.h>
 #include <tobyos/percpu.h>   /* slice 56: yield-if-ready in the recv wait loop */
+#include <tobyos/perf.h>     /* perf_now_ns: ns-based deadlines (2026-08-22) */
 #include <tobyos/smp.h>
 #include <tobyos/xserver.h>  /* tier 2.5 fake X protocol */
 
@@ -111,7 +113,8 @@ static struct sock *sock_peer_checked(struct sock *self) {
 
 struct sock *sock_alloc(int kind) {
     if (kind != SOCK_KIND_UDP && kind != SOCK_KIND_TCP &&
-        kind != SOCK_KIND_UNIX && kind != SOCK_KIND_NETLINK) return 0;
+        kind != SOCK_KIND_UNIX && kind != SOCK_KIND_NETLINK &&
+        kind != SOCK_KIND_RAW) return 0;
     for (int i = 0; i < SOCK_MAX; i++) {
         if (!g_socks[i].in_use) {
             memset(&g_socks[i], 0, sizeof(g_socks[i]));
@@ -322,6 +325,9 @@ void sock_deliver(struct sock *s,
 
     struct sock_dgram *d = &s->dgrams[s->head];
     d->src_ip   = src_ip_be;
+    d->src_is6  = 0;      /* ring slots are reused; a stale v6 flag from a
+                           * previous occupant would make recvfrom6 read
+                           * garbage src6 bytes for this v4 datagram */
     d->src_port = src_port_be;
     d->len      = (uint32_t)len;
     d->payload  = copy;
@@ -525,10 +531,8 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
 #endif
 
     uint64_t deadline = 0;
-    if (timeout_ms) {
-        uint32_t hz = pit_hz(); if (hz == 0) hz = 100;
-        deadline = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
-    }
+    if (timeout_ms)   /* ns-based (2026-08-22): pit ticks run ~15x slow under TCG */
+        deadline = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
 #ifdef CHROMIUM_BOOT
     /* Tier 2.5 headed wall: pid 3 sits "READY in recvmsg" for minutes and
      * the [cur] stamp cannot say ON WHICH SOCKET. Name it: log once per
@@ -537,16 +541,12 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
      * between "chromium waits for an X reply we never produced" and
      * "chromium waits on a Mojo channel", which are entirely different
      * bugs. */
-    uint64_t stuck_at = 0;
-    {
-        uint32_t hz2 = pit_hz(); if (hz2 == 0) hz2 = 100;
-        stuck_at = pit_ticks() + (uint64_t)hz2 * 5u;
-    }
+    uint64_t stuck_at = perf_now_ns() + 5000000000ull;
     bool stuck_logged = false;
 #endif
     while (self->count == 0) {
 #ifdef CHROMIUM_BOOT
-        if (!stuck_logged && pit_ticks() >= stuck_at) {
+        if (!stuck_logged && perf_now_ns() >= stuck_at) {
             stuck_logged = true;
             struct proc *sp = current_proc();
             kprintf("[uxstuck] pid=%d sock=%d xsrv=%d count=%u peer=%d "
@@ -562,11 +562,13 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
         }
 #endif
         struct proc *me = current_proc();
-        if (me->pending_signals) return EINTR_RET;
+        if (SIG_SHOULD_EINTR(me)) return EINTR_RET;
         if (!self->in_use)       return -1;
         if (self->peer_ip == 0 && !self->x_server)
             return 0;                            /* peer closed + drained -> EOF */
-        if (deadline && pit_ticks() >= deadline) return 0;   /* timed out */
+        if (self->rx_eof || self->shut_rd)
+            return 0;                            /* peer SHUT_WR / own SHUT_RD -> EOF */
+        if (deadline && perf_now_ns() >= deadline) return 0;   /* timed out */
         /* Cooperative wait: drop the BKL so peers/siblings can run. On UP,
          * a bare hlt returns to THIS context after the IRQ — READY clone3
          * threads never ran (chrome stuck: pid=3 RUNNING in recvmsg 50s+
@@ -653,6 +655,90 @@ struct sock *sock_peer_of(struct sock *self) {
     return sock_peer_checked(self);      /* slice 89: generation-validated */
 }
 
+/* /proc/net/{udp,unix} support (2026-08-22): read-only pool snapshot.
+ * Returns 0 for a live socket, -1 free, -2 past the pool. */
+int sock_snapshot(int idx, int *kind, uint16_t *lport,
+                  uint32_t *pip, uint16_t *pport, const char **uxname) {
+    if (idx < 0 || idx >= SOCK_MAX) return -2;
+    struct sock *s = &g_socks[idx];
+    if (!s->in_use) return -1;
+    *kind   = s->kind;
+    *lport  = s->local_port;
+    *pip    = s->peer_ip;
+    *pport  = s->peer_port;
+    *uxname = (s->kind == SOCK_KIND_UNIX) ? sock_unix_bound_name(s) : 0;
+    return 0;
+}
+
+/* ICMP destination-unreachable landed for a datagram WE sent (icmp.c
+ * decoded the embedded original headers). Latch the error on the matching
+ * connected UDP socket and wake its waiters -- the next send/recv returns
+ * it, which is how ECONNREFUSED reaches connect()ed-UDP callers. Matching
+ * is (our local port, connected peer); an unconnected socket gets no error
+ * (Linux semantics: only connected sockets consume async errors). */
+void sock_udp_icmp_error(uint16_t local_port_be, uint32_t peer_ip_be,
+                         uint16_t peer_port_be, uint8_t code) {
+    int err = (code == 3) ? 111        /* ECONNREFUSED */
+            : (code == 0) ? 101        /* ENETUNREACH  */
+            :               113;       /* EHOSTUNREACH */
+    for (int i = 0; i < SOCK_MAX; i++) {
+        struct sock *s = &g_socks[i];
+        if (!s->in_use || s->kind != SOCK_KIND_UDP) continue;
+        if (s->local_port != local_port_be) continue;
+        if (!s->peer_port) continue;                    /* not connected */
+        if (s->peer_ip != peer_ip_be || s->peer_port != peer_port_be)
+            continue;
+        s->so_error = err;
+        wq_wake_all(&s->wq_recv);
+    }
+}
+
+/* The v6 twin (2026-08-23). Same Linux semantics -- only a CONNECTED
+ * socket consumes the async error. Codes are RFC 4443 destination-
+ * unreachable: 0 no-route, 1 admin-prohibited, 3 address-unreachable,
+ * 4 port-unreachable. Found live: SLIRP answers a v6 DNS query with
+ * type1/code0 when the HOST has no IPv6 resolver -- an error we used
+ * to throw away, so the recv just timed out and the wire looked dead. */
+void sock_udp6_icmp_error(uint16_t local_port_be,
+                          const struct ipv6_addr *peer,
+                          uint16_t peer_port_be, uint8_t code) {
+    int err = (code == 4) ? 111        /* ECONNREFUSED */
+            : (code == 0) ? 101        /* ENETUNREACH  */
+            : (code == 1) ? 13         /* EACCES       */
+            :               113;       /* EHOSTUNREACH */
+    for (int i = 0; i < SOCK_MAX; i++) {
+        struct sock *s = &g_socks[i];
+        if (!s->in_use || s->kind != SOCK_KIND_UDP || !s->is_v6) continue;
+        if (s->local_port != local_port_be) continue;
+        if (!s->peer_port) continue;                    /* not connected */
+        if (!ipv6_addr_equal(&s->peer6, peer) ||
+            s->peer_port != peer_port_be)
+            continue;
+        s->so_error = err;
+        wq_wake_all(&s->wq_recv);
+    }
+}
+
+/* shutdown(2) helpers (2026-08-22). Live here because the wait queue is
+ * this file's private machinery. */
+void sock_shutdown_rd(struct sock *s) {
+    if (!s) return;
+    s->shut_rd = 1;
+    wq_wake_all(&s->wq_recv);              /* a blocked read returns EOF */
+}
+
+/* SHUT_WR on an AF_UNIX endpoint: the peer reads EOF once its ring drains,
+ * but its OWN sends keep working -- deliberately NOT sock_unix_peer_close,
+ * which severs the link (peer_ip = 0) and kills both directions. */
+void sock_unix_shutdown_tx(struct sock *self) {
+    if (!self || self->kind != SOCK_KIND_UNIX) return;
+    struct sock *peer = sock_peer_of(self);
+    if (peer && peer->in_use) {
+        peer->rx_eof = 1;
+        wq_wake_all(&peer->wq_recv);
+    }
+}
+
 void sock_unix_peer_close(struct sock *self) {
     if (!self || self->kind != SOCK_KIND_UNIX) return;
     if (self->x_server) return;                  /* no peer proc -- kernel side */
@@ -717,6 +803,9 @@ struct unix_bind {
     bool  listening;
     bool  abstract;
     char  name[109];
+    /* the name as bind(2) was given it, which getsockname says (a node's
+     * table name is its resolved path -- finding 193) */
+    char  shown[109];
     int   owner;                          /* sock pool index of the bound socket */
     int   backlog[UNIX_BACKLOG_MAX];      /* server ends waiting to be accepted */
     int   nq;
@@ -770,9 +859,32 @@ int sock_unix_bind_name(struct sock *s, const char *name, bool abstract) {
 /* The name this socket is bound to, or NULL if unnamed. Abstract names are
  * returned without their leading NUL; getsockname's caller does not need
  * the distinction here, since we keep one namespace. */
+/* Is NAME the in-kernel X server's socket? (syscall.c's connect asks) */
+bool sock_unix_is_x_socket(const char *name) { return is_x0_socket(name); }
+
 const char *sock_unix_bound_name(const struct sock *s) {
     struct unix_bind *b = unix_bind_of(s);
-    return b ? b->name : 0;
+    if (!b) return 0;
+    return b->shown[0] ? b->shown : b->name;
+}
+
+/* Bind S to the node at KPATH (made by the caller), shown as SHOWN. A
+ * binding still holding KPATH is a socket whose node was unlinked: it stays
+ * bound, as Linux's does, and no name reaches it any more. */
+int sock_unix_bind_path(struct sock *s, const char *kpath, const char *shown) {
+    struct unix_bind *old = unix_bind_find(kpath, false);
+    if (old) old->name[0] = '\0';
+    int rc = sock_unix_bind_name(s, kpath, false);
+    if (rc == 0) {
+        struct unix_bind *b = unix_bind_of(s);
+        if (b && shown) {
+            size_t n = strlen(shown);
+            if (n > sizeof(b->shown) - 1) n = sizeof(b->shown) - 1;
+            memcpy(b->shown, shown, n);
+            b->shown[n] = '\0';
+        }
+    }
+    return rc;
 }
 
 int sock_unix_listen(struct sock *s) {
@@ -868,11 +980,85 @@ int sock_unix_pair(struct sock **out_a, struct sock **out_b) {
 
 /* ---- UDP syscall surface --------------------------------------- */
 
+/* ---- raw sockets -------------------------------------------------------
+ *
+ * Both fan-outs walk the pool. That is O(SOCK_MAX) per packet, which would
+ * matter if it ran on every packet always -- it does not: the loop skips
+ * every slot unless a raw socket exists, and creating one needs root.
+ */
+void sock_deliver_raw(uint32_t src_ip_be, uint8_t proto,
+                      const void *ip_datagram, size_t len) {
+    for (int i = 0; i < SOCK_MAX; i++) {
+        struct sock *s = &g_socks[i];
+        if (!s->in_use || s->kind != SOCK_KIND_RAW) continue;
+        if (s->raw_is_packet) continue;
+        /* Protocol 0 means every protocol, which is what a sniffer wants. */
+        if (s->raw_proto != 0 && s->raw_proto != proto) continue;
+        sock_deliver(s, src_ip_be, 0, ip_datagram, len);
+    }
+}
+
+void sock_deliver_packet(const void *frame, size_t len) {
+    for (int i = 0; i < SOCK_MAX; i++) {
+        struct sock *s = &g_socks[i];
+        if (!s->in_use || s->kind != SOCK_KIND_RAW || !s->raw_is_packet) continue;
+        sock_deliver(s, 0, 0, frame, len);
+    }
+}
+
+/* Lets the loopback path skip building a header nobody will read. */
+int sock_any_raw_listener(void) {
+    for (int i = 0; i < SOCK_MAX; i++)
+        if (g_socks[i].in_use && g_socks[i].kind == SOCK_KIND_RAW &&
+            !g_socks[i].raw_is_packet) return 1;
+    return 0;
+}
+
+/* Lets the ethernet path skip work when nobody is listening. */
+int sock_any_packet_listener(void) {
+    for (int i = 0; i < SOCK_MAX; i++)
+        if (g_socks[i].in_use && g_socks[i].kind == SOCK_KIND_RAW &&
+            g_socks[i].raw_is_packet) return 1;
+    return 0;
+}
+
+long sock_setopt(struct sock *s, int opt, long val) {
+    if (!s) return -ABI_EBADF;
+    switch (opt) {
+    case ABI_SOCKOPT_IP_TTL:
+        if (val < 1 || val > 255) return -ABI_EINVAL;
+        if (s->kind != SOCK_KIND_UDP && s->kind != SOCK_KIND_RAW) return -ABI_EINVAL;
+        s->ip_ttl = (uint8_t)val;
+        return 0;
+    default:
+        return -ABI_EINVAL;
+    }
+}
+
 long sock_sendto(struct sock *s, const void *buf, size_t len,
                  uint32_t dst_ip_be, uint16_t dst_port_be) {
     if (!cap_check(current_proc(), CAP_NET, "sock_sendto")) return -1;
     if (!s || !s->in_use)  return -1;
     if (!buf && len)       return -1;
+
+    if (s->kind == SOCK_KIND_RAW) {
+        /* An AF_PACKET socket is a receive-only tap here: injecting a raw
+         * ethernet frame is a different capability from watching one, and
+         * nothing in this tree needs it. Refused by name rather than
+         * silently sent as IP. */
+        if (s->raw_is_packet) return -1;
+        if (len > ETH_MTU - 20) return -1;
+        if (!net_is_up()) return -4;
+        /* No port and no ephemeral bind: the payload IS the L4 packet and
+         * the kernel supplies only the IP header. */
+        struct net_ctx rprev = net_ctx_enter(s->net_ns, 0);
+        bool rsent = ip_send_ttl(dst_ip_be,
+                                 s->raw_proto ? s->raw_proto : IPPROTO_RAW,
+                                 buf, len, s->ip_ttl);
+        net_ctx_leave(rprev);
+        return rsent ? (long)len : -3;
+    }
+
     if (dst_port_be == 0)  return -1;
     if (len > ETH_MTU - 28) return -1;
 
@@ -893,7 +1079,7 @@ long sock_sendto(struct sock *s, const void *buf, size_t len,
      * that knows -- udp.c's other callers (DHCP, DNS, mDNS, NTP, QUIC) are host
      * services and correctly get the initial namespace by default. */
     struct net_ctx nprev = net_ctx_enter(s->net_ns, 0);
-    bool sent = udp_send(s->local_port, dst_ip_be, dst_port_be, buf, len);
+    bool sent = udp_send_ttl(s->local_port, dst_ip_be, dst_port_be, buf, len, s->ip_ttl);
     net_ctx_leave(nprev);
     if (!sent) return -3;
     return (long)len;
@@ -901,7 +1087,17 @@ long sock_sendto(struct sock *s, const void *buf, size_t len,
 
 long sock_recvfrom(struct sock *s, void *buf, size_t n,
                    uint32_t *src_ip_be, uint16_t *src_port_be) {
-    return sock_recvfrom_to(s, buf, n, src_ip_be, src_port_be, 0);
+    /* A timeout of 0 here means WAIT FOREVER, and for a raw socket that is
+     * always wrong. A raw socket has no notion of an expected reply: ping
+     * asks "has an echo reply arrived yet", tcpdump asks "has any frame
+     * arrived yet", and clockdiff asks a question most hosts never answer
+     * at all. Blocking forever on the first of those made `clockdiff`
+     * against a host that ignores ICMP TIMESTAMP hang the whole boot.
+     *
+     * So raw receives poll: a short bounded wait, returning 0 for "nothing
+     * yet", which is what every caller above is already written to loop on. */
+    uint32_t to = (s && s->kind == SOCK_KIND_RAW) ? 100 : 0;
+    return sock_recvfrom_to(s, buf, n, src_ip_be, src_port_be, to);
 }
 
 long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
@@ -912,16 +1108,14 @@ long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
     if (!buf && n)         return -1;
 
     uint64_t deadline = 0;
-    if (timeout_ms) {
-        uint32_t hz = pit_hz(); if (hz == 0) hz = 100;
-        deadline = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
-    }
+    if (timeout_ms)   /* ns-based (2026-08-22): pit ticks run ~15x slow under TCG */
+        deadline = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
 
     while (s->count == 0) {
         struct proc *self = current_proc();
-        if (self->pending_signals) return EINTR_RET;
+        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
         if (!s->in_use)            return -1;
-        if (deadline && pit_ticks() >= deadline) return 0;   /* timed out */
+        if (deadline && perf_now_ns() >= deadline) return 0;   /* timed out */
         /* Actively pull the NIC RX ring so inbound datagrams are delivered
          * (udp_recv -> sock_deliver) while we wait. The e1000 IRQ-driven wake
          * alone does not reliably advance a blocked UDP recv -- every other
@@ -968,12 +1162,169 @@ long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
     return (long)copy;
 }
 
+/* ---- AF_INET6 UDP (2026-08-23) ----------------------------------------
+ *
+ * The v6 substrate (ipv6.c: SLAAC + NDP + send/recv, and now an inline
+ * ::1/self loopback) predates this by months; what never existed was a
+ * socket that could USE it -- socket(AF_INET6) was an EAFNOSUPPORT and
+ * every non-DHCPv6 v6 datagram was silently dropped. These three
+ * functions are the missing layer: checksummed sends (mandatory in v6),
+ * a pool demux for inbound, and a recv that reports v6 sources. */
+
+void sock_udp6_deliver(const struct ipv6_addr *src, uint16_t sport,
+                       uint16_t dport, const void *data, size_t len) {
+    for (int i = 0; i < SOCK_MAX; i++) {
+        struct sock *s = &g_socks[i];
+        if (!s->in_use || s->kind != SOCK_KIND_UDP || !s->is_v6) continue;
+        if (ntohs(s->local_port) != dport) continue;
+        if (!net_ns_has_network(s->net_ns)) continue;   /* same rule as v4 */
+        {   /* capped trace while the wire path is young */
+            static int hits;
+            if (hits < 8) { hits++;
+                kprintf("[udp6] deliver dport=%u len=%u -> sock[%d]\n",
+                        (unsigned)dport, (unsigned)len, i);
+            } }
+
+        if (len > ETH_MTU) len = ETH_MTU;
+        if (s->count == SOCK_RX_DGRAMS) {
+            struct sock_dgram *old = &s->dgrams[s->tail];
+            if (old->payload) { kfree(old->payload); old->payload = 0; }
+            s->tail = (uint16_t)((s->tail + 1) % SOCK_RX_DGRAMS);
+            s->count--;
+            s->dropped++;
+        }
+        uint8_t *copy = (uint8_t *)kmalloc(len ? len : 1);
+        if (!copy) return;
+        if (len) memcpy(copy, data, len);
+        struct sock_dgram *d = &s->dgrams[s->head];
+        d->src_ip   = 0;
+        d->src_is6  = 1;
+        d->src6     = *src;
+        d->src_port = htons(sport);
+        d->len      = (uint32_t)len;
+        d->payload  = copy;
+        s->head = (uint16_t)((s->head + 1) % SOCK_RX_DGRAMS);
+        s->count++;
+        wq_wake_all(&s->wq_recv);
+        poll_event_notify();
+        return;
+    }
+    {   /* capped: an inbound v6 datagram nobody claimed, with the port
+         * it asked for -- the one fact that separates "demux mismatch"
+         * from "socket gone" while the wire path is young */
+        static int misses;
+        if (misses < 8) { misses++;
+            kprintf("[udp6] NO LISTENER dport=%u len=%u\n",
+                    (unsigned)dport, (unsigned)len);
+        } }
+}
+
+long sock_sendto6(struct sock *s, const void *buf, size_t len,
+                  const struct ipv6_addr *dst, uint16_t dst_port_be) {
+    if (!cap_check(current_proc(), CAP_NET, "sock_sendto6")) return -1;
+    if (!s || !s->in_use)  return -1;
+    if (!buf && len)       return -1;
+    if (dst_port_be == 0)  return -1;
+    if (len > ETH_MTU - 48) return -1;   /* v6 hdr(40) + udp hdr(8) */
+    if (s->local_port == 0 && sock_bind_ephemeral(s) != 0) return -1;
+
+    uint8_t pkt[ETH_MTU];
+    size_t tot = 8 + len;
+    pkt[0] = (uint8_t)(ntohs(s->local_port) >> 8);
+    pkt[1] = (uint8_t)(ntohs(s->local_port) & 0xff);
+    pkt[2] = (uint8_t)(ntohs(dst_port_be) >> 8);
+    pkt[3] = (uint8_t)(ntohs(dst_port_be) & 0xff);
+    pkt[4] = (uint8_t)(tot >> 8);
+    pkt[5] = (uint8_t)(tot & 0xff);
+    pkt[6] = 0;
+    pkt[7] = 0;
+    if (len) memcpy(pkt + 8, buf, len);
+    /* Mandatory checksum over the pseudo-header ipv6_send will really
+     * stamp -- ipv6_src_for mirrors its source selection, loopback
+     * (src == dst) included. */
+    uint16_t cs = ipv6_l4_checksum(ipv6_src_for(dst), dst,
+                                   IPV6_NH_UDP, pkt, tot);
+    pkt[6] = (uint8_t)(ntohs(cs) >> 8);
+    pkt[7] = (uint8_t)(ntohs(cs) & 0xff);
+
+    struct net_ctx nprev = net_ctx_enter(s->net_ns, 0);
+    int rc = ipv6_send(dst, IPV6_NH_UDP, pkt, tot);
+    net_ctx_leave(nprev);
+    return (rc == 0) ? (long)len : -3;
+}
+
+long sock_recvfrom6_to(struct sock *s, void *buf, size_t n,
+                       struct ipv6_addr *src6_out, uint16_t *src_port_be,
+                       uint32_t timeout_ms) {
+    /* Identical wait discipline to sock_recvfrom_to; only the source
+     * reporting differs. A v4-sourced datagram on a v6 socket reports
+     * a v4-mapped address (::ffff:a.b.c.d), the standard dual-stack
+     * spelling. */
+    if (!cap_check(current_proc(), CAP_NET, "sock_recvfrom6")) return -1;
+    if (!s || !s->in_use)  return -1;
+    if (!buf && n)         return -1;
+
+    uint64_t deadline = 0;
+    if (timeout_ms)
+        deadline = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+
+    while (s->count == 0) {
+        struct proc *self = current_proc();
+        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
+        if (!s->in_use)            return -1;
+        if (s->nonblock)           return SOCK_ERR_AGAIN;
+        /* An async ICMPv6 error (sock_udp6_icmp_error) ends the wait NOW
+         * -- the LX layer re-reads so_error and reports the errno. Left
+         * to the v4 shape ("error on the NEXT op") the caller would
+         * sleep out its full timeout first. */
+        if (s->so_error)           return SOCK_ERR_AGAIN;
+        if (deadline && perf_now_ns() >= deadline) return 0;
+        struct net_dev *nd = net_default();
+        if (nd && nd->rx_drain) nd->rx_drain(nd);
+        if (s->count > 0) break;
+        bool had_bkl = bkl_held();
+        if (had_bkl) bkl_exit();
+        sti();
+        {
+            struct percpu *me = smp_this_cpu();
+            if (me && __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE))
+                sched_yield();
+            else
+                hlt();
+        }
+        if (had_bkl) bkl_enter();
+    }
+
+    struct sock_dgram *d = &s->dgrams[s->tail];
+    size_t copy = d->len < n ? d->len : n;
+    if (copy && d->payload) memcpy(buf, d->payload, copy);
+    if (src6_out) {
+        if (d->src_is6) {
+            *src6_out = d->src6;
+        } else {
+            memset(src6_out, 0, sizeof *src6_out);
+            src6_out->bytes[10] = 0xff;
+            src6_out->bytes[11] = 0xff;
+            memcpy(&src6_out->bytes[12], &d->src_ip, 4);
+        }
+    }
+    if (src_port_be) *src_port_be = d->src_port;
+    if (d->payload) { kfree(d->payload); d->payload = 0; }
+    s->tail = (uint16_t)((s->tail + 1) % SOCK_RX_DGRAMS);
+    s->count--;
+    return (long)copy;
+}
+
 /* True when a recv would complete immediately. Non-blocking callers use this to
  * decide EAGAIN; blocking ones ignore it and park as before. TCP defers to the
  * connection's own readiness (buffered data, EOF, or error all count -- each
  * makes recv return without blocking). */
 bool sock_recv_ready(struct sock *s) {
     if (!s || !s->in_use) return true;         /* dead socket: recv returns at once */
+    /* shutdown(2): a shut read side or a peer's SHUT_WR both make recv
+     * return EOF without blocking -- that IS readiness. A latched async
+     * error (ICMP unreachable) likewise: the next op returns instantly. */
+    if (s->shut_rd || s->rx_eof || s->so_error) return true;
     if (s->kind == SOCK_KIND_TCP) {
         if (!s->tcp) return true;              /* unconnected -> immediate error */
         return (tcp_poll_flags(s->tcp) & (TCP_RDY_RECV | TCP_RDY_ERR)) != 0;
@@ -1053,7 +1404,8 @@ long sock_netlink_send(struct sock *s, const void *kbuf, size_t n) {
      * answering for the namespace it was created in. Same rule as every other
      * network operation here (net_ns_has_network). */
     size_t used = rtnl_process(s->net_ns, s->nl_pid,
-                               userns_capable(LCAP_NET_ADMIN),
+                               userns_capable_over(LCAP_NET_ADMIN,
+                                                   net_ns_owner(s->net_ns)),
                                kbuf, n, out, NL_REPLY_CAP);
 
     if (used) sock_deliver(s, 0, 0, out, used);

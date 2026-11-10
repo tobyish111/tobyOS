@@ -339,7 +339,25 @@ static void cdp_write(const char *json) {
         if (w <= 0) { g_quit = 1; return; }
         off += (size_t)w;
     }
-    printf("[chromewin] wrote %lu bytes to cmd pipe\n", (unsigned long)n);
+    /* SLICE 132: this fired on EVERY CDP command, and every screencast ack is
+     * one -- so at the ~12 fps the EliteDesk actually runs it emitted ~11
+     * lines/s forever. MEASURED off the 2026-08-16 real-hardware bootlog:
+     * ~420 B/s of a 38400-baud wire that carries 3840 B/s, i.e. ~11% of the
+     * link, permanently, to say "a frame was acked" 12 times a second.
+     *
+     * The bootstrap handshake IS worth seeing (it is how a chrome that never
+     * reaches DevTools gets diagnosed), so keep the first CDPW_LOG_MAX and
+     * then stop -- ANNOUNCING the cap when it is hit, because a logger that
+     * silently stops reads as an event that stopped happening, which has cost
+     * this tree four separate wrong conclusions. */
+#define CDPW_LOG_MAX 24
+    static unsigned long cdpw;
+    if (cdpw < CDPW_LOG_MAX)
+        printf("[chromewin] wrote %lu bytes to cmd pipe\n", (unsigned long)n);
+    else if (cdpw == CDPW_LOG_MAX)
+        printf("[chromewin] (cmd-pipe write log capped at %d -- further writes "
+               "are silent; the screencast acks one per frame)\n", CDPW_LOG_MAX);
+    cdpw++;
 }
 
 /* Pull one NUL-delimited message into g_msg (blocking). 0 on EOF/err. */
@@ -425,6 +443,8 @@ static int cdp_take_msg(void) {
 }
 
 /* Send a browser-level or session command; return its id. */
+static void cdp_wake(void);      /* slice 133: defined with the idle state */
+
 static int cdp_send(const char *method, const char *params_json, int with_session) {
     static char buf[16384];   /* slice 59h: 2048 truncated the grown probe JS into invalid JSON (-32700) */
     int id = g_next_id++;
@@ -436,6 +456,14 @@ static int cdp_send(const char *method, const char *params_json, int with_sessio
         snprintf(buf, sizeof buf,
                  "{\"id\":%d,\"method\":\"%s\",\"params\":%s}",
                  id, method, params_json ? params_json : "{}");
+    /* Slice 133: THE snap-back hook, placed here on purpose. Every input path
+     * -- mouse, key down/up/char, every variant and any added later -- funnels
+     * through cdp_send, so hooking the method name cannot miss one, which a
+     * hook at each call site eventually would. An Input.* command means the
+     * user just did something and is waiting to see the result, so drop out of
+     * idle and make any deferred ack due immediately. */
+    if (method && method[0] == 'I' && method[1] == 'n' && method[2] == 'p')
+        cdp_wake();
     cdp_write(buf);
     return id;
 }
@@ -485,6 +513,131 @@ static long g_t_turn, g_n_turn, g_last_ack_ms;
  * silent keep the 97 ms interactive path. Single-in-flight => one slot. */
 static int  g_ack_pend_sid = -1;          /* deferred ack; -1 = none */
 static long g_ack_due_ms;
+
+/* ---- SLICE 133: DON'T PAY FOR PHOTOGRAPHS OF A PAGE THAT DID NOT CHANGE --
+ *
+ * MEASURED, and this is the whole justification: a 39% smaller JPEG (Q=60 ->
+ * Q=20, 21602 -> 13152 bytes) moved the frame cycle by ONE millisecond
+ * (100 -> 99 ms). Encode, base64 and transport together are ~1% of the cycle;
+ * essentially all ~100 ms is chrome's CAPTURE -- the compositor readback. The
+ * cost is therefore PER CAPTURE, and per capture is exactly what is wasted:
+ * 84% of sampled frames on a Bing SERP are identical to the one before (6
+ * distinct JPEG sizes across a whole run; the EliteDesk bootlog agrees --
+ * jpeg=30710/30713/30660/30687).
+ *
+ * The screencast is SINGLE-IN-FLIGHT: chrome captures frame N+1 only after we
+ * ack frame N. So OUR ACK RATE IS CHROME'S CAPTURE RATE, and holding an ack
+ * back is the only lever the measurement supports. Slice 115 already built
+ * the deferred-ack machinery for the viz path; this engages it when CDP is
+ * the only source.
+ *
+ * Policy: after IDLE_ENTER consecutive unchanged frames, ack on a ~IDLE_ACK_MS
+ * timer (~2 captures/s) instead of immediately. ANY change, ANY input, ANY
+ * network event snaps back to full rate at once. The point is not to save
+ * power -- it is that the CPU chrome burns re-photographing a static page is
+ * exactly the CPU that is missing when the user finally clicks something.
+ *
+ * THE FAILURE MODE TO DESIGN AGAINST is a deferred ack that never gets sent:
+ * chrome would stop sending frames FOREVER and the window would freeze, which
+ * is far worse than a wasted capture. Three guards:
+ *   1. the flush in the main loop is UNCONDITIONAL (not under any #ifdef) and
+ *      runs every pass, so a pending ack always goes out once due;
+ *   2. g_ack_due_ms is an absolute deadline -- it cannot be pushed back;
+ *   3. anything that could mean "the user is waiting" calls cdp_wake(), which
+ *      clears the idle state and makes the pending ack due immediately.
+ * Slice 116's lesson also applies: a navigation drops the old session's
+ * deferred ack (see the frameNavigated handler), so a stale sid is never
+ * flushed against a dead session. */
+#define IDLE_ENTER   8            /* unchanged frames before backing off */
+#define IDLE_ACK_MS  500          /* ~2 captures/s while nothing is moving */
+/* SLICE 133b: match against the last SIG_RING frames, not just the previous
+ * one. MEASURED, on the very page the EliteDesk boots to (file:///etc/
+ * start.html -- no animation, no timers, no CSS transitions): the JPEG sizes
+ * run 30702, 30665, 30702, 30665, 30702, ... A CLEAN A/B ALTERNATION, ~37
+ * bytes apart in 30 KiB, i.e. visually nothing. Chrome re-encodes a static
+ * page to slightly different bytes from frame to frame, so "identical to the
+ * PREVIOUS frame" was never once true and the throttle never engaged --
+ * confirmed on real hardware (cap stayed 82-84ms through frames 30..120) and
+ * then reproduced in QEMU on the same URL.
+ *
+ * A ring fixes the whole family: A/B, A/B/C, A/B/C/D oscillation all match
+ * something recent and count as "not making progress". A genuine animation
+ * cycles through far more than SIG_RING distinct frames, so it never matches
+ * and keeps full rate -- which is the behaviour that matters. The deliberate
+ * trade is that a page whose ONLY motion is a 2-state blink (a text caret)
+ * gets throttled to ~2/s; a blinking caret is not worth 12 captures/s. */
+static unsigned g_same_run;               /* consecutive visually-unchanged frames */
+static int  g_idle_mode;                  /* 1 = currently backed off */
+static long g_idle_since_ms, g_idle_saved;/* [cwidle] accounting */
+
+/* SLICE 133c: COMPARE PIXELS, NOT BYTES.
+ *
+ * Two byte-level detectors were tried and both failed on the very page the
+ * machine boots to (file:///etc/start.html -- no animation, no timers). The
+ * JPEG size sequence there is 30702, 30665, 30702, 30665, ... 30652, 30639,
+ * 30652, ...: it ALTERNATES, and the alternating pair also DRIFTS every few
+ * frames. So "identical to the previous frame" was never true (throttle never
+ * engaged, cap stayed 82-84ms on real hardware), and "matches one of the last
+ * 4" only caught the alternation until the pair moved (4 [cwidle] lines in a
+ * 200s run; 11.99 -> 10.88 fps, i.e. nothing).
+ *
+ * The lesson: chrome re-encodes a visually static page to different bytes, so
+ * the JPEG stream is simply not a reliable identity for the PICTURE. The
+ * picture is, and we already decode every frame (dec=3ms) -- so sample the
+ * decoded pixels and allow a tolerance. ~37 bytes of JPEG difference in 30 KiB
+ * is sub-pixel noise; a real change moves many samples at once.
+ *
+ * SAMPLES points scattered by a large odd stride (co-prime with any plausible
+ * row width, so the samples never line up into one column and miss a change
+ * confined to a stripe). A frame counts as unchanged when at most DIFF_TOL
+ * samples moved by more than LUMA_EPS per channel. Cost is SAMPLES compares,
+ * i.e. microseconds -- and it runs where the frame is already in cache. */
+#define SIG_SAMPLES 512
+#define SIG_STRIDE  1021          /* prime; decorrelates from row width */
+#define LUMA_EPS    6             /* per-channel noise floor */
+#define DIFF_TOL    3             /* samples allowed to move and still "same" */
+static uint32_t g_prev_samp[SIG_SAMPLES];
+static int      g_prev_samp_ok;
+
+/* Returns 1 if this frame looks the SAME as the previous one. Updates the
+ * stored samples either way. */
+static int frame_unchanged(const toby_image_t *img) {
+    if (!img || !img->pixels || img->width <= 0 || img->height <= 0) return 0;
+    size_t npx = (size_t)img->width * (size_t)img->height;
+    if (npx == 0) return 0;
+    int diff = 0;
+    int was_ok = g_prev_samp_ok;
+    for (int i = 0; i < SIG_SAMPLES; i++) {
+        size_t idx = ((size_t)i * SIG_STRIDE) % npx;
+        uint32_t px = img->pixels[idx];
+        if (was_ok) {
+            uint32_t q = g_prev_samp[i];
+            int dr = (int)((px >> 16) & 0xff) - (int)((q >> 16) & 0xff);
+            int dg = (int)((px >>  8) & 0xff) - (int)((q >>  8) & 0xff);
+            int db = (int)( px        & 0xff) - (int)( q        & 0xff);
+            if (dr < 0) dr = -dr;
+            if (dg < 0) dg = -dg;
+            if (db < 0) db = -db;
+            if (dr > LUMA_EPS || dg > LUMA_EPS || db > LUMA_EPS) diff++;
+        }
+        g_prev_samp[i] = px;
+    }
+    g_prev_samp_ok = 1;
+    if (!was_ok) return 0;                 /* first frame: no verdict */
+    return diff <= DIFF_TOL;
+}
+
+/* "Something happened -- stop idling." Safe to call from anywhere, including
+ * before the first frame. */
+static void cdp_wake(void) {
+    g_same_run = 0;
+    if (g_idle_mode) {
+        g_idle_mode = 0;
+        printf("[cwidle] active (idled %lds, ~%ld captures skipped)\n",
+               (sys_clock_ms() - g_idle_since_ms) / 1000, g_idle_saved);
+    }
+    if (g_ack_pend_sid >= 0) g_ack_due_ms = 0;   /* flush on the next pass */
+}
 static long g_cdp_last_ms;                /* last screencast frame install */
 static long g_t_shot, g_n_shot, g_shot_sent_ms;
 static int  g_n_push, g_n_poll;
@@ -546,6 +699,15 @@ static int install_b64_frame(void) {
     toby_image_t *old = g_frame;
     g_frame = img;
     if (old) toby_image_free(old);
+#ifndef CW_LAT
+    /* Slice 133c: classify the PICTURE, now that we have pixels. */
+    if (frame_unchanged(img)) {
+        if (g_same_run < 1000000u) g_same_run++;
+    } else {
+        if (g_idle_mode) cdp_wake();          /* really moved -- full rate */
+        g_same_run = 0;
+    }
+#endif
     g_frames++;
     g_last_frame_ms = sys_clock_ms();
     g_cdp_last_ms = g_last_frame_ms;  /* slice 115: freshest-source paint */
@@ -621,6 +783,10 @@ static void handle_screencast_frame(void) {
      * b64+decode+paint serialized our ~2-5ms into every cycle. Acking first
      * overlaps chrome's next capture/encode with our decode of this frame.
      * (g_msg is not touched by cdp_send, so the payload survives the send.) */
+    /* Slice 133c: the changed/unchanged verdict is produced in
+     * install_b64_frame, from the DECODED pixels (see frame_unchanged). It is
+     * therefore one frame behind at this point, which is harmless -- the
+     * throttle needs IDLE_ENTER of them in a row before it does anything. */
     if (sid >= 0) {                                /* ack -> chrome sends the next */
 #if defined(CW_VIZ) && !defined(CW_LAT)
         /* Slice 115: defer the ack while viz frames flow (see decl block).
@@ -629,6 +795,25 @@ static void handle_screencast_frame(void) {
         if (g_xf_live && sys_clock_ms() - g_xf_last_ms < 300) {
             g_ack_pend_sid = sid;
             g_ack_due_ms = sys_clock_ms() + 450;
+        } else
+#endif
+#ifndef CW_LAT
+        /* Slice 133: nothing has changed for IDLE_ENTER frames -- stop asking
+         * chrome to re-photograph it at full rate. Lat mode is excluded: it
+         * measures this very path, and throttling it would measure the
+         * throttle. */
+        if (g_same_run >= IDLE_ENTER) {
+            if (!g_idle_mode) {
+                g_idle_mode = 1;
+                g_idle_since_ms = sys_clock_ms();
+                g_idle_saved = 0;
+                printf("[cwidle] idle: %u unchanged frames -- backing off to "
+                       "~%d captures/s until something moves\n",
+                       g_same_run, 1000 / IDLE_ACK_MS);
+            }
+            g_idle_saved++;
+            g_ack_pend_sid = sid;
+            g_ack_due_ms = sys_clock_ms() + IDLE_ACK_MS;
         } else
 #endif
         {
@@ -710,6 +895,42 @@ static int g_req_total, g_req_media, g_resp_media, g_fail_total, g_fin_media;
  * completes, tiles=2/cmt=0 is a DATA problem, not a rendering one). */
 static int g_req_thumb, g_req_api, g_resp_api_ok, g_resp_api_bad, g_req_cont;
 
+/* ---- Slice 130: THE LOADING INDICATOR ---------------------------------- *
+ * Until now the bar showed one plain string, and on navigation it was set to
+ * the DESTINATION URL immediately while the page area kept showing the
+ * PREVIOUS page's last frame. First paint on this hardware is tens of
+ * seconds out, so for that whole window the browser looked exactly like a
+ * hung one -- no feedback that the click had even registered. That is a real
+ * part of "sluggish" that has nothing to do with frame rate.
+ *
+ * chrome already tells us everything needed: Network.enable is unconditional
+ * (see chrome_bootstrap) and requestWillBeSent / loadingFinished /
+ * loadingFailed bracket every request. So this is a HONEST indicator -- an
+ * animated glyph plus the real number of outstanding requests -- not a
+ * decorative spinner that spins whether or not anything is happening.
+ *
+ * The failure mode to design against is a spinner that never stops, which is
+ * worse than none: it would report "still loading" forever and train the user
+ * to ignore it. Two guards:
+ *   - the in-flight count is CLAMPED at zero (a loadingFailed we never saw a
+ *     request for must not drive it negative, or it can never return to 0);
+ *   - it is ARMED BY RECENT ACTIVITY. chrome can drop a request without a
+ *     terminal event (aborted speculative loads do exactly this -- see the
+ *     ERR_ABORTED note in the cwwebgl gate), leaking the count. If no network
+ *     event has arrived for LOAD_QUIET_MS the page is done as far as the user
+ *     is concerned, whatever the counter says. */
+#define LOAD_QUIET_MS 5000
+#define SPIN_STEP_MS  120            /* glyph advance; ~8 steps/s reads as alive */
+static int  g_net_inflight;          /* requests started but not yet ended */
+static long g_net_last_ms;           /* last network event, 0 = none yet */
+static int  g_spin_phase;            /* advanced by the main loop, not by paint */
+
+/* Is the page loading RIGHT NOW? Both conditions, for the reasons above. */
+static int load_active(void) {
+    return g_net_inflight > 0 && g_net_last_ms &&
+           (sys_clock_ms() - g_net_last_ms) < LOAD_QUIET_MS;
+}
+
 /* Slice 122: .br.js decode diagnostic state (see the responseReceived and
  * loadingFinished branches below, and the reply handler in cdp_dispatch). */
 static char g_brjs_rid[48];
@@ -720,6 +941,31 @@ static int  g_brjs_printed;
 
 static void note_network_event(void) {
     static char url[160], err[96];
+
+    /* Slice 130: keep the in-flight count HERE, at the top, before any of the
+     * per-URL branches below -- every one of them ends in an early `return`,
+     * so a decrement placed inside the loadingFinished branch would be
+     * skipped for exactly the requests that took the media/api/thumb paths
+     * and the count would never come back down. */
+    {
+        int started = strstr(g_msg, "\"Network.requestWillBeSent\"") != 0;
+        int ended   = strstr(g_msg, "\"Network.loadingFinished\"") != 0 ||
+                      strstr(g_msg, "\"Network.loadingFailed\"")   != 0;
+        if (started || ended) {
+            g_net_last_ms = sys_clock_ms();
+            if (started) g_net_inflight++;
+            else if (g_net_inflight > 0) g_net_inflight--;   /* clamped */
+            /* Slice 133: the page is fetching something, so it is about to
+             * change -- do not sit in the idle throttle through a load. */
+            cdp_wake();
+            /* Deliberately NO tk_redraw here. A busy page fires hundreds of
+             * these, and tk_redraw only marks dirty -- so they would coalesce
+             * into a paint on every one of the ~66 main-loop passes per
+             * second, adding compositor work during precisely the load window
+             * this indicator exists to make feel faster. The 120 ms spinner
+             * tick already repaints; the count rides along with it. */
+        }
+    }
 
     if (strstr(g_msg, "\"Network.requestWillBeSent\"")) {
         g_req_total++;
@@ -865,6 +1111,11 @@ static void cdp_dispatch(void) {
         !strstr(g_msg, "\"parentId\"")) {
         char scp[128];
         g_ack_pend_sid = -1;
+        /* Slice 133: a new document is the least idle thing that can happen --
+         * drop the throttle AND the old page's frame signature, or the first
+         * frames of the new page could be compared against the old one's. */
+        g_prev_samp_ok = 0;        /* new document: no verdict from the old one */
+        cdp_wake();
         snprintf(scp, sizeof scp,
                  "{\"format\":\"jpeg\",\"quality\":" CW_STR(CW_Q) ","
                  "\"maxWidth\":%d,\"maxHeight\":%d,"
@@ -1304,6 +1555,41 @@ static int spawn_chrome(void) {
              * further down, not added here. Chrome keeps only the LAST
              * --vmodule on the command line (slice 89 cost a whole run to
              * that), so a second one here would silently disable itself. */
+#elif defined(CW_SWGL)
+            /* Slice 123: WebGL that EXISTS, via ANGLE-on-SwiftShader.
+             *
+             * This is NOT a reopening of tier 3. Tier 3 asked "can chrome
+             * raster on the HOST GPU faster than CPU raster" and was closed
+             * with a measured no. This asks a different question with a
+             * different answer at stake: chrome here reports
+             * `tobygl ctx=NONE` -- not slow WebGL, NO WebGL -- and a
+             * Chrome 151 with no WebGL context at all is a genuine anomaly
+             * that every fingerprinting gate can see for free. SwiftShader
+             * is pure CPU rasterisation, so it needs no host GPU, behaves
+             * identically in QEMU and on the EliteDesk, and cannot drag the
+             * virgl/Mesa road back open.
+             *
+             * The pieces were staged all along and simply switched off: the
+             * headless-shell distribution ships libEGL/libGLESv2 (ANGLE),
+             * libvulkan.so.1, libvk_swiftshader.so and its ICD json, and
+             * VK_ICD_FILENAMES already points at that json in software
+             * builds. What blocked WebGL was this very flag set --
+             * --disable-gpu kills the GPU host entirely, and --disable-vulkan
+             * removes the one API ANGLE's SwiftShader backend speaks.
+             *
+             * --enable-unsafe-swiftshader is REQUIRED, not optional garnish:
+             * modern Chromium refuses to satisfy a WebGL context from
+             * SwiftShader without it (the fallback was gated for security
+             * after GPU-process sandbox concerns), and a build missing it
+             * fails exactly like a build with no SwiftShader at all --
+             * ctx=NONE, no error. gl_renderer_probe() below is the arbiter:
+             * a renderer string naming SwiftShader means this worked, and
+             * ctx=NONE means it did not, whatever the flags claim. */
+            (char *)"--use-gl=angle",
+            (char *)"--use-angle=swiftshader",
+            (char *)"--enable-unsafe-swiftshader",
+            (char *)"--ignore-gpu-blocklist",
+            (char *)"--ozone-platform=headless",
 #else
             (char *)"--disable-gpu",
             (char *)"--disable-vulkan",
@@ -1480,8 +1766,17 @@ static int spawn_chrome(void) {
             /* DISPLAY is deliberately ABSENT in CW_GL builds: run 1 proved
              * that giving GPU-enabled chrome an X display sends it into
              * libX11/GLX, where it CHECK-crashes against our stub server.
-             * Software mode still wants it (the tier-2.5 era paths). */
+             * Software mode still wants it (the tier-2.5 era paths).
+             *
+             * Slice 123: CW_SWGL is withheld it for the SAME reason as
+             * CW_GL. That crash was about a GPU-ENABLED chrome finding a
+             * display, not about which GL backend it settles on -- and
+             * CW_SWGL is GPU-enabled by construction (that is the whole
+             * point). Ozone headless + no DISPLAY leaves ANGLE the road we
+             * want it on. */
+#ifndef CW_SWGL
             (char *)"DISPLAY=:0",
+#endif
 #endif
 #ifdef CW_GL
             /* Phase 1d: the EXACT env slice 105 measured "GL_RENDERER: virgl"
@@ -2699,6 +2994,19 @@ static void paint(struct tk_window *w, struct tk_widget *cv) {
         char ob[256];
         snprintf(ob, sizeof ob, "%s_", g_omni);        /* trailing cursor */
         tk_draw_text(w, 60, 6, ob, 0x00f0f4f8u, 14, 0);
+    } else if (load_active()) {
+        /* Slice 130: glyph + the REAL number of outstanding requests.
+         * ASCII |/-\ deliberately: the bar is drawn with the Lato TTF and a
+         * prettier braille/box spinner would silently fall back to a missing
+         * glyph. g_spin_phase is advanced by the main loop on a wall clock,
+         * not per paint -- painting is driven by frame arrival, which is the
+         * very thing that stops during a load, so a per-paint animation would
+         * freeze exactly when it is supposed to be reassuring. */
+        static const char glyph[4] = { '|', '/', '-', '\\' };
+        char lb[192];
+        snprintf(lb, sizeof lb, "%c  %s  (%d)",
+                 glyph[g_spin_phase & 3], g_status, g_net_inflight);
+        tk_draw_text(w, 60, 6, lb, 0x00e0e4f0u, 14, 0);
     } else {
         tk_draw_text(w, 60, 6, g_status, 0x00d0d0d8u, 14, 0);
     }
@@ -2795,6 +3103,22 @@ static void on_event(struct tk_window *w, struct tk_widget *cv,
         if (g_omni_active) { g_omni_active = 0; tk_redraw(&win); }
         send_mouse("mousePressed",  ev->x, py, ev->button, 1); break;
     case TK_EV_MOUSE_UP:   send_mouse("mouseReleased", ev->x, py, ev->button, 1); break;
+    case TK_EV_WHEEL: {
+        /* Real user scrolling, over the same CDP verb the scripted tour
+         * already drives. CDP deltaY is in PIXELS and its sign is the
+         * opposite of ours: positive deltaY scrolls the page DOWN (the
+         * content moves up), while a positive detent means away-from-user
+         * = up. Hence the negation. */
+        if (!ev->wheel) break;
+        char sp[160];
+        int dy = -(int)ev->wheel * TK_WHEEL_LINES * TK_WHEEL_STEP_PX;
+        snprintf(sp, sizeof sp,
+                 "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
+                 "\"deltaX\":0,\"deltaY\":%d,\"modifiers\":0}",
+                 ev->x, py, dy);
+        cdp_send("Input.dispatchMouseEvent", sp, 1);
+        break;
+    }
     default: break;
     }
 }
@@ -2890,20 +3214,38 @@ int main(void) {
 #endif
 #ifdef CW_VIZ
         vizframe_poll_once();      /* slice 107: chrome's viz shared bitmaps */
-        /* Slice 115: flush a deferred screencast ack once due (or at once
-         * when viz has gone quiet -- an interactive frame may be waiting). */
-        if (g_ack_pend_sid >= 0 &&
-            (sys_clock_ms() >= g_ack_due_ms ||
-             sys_clock_ms() - g_xf_last_ms >= 300)) {
-            char ackp[48];
-            snprintf(ackp, sizeof ackp, "{\"sessionId\":%d}", g_ack_pend_sid);
-            cdp_send("Page.screencastFrameAck", ackp, 1);
-            g_last_ack_ms = sys_clock_ms();
-            g_ack_pend_sid = -1;
-        }
-#ifdef CW_LAT
-        lat_probe_tick();          /* slice 114: responsiveness probes */
 #endif
+        /* SLICE 133: THIS FLUSH IS UNCONDITIONAL AND MUST STAY THAT WAY.
+         *
+         * It was inside #ifdef CW_VIZ, which was correct while viz was the
+         * only thing deferring acks. The idle throttle now defers them on the
+         * plain CDP path too -- the one every user actually runs -- and a
+         * deferred ack that is never sent stops chrome sending frames FOREVER
+         * (the window freezes, which is far worse than a wasted capture). So
+         * the flush runs on every pass of the loop that always runs, gated
+         * only by a deadline that can never be pushed back.
+         *
+         * The viz-quiet condition is kept (an interactive frame may be waiting
+         * behind a viz lull) but is now an EXTRA reason to flush early, never
+         * a requirement for flushing at all. */
+        if (g_ack_pend_sid >= 0) {
+            long now = sys_clock_ms();
+            int due = (now >= g_ack_due_ms);
+#ifdef CW_VIZ
+            if (!due && now - g_xf_last_ms >= 300) due = 1;
+#endif
+            if (due) {
+                char ackp[48];
+                snprintf(ackp, sizeof ackp, "{\"sessionId\":%d}", g_ack_pend_sid);
+                g_ack_pend_sid = -1;       /* clear BEFORE the send: cdp_send */
+                                           /* can set g_quit, and a half-sent  */
+                                           /* ack must not look still-pending  */
+                cdp_send("Page.screencastFrameAck", ackp, 1);
+                g_last_ack_ms = sys_clock_ms();
+            }
+        }
+#if defined(CW_VIZ) && defined(CW_LAT)
+        lat_probe_tick();          /* slice 114: responsiveness probes */
 #endif
 
         for (;;) {                             /* drain all buffered CDP msgs */
@@ -3007,6 +3349,66 @@ int main(void) {
                 g_ping_sent_ms = nowp;
             }
         }
+
+#ifdef CW_CLICK_AT
+        /* Slice 126: SCRIPTED CLICKS, so an INTERACTIVE failure can be
+         * reproduced without a human at the keyboard.
+         *
+         * The reCAPTCHA report ("renders for the first few, then not
+         * properly, so I can't finish it") is invisible to every harness we
+         * have: cwnet.sh loads a URL and never clicks, so it can reach the
+         * challenge page but never the tile phase where the failure lives.
+         *
+         * CW_CLICK_AT is "t,x,y:t,x,y:..." with t in ms after the CDP
+         * session comes up. THE RECORD SEPARATOR IS ':' AND THAT IS A BUILD
+         * CONSTRAINT, not a taste: PROG_EXTRA_CFLAGS is expanded UNQUOTED
+         * inside make's recipe shell, so a ';' in the value terminates the
+         * clang command mid-flag ("clang: error: no input files", which
+         * looks like a broken makefile rather than a bad -D). ';' is still
+         * accepted by the parser for anyone editing the string in C.
+         *
+         * Clicks are dispatched through the SAME
+         * Input.dispatchMouseEvent path a real TobyTK click takes -- browser
+         * level, so they land in cross-origin iframes (the reCAPTCHA anchor
+         * and challenge frames) exactly as a user's would, which a
+         * page-context script could never do. Combined with run_watch.py's
+         * timed screendumps, that turns "it looks wrong on my screen" into a
+         * reproducible before/after image pair. */
+        {
+            static long t_base;
+            static int  click_idx;
+            long nowc = sys_clock_ms();
+            if (!t_base && g_session[0]) t_base = nowc;
+            if (t_base) {
+                /* Re-walk the string each time rather than caching a cursor:
+                 * the list is a handful of entries and this keeps the parser
+                 * stateless (no pointer to invalidate, nothing to get out of
+                 * step with click_idx). */
+                const char *p = CW_CLICK_AT;
+                for (int i = 0; i < click_idx && *p; i++) {
+                    while (*p && *p != ':' && *p != ';') p++;
+                    if (*p == ':' || *p == ';') p++;
+                }
+                if (*p) {
+                    long t = atol(p);
+                    const char *c1 = strchr(p, ',');
+                    const char *c2 = c1 ? strchr(c1 + 1, ',') : 0;
+                    if (c1 && c2 && (nowc - t_base) >= t) {
+                        int cx = atoi(c1 + 1), cy = atoi(c2 + 1);
+                        printf("[cwclick] #%d t=%ldms -> (%d,%d)\n",
+                               click_idx, t, cx, cy);
+                        /* Move first: a press with no prior move lands on a
+                         * page that never saw hover, and some widgets (the
+                         * reCAPTCHA checkbox among them) gate on it. */
+                        send_mouse("mouseMoved",    cx, cy, 0, 0);
+                        send_mouse("mousePressed",  cx, cy, 0, 1);
+                        send_mouse("mouseReleased", cx, cy, 0, 1);
+                        click_idx++;
+                    }
+                }
+            }
+        }
+#endif
 
 #ifdef IPC_SIZE_LADDER
         /* One rung every 3s, starting 5s in (after the MSE test settles). */
@@ -3260,6 +3662,50 @@ int main(void) {
          * configuration the verified +16.5% was measured in. (n=1 per arm and
          * multi-process runs vary, so treat 38.3 as indicative -- but there is
          * no evidence FOR the change, so it does not ship.) */
+        /* Slice 130: drive the loading glyph off the WALL CLOCK.
+         * Everything else in this window repaints when a frame arrives -- and
+         * during a page load frames are exactly what is not arriving, which is
+         * why the browser looked hung in the first place. So tick here, in the
+         * loop that always runs, and only while a load is actually active:
+         * an idle browser must not wake the compositor 8 times a second.
+         * One redraw per 120 ms costs ~1 ms of paint (measured: paint=0ms). */
+        {
+            static long next_spin, load_t0;
+            static int  was_loading, load_reqs;
+            long now = sys_clock_ms();
+            /* Two lines per page load, on the STATE TRANSITIONS only -- enough
+             * to gate the indicator from a log ("did it arm, and did it ever
+             * disarm?") without becoming per-request chatter. The stuck-
+             * spinner failure mode is invisible from a screenshot and obvious
+             * from these. */
+            if (load_active() != was_loading) {
+                was_loading = !was_loading;
+                if (was_loading) {
+                    load_t0 = now; load_reqs = g_req_total;
+                    printf("[cwload] loading: %d in flight\n", g_net_inflight);
+                } else {
+                    printf("[cwload] settled after %ldms, %d requests, "
+                           "%d still counted in flight\n",
+                           now - load_t0, g_req_total - load_reqs,
+                           g_net_inflight);
+                }
+            }
+            if (load_active()) {
+                if (now >= next_spin) {
+                    next_spin = now + SPIN_STEP_MS;
+                    g_spin_phase++;
+                    tk_redraw(&win);
+                }
+            } else if (g_spin_phase) {
+                /* Load just ended: one final repaint to clear the glyph and
+                 * the count, otherwise the last spinner frame stays on screen
+                 * until something else happens to trigger a paint. */
+                g_spin_phase = 0;
+                next_spin = 0;
+                tk_redraw(&win);
+            }
+        }
+
         usleep(15000);
     }
     printf("[chromewin] exiting; frames=%d\n", g_frames);

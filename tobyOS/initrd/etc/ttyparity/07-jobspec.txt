@@ -1,0 +1,14 @@
+# %jobspec end to end: ^Z makes a stopped job; `kill %1; wait %1` on ONE
+# line TERMs+CONTinues the group and reaps it synchronously -- the
+# blocking wait is also what SCHEDULES the dying job (a woken-from-stop
+# proc starves while the shell spins userspace; see the handoff's
+# scheduler note), and the ~30ms death latency vs the microseconds
+# between the two builtins pins their order. No async announcement can
+# fire (the wait consumes the job), and no pids appear anywhere.
+sleep 30
+%CTRLZ%
+kill %1; wait %1
+echo "w=$?"
+jobs
+echo "j=$?"
+exit 0

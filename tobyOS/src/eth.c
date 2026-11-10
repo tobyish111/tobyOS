@@ -22,12 +22,14 @@
 
 #include <tobyos/eth.h>
 #include <tobyos/net.h>
+#include <tobyos/socket.h>  /* AF_PACKET taps */
 #include <tobyos/arp.h>
 #include <tobyos/ip.h>
 #include <tobyos/ipv6.h>
 #include <tobyos/nsproxy.h>   /* net_ns_dev / net_ctx_* (slice 12 cuts 2+5) */
 #include <tobyos/proc.h>
 #include <tobyos/klibc.h>
+#include <tobyos/printk.h>    /* capped v6-arrival diagnostic (2026-08-23) */
 
 bool eth_send(const uint8_t dst_mac[ETH_ADDR_LEN],
               uint16_t      ethertype,
@@ -108,6 +110,13 @@ void eth_recv_dev(const void *frame, size_t len, void *ns,
 static void eth_recv_inner(const void *frame, size_t len) {
     if (len < ETH_HDR_LEN) return;
 
+    /* AF_PACKET taps see the frame exactly as it arrived -- before the
+     * EtherType demux, so ARP and IPv6 are visible too, and before any
+     * decision about whether the frame is addressed to us. That is the
+     * whole point of a sniffer. Guarded so the normal case (nobody
+     * listening) costs one predictable branch. */
+    if (sock_any_packet_listener()) sock_deliver_packet(frame, len);
+
     const uint8_t *f = (const uint8_t *)frame;
     /* `et_off` indexes the 16-bit EtherType field (always 12 bytes after
      * the start of the current DMAC+SMAC header). VLAN tags insert 4 bytes
@@ -133,9 +142,47 @@ static void eth_recv_inner(const void *frame, size_t len) {
         arp_recv(pl, pln);
         break;
     case ETH_TYPE_IPV4:
+        /* Learn the sender's MAC from the frame that just carried it.
+         *
+         * Without this the cache was fed ONLY by arp_recv(), so the first
+         * reply to any host that spoke to us first was dropped: ip_send()
+         * calls arp_resolve(), and on a miss it fires an ARP request and
+         * RETURNS FALSE -- the packet is discarded, not queued. Measured on
+         * the EliteDesk as "[tcp] SYN/ACK send failed" on the opening SYN of
+         * every inbound connection, with the session only establishing on the
+         * client retransmit ~1 s later. One second of dead air on every first
+         * SSH or VNC connect.
+         *
+         * ONLY for senders on our own subnet. A packet from off-subnet
+         * arrives wearing the GATEWAY MAC, and caching that against the
+         * remote IP would record a mapping that is not a fact about the
+         * network -- it would work by accident and hide the next-hop logic.
+         *
+         * This trusts what the wire says, as any ARP cache must; it is the
+         * same trust arp_recv() already extends, and matches how a normal
+         * stack treats received unicast on a LAN. */
+        if (pln >= 20) {
+            uint32_t src_ip;
+            memcpy(&src_ip, pl + 12, sizeof src_ip);
+            uint32_t me = net_my_ip(), mask = net_my_netmask();
+            if (src_ip != 0 && src_ip != 0xFFFFFFFFu && src_ip != me &&
+                mask != 0 && (src_ip & mask) == (me & mask) &&
+                !(f[6] & 0x01))            /* never a multicast/broadcast MAC */
+                arp_cache_set(src_ip, f + 6);
+        }
         ip_recv(pl, pln);
         break;
     case ETH_TYPE_IPV6:
+        /* Capped arrival log (2026-08-23): the one guest-side fact that
+         * separates "SLIRP never sent it" from "we dropped it" -- a
+         * netdev filter-dump turned out to capture only the guest->host
+         * direction, so the wire pcap cannot answer this. */
+        {   static int v6_rx_logged;
+            if (v6_rx_logged < 8) { v6_rx_logged++;
+                kprintf("[eth] v6 frame in len=%u dst=%02x:%02x:%02x:"
+                        "%02x:%02x:%02x\n", (unsigned)pln,
+                        f[0], f[1], f[2], f[3], f[4], f[5]);
+            } }
         ipv6_recv(pl, pln);
         break;
     default:

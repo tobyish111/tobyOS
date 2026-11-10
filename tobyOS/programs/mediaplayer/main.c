@@ -124,6 +124,19 @@ static void paint(struct tk_window *w,struct tk_widget *c){
 
 static void on_event(struct tk_window *w,struct tk_widget *c,struct tk_event *ev){
     (void)c;
+    if(ev->type==TK_EV_WHEEL){
+        /* Until now NOTHING ever wrote playlist_scroll, so a playlist
+         * longer than one screenful was simply unreachable past the
+         * first page. The wheel is its first (and only) mover. */
+        if(!ev->wheel||ev->x>=PLAYLIST_W)return;
+        int vis=(H-CONTROLS_H-30)/20; if(vis<1)vis=1;
+        playlist_scroll-=(int)ev->wheel*TK_WHEEL_LINES;
+        int maxs=playlist_count-vis; if(maxs<0)maxs=0;
+        if(playlist_scroll>maxs)playlist_scroll=maxs;
+        if(playlist_scroll<0)playlist_scroll=0;
+        tk_redraw(w);
+        return;
+    }
     if(ev->type!=TK_EV_MOUSE_DOWN)return;
     int mx=ev->x,my=ev->y;
     if(mx<PLAYLIST_W&&my>=30){ int idx=(my-30)/20+playlist_scroll; if(idx>=0&&idx<playlist_count)play_track(idx); }

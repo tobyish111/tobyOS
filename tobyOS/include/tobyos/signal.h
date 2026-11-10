@@ -45,8 +45,82 @@
 #define SIGIO    29
 #define SIGSYS   31
 
-#define SIG_MAX  32
-#define SIGMASK(s) ((uint32_t)1u << (s))
+/* 2026-08-22: SIG_MAX 32 -> 64. The realtime range (32..63) exists so that
+ * glibc NPTL works AT ALL on the Linux personality: its internal SIGCANCEL
+ * is 32 and SIGSETXID is 33, and with SIG_MAX at 32 both rt_sigaction and
+ * tgkill answered EINVAL -- so pthread_cancel and setuid() from any
+ * threaded process were structurally impossible, quietly. tobyOS's mask
+ * convention keeps bit s for signal s (bit 0 unused), so 64 bits carry
+ * signals 1..63; Linux's signal 64 (SIGRTMAX) is the one casualty, refused
+ * with EINVAL rather than silently aliased. */
+#define SIG_MAX  65
+/* Batch 32 (finding 195): signal 64, Linux's SIGRTMAX, rides bit 0, which
+ * the bit-s convention never used -- so 1..63 keep their bits and every
+ * mask, table and loop that counts to SIG_MAX now holds all of Linux's
+ * signals. It was refused with EINVAL: psmisc's `killall -64` and
+ * `kill -64` work on Linux. */
+#define SIGMASK(s) ((uint64_t)((s) == 64 ? 1ull : (1ull << (s))))
+
+/* tobyOS's mask from and to a Linux sigset (signal s at bit s-1): a rotate
+ * by one -- signal 64 is Linux's bit 63 and tobyOS's bit 0. */
+static inline uint64_t sig_mask_from_linux(uint64_t l) { return (l << 1) | (l >> 63); }
+static inline uint64_t sig_mask_to_linux(uint64_t k)   { return (k >> 1) | ((k & 1ull) << 63); }
+
+/* Signals whose DEFAULT DISPOSITION IS IGNORE, as a mask.
+ *
+ * A blocking primitive must not report EINTR for a signal the process is
+ * ignoring -- Linux only interrupts a syscall for a signal that is actually
+ * ACTED ON (a handler, or a default action that stops/kills). Every blocking
+ * path in this kernel except the wait arms was testing `pending_signals` RAW,
+ * so any of these spuriously interrupted it.
+ *
+ * Found 2026-08-27 chasing a "ptrace POKEDATA is broken" gate failure that
+ * turned out not to involve ptrace at all: the tracer sat in read() on a pipe,
+ * the tracee exited, the resulting SIGCHLD (only wired up recently, 269963f)
+ * EINTR'd the read, and the test's `while ((r = read(..)) > 0)` loop treated
+ * that as end-of-data. The value it then blamed on POKEDATA was its own
+ * uninitialised default. pty.c had the same shape, which means a WINDOW RESIZE
+ * (SIGWINCH) interrupted terminal reads.
+ *
+ * Deliberately NARROWER than syscall.c's SLEEP_UNINTERRUPTING, which also
+ * masks the STOP class. Stop handling is taken at a cooperative stop point,
+ * and a read loop that neither returns nor reaches that point would hang a
+ * ^Z'd process -- a different question, on a gate (ttyparity job control)
+ * that was only just closed at 7/7. Not reopening it here. (Batch 15:
+ * that EINTR no longer reaches the program -- signal_deliver restarts a
+ * call a stop interrupted once the process is continued.)
+ *
+ * SIGCONT is here too: its work is done when it is SENT (the stopped
+ * process resumes), and with no handler its delivery does nothing. Left
+ * out, the SIGCONT that resumed a reader made the read it went back to
+ * return EINTR -- `cat` on a pipe, stopped and continued, failed (logs/b15
+ * stopw). */
+#define SIG_DEFAULT_IGNORE_MASK \
+    (SIGMASK(SIGCHLD) | SIGMASK(SIGURG) | SIGMASK(SIGWINCH) | SIGMASK(SIGCONT))
+
+/* Would any signal pending on `p` actually be ACTED ON, and therefore
+ * legitimately interrupt a blocking call?
+ *
+ * NOT a pure function of the pending mask, which is why this is a call and not
+ * a macro. SIG_DEFAULT_IGNORE_MASK above lists signals whose DEFAULT action is
+ * ignore -- but "default" is the operative word: a process that installs a
+ * handler for SIGCHLD (routine for async child reaping) MUST be interrupted so
+ * the handler can run, exactly as Linux does. A first cut of this fix masked
+ * those three unconditionally and so traded one wrong answer for another:
+ * ignored signals stopped interrupting (right) but HANDLED ones stopped too
+ * (wrong). This consults the actual per-thread-group disposition.
+ *
+ * Blocked signals do not count either -- a signal the thread has masked is not
+ * going to be delivered, so it cannot be the reason a syscall returns EINTR. */
+struct proc;   /* forward-declared HERE, before the prototype below: a
+                * `struct proc *` first mentioned inside a prototype gets
+                * PROTOTYPE SCOPE and is a distinct incomplete type, which
+                * produces the memorable "incompatible pointer types passing
+                * 'struct proc *' to 'struct proc *'". */
+bool sig_should_eintr(struct proc *p);
+
+/* Call sites take the PROC, not the mask -- the disposition is needed. */
+#define SIG_SHOULD_EINTR(p)  sig_should_eintr(p)
 
 /* ---- Signal action flags ----
  *
@@ -69,7 +143,10 @@
 
 /* ---- sigaction structure ---- */
 
-typedef uint32_t sigset_t;
+typedef uint64_t sigset_t;   /* 64 signals since 2026-08-22; matches
+                              * libtoby's unsigned long sigset_t for real
+                              * now (the old u32 only matched by accident
+                              * of ucontext padding). */
 
 struct sigaction {
     void     (*sa_handler)(int);
@@ -89,6 +166,7 @@ struct sigaction {
 #define SI_USER    0       /* kill()/raise()/tty-generated */
 #define SI_KERNEL  0x80    /* kernel-synthesized */
 #define SI_TKILL  (-6)     /* tkill/tgkill-generated (Linux) */
+#define SI_QUEUE  (-1)     /* sigqueue(3) (finding 215) */
 
 /* Synchronous-fault si_code values (Linux x86-64). Reported in the
  * siginfo_t a SIGSEGV/SIGFPE/SIGILL handler receives. */
@@ -106,8 +184,15 @@ typedef struct {
     int          si_pid;     /* sending pid (0 == kernel/tty)        */
     unsigned int si_uid;     /* sending uid                          */
     void        *si_addr;    /* fault address (unused for now, 0)    */
-    int          si_status;  /* exit/signal status (unused for now)  */
-    int          _pad;
+    /* sigqueue's value shares si_status's bytes, as in Linux's union
+     * (finding 215): one is meant for SIGCHLD, the other SI_QUEUE */
+    union {
+        struct {
+            int  si_status;  /* exit/signal status (unused for now)  */
+            int  _pad;
+        };
+        uint64_t si_value;   /* SI_QUEUE: union sigval              */
+    };
 } siginfo_t;
 
 /* Minimal machine context. Register slots are populated from the saved
@@ -122,8 +207,9 @@ typedef struct {
 typedef struct ucontext {
     uint64_t          uc_flags;
     struct ucontext  *uc_link;
-    sigset_t          uc_sigmask;
-    uint32_t          _pad;
+    sigset_t          uc_sigmask;   /* was u32 mask + u32 pad; an 8-byte
+                                     * sigset_t occupies the same bytes, so
+                                     * the layout libtoby reads is unchanged */
     mcontext_t        uc_mcontext;
 } ucontext_t;
 
@@ -138,6 +224,17 @@ struct signal_state {
      * send time and read at delivery to populate siginfo_t. */
     int              si_pid[SIG_MAX];
     uint32_t         si_uid[SIG_MAX];
+    /* si_code per pending signal (SI_USER=0 / SI_TKILL=-6). NOT cosmetic:
+     * glibc's NPTL handlers for SIGCANCEL/SIGSETXID begin with
+     *   if (si->si_pid != getpid() || si->si_code != SI_TKILL) return;
+     * -- an anti-spoof check -- so a tgkill-generated signal delivered
+     * with SI_USER is silently DISCARDED by the very handler it exists
+     * for. Found live: the threaded-setuid broadcast's handler ran and
+     * did nothing, forever (2026-08-22). */
+    int8_t           si_code[SIG_MAX];
+    /* sigqueue's value (union sigval) per pending signal, for SI_QUEUE
+     * (finding 215: rt_sigqueueinfo was kill, and the value went) */
+    uint64_t         si_value[SIG_MAX];
 };
 
 /* errno-ish return value for interrupted blocking primitives */
@@ -153,11 +250,24 @@ struct signal_state {
  *
  * THIS MUST STAY IN SYNC WITH THE PUSH SEQUENCE IN syscall_entry.S. */
 struct syscall_regs {
+    /* THE IRETQ RETURN PATH (2026-09-20). sys_sigreturn cannot resume an
+     * interrupted context through SYSRETQ: that instruction loads RIP from
+     * rcx and RFLAGS from r11, so the user's own rcx/r11 are destroyed. That
+     * is harmless when the context was a syscall (the ABI already treats
+     * them as dead there) and fatal when it was interrupted by the TIMER
+     * IRQ in the middle of ordinary code -- which is exactly how a caught
+     * signal reaches a running process (pit.c -> signal_deliver_irq). GNU
+     * bash 5.2 in the corpus took its SIGCHLD that way and faulted with ecx
+     * holding a code address. So sys_sigreturn parks the real rcx/r11 here
+     * and sets `pad` non-zero; syscall_return_unwind then builds an IRETQ
+     * frame instead of falling through to sysretq. Pushed as zero on every
+     * entry, so a stale selector can never leak into the next syscall. */
+    uint64_t sig_rcx, sig_r11;
     uint64_t r15, r14, r13, r12, rbp, rbx;   /* callee-saved          */
     uint64_t r9, r8, r10, rdx, rsi, rdi;     /* user syscall arg regs */
     uint64_t r11;        /* user RFLAGS (SYSRETQ reloads from here)   */
     uint64_t rcx;        /* user RIP    (SYSRETQ reloads from here)   */
-    uint64_t pad;        /* 16-byte alignment pad                     */
+    uint64_t pad;        /* alignment pad; non-zero = return via IRETQ  */
     uint64_t user_rsp;   /* saved user RSP                            */
 };
 
@@ -169,6 +279,18 @@ void signal_init(void);
 
 /* Initialize per-process signal state to defaults */
 void signal_init_proc(struct signal_state *ss);
+/* execve's reset: caught -> default, ignored stays, mask and pending kept. */
+void signal_exec_reset(struct signal_state *ss);
+
+/* The HANDLER TABLE is a thread-group property (POSIX sighand): a handler
+ * installed by any thread is visible to all. Threads reach the LEADER's
+ * actions[] through this accessor -- the same indirection proc_fds() uses
+ * for the fd table, and for the same reason: sys_clone_thread's whole-PCB
+ * memcpy gives each thread a SNAPSHOT copy, and before this accessor
+ * existed (2026-08-22) a handler installed after pthread_create was
+ * invisible to every sibling. Masks and pending sets stay PER-THREAD --
+ * that half of the split is correct POSIX, not a shortcut. */
+struct sigaction *sig_actions_of(struct proc *p);
 
 /* Foreground tracking */
 int  signal_get_foreground(void);
@@ -177,13 +299,30 @@ void signal_set_foreground(int pid);
 /* Send a signal. Safe from IRQ context. */
 void signal_send(struct proc *p, int sig);
 void signal_send_to_pid(int pid, int sig);
+/* Same, but reports a pid that does not exist: 0 on delivery, -1 if there
+ * is no such process. The shell's `kill` needs the answer for its status. */
+int  signal_send_to_pid_checked(int pid, int sig);
 void signal_send_to_foreground(int sig);
+/* Group send for the tty/pty line discipline (^C/^Z to the foreground
+ * group). Kernel-trusted; no permission model. */
+void signal_send_to_pgrp(int pgrp, int sig);
+
+/* Cooperative stop point for long-held syscall loops: applies one pending
+ * default-disposition stop (parks until SIGCONT) and returns true; false
+ * when the pending stop is caught (caller should EINTR instead). */
+bool signal_take_pending_stop(void);
 
 /* Check and deliver pending signals from an IRQ (PIT) context, where no
  * saved syscall trapframe exists. Handles fatal/default dispositions;
  * caught (user-handler) signals are left pending for the next syscall
  * return to deliver. */
 void signal_deliver_if_pending(void);
+/* Deliver a CAUGHT signal from the timer IRQ by rewriting the ring-3
+ * trapframe. Without this, a process that installs a handler and then spins
+ * in userspace never receives the signal at all -- signal_deliver_if_pending
+ * defers caught signals to "the next syscall return", which a pure userspace
+ * loop never reaches. Returns true if a handler was entered. */
+bool signal_deliver_irq(struct regs *r);
 
 /* Check and deliver pending signals from the SYSCALL return path. `rv` is
  * the syscall's return value and `num` its number (for SA_RESTART: an
@@ -191,8 +330,10 @@ void signal_deliver_if_pending(void);
  * the saved user RIP to the `syscall` instruction with RAX = num). For a
  * signal with a user handler this pushes a signal frame onto the user stack
  * and rewrites the saved trapframe so the SYSRETQ lands in the handler;
- * sys_sigreturn later restores the context. */
-void signal_deliver_syscall(long rv, long num);
+ * sys_sigreturn later restores the context. Returns the value the call
+ * returns to user mode: RV, or NUM when a stop with no handler interrupted
+ * it and it is to run again (the saved RIP rewound). */
+long signal_deliver_syscall(long rv, long num);
 
 /* Deliver a SYNCHRONOUS CPU-fault signal (SIGSEGV/SIGFPE/SIGILL/...) to the
  * faulting user process from the exception path. `r` is the CPU exception
@@ -224,8 +365,16 @@ long sys_sigreturn(void);
 /* sigrestorer: register the user-space sigreturn trampoline address. */
 void sys_sigrestorer(uint64_t addr);
 
-/* kill: send signal to process */
+/* kill: send signal to process (process-directed: may deliver to any
+ * group member with the signal unblocked) */
 int sys_kill(int pid, int sig);
+/* Finding 215: sigqueue(3) / rt_sigqueueinfo(2) -- kill(PID, SIG) with
+ * siginfo's si_code CODE and si_value VALUE */
+int signal_queue(int pid, int sig, int code, uint64_t value);
+
+/* tkill/tgkill: thread-directed, never retargeted; tgid > 0 is verified
+ * against the target's group, tgid <= 0 skips the check (tkill). */
+int sys_tgkill(int tgid, int tid, int sig);
 
 /* sigprocmask `how` values */
 #define SIG_BLOCK   0

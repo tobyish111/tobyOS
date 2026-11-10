@@ -241,6 +241,12 @@ bool kbd_haschar(void) {
              case 0x4F: kbd_dispatch_char((char)0x85); break; /* End   */
              case 0x53: kbd_dispatch_char((char)0x86); break; /* Del   */
              case 0x5D: kbd_dispatch_char((char)0x87); break; /* Menu  */
+             /* 2026-08-24: PageUp/PageDown were the only navigation keys
+              * with no code at all, so /bin/gui_term bound its scrollback
+              * to 0x86/0x87 -- which are Delete and Menu. Giving them real
+              * codes (TK_KEY_PGUP/PGDN) is what frees Delete to be Delete. */
+             case 0x49: kbd_dispatch_char((char)0x88); break; /* PgUp  */
+             case 0x51: kbd_dispatch_char((char)0x89); break; /* PgDn  */
              /* Win/Super key -> toggle the taskbar app search, so an
               * app launch is: Win, type a few letters, Enter. */
              case 0x5B:                                       /* LWin  */
@@ -357,21 +363,26 @@ bool kbd_haschar(void) {
      g_chars_dispatched++;
      g_last_char = c;
  
-    /* TTY job-control keys -> signals to the foreground process. Checked
-    * before the GUI dispatch so they work from the console shell; when no
-    * console foreground job is set (the usual case under the GUI) the send
-    * is a no-op, so GUI apps still see normal keys. Track B/B21: this is now
-    * driven by the live console termios -- tty_handle_isig() fires SIGINT/
-    * SIGQUIT/SIGTSTP only while ISIG is set and only for the configured
-    * VINTR/VQUIT/VSUSP control chars, so an app in raw mode (ISIG cleared)
-    * receives e.g. Ctrl-C as a literal data byte instead of a signal. */
-    if (tty_handle_isig(c)) return;
-
+    /* UNDER THE DESKTOP A KEY IS THE FOCUSED WINDOW'S, ^C ^\ ^Z included:
+     * the terminal window's pty makes them signals for ITS foreground job
+     * (pty.c pty_master_write), as a Linux terminal window does while the
+     * console's ISIG sleeps under X. They were taken for the CONSOLE first
+     * -- tty_handle_isig consumed them whatever had the keyboard (the
+     * comment here said GUI apps still saw them; none ever did) -- so ^C
+     * in the terminal window interrupted the console's kernel shell
+     * instead, and `sleep 15` in the window ran on
+     * (tools/agent/probes/b21/guiterm.py). */
      if (gui_active()) {
          gui_post_key((uint8_t)c);
          return;
      }
- 
+
+    /* The console's: its termios decides (tty_handle_isig fires SIGINT/
+     * SIGQUIT/SIGTSTP only while ISIG is set and only for the configured
+     * VINTR/VQUIT/VSUSP control chars, so an app in raw mode receives e.g.
+     * Ctrl-C as a literal data byte instead of a signal). */
+    if (tty_handle_isig(c)) return;
+
      buf_push(c);
  }
 

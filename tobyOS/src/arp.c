@@ -25,6 +25,21 @@ struct arp_entry {
 static struct arp_entry g_cache[ARP_CACHE_MAX];
 static unsigned         g_next_evict;
 
+bool arp_cache_entry(int i, uint32_t *ip_be, uint8_t mac[ETH_ADDR_LEN]) {
+    if (i < 0 || i >= ARP_CACHE_MAX || !g_cache[i].valid) return false;
+    if (ip_be) *ip_be = g_cache[i].ip;
+    if (mac) memcpy(mac, g_cache[i].mac, ETH_ADDR_LEN);
+    return true;
+}
+
+int arp_cache_capacity(void) { return ARP_CACHE_MAX; }
+
+bool arp_cache_delete(uint32_t ip_be) {
+    for (int i = 0; i < ARP_CACHE_MAX; i++)
+        if (g_cache[i].valid && g_cache[i].ip == ip_be) { g_cache[i].valid = false; return true; }
+    return false;
+}
+
 void arp_init(void) {
     memset(g_cache, 0, sizeof(g_cache));
     g_next_evict = 0;

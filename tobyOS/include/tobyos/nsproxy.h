@@ -157,10 +157,12 @@ void ns_file_close(struct file *f);
 /* =====================================================================
  * PID namespaces (slice 10) -- src/pid_ns.c owns `struct pid_ns`.
  *
- * THE CONSTRAINT THAT SHAPES ALL OF THIS: in tobyOS a process's pid IS its
- * index into `g_proc[PROC_MAX]`, and `proc_lookup()` is a direct array index.
- * A pid therefore cannot be reassigned, and `struct proc`, the ready queues,
- * wait queues and every internal reference keep using it.
+ * THE CONSTRAINT THAT SHAPED ALL OF THIS: in tobyOS a process's pid WAS its
+ * index into `g_proc[PROC_MAX]`, and `proc_lookup()` a direct array index.
+ * (Since batch 26 pids run to PID_MAX and proc_lookup goes through a map --
+ * proc.h -- but there is still one stored pid per process.) A pid therefore
+ * cannot be reassigned, and `struct proc`, the ready queues, wait queues and
+ * every internal reference keep using it.
  *
  * So pids follow the shape slice 2 chose for uids: **the stored pid is always
  * the host / initial-namespace number (call it the kpid), and namespace-local
@@ -176,6 +178,10 @@ void ns_file_close(struct file *f);
  * itself the visibility test: `pid_vnr_in(ns, kpid) == 0` means "not visible
  * from ns", with no separate ancestry walk.
  * ===================================================================== */
+
+/* The last pid handed out in pid namespace NS (NULL: the initial one) --
+ * /proc/sys/kernel/ns_last_pid. */
+int pid_ns_last_pid(void *ns);
 
 /* Called from every process-creation path AFTER the namespace pointers have
  * been inherited. Places `child` in the correct pid namespace -- which is
@@ -214,7 +220,8 @@ void pid_ns_kill_members(struct proc *p);
 int  pid_ns_reaper_kpid(struct proc *dead);
 
 /* Lifecycle hooks used by nsproxy.c's generic dispatch. */
-void    *pid_ns_create(void *parent_ns);
+void    *pid_ns_create(void *parent_ns, void *owner_user_ns);
+void    *pid_ns_owner(void *pid_ns);     /* finding 241: NULL = initial */
 void     pid_ns_get(void *ns);
 void     pid_ns_put(void *ns);
 uint64_t pid_ns_inum(void *ns);
@@ -260,6 +267,15 @@ long userns_write_map(struct proc *target, bool want_uid,
                       const char *buf, size_t len);
 long userns_write_setgroups(struct proc *target, const char *buf, size_t len);
 bool userns_setgroups_allowed(struct proc *p);
+/* Finding 241: setgroups(2) only once gid_map is written and setgroups is
+ * allowed; a user namespace only by a caller its own namespace has ids for */
+bool userns_may_setgroups(struct proc *p);
+bool userns_may_create(void);
+bool userns_covers(void *anc, void *ns);   /* ANC is NS or above it */
+/* Finding 257: a capability over an object's owning namespace, and over a
+ * file's ids */
+bool userns_capable_over(int cap, void *owner_ns);
+bool userns_capable_wrt_ids(int cap, uint32_t kuid, uint32_t kgid);
 
 /* Which user namespace owns a mount namespace (vfs.c). NULL == initial. */
 void *mount_ns_owner(void *mnt_ns);
@@ -277,6 +293,7 @@ void    *net_ns_create(void);
 void     net_ns_get(void *ns);
 void     net_ns_put(void *ns);
 uint64_t net_ns_inum(void *ns);
+void    *net_ns_owner(void *ns);   /* finding 257: NULL = the initial user ns */
 bool     net_ns_is_initial(struct proc *p);
 /* May a socket created in `sock_ns` touch a real interface? Asked of the
  * SOCKET's namespace, not the caller's, so a socket predating an unshare keeps
@@ -362,6 +379,10 @@ struct net_dev *net_ctx_dev(void);
 #define LCAP_SETUID     7
 #define LCAP_NET_ADMIN  12
 #define LCAP_SYS_CHROOT 18
+#define LCAP_SYS_PTRACE 19   /* finding 257 */
 #define LCAP_SYS_ADMIN  21
+#define LCAP_MKNOD      27
+#define LCAP_FOWNER     3
+#define LCAP_SETFCAP    31
 
 #endif /* TOBYOS_NSPROXY_H */

@@ -1,0 +1,597 @@
+/* shparity/main.c -- the bash-parity gate: /bin/shparity.
+ *
+ * THE CONTRACT THIS MEASURES
+ * --------------------------
+ * The tobyOS shell is meant to be a SUPERSET of bash, the way TypeScript is
+ * a superset of JavaScript: every script that runs under bash must run under
+ * tsh and produce the SAME BYTES and the SAME EXIT STATUS. Extra features are
+ * allowed; divergence on shared syntax is a bug, not a dialect.
+ *
+ * "Superset" is a claim until something checks it, so this program checks it
+ * DIFFERENTIALLY against the real thing. tobyOS already ships an unmodified
+ * GNU bash 5.2 (programs/realbash), so the oracle is not a specification we
+ * interpret -- it is the actual binary every user compares us against. For
+ * each corpus script we run:
+ *
+ *     /bin/bash --norc --noprofile CASE      (the oracle)
+ *     /bin/tsh                     CASE      (the subject)
+ *
+ * with identical argv, identical environment, and identical fresh working
+ * directories, then require byte-identical stdout and identical exit status.
+ *
+ * WHAT COUNTS AS A FAILURE, AND WHAT DOES NOT
+ * -------------------------------------------
+ * stdout and exit status must match EXACTLY -- that is the superset contract.
+ * stderr is captured and reported but NOT required to match: diagnostics
+ * legitimately name the shell that produced them ("bash: line 3: ..." can
+ * never equal a tsh message), so requiring equality there would bake in a
+ * failure we would then be tempted to paper over. It is reported so a case
+ * that starts spewing errors is still visible.
+ *
+ * WHY A FRESH WORKING DIRECTORY PER RUN
+ * -------------------------------------
+ * Cases that create files (redirection, globbing) would otherwise let the
+ * bash run seed state that the tsh run reads -- the second shell would look
+ * correct because the first one already did the work. Each run gets a wiped
+ * directory, so each shell is measured on what IT did.
+ *
+ * WHERE SCRATCH LIVES
+ * -------------------
+ * /tmp (tmpfs), falling back to /data. It cannot live on `/`: the root
+ * filesystem is the read-only initrd ramfs, whose create hook returns ROFS
+ * for any path not already in the tar. If neither is writable the gate
+ * reports SKIP -- loudly, with the reason -- rather than inventing a pass. A
+ * gate that silently degrades is worse than no gate. See SCRATCH_DIR below
+ * for why this moved off the persistent volume.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <signal.h>
+
+extern pid_t toby_spawn(const char *path, char *const argv[],
+                        char *const envp[], int fd0, int fd1, int fd2);
+
+#define CORPUS_DIR   "/etc/shparity"
+/* Scratch lives on tmpfs, not on the persistent volume.
+ *
+ * It used to be /data, because /tmp did not exist -- the root filesystem is
+ * the read-only initrd ramfs and nothing had ever mounted a writable temp
+ * area. That made every gate run write to the real disk, and killing QEMU
+ * mid-run (which the harness script does on timeout) eventually corrupted the
+ * volume: `mount of '/data' WARNING: 20 issue(s): ino=96 allocated but
+ * type=FREE (orphan slot)`, after which the scratch directory could be
+ * neither opened nor recreated and the gate could only report SKIP.
+ *
+ * A test harness has no business persisting anything. tmpfs is fresh every
+ * boot, needs no cleanup, cannot be corrupted by a hard kill, and does not
+ * make the gate depend on a disk being attached. */
+#define SCRATCH_DIR  "/tmp/shparity"
+#define SCRATCH_ALT  "/data/shparity"   /* fallback if /tmp is missing */
+#define BASH_PATH    "/bin/bash"
+#define TSH_PATH     "/bin/tsh"
+
+#define MAX_PATH     256
+/* Per-stream capture cap. 64 KiB was outgrown by batch 27's help cases --
+ * every help topic in four forms is ~200 KB -- which came back "BROKEN
+ * capture" rather than compared. */
+#define CAP_OUT      (1024 * 1024)
+
+/* Captured output lives in .bss, not on the stack: two CAP_OUT buffers is
+ * 2 MiB and user stacks here are far smaller than that. */
+static char g_buf_a[CAP_OUT];
+static char g_buf_b[CAP_OUT];
+/* The case list grows with the corpus. It was a fixed 160 rows, and the
+ * readdir loop stopped at the 161st case WITHOUT A WORD: with 163 fixtures
+ * the verdict read "PASS 160/160" while three cases -- whichever readdir
+ * happened to return last -- were never run. */
+static char (*g_cases)[NAME_MAX + 1];
+static int  g_ncases, g_cases_cap;
+
+/* ---- output -------------------------------------------------------------
+ *
+ * Every line is formatted into one buffer and emitted with a SINGLE write().
+ * The serial console splits a printf at its format conversions, so a line
+ * built from several printf calls arrives interleaved with whatever else is
+ * logging -- and then a whole-line grep in the host harness silently matches
+ * nothing. One write per line is what makes the host-side greps trustworthy. */
+static void emit(const char *s) {
+    write(1, s, strlen(s));
+}
+
+static void emitf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void emitf(const char *fmt, ...) {
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof line - 1) n = (int)sizeof line - 1;
+    write(1, line, (size_t)n);
+}
+
+/* ---- small helpers ------------------------------------------------------ */
+
+static int has_suffix(const char *s, const char *suf) {
+    size_t ls = strlen(s), lf = strlen(suf);
+    return ls >= lf && strcmp(s + ls - lf, suf) == 0;
+}
+
+/* Read a whole file into `buf`, capped. Returns the byte count, or -1. A file
+ * that would exceed the cap is reported as an error rather than silently
+ * truncated -- a truncated capture compares equal too easily. */
+static long read_all(const char *path, char *buf, size_t cap) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    size_t got = 0;
+    for (;;) {
+        if (got >= cap) { close(fd); return -2; }   /* overflow */
+        ssize_t n = read(fd, buf + got, cap - got);
+        if (n < 0) { close(fd); return -1; }
+        if (n == 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+    return (long)got;
+}
+
+/* Delete every regular file in `dir`. The corpus is written so that cases do
+ * not create subdirectories, so a flat sweep is enough; a case that did would
+ * show up as a leftover and is worth catching loudly rather than recursing
+ * blindly under a path we then delete from. */
+static int wipe_dir(const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    struct dirent *de;
+    int left = 0;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (de->d_type == DT_DIR) { left++; continue; }
+        char p[MAX_PATH];
+        snprintf(p, sizeof p, "%s/%s", dir, de->d_name);
+        if (unlink(p) != 0) left++;
+    }
+    closedir(d);
+    return left;      /* >0 == something survived; caller decides how loud */
+}
+
+/* ---- running one shell over one case ------------------------------------
+ *
+ * Returns the child's exit status, or a negative value if it could not run.
+ * `workdir` is the child's cwd; `out`/`err` receive its two streams. */
+/* A BACKGROUND JOB CAN STILL BE WRITING WHEN THE SHELL HAS EXITED.
+ *
+ *     echo trailing &          # the case's last line (fixture 71)
+ *
+ * Neither shell waits for it (bash does not, and since S1 neither does
+ * tsh), so its output can land after waitpid() on the shell has returned,
+ * and reading the files at once lost it: gates-s12cA's first run failed 71
+ * with no "trailing" from tsh (finding 31). So the shell runs in a process
+ * group of its own -- forked, it takes a new group and execs -- and
+ * after the shell has exited, the case is over only when nothing is left
+ * in that group: a job started with `&` stays in its shell's group unless
+ * `set -m` gives it one. Bounded by GROUP_WAIT_MS, so a job that outlives
+ * the case on purpose cannot hold the gate. (Orphans are re-marked ppid -1
+ * when their parent exits, so the group, not the parent link, is what
+ * still ties them to the case.) */
+#define GROUP_STEP_MS  1     /* < 2 ms: a nap that spins, see oilspec's wait_bounded */
+#define GROUP_WAIT_MS  3000
+static void wait_for_group(pid_t pgid) {
+    for (int waited = 0; waited < GROUP_WAIT_MS; waited += GROUP_STEP_MS) {
+        if (kill(-pgid, 0) != 0) return;          /* nobody left */
+        usleep(GROUP_STEP_MS * 1000);
+    }
+}
+
+static int run_shell(const char *shell, char *const argv[],
+                     const char *workdir, const char *out, const char *err) {
+    static char *const envp[] = {
+        (char *)"PATH=/bin",
+        (char *)"HOME=/",
+        (char *)"TERM=dumb",
+        (char *)"LC_ALL=C",
+        0
+    };
+
+    int fo = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fo < 0) return -101;
+    int fe = open(err, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fe < 0) { close(fo); return -102; }
+
+    /* The child inherits our cwd, so chdir here and restore after. Both
+     * shells therefore start from a byte-identical directory state. */
+    char saved[MAX_PATH];
+    if (!getcwd(saved, sizeof saved)) saved[0] = '\0';
+    if (chdir(workdir) != 0) { close(fo); close(fe); return -103; }
+
+    /* The shell leads a process group of its own and is still OUR child, so
+     * everything a case can see is what toby_spawn gave it -- above all
+     * $PPID, which a forked leader in between made a new number on every
+     * run (Oils 2653 turned oracle-nondet that way). fork, take the group,
+     * fds 0-2 only (toby_spawn passes exactly three), the signal state a
+     * fresh process has, exec. */
+    pid_t pid = fork();
+    if (pid == 0) {
+        (void)setpgid(0, 0);
+        if (dup2(fo, 1) < 0 || dup2(fe, 2) < 0) _exit(126);
+        for (int fd = 3; fd < 256; fd++) close(fd);
+        sigset_t none;
+        sigemptyset(&none);
+        (void)sigprocmask(SIG_SETMASK, &none, 0);
+        for (int s = 1; s < 32; s++) (void)signal(s, SIG_DFL);
+        execve(shell, argv, envp);
+        _exit(127);
+    }
+
+    if (saved[0]) (void)chdir(saved);
+    close(fo);
+    close(fe);
+
+    if (pid < 0) return -104;
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -105;
+    wait_for_group(pid);
+    return WEXITSTATUS(status);
+}
+
+/* ---- diffing ------------------------------------------------------------ */
+
+/* Print the first differing line from each side, escaped and truncated. This
+ * is the whole diagnostic value of the gate: "outputs differ" tells you
+ * nothing, "line 3: bash said `a b` and tsh said `a  b`" tells you it is word
+ * splitting. */
+/* Print every differing LINE, not just the first differing byte.
+ *
+ * The old version reported one line per side, taken at the first byte that
+ * differed. That is enough to know a case failed and almost never enough to
+ * know why: if one shell emits an extra line early, every later line is
+ * "different" and the reported pair points at whatever happened to be
+ * adjacent rather than at the cause. Three root causes in a row were read
+ * wrong that way -- a per-handle lseek looked like a flushing problem, a
+ * multi-line function body looked like a getopts bug, and a builtin shadowing
+ * /bin/cat looked like a pipeline bug.
+ *
+ * Comparing line by line and showing each mismatch makes the SHAPE of the
+ * difference visible: a missing line, an extra line, or a changed one. Bounded,
+ * so a wholly divergent case cannot flood the serial log. */
+
+#define DIFF_MAX_LINES 400
+/* ...and how many stderr lines per side; see the reporting block below. */
+#define STDERR_MAX_LINES 12   /* a whole probe fixture, not a taste of it */
+
+/* Copy line `want` (0-based) of `buf` into `out`, escaping control characters.
+ * Returns -1 if that line does not exist -- itself information, since it says
+ * one side simply stopped producing output. */
+static int line_at(const char *buf, long len, int want, char *out, size_t cap) {
+    int line = 0;
+    long i = 0;
+    while (i < len && line < want) {
+        if (buf[i] == '\n') line++;
+        i++;
+    }
+    if (i >= len && line < want) return -1;
+    size_t o = 0;
+    for (; i < len && buf[i] != '\n' && o + 5 < cap; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c == '\t') { out[o++] = '\\'; out[o++] = 't'; }
+        else if (c < 0x20 || c == 0x7f)
+            o += (size_t)snprintf(out + o, cap - o, "\\x%02x", c);
+        else out[o++] = (char)c;
+    }
+    out[o] = '\0';
+    return 0;
+}
+
+static int count_lines(const char *buf, long len) {
+    int n = 0;
+    for (long i = 0; i < len; i++) if (buf[i] == '\n') n++;
+    if (len > 0 && buf[len - 1] != '\n') n++;
+    return n;
+}
+
+/* THE SHELL'S OWN NAME IS NOT BEHAVIOUR (S12). A diagnostic starts with
+ * where it came from -- "SCRIPT: line N: " in a script, which both shells
+ * spell the same, but "bash: " / "tsh: " (or "/bin/bash: ", "sh: ") for a
+ * nested -c or a startup error, and tsh cannot call itself bash. Such a
+ * line-leading name becomes "SH: " on both sides before stderr is compared;
+ * every other byte must match. In place; returns the new length. */
+static long norm_progname(char *t, long len) {
+    static const char *const pfx[] = { "/bin/bash: ", "/bin/tsh: ", "/bin/sh: ",
+                                        "bash: ", "tsh: ", "sh: ", 0 };
+    long r = 0, w = 0;
+    while (r < len) {
+        if (r == 0 || t[r - 1] == '\n') {
+            for (int i = 0; pfx[i]; i++) {
+                long pl = (long)strlen(pfx[i]);
+                if (r + pl <= len && memcmp(t + r, pfx[i], (size_t)pl) == 0) {
+                    memcpy(t + w, "SH: ", 4);
+                    w += 4;
+                    r += pl;
+                    break;
+                }
+            }
+            if (r >= len) break;
+        }
+        t[w++] = t[r++];
+    }
+    return w;
+}
+
+/* ...and a PID is not behaviour either: the two shells' children get
+ * different ones. Two shapes carry one: kill's "kill: (-38) - No such
+ * process", and a job's death report, "SCRIPT: line 3:    79 Killed ..."
+ * (bash's %5d). The number becomes "#" on both sides. Only ever shortens,
+ * so it works in place; returns the new length. */
+static long norm_pids(char *t, long len) {
+    long r = 0, w = 0;
+    while (r < len) {
+        if (r + 7 <= len && memcmp(t + r, "kill: (", 7) == 0) {
+            memmove(t + w, t + r, 7);
+            w += 7;
+            r += 7;
+            if (r < len && t[r] == '-') t[w++] = t[r++];
+            if (r < len && t[r] >= '0' && t[r] <= '9') {
+                while (r < len && t[r] >= '0' && t[r] <= '9') r++;
+                t[w++] = '#';
+            }
+            continue;
+        }
+        if (r + 7 <= len && memcmp(t + r, ": line ", 7) == 0) {
+            long q = r + 7;
+            while (q < len && t[q] >= '0' && t[q] <= '9') q++;
+            if (q > r + 7 && q + 2 <= len && t[q] == ':' && t[q + 1] == ' ') {
+                long d = q + 2, e;
+                while (d < len && t[d] == ' ') d++;
+                e = d;
+                while (e < len && t[e] >= '0' && t[e] <= '9') e++;
+                if (e > d && e < len && t[e] == ' ') {
+                    memmove(t + w, t + r, (size_t)(q + 2 - r));
+                    w += q + 2 - r;
+                    t[w++] = '#';
+                    r = e;
+                    continue;
+                }
+            }
+        }
+        t[w++] = t[r++];
+    }
+    return w;
+}
+
+static void show_diff(const char *a, long na, const char *b, long nb) {
+    int la = count_lines(a, na), lb = count_lines(b, nb);
+    emitf("[shparity]     lines bash=%d tsh=%d\n", la, lb);
+
+    int shown = 0;
+    int most = (la > lb) ? la : lb;
+    for (int n = 0; n < most && shown < DIFF_MAX_LINES; n++) {
+        char ta[160], tb[160];
+        int ra = line_at(a, na, n, ta, sizeof ta);
+        int rb = line_at(b, nb, n, tb, sizeof tb);
+        if (ra < 0) ta[0] = '\0';
+        if (rb < 0) tb[0] = '\0';
+        if (ra == rb && strcmp(ta, tb) == 0) continue;
+        emitf("[shparity]     L%-3d bash: %s\n", n + 1, ra < 0 ? "<none>" : ta);
+        emitf("[shparity]     L%-3d tsh : %s\n", n + 1, rb < 0 ? "<none>" : tb);
+        shown++;
+    }
+    if (shown >= DIFF_MAX_LINES)
+        emitf("[shparity]     ... further differences suppressed\n");
+}
+
+/* ---- main --------------------------------------------------------------- */
+
+int main(void) {
+    emit("[shparity] ==== tobyOS shell <-> GNU bash differential parity gate ====\n");
+
+    /* --- oracle and subject must both exist. Say which is missing. --- */
+    int fd = open(BASH_PATH, O_RDONLY);
+    if (fd < 0) {
+        emit("[SHPARITY] VERDICT: SKIP reason=no-bash "
+             "(need programs/realbash/bash staged as /bin/bash)\n");
+        return 0;
+    }
+    close(fd);
+
+    fd = open(TSH_PATH, O_RDONLY);
+    if (fd < 0) {
+        emit("[SHPARITY] VERDICT: SKIP reason=no-tsh "
+             "(programs/sh/sh.elf must be staged as /bin/tsh)\n");
+        return 0;
+    }
+    close(fd);
+
+    /* --- scratch space: tmpfs, falling back to /data. See the header. --- */
+    const char *scratch = 0;
+    static const char *const candidates[] = { SCRATCH_DIR, SCRATCH_ALT, 0 };
+    for (int c = 0; candidates[c] && !scratch; c++) {
+        if (mkdir(candidates[c], 0755) == 0) { scratch = candidates[c]; break; }
+        /* Already there is fine -- as long as it can actually be opened.
+         * A directory whose inode was orphaned by a crash fails BOTH
+         * mkdir (the name exists) and opendir (the inode does not), which
+         * is exactly why this tries the next candidate instead of
+         * assuming the first one works. */
+        DIR *probe = opendir(candidates[c]);
+        if (probe) { closedir(probe); scratch = candidates[c]; }
+    }
+    if (!scratch) {
+        emit("[SHPARITY] VERDICT: SKIP reason=no-writable-scratch "
+             "(tried /tmp and /data; root is the read-only initrd ramfs)\n");
+        return 0;
+    }
+    emitf("[shparity] scratch: %s\n", scratch);
+
+    char wdir_a[MAX_PATH], wdir_b[MAX_PATH];
+    snprintf(wdir_a, sizeof wdir_a, "%s/a", scratch);
+    snprintf(wdir_b, sizeof wdir_b, "%s/b", scratch);
+    (void)mkdir(wdir_a, 0755);
+    (void)mkdir(wdir_b, 0755);
+
+    /* --- collect the corpus, sorted, so runs are comparable to each other. */
+    DIR *cd = opendir(CORPUS_DIR);
+    if (!cd) {
+        emit("[SHPARITY] VERDICT: SKIP reason=no-corpus "
+             "(expected " CORPUS_DIR "/*.sh in the initrd)\n");
+        return 0;
+    }
+    struct dirent *de;
+    while ((de = readdir(cd)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        if (!has_suffix(de->d_name, ".sh")) continue;
+        if (g_ncases == g_cases_cap) {
+            int ncap = g_cases_cap ? g_cases_cap * 2 : 256;
+            void *nc = realloc(g_cases, (size_t)ncap * sizeof g_cases[0]);
+            if (!nc) {
+                emit("[SHPARITY] VERDICT: BROKEN reason=out-of-memory "
+                     "(the case list could not grow)\n");
+                closedir(cd);
+                return 1;
+            }
+            g_cases = nc;
+            g_cases_cap = ncap;
+        }
+        snprintf(g_cases[g_ncases], sizeof g_cases[0], "%s", de->d_name);
+        g_ncases++;
+    }
+    closedir(cd);
+
+    for (int i = 1; i < g_ncases; i++) {          /* insertion sort by name */
+        char key[NAME_MAX + 1];
+        snprintf(key, sizeof key, "%s", g_cases[i]);
+        int j = i - 1;
+        while (j >= 0 && strcmp(g_cases[j], key) > 0) {
+            memcpy(g_cases[j + 1], g_cases[j], sizeof g_cases[0]);
+            j--;
+        }
+        snprintf(g_cases[j + 1], sizeof g_cases[0], "%s", key);
+    }
+
+    if (g_ncases == 0) {
+        emit("[SHPARITY] VERDICT: SKIP reason=empty-corpus\n");
+        return 0;
+    }
+    emitf("[shparity] corpus: %d case(s) from %s\n", g_ncases, CORPUS_DIR);
+
+    /* --- run every case under both shells. --- */
+    int pass = 0, fail = 0, broke = 0, errdiff = 0, errneq = 0;
+
+    for (int i = 0; i < g_ncases; i++) {
+        char cpath[MAX_PATH];
+        snprintf(cpath, sizeof cpath, "%s/%s", CORPUS_DIR, g_cases[i]);
+
+        char ao[MAX_PATH], ae[MAX_PATH], bo[MAX_PATH], be[MAX_PATH];
+        snprintf(ao, sizeof ao, "%s/a.out", scratch);
+        snprintf(ae, sizeof ae, "%s/a.err", scratch);
+        snprintf(bo, sizeof bo, "%s/b.out", scratch);
+        snprintf(be, sizeof be, "%s/b.err", scratch);
+
+        /* Identical argv shape for both: argv[0], the script, nothing else.
+         * bash gets --norc/--noprofile so no startup file can perturb it. */
+        char *bash_argv[] = { (char *)"bash", (char *)"--norc",
+                              (char *)"--noprofile", cpath, 0 };
+        char *tsh_argv[]  = { (char *)"tsh", cpath, 0 };
+
+        wipe_dir(wdir_a);
+        int rc_a = run_shell(BASH_PATH, bash_argv, wdir_a, ao, ae);
+
+        wipe_dir(wdir_b);
+        int rc_b = run_shell(TSH_PATH, tsh_argv, wdir_b, bo, be);
+
+        if (rc_a <= -100 || rc_b <= -100) {
+            emitf("[shparity] %-28s BROKEN spawn rc bash=%d tsh=%d\n",
+                  g_cases[i], rc_a, rc_b);
+            broke++;
+            continue;
+        }
+
+        long na = read_all(ao, g_buf_a, sizeof g_buf_a);
+        long nb = read_all(bo, g_buf_b, sizeof g_buf_b);
+        if (na < 0 || nb < 0) {
+            emitf("[shparity] %-28s BROKEN capture bash=%ld tsh=%ld\n",
+                  g_cases[i], na, nb);
+            broke++;
+            continue;
+        }
+
+        int same_out = (na == nb) && (memcmp(g_buf_a, g_buf_b, (size_t)na) == 0);
+        int same_rc  = (rc_a == rc_b);
+
+        if (same_out && same_rc) {
+            emitf("[shparity] %-28s PASS  (%ld bytes, exit=%d)\n",
+                  g_cases[i], na, rc_a);
+            pass++;
+        } else {
+            emitf("[shparity] %-28s FAIL  stdout=%s exit bash=%d tsh=%d\n",
+                  g_cases[i], same_out ? "same" : "DIFF", rc_a, rc_b);
+            if (!same_out) show_diff(g_buf_a, na, g_buf_b, nb);
+            fail++;
+        }
+
+        /* stderr is informational -- reported, never fatal. See header. But
+         * its lines are usually the actual cause ("[: not found" explains a
+         * whole file of wrong branches), so print them rather than only a
+         * byte count that leaves the reader guessing.
+         *
+         * UP TO STDERR_MAX_LINES, not just the first. A case that failed for
+         * TWO reasons showed only the earlier one, so each fix revealed the
+         * next only after another full build-and-boot round -- twice on the
+         * for-expression probe (2026-09-20). */
+        long ea_n = read_all(ae, g_buf_a, sizeof g_buf_a);
+        long eb_n = read_all(be, g_buf_b, sizeof g_buf_b);
+        if (ea_n > 0 || eb_n > 0) {
+            errdiff++;
+            /* Compared with the program name and pids normalised (S12):
+             * still informational, but counted, so the number can be driven
+             * to zero. The lines printed below are the normalised ones. */
+            {
+                long na = norm_pids(g_buf_a,
+                                    norm_progname(g_buf_a, ea_n < 0 ? 0 : ea_n));
+                long nb = norm_pids(g_buf_b,
+                                    norm_progname(g_buf_b, eb_n < 0 ? 0 : eb_n));
+                if (na != nb || memcmp(g_buf_a, g_buf_b, (size_t)na) != 0) {
+                    errneq++;
+                    emitf("[shparity]     stderr DIFFERS (program name and pids normalised)\n");
+                }
+                ea_n = na;
+                eb_n = nb;
+            }
+            emitf("[shparity]     (stderr bytes bash=%ld tsh=%ld -- informational)\n",
+                  ea_n < 0 ? 0 : ea_n, eb_n < 0 ? 0 : eb_n);
+            for (int side = 0; side < 2; side++) {
+                const char *s = side ? g_buf_b : g_buf_a;
+                long n = side ? eb_n : ea_n;
+                if (n <= 0) continue;
+                long k = 0;
+                for (int ln = 0; ln < STDERR_MAX_LINES && k < n; ln++) {
+                    char text[160];
+                    size_t o = 0;
+                    for (; k < n && s[k] != '\n'; k++)
+                        if ((unsigned char)s[k] >= 0x20 && o < sizeof text - 1)
+                            text[o++] = s[k];
+                    text[o] = '\0';
+                    if (k < n) k++;               /* step over the newline */
+                    if (o == 0) { ln--; continue; }    /* a blank line is not one */
+                    emitf("[shparity]     %s stderr[%d]: %s\n",
+                          side ? "tsh " : "bash", ln, text);
+                }
+            }
+        }
+    }
+
+    /* One line, one write: this is what the host harness greps for. */
+    emitf("[SHPARITY] VERDICT: %s %d/%d pass fail=%d broken=%d stderr-cases=%d "
+          "stderr-differ=%d (stdout+exit must match GNU bash 5.2 exactly)\n",
+          (fail == 0 && broke == 0) ? "PASS" : "FAIL",
+          pass, g_ncases, fail, broke, errdiff, errneq);
+
+    return (fail == 0 && broke == 0) ? 0 : 1;
+}

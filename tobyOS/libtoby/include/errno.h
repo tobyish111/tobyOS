@@ -45,6 +45,36 @@ extern int errno;
 #define EDEADLK         35
 #define EBUSY           16
 #define ETIMEDOUT      110
+/* 2026-08-24. Both were already reachable from the kernel and had no name
+ * here, so callers could only compare against a bare number: EXDEV is what
+ * vfs_rename answers for a cross-mount move (mv's copy fallback keys off
+ * it) and ENOTEMPTY is what rmdir(2) answers for a populated directory. */
+#define EXDEV           18
+#define ENOTEMPTY       39
+/* 2026-09-01: the loaders learned "#!". ENOEXEC is what execve answers for
+ * a file that is neither script, ELF nor PE (execvp then runs it through
+ * the shell, per POSIX); ELOOP is a #! chain deeper than the kernel will
+ * follow. */
+#define ENOEXEC          8
+#define ELOOP           40
+/* 2026-10-04: /dev/tty without a controlling terminal is ENXIO, and the
+ * terminal ioctls on a non-terminal ENOTTY; ESPIPE is lseek on a pipe. */
+#define ENXIO            6
+/* batch 31: mount(8)'s "no such device" (an unknown filesystem type) and
+ * "block device required" -- Linux's numbers; strerror had the words */
+#define ENOTBLK         15
+#define ENODEV          19
+#define ENOTTY          25
+#define ESPIPE          29
+/* 2026-10-12 (batch 25): a value too large for its type -- GNU truncate
+ * says it of a size past the largest. Linux's number, musl's words in
+ * strerror. */
+#define EOVERFLOW       75
+#define ENODATA         61      /* no data: GNU stat's %C without SELinux */
+/* finding 225: an attribute namespace no filesystem keeps (Linux's 95;
+ * strerror's words are musl's, "Not supported") */
+#define EOPNOTSUPP      95
+#define ENOTSUP         EOPNOTSUPP
 
 /* GNU-flavoured strerror_r returns the message pointer. */
 const char *strerror(int err);

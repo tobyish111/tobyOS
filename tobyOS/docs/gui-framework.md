@@ -73,12 +73,12 @@ the kernel falls back to the smoothed scaled-bitmap path so text never vanishes.
 
 ### Event ABI (read this before defining a local copy)
 
-`struct gui_event { int type; int x, y; uint8_t button, key; uint8_t _pad[2]; }`
+`struct gui_event { int type; int x, y; uint8_t button, key; int8_t wheel; uint8_t _pad[1]; }`
 is mirrored verbatim to userspace by `GUI_POLL_EVENT` — its layout must stay
 stable. Event types (`include/tobyos/gui.h`, `GUI_EV_*`):
 
 ```
-NONE=0  MOUSE_MOVE=1  MOUSE_DOWN=2  MOUSE_UP=3  KEY=4  CLOSE=5  RESIZE=6
+NONE=0  MOUSE_MOVE=1  MOUSE_DOWN=2  MOUSE_UP=3  KEY=4  CLOSE=5  RESIZE=6  WHEEL=7
 ```
 
 **Footgun:** a stale local enum once defined `CLOSE=1`, colliding with
@@ -86,6 +86,17 @@ NONE=0  MOUSE_MOVE=1  MOUSE_DOWN=2  MOUSE_UP=3  KEY=4  CLOSE=5  RESIZE=6
 exited. Mouse coordinates delivered to a window are in **client** coordinates
 (the compositor subtracts the title-bar/border). `toby/tk.h` defines `TK_EV_*`
 equal to these and documents the history; do not re-derive the numbers.
+
+**Wheel (`GUI_EV_WHEEL`, 2026-08-23).** `wheel` is signed detents, `+` = away
+from the user (scroll up); `x`/`y` still carry the pointer position. It was
+carved out of the old two-byte `_pad` **on purpose** so `sizeof` never changed
+and programs built before wheels existed still load — if you keep a local copy
+of this struct, replace one pad byte rather than appending a field.
+Unlike keys (which go to the focused window), a wheel is routed to the window
+**under the cursor**, so you can scroll a list without clicking it first.
+Toolkit apps get list/table/textarea scrolling for free from `tk.c`'s
+`dispatch()`; a `TK_CANVAS` receives the raw event through its `on_event`.
+`TK_WHEEL_LINES` (3) and `TK_WHEEL_STEP_PX` (48) keep the feel uniform.
 
 ## Layer 2 — the native toolkit (TobyTK)
 

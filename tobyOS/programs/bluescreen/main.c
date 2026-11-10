@@ -30,7 +30,9 @@ struct gui_event {
     int     x, y;
     uint8_t button;
     uint8_t key;
-    uint8_t _pad[2];
+    signed char wheel;
+
+    uint8_t _pad[1];
 };
 
 #define GUI_EV_KEY   4

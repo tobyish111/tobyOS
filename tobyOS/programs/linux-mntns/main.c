@@ -124,6 +124,12 @@ int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);   /* children _exit(); see slice 8 */
 
     unsigned long long my_inum = ns_inum("mnt");
+    /* The mount points, made first: Linux binds only onto a name that
+     * exists (ENOENT otherwise), and this test leaned on tobyOS's binding
+     * onto any name at all until finding 241 made the kernel Linux's. */
+    static const char *const mps[] = { "/slv_in", "/slv_out", "/nsmnt",
+        "/nsctl", "/nsprop", "/nspriv", "/nsub", "/newroot", 0 };
+    for (int i = 0; mps[i]; i++) (void)mkdir(mps[i], 0755);
     int base_mounts = count_mounts();
     printf("mntns: start mnt:[%llu] mounts=%d\n", my_inum, base_mounts);
 
@@ -429,6 +435,7 @@ int main(void) {
     }
 
     { char p[256]; snprintf(p, sizeof p, "/data/%s", PROBE); (void)unlink(p); }
+    for (int i = 0; mps[i]; i++) (void)rmdir(mps[i]);
     printf("mntns: BITS=0x%x (want 0xff)\n", bits);
     return bits;
 }

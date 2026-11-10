@@ -18,11 +18,13 @@
  * (JBD2 inherited this from ext3). tobyOS runs little-endian x86-64, so
  * the driver byte-swaps on every access (be16()/be32() in ext4.c).
  *
- * What we implement: the classic format -- no metadata checksums
- * (CSUM_V2/V3), no 64-bit block numbers, no async commit. We DO parse
- * revoke blocks during recovery for fidelity, though our own writer
- * never emits them (it checkpoints each transaction immediately, so at
- * most one transaction is ever outstanding in the log).
+ * What we implement: the classic format, tobyOS's own formatter's; and,
+ * since finding 274, Linux's mkfs.ext4 default -- 64-bit block numbers
+ * and CRC-32C v3 checksums (16-byte tags, a 4-byte sum at the end of each
+ * descriptor and revoke block, the commit block's sum, the superblock's).
+ * No async commit, no CSUM_V2, no fast commits. Revoke blocks are parsed
+ * during recovery; our own writer never needs one (it checkpoints each
+ * transaction before the next, so at most one is in the log).
  */
 
 #ifndef TOBYOS_JBD2_H
@@ -45,16 +47,28 @@
 #define JBD2_FLAG_DELETED       4u
 #define JBD2_FLAG_LAST_TAG      8u   /* final tag in this descriptor block */
 
-/* journal feature_incompat bits. We can drive a journal that has at most
- * REVOKE set; anything else (64BIT / ASYNC_COMMIT / CSUM_V2 / CSUM_V3)
- * means we can't safely recover it. */
+/* journal feature_incompat bits. We drive a journal with REVOKE, 64BIT
+ * and CSUM_V3 -- Linux's mkfs.ext4 default (finding 274); ASYNC_COMMIT,
+ * CSUM_V2 and FAST_COMMIT we cannot, nor the v1 commit sum (compat). */
 #define JBD2_FEATURE_INCOMPAT_REVOKE        0x0001u
 #define JBD2_FEATURE_INCOMPAT_64BIT         0x0002u
 #define JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT  0x0004u
 #define JBD2_FEATURE_INCOMPAT_CSUM_V2       0x0008u
 #define JBD2_FEATURE_INCOMPAT_CSUM_V3       0x0010u
+#define JBD2_FEATURE_INCOMPAT_FAST_COMMIT   0x0020u
+#define JBD2_FEATURE_COMPAT_CHECKSUM        0x0001u
 
-#define JBD2_INCOMPAT_SUPPORTED  (JBD2_FEATURE_INCOMPAT_REVOKE)
+/* s_checksum_type: CRC-32C, the v3 sums' */
+#define JBD2_CRC32C_CHKSUM  4u
+/* a commit block's h_chksum_type for the v1 sum: CRC-32 (crc32_be) */
+#define JBD2_CRC32_CHKSUM   1u
+
+#define JBD2_INCOMPAT_SUPPORTED  (JBD2_FEATURE_INCOMPAT_REVOKE | \
+                                  JBD2_FEATURE_INCOMPAT_64BIT  | \
+                                  JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT | \
+                                  JBD2_FEATURE_INCOMPAT_CSUM_V2 | \
+                                  JBD2_FEATURE_INCOMPAT_CSUM_V3 | \
+                                  JBD2_FEATURE_INCOMPAT_FAST_COMMIT)
 
 #pragma pack(push, 1)
 

@@ -234,6 +234,11 @@ static void pfloop_note_resolved(struct regs *r, uint64_t fault_addr) {
     }
 }
 
+/* src/ptrace.c owns this; the tree declares cross-module kernel entry
+ * points at the use site rather than in a header (there is no
+ * tobyos/ptrace.h). */
+bool ptrace_trap_stop(struct proc *p, int sig, struct regs *r);
+
 static void default_exception(struct regs *r) {
     bool from_user = (r->cs & 3) == 3;
 
@@ -304,6 +309,26 @@ static void default_exception(struct regs *r) {
      * rewrites this trapframe so the trailing iretq enters the handler; we
      * return straight away. Otherwise it returns false and we fall through to
      * the diagnostic dump + terminate exactly as before. */
+    /* A DEBUG TRAP IN A TRACED PROCESS BELONGS TO ITS TRACER, not to the
+     * signal path. #BP is the int3 a debugger planted; #DB is the trap that
+     * ends a single step. Both park the process and hand the trap frame to
+     * the tracer, which is what makes breakpoints and stepping possible at
+     * all -- delivering SIGTRAP instead would kill the very process being
+     * debugged.
+     *
+     * Interrupts are off (the IDT uses interrupt gates), and parking calls
+     * sched_yield, so they are re-enabled first if the interrupted code had
+     * them on. Yielding with IF clear would stop the timer that has to run
+     * for the tracer to be scheduled and resume us. */
+    if (from_user && (r->vector == 1 || r->vector == 3)) {
+        struct proc *tp = current_proc();
+        if (tp && tp->tracer_pid) {
+            if (r->vector == 1) r->rflags &= ~(1ull << 8);   /* consume TF */
+            if (r->rflags & 0x200) sti();
+            if (ptrace_trap_stop(tp, SIGTRAP, r)) return;
+        }
+    }
+
     if (from_user) {
         int sig = 0, code = 0;
         uint64_t addr = 0;
@@ -757,14 +782,38 @@ static void default_exception(struct regs *r) {
             }
         }
 #endif
-        proc_exit(-1);
+        /* GROUP-fatal, with the Linux-shaped code (2026-08-22). This was
+         * proc_exit(-1): an uncaught fault killed only the faulting THREAD
+         * -- a worker's SIGSEGV left its siblings limping on, which no
+         * crash handler or supervisor expects -- and the parent's waitpid
+         * read -1 instead of the signal. linux-nptl bit4 caught both. */
+        {
+            int fsig;
+            switch (r->vector) {
+            case 0: case 16: case 19: fsig = SIGFPE;  break;
+            case 3:                   fsig = SIGTRAP; break;
+            case 6:                   fsig = SIGILL;  break;
+            default:                  fsig = SIGSEGV; break;
+            }
+            proc_exit_group(128 + fsig);
+        }
         /* unreachable */
     }
 
     kpanic("unhandled exception %lu (%s)", r->vector, exc_name(r->vector));
 }
 
+/* /proc/stat "intr": every interrupt that is not an exception, in total and
+ * per vector (the per-IRQ columns after the total). Atomic, because every
+ * CPU's timer lands here. */
+uint64_t g_intr_total;
+uint64_t g_intr_vec[256];
+
 void isr_dispatch(struct regs *r) {
+    if (r->vector >= 32 && r->vector < 256) {
+        __atomic_fetch_add(&g_intr_total, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_intr_vec[r->vector], 1, __ATOMIC_RELAXED);
+    }
     isr_handler_fn fn = g_handlers[r->vector];
     if (fn) {
         fn(r);

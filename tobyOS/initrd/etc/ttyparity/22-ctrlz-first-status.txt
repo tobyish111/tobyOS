@@ -1,0 +1,22 @@
+# $? WHEN A PIPELINE STOPS. bash's wait_for takes 128 + WSTOPSIG of the
+# status of the job's FIRST process: its stop signal when it stopped too,
+# the byte WSTOPSIG reads in its exit status when it had already ended --
+# so 131 when it exited 3, 128 when it exited 0, and 128 again when fg
+# brings the job back and ^Z stops it a second time. tsh said 128 + the
+# stop signal whatever the first process was (finding 125).
+sh -c 'exit 3' | sleep 30
+%CTRLZ%
+echo "first-exited=$?"
+fg
+%CTRLC%
+echo "after=$?"
+true | sleep 30
+%CTRLZ%
+echo "first-true=$?"
+fg
+%CTRLZ%
+echo "fg-again=$?"
+fg
+%CTRLC%
+echo "after2=$?"
+exit 0

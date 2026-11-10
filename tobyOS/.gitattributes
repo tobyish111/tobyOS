@@ -1,0 +1,16 @@
+# Shell scripts must reach the guest with LF endings.
+#
+# core.autocrlf is on for this checkout, and a corpus case checked out with
+# CRLF fails INSIDE tobyOS in a way that looks like a shell bug: the guest's
+# bash sees the stray CR and exits 2 with a syntax error, while MSYS bash on
+# the host tolerates it and reports the same file as fine. That cost a full
+# build-and-boot cycle to track down once already.
+*.sh text eol=lf
+
+# The busybox applet list is read line-by-line by the initrd rule to create
+# one hard link per name. A CRLF checkout cost a build cycle here too, and in
+# a nastier way than the scripts above: MSYS resolves "bin/ls\r" as if the CR
+# were not there, so `[ -e ]` answered TRUE for all 400 names, every one was
+# skipped as "already taken", and the build reported success having linked
+# nothing. The rule strips a trailing CR defensively as well.
+programs/busybox/applets.txt text eol=lf

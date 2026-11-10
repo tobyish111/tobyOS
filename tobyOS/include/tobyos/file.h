@@ -146,6 +146,20 @@ enum file_kind {
      * namespace outlives its last member while an fd still names it (the
      * mechanism `ip netns add` pins one with). See nsproxy.c. */
     FILE_KIND_NSFD       = 24,
+    /* 2026-08-22: a REAL inotify fd. sys_inotify_init used to return a
+     * bare instance INDEX -- the first caller got 0 and then read stdin
+     * believing it was watching the filesystem. */
+    FILE_KIND_INOTIFY    = 25,
+    /* A FIFO opened for reading AND writing (`exec 8<> fifo`): one
+     * descriptor that is both ends of the FIFO's pipe, as Linux gives one,
+     * counted as a reader and a writer. See pipe.c fifo_open. */
+    FILE_KIND_PIPE_RW    = 26,
+    /* /dev/rtc0, the RTC as Linux's rtc-cmos gives it: RTC_RD_TIME and
+     * RTC_SET_TIME; one opener at a time (finding 157's write-back). */
+    FILE_KIND_RTC        = 27,
+    /* /dev/sda and the rest (finding 198): a disk or partition's bytes,
+     * read and written a sector at a time underneath. */
+    FILE_KIND_BLKDEV     = 28,
 };
 
 struct eventfd;
@@ -154,16 +168,21 @@ struct shm_cache;
 struct timerfd;
 struct signalfd;
 struct nsfd;
+struct blk_dev;
 
 struct file {
     enum file_kind  kind;
-    /* For PIPE_R / PIPE_W. */
+    /* For PIPE_R / PIPE_W / PIPE_RW. */
     struct pipe    *pipe;
+    /* O_NONBLOCK on a pipe end (pipe2, F_SETFL, a FIFO's open): a read
+     * with nothing to read and a write with no room are EAGAIN. */
+    bool            pipe_nonblock;
     /* For VFS-backed handles. */
     struct vfs_file vfs;
     /* Milestone 25A: side-allocated open-file-description refcount so
      * dup()/dup2() can hand multiple struct files to the same underlying
-     * vfs_file. NULL for non-VFS kinds. The pointed-at counter starts at
+     * vfs_file. NULL for kinds other than VFS and BLKDEV (a disk's
+     * description holds its offset alone). The pointed-at counter starts at
      * 1 in sys_open, +1 per clone, -1 per close; the underlying handle's
      * ops->close is invoked exactly once, when the count reaches zero. */
     int            *vfs_refs;
@@ -180,6 +199,11 @@ struct file {
     struct window  *win;
     /* For TERM (milestone 13). */
     struct term_session *term;
+    /* For FILE_KIND_BLKDEV: the device (finding 198). Its offset is the
+     * open file description's, vfs_refs's struct vfs_ofd, as a file's is:
+     * dup and fork share it (finding 279). Struct changed: CLEAN BUILD
+     * required. */
+    struct blk_dev *blkdev;
     /* For FILE_KIND_DIR (Track B/B3 getdents64): kmalloc'd absolute path
      * of the directory + how many entries have already been returned, so
      * each getdents64 re-opens and resumes. */
@@ -215,6 +239,26 @@ struct file {
      * O_RDWR via F_GETFL -- a blanket-0 fcntl made it look read-only and
      * ImmediateCrash'd. Copied across dup() in file_clone. */
     int o_accmode;
+    /* The status flags, Linux's bits, as Linux's file keeps them (finding
+     * 235): what open was given less what acts only at open time, and
+     * O_LARGEFILE; F_SETFL changes the settable ones. O_APPEND and
+     * O_NONBLOCK of the kinds that act on them live in vfs.append,
+     * pipe_nonblock and the socket; fcntl_getfl reads those. */
+    uint32_t fl_status;
+    /* For FILE_KIND_INOTIFY: the instance index in inotify.c's table. */
+    int inotify_id;
+    /* The canonical path this handle was opened by (2026-08-22), kmalloc'd
+     * at open, cloned on dup/fork, freed at close; NULL for kinds with no
+     * path. The long-missing identity behind three audit findings at once:
+     * /proc/<pid>/fd readlink answered "/", fgetxattr/fsetxattr had no file
+     * to attach to, and glibc's fexecve fallback (/proc/self/fd/N) resolved
+     * to nothing. NOT an inode identity -- unlink/rename do not chase it. */
+    char *open_path;
+    /* When /proc/PID/fd/N first said this descriptor was there (finding
+     * 270): its link's times, as Linux's are its inode's, made at that
+     * first look and kept. 0 = not looked at yet. Struct grew: CLEAN
+     * BUILD required. */
+    uint64_t proc_seen_ns;
 };
 
 /* eventfd flags (Linux ABI) */
@@ -267,7 +311,57 @@ struct file *console_file_make(void);
 /* Allocate a fresh struct file pointing at the same backing object as
  * `src`. For pipes this also bumps the pipe's reader/writer count, so
  * inheritance Just Works. Returns NULL on OOM. */
+/* ---- the open file description -------------------------------------------
+ *
+ * POSIX says a descriptor duplicated by dup()/dup2() or inherited across
+ * fork() shares ONE open file description with its original, and therefore
+ * one file OFFSET. tobyOS did not: file_clone() byte-copies struct vfs_file,
+ * cursor included, so parent and child each advanced their own copy. A
+ * subshell would write at offset N, the parent's offset would still be N, and
+ * the parent's next write would overwrite the child's bytes -- which is
+ * exactly what made `(echo a) >> log` and `cmd > f 2>&1` lose output.
+ *
+ * The fix reuses the side allocation that already exists. `struct file` has
+ * carried an `int *vfs_refs` since milestone 25A so that dup'd handles share
+ * one refcount; that pointer now aims at the `refs` member of this struct
+ * instead of a bare int. `refs` is deliberately FIRST, so every existing
+ * `*f->vfs_refs` read, write and kfree() keeps working unchanged, and
+ * sizeof(struct file) does not move -- which matters, because this build has
+ * no header dependency tracking and a real layout change to struct file would
+ * silently corrupt every object not rebuilt.
+ *
+ * The cursor is synchronised at the file_read/file_write boundary rather than
+ * being read through a pointer everywhere: struct vfs_file is also used
+ * standalone by drivers that know nothing about descriptors. */
+struct vfs_ofd {
+    int    refs;        /* MUST stay first: vfs_refs points here */
+    size_t pos;         /* the shared file offset */
+};
+
+/* Read/set the offset of `f`, honouring the shared description when there is
+ * one and falling back to the embedded cursor when there is not (memfd, and
+ * handles minted before the description existed). */
+size_t file_pos_get(struct file *f);
+void   file_pos_set(struct file *f, size_t pos);
+
+/* A fresh handle on the shell's own standard descriptor `fd` (0, 1 or 2).
+ *
+ * The shell stores NULL for "not redirected", which duplication turned into
+ * nothing: `echo x 1>&2` cloned a NULL and set fd 1 to NULL, i.e. back to the
+ * default, so the redirection silently did nothing. Duplication needs a real
+ * object to clone, and only the host knows what its standard descriptors are
+ * -- the kernel's are all the console, a user process's are three different
+ * files. Implemented in src/file.c and in programs/tsh/host.c. */
+struct file *file_std_handle(int fd);
+
+/* The mode (S_IFCHR | perms) of a synthesised /dev node -- /dev/null,
+ * /dev/zero, /dev/tty... -- or 0 if `kpath` is not one. sys_open makes these
+ * without any VFS entry, so vfs_stat has never heard of them; this table in
+ * syscall.c is the single answer to "what exists in /dev". */
+uint32_t dev_synth_mode(const char *kpath);
+
 struct file *file_clone(struct file *src);
+void file_set_open_path(struct file *f, const char *kpath);
 
 /* Drop one fd-level reference. For pipes, this decrements the pipe's
  * reader/writer count (potentially waking the other end with EOF/EPIPE)

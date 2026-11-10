@@ -1,0 +1,2 @@
+[ -a -a ]
+echo status=$?

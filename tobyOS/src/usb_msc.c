@@ -111,6 +111,17 @@ _Static_assert(sizeof(struct csw) == 13, "BBB CSW must be 13 B");
 #define SCSI_READ_CAPACITY_10   0x25
 #define SCSI_READ_10            0x28
 #define SCSI_WRITE_10           0x2A
+/* 64-bit-LBA forms, for media past 2 TiB. READ CAPACITY (16) is a
+ * SERVICE ACTION IN (0x9E) with service action 0x10. */
+#define SCSI_SERVICE_ACTION_IN  0x9E
+#define SCSI_SAI_READ_CAPACITY_16 0x10
+#define SCSI_READ_16            0x88
+#define SCSI_WRITE_16           0x8A
+
+/* The largest LBA a 10-byte CDB can name. At 512-byte sectors that is
+ * exactly 2 TiB, which is why it is a filesystem-visible limit and not
+ * merely a driver detail -- see TFS_MAX_TOTAL_BLOCKS. */
+#define USB_MSC_LBA32_MAX       0xFFFFFFFFull
 #define SCSI_SYNCHRONIZE_CACHE_10 0x35
 
 /* ============================================================== */
@@ -160,11 +171,9 @@ static size_t         g_msc_count = 0;
 
 /* ============================================================== */
 /* DMA scratch allocator: one shared 4 KiB page, kept zero-init'd.  */
-/* Pre-cluster (4 KiB) is the largest data phase any FS layer will   */
-/* hand us today, so we pin a single page per device once + reuse.   */
+/* (The CBW/CSW page; each device's data buffer is msc_dma below.)  */
 /* ============================================================== */
 
-#define USB_MSC_DATA_BUF_SZ 4096u
 struct dma_buf {
     void    *virt;
     uint64_t phys;
@@ -180,15 +189,47 @@ static bool alloc_dma_page(struct dma_buf *out) {
 }
 
 /* ============================================================== */
-/* Per-device data buffer (one cluster).                            */
+/* Per-device data buffer: a command's whole data phase.            */
 /* ============================================================== */
+
+/* 64 KiB, one bulk TRB's worth: physically contiguous and aligned to
+ * 64 KiB, as xHCI asks of a TRB's buffer (no 64 KiB boundary inside it).
+ * It was one 4 KiB page, so a SCSI command moved 8 sectors at most and a
+ * large read cost a command, three bulk transfers and their waits each
+ * 4 KiB (finding 276). Linux's usb-storage sends up to 240 sectors a
+ * command; 128 here. One page if no aligned run can be had. */
+#define USB_MSC_DATA_BUF_MAX (64u * 1024u)
 
 struct msc_dma {
     void    *virt;
     uint64_t phys;
+    uint32_t size;
 };
 
 static struct msc_dma g_data_buf[USB_MSC_MAX_DEVICES];
+
+static bool alloc_data_buf(struct msc_dma *out) {
+    const size_t want = USB_MSC_DATA_BUF_MAX / 4096u;      /* 16 pages */
+    uint64_t run = pmm_alloc_pages(2 * want - 1);          /* holds an aligned 16 */
+    if (run) {
+        uint64_t base = (run + USB_MSC_DATA_BUF_MAX - 1) & ~(uint64_t)(USB_MSC_DATA_BUF_MAX - 1);
+        size_t head = (size_t)((base - run) / 4096u);
+        if (head) pmm_free_pages_range(run, head);
+        size_t tail = 2 * want - 1 - head - want;
+        if (tail) pmm_free_pages_range(base + USB_MSC_DATA_BUF_MAX, tail);
+        out->virt = pmm_phys_to_virt(base);
+        out->phys = base;
+        out->size = USB_MSC_DATA_BUF_MAX;
+        memset(out->virt, 0, USB_MSC_DATA_BUF_MAX);
+        return true;
+    }
+    struct dma_buf pg;
+    if (!alloc_dma_page(&pg)) return false;
+    out->virt = pg.virt;
+    out->phys = pg.phys;
+    out->size = 4096u;
+    return true;
+}
 
 /* ============================================================== */
 /* Low-level CBW / CSW helpers                                     */
@@ -296,6 +337,49 @@ static int scsi_read_capacity_10(struct usb_msc *m,
     return 0;
 }
 
+/* READ CAPACITY (16). Only issued when the 10-byte form reports the
+ * all-ones sentinel, which is how a device says "I am bigger than this
+ * field can express". Without it a 4 TB drive reports as exactly 2 TiB --
+ * not an error anywhere, just a silently halved disk. */
+static int scsi_read_capacity_16(struct usb_msc *m,
+                                 uint64_t *last_lba, uint32_t *block_size) {
+    uint8_t cdb[16] = { SCSI_SERVICE_ACTION_IN, SCSI_SAI_READ_CAPACITY_16,
+                        0,0,0,0,0,0,0,0,          /* LBA (unused for this SA) */
+                        0, 0, 0, 32,              /* allocation length = 32 */
+                        0, 0 };
+    uint8_t resp[32] = { 0 };
+    int rc = do_cbw_data_csw(m, true, resp, sizeof(resp), cdb, 16);
+    if (rc) return rc;
+    uint64_t lba = 0;
+    for (int i = 0; i < 8; i++) lba = (lba << 8) | resp[i];
+    *last_lba   = lba;
+    *block_size = ((uint32_t)resp[8] << 24) | ((uint32_t)resp[9] << 16) |
+                  ((uint32_t)resp[10] << 8) | ((uint32_t)resp[11]);
+    return 0;
+}
+
+/* SCSI READ (16) / WRITE (16): the 64-bit-LBA forms. Used ONLY when an
+ * access actually reaches past the 32-bit range, so every device that fits
+ * in a 10-byte CDB -- which is every stick anyone is likely to own -- takes
+ * exactly the same path it always did. */
+static int scsi_rw_16(struct usb_msc *m, bool is_write,
+                      uint64_t lba, uint32_t count, void *buf) {
+    uint8_t cdb[16] = {
+        is_write ? SCSI_WRITE_16 : SCSI_READ_16,
+        0,                               /* RDPROTECT/DPO/FUA = 0 */
+        (uint8_t)(lba >> 56), (uint8_t)(lba >> 48),
+        (uint8_t)(lba >> 40), (uint8_t)(lba >> 32),
+        (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
+        (uint8_t)(lba >>  8), (uint8_t)(lba),
+        (uint8_t)(count >> 24), (uint8_t)(count >> 16),
+        (uint8_t)(count >>  8), (uint8_t)(count),
+        0,                               /* group number */
+        0,                               /* control */
+    };
+    return do_cbw_data_csw(m, !is_write, buf,
+                           count * m->block_size, cdb, 16);
+}
+
 /* SCSI READ (10) / WRITE (10): one CBW per call. count is 16-bit LBAs;
  * the FS layers above us cap at one cluster (8 sectors today), so we
  * never split into multiple CBWs. */
@@ -314,6 +398,17 @@ static int scsi_rw_10(struct usb_msc *m, bool is_write,
                            (uint32_t)count * m->block_size, cdb, 10);
 }
 
+/* Pick the CDB width for one transfer. The 10-byte form stays the default
+ * so nothing about existing devices changes; the 16-byte one engages only
+ * where the 10-byte LBA field would silently wrap and address the wrong
+ * blocks. */
+static int scsi_rw(struct usb_msc *m, bool is_write,
+                   uint64_t lba, uint32_t count, void *buf) {
+    if (lba + count > USB_MSC_LBA32_MAX)
+        return scsi_rw_16(m, is_write, lba, count, buf);
+    return scsi_rw_10(m, is_write, (uint32_t)lba, (uint16_t)count, buf);
+}
+
 /* ============================================================== */
 /* blk_dev hooks                                                    */
 /* ============================================================== */
@@ -330,16 +425,16 @@ static int msc_read(struct blk_dev *dev, uint64_t lba, uint32_t count,
     if (lba + count > m->block_count) { m->stats.reads_eio++; return -1; }
 
     uint8_t *out = (uint8_t *)buf;
-    /* Largest CBW we use is one cluster = 4 KiB / m->block_size sectors. */
-    uint32_t max_per_cbw = USB_MSC_DATA_BUF_SZ / m->block_size;
+    /* the most sectors a command takes: the data buffer's */
+    uint32_t max_per_cbw = g_data_buf[m - g_msc].size / m->block_size;
     if (max_per_cbw == 0) max_per_cbw = 1;
 
     while (count > 0) {
         uint16_t chunk = (count > max_per_cbw) ? (uint16_t)max_per_cbw
                                                : (uint16_t)count;
 
-        int rc = scsi_rw_10(m, false, (uint32_t)lba, chunk,
-                            g_data_buf[m - g_msc].virt);
+        int rc = scsi_rw(m, false, lba, chunk,
+                         g_data_buf[m - g_msc].virt);
         if (rc) {
             kprintf("[usb-msc] READ(10) lba=%llu cnt=%u rc=%d\n",
                     (unsigned long long)lba, chunk, rc);
@@ -366,7 +461,7 @@ static int msc_write(struct blk_dev *dev, uint64_t lba, uint32_t count,
     if (lba + count > m->block_count) { m->stats.writes_eio++; return -1; }
 
     const uint8_t *in = (const uint8_t *)buf;
-    uint32_t max_per_cbw = USB_MSC_DATA_BUF_SZ / m->block_size;
+    uint32_t max_per_cbw = g_data_buf[m - g_msc].size / m->block_size;
     if (max_per_cbw == 0) max_per_cbw = 1;
 
     while (count > 0) {
@@ -375,8 +470,8 @@ static int msc_write(struct blk_dev *dev, uint64_t lba, uint32_t count,
         memcpy(g_data_buf[m - g_msc].virt, in,
                (size_t)chunk * m->block_size);
 
-        int rc = scsi_rw_10(m, true, (uint32_t)lba, chunk,
-                            g_data_buf[m - g_msc].virt);
+        int rc = scsi_rw(m, true, lba, chunk,
+                         g_data_buf[m - g_msc].virt);
         if (rc) {
             kprintf("[usb-msc] WRITE(10) lba=%llu cnt=%u rc=%d\n",
                     (unsigned long long)lba, chunk, rc);
@@ -520,8 +615,7 @@ bool usb_msc_probe(struct usb_device *dev,
         m->csw_phys = cbw_csw.phys + 64;
     }
 
-    if (!g_data_buf[midx].virt &&
-        !alloc_dma_page((struct dma_buf *)&g_data_buf[midx])) {
+    if (!g_data_buf[midx].virt && !alloc_data_buf(&g_data_buf[midx])) {
         kprintf("[usb-msc] OOM for data buffer\n");
         return false;
     }
@@ -574,7 +668,25 @@ bool usb_msc_probe(struct usb_device *dev,
 
     /* READ CAPACITY (10): tells us LBA count + sector size. */
     uint32_t last_lba = 0, blksz = 0;
+    uint64_t last_lba64 = 0;
     rc = scsi_read_capacity_10(m, &last_lba, &blksz);
+    if (!rc && last_lba == 0xFFFFFFFFu) {
+        /* The sentinel: the real capacity does not fit a 32-bit field.
+         * Believing the 10-byte answer here would register the device as
+         * exactly 2 TiB and quietly strand everything above that. */
+        uint32_t bs16 = 0;
+        int rc16 = scsi_read_capacity_16(m, &last_lba64, &bs16);
+        if (rc16 == 0 && last_lba64 > 0xFFFFFFFFull) {
+            blksz = bs16;
+            kprintf("[usb-msc] >2 TiB device: READ CAPACITY(16) reports "
+                    "%llu sectors (10-byte form saturated)\n",
+                    (unsigned long long)last_lba64 + 1ull);
+        } else {
+            last_lba64 = last_lba;      /* genuinely 0xFFFFFFFF, or no SAI */
+        }
+    } else {
+        last_lba64 = last_lba;
+    }
     if (rc) {
         kprintf("[usb-msc] READ_CAPACITY rc=%d\n", rc);
         return false;
@@ -587,7 +699,7 @@ bool usb_msc_probe(struct usb_device *dev,
         return false;
     }
     m->block_size  = blksz;
-    m->block_count = (uint64_t)last_lba + 1ull;
+    m->block_count = last_lba64 + 1ull;
 
     /* Build a "usbN" name. Lower-case + decimal index, stable for
      * blk_find lookups from the shell. A revived slot regains its OLD
@@ -605,6 +717,10 @@ bool usb_msc_probe(struct usb_device *dev,
     m->blk.sector_count = m->block_count;
     m->blk.priv         = m;
     m->blk.class        = BLK_CLASS_DISK;
+    /* USB mass storage is REMOVABLE. The provisioning guard's explicit-erase
+     * path is gated on this, so that "yes, reformat my stick" can never be
+     * aimed at an internal disk -- see the field's comment in blk.h. */
+    m->blk.removable    = true;
     m->self             = m;
     /* Model = INQUIRY vendor (8 chars) + product (16 chars), trimmed. */
     {
@@ -631,16 +747,16 @@ bool usb_msc_probe(struct usb_device *dev,
             m->name, (unsigned long long)m->block_count, m->block_size,
             (unsigned long long)((m->block_count * m->block_size) >> 20));
 
-    /* Scan for GPT partitions on the new disk. partition_scan_disk
-     * silently returns -1 for raw (non-GPT) media, which is fine for
+    /* Scan for GPT or MBR partitions on the new disk. partition_scan_disk
+     * silently returns -1 for raw media with no table, which is fine for
      * single-FS USB sticks. The kernel boot path will look at /usb
      * directly for the FAT32 mount in that case. */
     int parts = partition_scan_disk(&m->blk);
     if (parts > 0) {
-        kprintf("[usb-msc] '%s': %d GPT partition(s) registered\n",
+        kprintf("[usb-msc] '%s': %d partition(s) registered\n",
                 m->name, parts);
     } else {
-        kprintf("[usb-msc] '%s': no GPT (raw filesystem assumed)\n",
+        kprintf("[usb-msc] '%s': no partition table (raw filesystem assumed)\n",
                 m->name);
     }
 

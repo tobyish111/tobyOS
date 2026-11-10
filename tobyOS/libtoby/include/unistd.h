@@ -23,6 +23,10 @@ extern "C" {
 #define SEEK_SET       0
 #define SEEK_CUR       1
 #define SEEK_END       2
+/* finding 215: the next data at or after the offset, and the next hole --
+ * the whole file is data on a filesystem that keeps no holes */
+#define SEEK_DATA      3
+#define SEEK_HOLE      4
 
 ssize_t read   (int fd, void *buf, size_t n);
 ssize_t write  (int fd, const void *buf, size_t n);
@@ -52,11 +56,58 @@ int     truncate(const char *path, off_t length);
 int     ftruncate(int fd, off_t length);
 int     chmod  (const char *path, mode_t mode);
 int     chown  (const char *path, uid_t owner, gid_t group);
+int     lchown (const char *path, uid_t owner, gid_t group);
+int     getgroups(int size, gid_t list[]);
+int     setgroups(size_t size, const gid_t *list);
+int     chroot(const char *path);                   /* finding 214 */
+/* finding 215: a file's own data to its disk, and the limits pathconf
+ * reports (glibc's numbers, by filesystem type) */
+int     fsync(int fd);
+int     fdatasync(int fd);
+long    pathconf(const char *path, int name);
+long    fpathconf(int fd, int name);
+#define _PC_LINK_MAX            0
+#define _PC_MAX_CANON           1
+#define _PC_MAX_INPUT           2
+#define _PC_NAME_MAX            3
+#define _PC_PATH_MAX            4
+#define _PC_PIPE_BUF            5
+#define _PC_CHOWN_RESTRICTED    6
+#define _PC_NO_TRUNC            7
+#define _PC_VDISABLE            8
+#define _PC_SYNC_IO             9
+#define _PC_ASYNC_IO            10
+#define _PC_PRIO_IO             11
+#define _PC_SOCK_MAXBUF         12
+#define _PC_FILESIZEBITS        13
+#define _PC_REC_INCR_XFER_SIZE  14
+#define _PC_REC_MAX_XFER_SIZE   15
+#define _PC_REC_MIN_XFER_SIZE   16
+#define _PC_REC_XFER_ALIGN      17
+#define _PC_ALLOC_SIZE_MIN      18
+#define _PC_SYMLINK_MAX         19
+#define _PC_2_SYMLINKS          20
+int     initgroups(const char *user, gid_t group);
 int     rename (const char *oldpath, const char *newpath);
 int     link   (const char *oldpath, const char *newpath);
 int     symlink(const char *target, const char *linkpath);
 ssize_t readlink(const char *path, char *buf, size_t bufsiz);
 
+/* tobyOS-specific (2026-09-04): per-socket options and the ARP cache, for
+ * traceroute and arping. Linux spells these setsockopt(IP_TTL) and
+ * /proc/net/arp + raw ethernet; the native ABI has neither, so these are the
+ * two small calls the tools actually need. */
+int toby_sockopt(int fd, int opt, long val);
+int toby_arp_resolve(unsigned int ip_be, unsigned char mac[6]);   /* 0, or -1 */
+int toby_arp_request(unsigned int ip_be);
+
+int     setpgid(pid_t pid, pid_t pgid);
+pid_t   getpgid(pid_t pid);
+pid_t   getpgrp(void);
+pid_t   setsid(void);
+/* tty/pty control. Declared here rather than a separate <sys/ioctl.h>;
+ * the request constants live with the caller. */
+int     ioctl(int fd, unsigned long req, void *argp);
 uid_t   getuid (void);
 int     setuid (uid_t uid);      /* slice 14: real privilege drop */
 int     setgid (gid_t gid);
@@ -81,6 +132,7 @@ int     brk    (void *addr);
 
 unsigned int sleep (unsigned int seconds);
 int          usleep(unsigned int usecs);
+int          nice(int inc);                 /* the new niceness, or -1 (batch 25) */
 
 void    _exit  (int code) __attribute__((noreturn));
 

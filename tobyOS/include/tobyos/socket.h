@@ -13,6 +13,7 @@
 
 #include <tobyos/types.h>
 #include <tobyos/net.h>
+#include <tobyos/ipv6.h>   /* AF_INET6 endpoints (2026-08-23) */
 
 #define SOCK_MAX               128     /* pool depth (chrome/Mojo makes many pairs) */
 #define SOCK_RX_DGRAMS         128     /* per-socket UDP/UNIX ring depth. Was 64
@@ -32,17 +33,34 @@
 #define SOCK_KIND_TCP          2
 #define SOCK_KIND_UNIX         3       /* AF_UNIX socketpair endpoint (Track B) */
 #define SOCK_KIND_NETLINK      4       /* AF_NETLINK/NETLINK_ROUTE (Track B) */
+#define SOCK_KIND_RAW          5       /* SOCK_RAW: AF_INET (IP datagrams,
+                                        * header included) or AF_PACKET
+                                        * (whole ethernet frames) */
 
 /* User-visible "domain"/"type" constants. */
 #define AF_UNIX                1
 #define AF_INET                2
-#define AF_INET6               10      /* not implemented; lx_socket -> EAFNOSUPPORT */
+#define AF_INET6               10      /* UDP since 2026-08-23; SOCK_STREAM -> EAFNOSUPPORT */
 #define AF_NETLINK             16      /* rtnetlink (chrome's NetworkChangeNotifier) */
+#define AF_PACKET              17      /* link-layer frames (tcpdump) */
+#define ETH_P_ALL              0x0003  /* AF_PACKET: every EtherType */
 #define NETLINK_ROUTE          0
 #define SOCK_STREAM            1       /* TCP */
 #define SOCK_DGRAM             2       /* UDP */
 #define SOCK_RAW               3       /* AF_NETLINK uses this */
 #define SOCK_SEQPACKET         5       /* AF_UNIX message socket (Mojo uses this) */
+
+/* The native ABI's socket() takes (domain, type) and has no room for a
+ * protocol argument. A raw socket needs one, so it rides in the TOP 16
+ * bits of `type`: socket(AF_INET, SOCK_RAW | (IPPROTO_ICMP << 16)).
+ * Protocol 0 means "every protocol", which is what tcpdump wants. */
+#define SOCK_RAW_PROTO_SHIFT   16
+#define SOCK_TYPE_MASK         0xFFFF
+
+#define IPPROTO_ICMP           1
+#define IPPROTO_TCP            6
+#define IPPROTO_UDP            17
+#define IPPROTO_RAW            255
 
 /* Type-flag bits OR'd into socket()/accept4()'s `type` argument. Chrome's
  * network service creates EVERY socket with SOCK_NONBLOCK and drives it from
@@ -91,6 +109,10 @@ struct file;
 struct sock_dgram {
     uint32_t  src_ip;          /* network byte order */
     uint16_t  src_port;        /* network byte order */
+    /* AF_INET6 (2026-08-23): when src_is6 is set, src6 carries the
+     * sender and src_ip is meaningless. src_port serves both families. */
+    uint8_t   src_is6;
+    struct ipv6_addr src6;
     /* Slice 56d: uint16_t until 2026-07-28 -- and unix_enqueue_fds SILENTLY
      * TRUNCATED any AF_UNIX message > 65535 bytes while telling the sender it
      * all went out. Chrome's browser->renderer Mojo channel messages cross
@@ -149,11 +171,39 @@ struct sock {
                                         * into THIS sock's own rx ring. */
     uint8_t         x_setup_done;      /* X11 connection-setup reply delivered. */
 
+    /* SOCK_RAW. `raw_proto` is the IP protocol number this socket wants (0
+     * = all). `raw_is_packet` marks an AF_PACKET socket, which receives
+     * whole ethernet frames instead of IP datagrams and is never a send
+     * target. Every raw socket is root-only at creation; nothing here
+     * re-checks, because a socket cannot change owner. */
+    uint8_t          raw_proto;
+    uint8_t          raw_is_packet;
+    uint8_t          ip_ttl;        /* 0 = IP_DEFAULT_TTL; else the TTL this
+                                       socket's datagrams leave with
+                                       (ABI_SOCKOPT_IP_TTL, for traceroute) */
+
     /* TCP: wrapped kernel connection. */
     struct tcp_conn *tcp;
     bool             tcp_listening;
     uint32_t         recv_timeout_ms;
     uint32_t         send_timeout_ms;
+
+    /* shutdown(2) state (2026-08-22 -- it was a `return 0` no-op before,
+     * so no half-close existed anywhere). shut_tx: we sent our FIN /
+     * promised no more data -- further sends are EPIPE. shut_rd: reads
+     * return EOF. rx_eof: the PEER shut its write side (AF_UNIX) -- reads
+     * return EOF once the ring drains, while OUR sends still work; this is
+     * deliberately distinct from severing the peer link (peer_ip = 0),
+     * which kills both directions and is what full close does. */
+    uint8_t          shut_tx;
+    uint8_t          shut_rd;
+    uint8_t          rx_eof;
+    /* SO_REUSEADDR (2026-08-22): lets listen() take a port whose only
+     * holders are dying conns (TIME_WAIT &c). It was accept-and-discard
+     * while bind refused in-use ports unconditionally, so a restarted
+     * server hit EADDRINUSE with no escape -- the exact scenario the
+     * option exists for. */
+    uint8_t          reuseaddr;
 
     /* UDP: connect() peer (network byte order; 0 = not connected). A
      * connected UDP socket lets send()/recv() and read()/write() omit the
@@ -161,6 +211,13 @@ struct sock {
      * the only sender in practice). */
     uint32_t         peer_ip;
     uint16_t         peer_port;
+
+    /* AF_INET6 (2026-08-23). is_v6 marks the socket's family for the
+     * syscall arms; local6 is the bind address (all-zero = ::, any);
+     * peer6 is the connect() peer when is_v6 (peer_port is shared). */
+    uint8_t          is_v6;
+    struct ipv6_addr local6;
+    struct ipv6_addr peer6;
 
     /* ---- Slice 89: SLOT GENERATION (fixes the hazard slice 78 named) ----
      * Pool slots are recycled IMMEDIATELY by sock_alloc, and an AF_UNIX
@@ -218,7 +275,10 @@ struct sock {
      * in SYN_SENT forever and make poll() silent for good. */
     uint8_t          connecting;
     int              so_error;         /* pending errno; 0 = none */
-    uint64_t         conn_deadline;    /* pit ticks; 0 = no deadline */
+    uint64_t         conn_deadline;    /* perf_now_ns() ns; 0 = no deadline.
+                                        * Was pit ticks: under TCG only ~1/15
+                                        * of 1 kHz PIT IRQs arrive, so every
+                                        * tick-based ms deadline ran 15x long. */
 
     /* AF_NETLINK: the nl_pid this socket bound to (unique per socket, as on
      * Linux, where an unbound sendmsg auto-binds to the tid). */
@@ -283,6 +343,8 @@ void sock_ref(struct sock *s);
 long sock_unix_send_fds(struct sock *self, const void *kbuf, size_t n,
                         struct file **files, int nfiles);
 struct sock *sock_peer_of(struct sock *self);   /* slice 81: SO_PEERCRED */
+void sock_shutdown_rd(struct sock *s);          /* shutdown(2): reads -> EOF */
+void sock_unix_shutdown_tx(struct sock *self);  /* peer sees EOF, keeps sending */
 long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
                         uint32_t timeout_ms,
                         struct file **out_files, int max_out, int *out_n);
@@ -302,6 +364,9 @@ int  sock_unix_connect_named(struct sock *s, const char *name, bool abstract);
  * registry lives in socket.c so struct sock does not change size. */
 int  sock_unix_bind_name(struct sock *s, const char *name, bool abstract);
 const char *sock_unix_bound_name(const struct sock *s);
+/* Finding 193: bind to a filesystem node's resolved path, shown as given. */
+int sock_unix_bind_path(struct sock *s, const char *kpath, const char *shown);
+bool sock_unix_is_x_socket(const char *name);
 int  sock_unix_listen(struct sock *s);
 bool sock_unix_can_accept(const struct sock *s);
 int  sock_unix_accept(struct sock *s, struct sock **out);
@@ -311,6 +376,32 @@ void sock_unix_unbind(struct sock *s);
 int sock_bind(struct sock *s, uint16_t port_be);
 
 /* UDP sendto / recvfrom. */
+/* AF_INET6 UDP (2026-08-23). sendto6 checksums with the mandatory v6
+ * pseudo-header and short-circuits ::1/self through the inline loopback;
+ * recvfrom6_to mirrors recvfrom_to with a v6 source out-param; the
+ * deliver hook is called from ipv6_recv's UDP demux. */
+long sock_sendto6(struct sock *s, const void *buf, size_t len,
+                  const struct ipv6_addr *dst, uint16_t dst_port_be);
+long sock_recvfrom6_to(struct sock *s, void *buf, size_t n,
+                       struct ipv6_addr *src6_out, uint16_t *src_port_be,
+                       uint32_t timeout_ms);
+void sock_udp6_deliver(const struct ipv6_addr *src, uint16_t sport,
+                       uint16_t dport, const void *data, size_t len);
+
+/* Raw delivery. sock_deliver_raw takes the WHOLE IP datagram (header
+ * included, as Linux does for SOCK_RAW) and fans it out to every raw
+ * socket whose protocol matches. sock_deliver_packet takes a whole
+ * ethernet frame and fans it out to every AF_PACKET socket. Both are
+ * no-ops when no raw socket exists, which is the normal case. */
+void sock_deliver_raw(uint32_t src_ip_be, uint8_t proto,
+                      const void *ip_datagram, size_t len);
+void sock_deliver_packet(const void *frame, size_t len);
+int  sock_any_packet_listener(void);
+int  sock_any_raw_listener(void);
+
+/* Native ABI_SYS_SOCKOPT: set one per-socket option. 0 or -ABI_E*. */
+long sock_setopt(struct sock *s, int opt, long val);
+
 long sock_sendto(struct sock *s, const void *buf, size_t len,
                  uint32_t dst_ip_be, uint16_t dst_port_be);
 long sock_recvfrom(struct sock *s, void *buf, size_t n,

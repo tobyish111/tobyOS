@@ -73,19 +73,39 @@ extern "C" {
  *  Numeric limits
  * ============================================================ */
 
-/* Maximum path length passed across a syscall (incl. trailing NUL). */
-#define ABI_PATH_MAX        256
+/* Maximum path length passed across a syscall (incl. trailing NUL):
+ * Linux's PATH_MAX (finding 227; it was 256). */
+#define ABI_PATH_MAX        4096
 
 /* Maximum read/write request size honoured by the kernel per call.
  * Larger requests are silently clipped to this. */
 #define ABI_RW_MAX          65536u
 
 /* Maximum argv string and environment string length passed to spawn. */
-#define ABI_ARG_MAX         512
+/* One argv/envp string. 512 until 2026-09-03, which cut `ssh host 'long
+ * command'` silently at the spawn (measured: 500 bytes fine, 660 nothing)
+ * and refused any `-c` script, `python3 -c`, or grep pattern past it, on
+ * every personality. 4096 matches the SSH server's exec-command cap, so
+ * that refusal threshold is the real one. The two static pools in
+ * sys_execve (src/fork.c) are sized off this: 64 x 4 KiB each. */
+#define ABI_ARG_MAX         4096
 
-/* Maximum number of argv / envp entries passed to spawn. */
-#define ABI_ARGV_MAX        64
-#define ABI_ENVP_MAX        64
+/* A PROGRAM'S ARGUMENTS AND ENVIRONMENT, as Linux bounds them: no count
+ * limit, ABI_ARG_STRLEN_MAX per string (Linux MAX_ARG_STRLEN, NUL
+ * included) and ABI_ARGS_TOTAL_MAX for all of argv + envp together --
+ * strings and their pointers (Linux: a quarter of the 8 MiB stack limit).
+ * Past either, spawn and execve fail with E2BIG.
+ *
+ * There were 64 entries of 4 KiB each. spawn refused a 65th with E2BIG,
+ * and execve did not refuse at all: it copied the first 64 and the first
+ * 4096 bytes of each and ran the program with what fitted --
+ *
+ *     bash$ /bin/echo $(seq 100) | wc -w      -> 63
+ *     bash$ /bin/echo "$(printf 'x%.0s' $(seq 10000))" | wc -c   -> 4096
+ *
+ * and a child saw 61 of 150 exported variables. The program never knew. */
+#define ABI_ARG_STRLEN_MAX  (128u * 1024u)
+#define ABI_ARGS_TOTAL_MAX  (2u * 1024u * 1024u)
 
 /* ============================================================
  *  Error codes (negative; userspace negates back to ABI_E*).
@@ -96,7 +116,10 @@ extern "C" {
 #define ABI_ENOENT           2   /* no such file or directory */
 #define ABI_ESRCH            3   /* no such process */
 #define ABI_EIO              5   /* I/O error from underlying device */
+#define ABI_ENXIO            6   /* no such device: /dev/tty without a terminal */
 #define ABI_E2BIG            7   /* arg/env list too long */
+#define ABI_ENOEXEC          8   /* exec format error */
+#define ABI_ELOOP           40   /* too many levels (#! nesting) */
 #define ABI_EBADF            9   /* bad file descriptor */
 #define ABI_ECHILD          10   /* no child processes */
 #define ABI_EAGAIN          11   /* resource temporarily unavailable (== EWOULDBLOCK) */
@@ -108,6 +131,7 @@ extern "C" {
 #define ABI_ENOTDIR         20   /* not a directory */
 #define ABI_EISDIR          21   /* is a directory */
 #define ABI_EINVAL          22   /* invalid argument */
+#define ABI_ENFILE          23   /* too many open files in the system */
 #define ABI_EMFILE          24   /* too many open files (per-proc cap) */
 #define ABI_ENOSPC          28   /* no space left on device */
 #define ABI_ESPIPE          29   /* illegal seek (pread/pwrite on pipe) */
@@ -121,7 +145,15 @@ extern "C" {
  * above -- adding new ones is explicitly safe per the stability promise. */
 #define ABI_EINTR            4   /* interrupted system call */
 #define ABI_ENOTEMPTY       39   /* directory not empty (rmdir) */
+#define ABI_ENOLCK          37   /* no record locks available (table full) */
+#define ABI_ENOTBLK         15   /* block device required (mount of a file, batch 32) */
 #define ABI_ENODEV          19   /* no such device / unknown filesystem type */
+#define ABI_ENODATA         61   /* no such extended attribute (Linux ENODATA) */
+#define ABI_ENOTSUP         95   /* operation not supported (EOPNOTSUPP) */
+#define ABI_EXDEV           18   /* hard link across filesystems */
+#define ABI_ENOMSG          42   /* no message of desired type (msgrcv) */
+#define ABI_EIDRM           43   /* IPC id was removed */
+#define ABI_EAFNOSUPPORT    97   /* address family not supported */
 
 /* ============================================================
  *  Process ABI personality (Track B: foreign-binary compat)
@@ -1025,8 +1057,427 @@ struct abi_vizmap {
 #define ABI_SYS_SETUID          189
 #define ABI_SYS_SETGID          190
 
+/* Job control: real process groups (the shell's `set -m` contract).
+ * SETPGID(pid, pgid) follows POSIX: pid 0 means self, pgid 0 means the
+ * target's own pid. GETPGID(pid), pid 0 for self. Both route into the
+ * same implementation the Linux personality's setpgid/getpgid use --
+ * one process-group model, two ABIs, per the shared-semantics rule
+ * above. */
+#define ABI_SYS_SETPGID         191
+#define ABI_SYS_GETPGID         192
+/* ioctl(fd, req, argp). Routed through the Linux personality's ioctl arm,
+ * so the tty/pty control surface (TIOC*, TC*) is ONE implementation for
+ * both ABIs. Added for the interactive parity gate, which needs the
+ * openpty handshake (TIOCGPTN) from a native program. */
+#define ABI_SYS_IOCTL           193
+
+/* ---- 2026-08-24: the write-side calls the native ABI never had ----
+ *
+ * libtoby carried these as ENOSYS stubs ("the kernel doesn't expose these
+ * yet") and rename() as a read-copy-write-unlink emulation that could not
+ * move a directory and was not atomic. The kernel had all three the whole
+ * time -- vfs_truncate/vfs_rename exist and the LINUX personality already
+ * routes truncate(2)/renameat(2) to them -- so a busybox binary could do
+ * what a native tobyOS program could not, on the same filesystem. */
+#define ABI_SYS_TRUNCATE        194  /* (const char *path, uint64 len) -> 0|-E */
+#define ABI_SYS_FTRUNCATE       195  /* (int fd, uint64 len)          -> 0|-E */
+#define ABI_SYS_RENAME          196  /* (const char *old, const char *new) */
+/* rmdir(2) proper. libtoby's rmdir() was an alias for unlink(), so
+ * `rmdir somefile` removed the FILE instead of reporting ENOTDIR. */
+#define ABI_SYS_RMDIR           197  /* (const char *path) -> 0|-E */
+/* utimes: set a path's timestamps, in EPOCH SECONDS. (uint64_t)-1 in
+ * either field means "now", which is how touch(1) spells its default.
+ * `touch existingfile` used to open() it and close it again, which does
+ * not change a timestamp on any filesystem -- so the one command whose
+ * entire job is updating an mtime never updated one. */
+#define ABI_SYS_UTIMES          198  /* (path, mtime_sec, atime_sec) -> 0|-E */
+
+/* Genuinely MONOSPACED window text: 8x16 VGA cell, fixed 8px advance, opaque
+ * background.
+ *
+ * ABI_SYS_GUI_TEXT was the bitmap call until C18c rewired it to render
+ * proportional TrueType whenever a font is loaded -- which is every boot. The
+ * toolkit's tk_draw_text_mono() still pointed at it and still described itself
+ * as column-aligned, so every character grid built on it (the terminal) placed
+ * its cells at column*8 and rendered them at Lato's widths. The `bg` argument
+ * was dropped entirely too, so cell background colours never painted.
+ *
+ * a2 = (x & 0xFFFF) | (y << 16) | (cell_h << 32). cell_h is the caller's ROW
+ * PITCH -- the glyph is centred in it and clipped, and the opaque background
+ * covers exactly that many rows. It has to be a parameter because the callers
+ * disagree: the terminal is 16, gui_edit and gui_browser are 12, gui_viewer is
+ * 14, and painting 16 rows into a 12-row pitch erases the top of the line
+ * below. 0 means the font's own 16. */
+#define ABI_SYS_GUI_TEXT_MONO   199  /* (fd, xy|cell_h<<32, str, fg, bg) */
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          191
+/* Resolve a hostname to an IPv4 address, network byte order.
+ *
+ * There was NO resolver syscall, and libtoby's toby_dns_resolve() called
+ * number 78 anyway -- which is ABI_SYS_CLIP_PASTE. Every hostname lookup
+ * from userland was therefore a clipboard paste with the hostname as the
+ * destination buffer and the address of the caller's output variable as
+ * the buffer SIZE. It never resolved anything, and it could corrupt
+ * memory. This is the call it should always have made. */
+#define ABI_SYS_DNS_RESOLVE     200  /* (const char *name, uint32_t *ip_be) */
+
+/* Read raw sectors from a registered block device.
+ *
+ * args: (const char *devname, uint64_t lba, void *buf, uint32_t nsectors)
+ * returns 0, or -ABI_E* .  ROOT ONLY.
+ *
+ * There was no way for userland to see a disk's bytes at all, so none of
+ * dumpe2fs / e2fsck / debugfs / badblocks could exist. This is READ-ONLY on
+ * purpose: a general raw WRITE would bypass the foreign-filesystem and
+ * boot-medium guards that provisioning carries, and those exist because
+ * swap once targeted a Windows EFI partition. Anything that needs to write
+ * should go through SYS_DATA_PROVISION and its checks.
+ */
+#define ABI_SYS_BLK_READ        201  /* (name, lba, buf, nsectors) */
+
+/* Power control: shut down, reboot, or halt the machine.
+ *
+ * args: (unsigned action)  -- one of ABI_POWER_* below.  ROOT ONLY.
+ * Does not return on success; returns -ABI_E* if it could not act.
+ *
+ * The kernel has had acpi_shutdown() and acpi_reboot() for a long time
+ * (src/acpi.c, which also flushes the block cache first), but nothing
+ * exposed them, so shutdown/poweroff/halt/reboot -- four commands every
+ * distro has -- could not exist. Root only for the obvious reason: this
+ * ends every other process on the machine without asking them. */
+#define ABI_SYS_POWER           202  /* (action) */
+
+#define ABI_POWER_OFF     0u   /* ACPI S5 */
+#define ABI_POWER_REBOOT  1u
+#define ABI_POWER_HALT    2u   /* stop the CPUs, leave the power on */
+
+/* Flush every dirty filesystem block to stable media.
+ *
+ * args: none.  ret: 0.
+ *
+ * The block cache has always had bcache_sync(), and the graceful power-off
+ * path calls it, but no syscall reached it -- so `sync`, which is how a
+ * script says "make sure that is really on the disk before I pull the
+ * plug", could not exist. Not privileged: flushing your own writes is not
+ * a privileged act, and the call cannot lose data. */
+#define ABI_SYS_SYNC            203  /* () */
+#define ABI_SYS_PCI_CFG         204  /* (op, bdf, off, val) */
+#define ABI_SYS_AUTH_CHECK      205  /* (user, password) -> 0 | -EACCES */
+#define ABI_PCI_CFG_READ32      0
+#define ABI_PCI_CFG_WRITE32     1
+
+/* Native umask(2) (2026-09-01). The per-process umask has existed since
+ * Linux slice 1 and file creation applied it, but only the Linux
+ * personality's umask(2) could set or read it. chmod's who-less "+x" is
+ * defined in terms of it. Returns the previous mask. */
+#define ABI_SYS_UMASK           206
+
+/* Native realtime clock (2026-09-03). (clk) -> nanoseconds, or -EINVAL.
+ * ABI_CLOCK_REALTIME counts from 1970-01-01 00:00:00 UTC, anchored to the
+ * RTC once at first use and driven by the TSC -- the same converter the
+ * Linux personality's CLOCK_REALTIME and the filesystems' inode stamps use,
+ * so a native and a Linux program asking at the same instant get the same
+ * number. ABI_CLOCK_MONOTONIC counts from boot at the same resolution.
+ * Until this existed the only native clock was CLOCK_MS, and libtoby's
+ * time() was seconds since boot on a pretend 2025-01-01 base: `date` said
+ * 2025 on a machine whose RTC said 2026, and busybox said 2026. */
+#define ABI_SYS_CLOCK_NS        207
+#define ABI_CLOCK_REALTIME      0
+#define ABI_CLOCK_MONOTONIC     1
+
+/* ---- Native-parity batch (2026-09-04): what the last 46 busybox-only
+ * utilities needed from the kernel that no native program could reach. */
+#define ABI_SYS_BLK_WRITE       208  /* (name, lba, buf, nsectors) -> 0|-E.
+                                        ROOT ONLY, and REFUSED (-EBUSY) for a
+                                        device backing a live mount: mkfs on
+                                        /data through this is a bug, not a
+                                        feature. Mirrors BLK_READ. */
+#define ABI_SYS_LINK            209  /* (oldpath, newpath) -> 0|-E: a HARD
+                                        link. tobyfs/tmpfs/ramfs carry it;
+                                        -EPERM where the fs cannot. */
+#define ABI_SYS_SETPASSWD       210  /* (user, newpw, oldpw) -> 0|-E. Root
+                                        sets anyone's (oldpw ignored); a user
+                                        sets ONLY their own and must present
+                                        the old one (-EACCES otherwise). */
+#define ABI_SYS_SOCKOPT         211  /* (fd, opt, val) -> 0|-E */
+#define ABI_SOCKOPT_IP_TTL      1    /* val 1..255: the IP TTL this socket's
+                                        datagrams leave with. traceroute. */
+#define ABI_SYS_ARP             212  /* (op, ip_be, mac6) -> 0|-E
+                                        op 0: resolve from the cache into mac6
+                                              (-ENOENT if absent)
+                                        op 1: send an ARP request for ip_be
+                                        op 2: (index, struct abi_arp_entry*)
+                                              -- cache slot #index; -ENOENT
+                                              past the end, valid=0 if empty
+                                        op 3: delete the entry for ip_be
+                                        op 4: set a static entry (ip_be, mac6)
+                                        op 5: (ip_be, mac6) resolve, PUMPING the
+                                              NIC once -- fills mac6 from the
+                                              cache, or on a miss sends a request,
+                                              drains the RX ring and tries again;
+                                              -ENOENT if still unresolved. The
+                                              caller loops this with a short
+                                              sleep (the wait stays in userspace,
+                                              never spinning the NIC under the BKL).
+                                        ops 1, 3, 4 are root only. */
+struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _pad; };
+
+#define ABI_SYS_NETCFG          213  /* (op, a, b, c) -> 0|-E. ROOT ONLY.
+                                        op 0: set address  (ip_be, mask_be)
+                                        op 1: set gateway  (gw_be)
+                                        op 2: route add    (dst_be, mask_be, gw_be)
+                                        op 3: route del    (dst_be, mask_be)
+                                        op 4: link up/down (1|0)
+                                        op 5: get MAC into mac6 (any uid)
+                                        The native `ip`/`route` setters; the
+                                        Linux personality reaches the same
+                                        kernel state through rtnetlink. */
+#define ABI_SYS_USERADD         214  /* (op, name, uid, gid) -> 0|-E. ROOT ONLY.
+                                        op 0: add the account to the KERNEL's
+                                              authentication database
+                                              (-EEXIST if the name or uid is taken)
+                                        op 1: delete it (-ENOENT if absent)
+                                        useradd/userdel wrote only /etc/passwd
+                                        before 2026-09-04; the kernel kept a
+                                        separate table that only a shell
+                                        builtin could add to, so a useradd'd
+                                        user could never authenticate. */
+#define ABI_SYS_GETRUID         215  /* () -> the caller's REAL uid. getuid
+                                        returns the EFFECTIVE uid, which a
+                                        setuid-root exec has already set to 0;
+                                        su must ask "was the INVOKER root?"
+                                        before it decides to skip the password. */
+#define ABI_SYS_STATFS          216  /* (path, struct abi_statfs *out) -> 0|-E.
+                                        The numbers statfs(2) gives a Linux
+                                        program, for the filesystem holding
+                                        PATH; -ENOENT if PATH does not exist.
+                                        /bin/df read a filesystem CHECKER's
+                                        report through a struct that did not
+                                        match it (M3). */
+#define ABI_SYS_TIMES           217  /* (int who, struct abi_times *out) ->
+                                        0|-E. who 0 = this process (its
+                                        thread group) with its reaped
+                                        children, 1 = this thread alone.
+                                        times(2) and getrusage(2) for a
+                                        native program: /bin/tsh's `times`
+                                        and `time` printed wall-clock
+                                        uptime and nothing. */
+#define ABI_SYS_SETSID          218  /* () -> the caller's pid, a new session
+                                        and group with no controlling
+                                        terminal; -EPERM for a process-
+                                        group leader. setsid(2). */
+#define ABI_SYS_POLL            219  /* (struct pollfd *fds, nfds, timeout_ms)
+                                        -> ready count|0|-E: poll(2), the
+                                        Linux personality's own (same
+                                        struct, same POLL* bits). libtoby's
+                                        poll() had no syscall to call and
+                                        slept the whole timeout, then said
+                                        every fd was ready -- so tsh's
+                                        `read -t 5` always waited five
+                                        seconds and `sleep 4 | read -t 2`
+                                        four (logs/b15 rt). Never restarted
+                                        after a handler, as on Linux. */
+#define ABI_SYS_LSTAT           220  /* (path, struct abi_stat *out) -> 0|-E:
+                                        lstat(2) -- a symbolic link itself,
+                                        S_IFLNK. SYS_STAT follows one. There
+                                        was no lstat, and stat called a link
+                                        a regular file (finding 87). */
+#define ABI_SYS_MKFIFO          221  /* (path, mode) -> 0|-E: mkfifo(3), a
+                                        FIFO with mode less the umask; EEXIST,
+                                        EPERM where the filesystem cannot
+                                        hold one. There were no FIFOs. */
+#define ABI_SYS_XSTAT           222  /* (int kind, long path_or_fd, struct
+                                        abi_stat *out, size_t size) -> 0|-E:
+                                        kind 0 stat, 1 lstat, 2 fstat, the
+                                        whole struct abi_stat as it is now,
+                                        written to at most SIZE bytes of OUT.
+                                        SYS_STAT/LSTAT/FSTAT write exactly
+                                        the layout up to its ctime field
+                                        (ABI_STAT_V1_SIZE) and nothing after,
+                                        so a binary built before the struct
+                                        grew is never written past; libtoby
+                                        asks through this one (batch 25). */
+#define ABI_SYS_GETNICE         223  /* (int which, int who) -> 20 less the
+                                        lowest niceness among the processes
+                                        WHICH and WHO name, or -ABI_E*:
+                                        getpriority(2) as the raw Linux call
+                                        answers it. which 0 a process, 1 a
+                                        process group, 2 a user (by real
+                                        uid); who 0 is the caller's own. */
+#define ABI_SYS_SETNICE         224  /* (int which, int who, int nice) -> 0
+                                        |-E: setpriority(2). The niceness is
+                                        clamped to -20..19; EPERM for another
+                                        user's process, EACCES for a lower one
+                                        unless root, ESRCH for none. This is
+                                        not SETPRIORITY's scheduling CLASS
+                                        (165) -- though a niceness moves the
+                                        class with it. (batch 25) */
+#define ABI_SYS_UTIMENSAT       225  /* (path, const struct abi_timespec
+                                        times[2] | NULL, int flags) -> 0|-E:
+                                        utimensat(2) at AT_FDCWD. times[0]
+                                        the access time, times[1] the
+                                        modification time, either one's
+                                        tv_nsec ABI_UTIME_NOW or
+                                        ABI_UTIME_OMIT; NULL is now for both.
+                                        Seconds are signed (1969 is a time).
+                                        flags ABI_AT_SYMLINK_NOFOLLOW: the
+                                        link itself. EPERM to set an explicit
+                                        time on another user's file, EACCES
+                                        to set now on one not writable.
+                                        SYS_UTIMES could not say 1969-12-31
+                                        23:59:59 -- its -1 meant now -- nor
+                                        leave one time as it was. (batch 26) */
+#define ABI_SYS_CLOCK_SETTIME   226  /* (int clk, const struct abi_timespec
+                                        *ts) -> 0|-E: clock_settime(2),
+                                        Linux's rules: only CLOCK_REALTIME
+                                        (else EINVAL), a valid time (EINVAL),
+                                        CAP_SYS_TIME in the initial user
+                                        namespace (EPERM), not before
+                                        CLOCK_MONOTONIC (EINVAL). Moves the
+                                        wall clock; monotonic never jumps.
+                                        (finding 157) */
+#define ABI_SYS_LCHOWN          227  /* (path, uid, gid) -> 0|-E: lchown(2),
+                                        SYS_CHOWN's rules for the node the
+                                        path names -- a symbolic link is
+                                        changed, not followed, where
+                                        SYS_CHOWN now follows one (chgrp
+                                        -h, chgrp -R, finding 151) */
+#define ABI_SYS_GETGROUPS       228  /* (int size, gid_t *list) -> how many:
+                                        getgroups(2), Linux's rules (size 0
+                                        asks how many; too small is EINVAL).
+                                        The supplementary groups a login
+                                        gives (users_initgroups) were real
+                                        and no native program could ask for
+                                        them: id said groups=1000 alone. */
+#define ABI_SYS_FS_READDIR2     229  /* (path, struct abi_dirent2 *out, int
+                                        cap, int offset) -> how many: a
+                                        directory as Linux's readdir gives
+                                        it -- "." and ".." first, each
+                                        entry's inode (what stat would say)
+                                        and full type, names whole.
+                                        SYS_FS_READDIR (no dots, two types,
+                                        63-byte names) is kept unchanged
+                                        for the programs that call it
+                                        directly (finding 187). */
+#define ABI_SYS_MOUNT           230  /* (source, target, fstype, flags, data)
+                                        -> 0|-E: mount(2), the Linux
+                                        personality's (root, CAP_SYS_ADMIN
+                                        in the mount namespace's owner) --
+                                        mount(8) had no native way in */
+#define ABI_SYS_UMOUNT2         231  /* (target, flags) -> 0|-E: umount2(2),
+                                        MNT_FORCE 1, MNT_DETACH 2,
+                                        MNT_EXPIRE 4, UMOUNT_NOFOLLOW 8 */
+#define ABI_SYS_RENAMEAT2       232  /* (olddirfd, old, newdirfd, new, flags)
+                                        -> 0|-E: renameat2(2), the Linux
+                                        personality's -- RENAME_NOREPLACE,
+                                        RENAME_EXCHANGE (mv --exchange) */
+#define ABI_SYS_SETGROUPS       233  /* (int size, const gid_t *list) -> 0|-E:
+                                        setgroups(2), the Linux personality's
+                                        (privileged). su set no supplementary
+                                        groups: the target kept the caller's
+                                        (finding 203) */
+#define ABI_SYS_GETRGID         234  /* () -> the caller's REAL gid, as
+                                        GETRUID is the real uid: libtoby's
+                                        getgid() (finding 206) */
+#define ABI_SYS_CHROOT          235  /* (path) -> 0|-E: chroot(2), the Linux
+                                        personality's, in Linux's order of
+                                        answers (finding 214) */
+#define ABI_SYS_MKNOD           236  /* (dirfd, path, mode, dev) -> 0|-E:
+                                        mknodat(2), Linux's dev_t; a device
+                                        node keeps its numbers and opens the
+                                        device they name (finding 214) */
+#define ABI_SYS_FCNTL           237  /* (fd, cmd, arg) -> the answer|-E:
+                                        fcntl(2), the Linux personality's --
+                                        Linux's commands and flags; libtoby's
+                                        fcntl was a stub (finding 235) */
+#define ABI_SYS_XATTR           238  /* (lxnr, a, b, c, d) -> the answer|-E:
+                                        the twelve xattr calls, LXNR Linux's
+                                        number (188 setxattr .. 199
+                                        fremovexattr) and A-D its arguments;
+                                        a set's D is size | flags << 32
+                                        (finding 225) */
+#define ABI_SYS_SHADOW          239  /* (op, name, arg) -> 0|-E: an account's
+                                        aging and password state, what
+                                        shadow-utils' passwd and chpasswd
+                                        change (finding 213): ABI_SHADOW_* */
+#define ABI_SYS_UNSHARE         240  /* (flags) -> 0|-E: unshare(2), Linux's
+                                        CLONE_NEW* bits -- what the Linux
+                                        personality has had since slice 8,
+                                        for tobyOS's unshare(1) (finding
+                                        241) */
+#define ABI_SYS_SIGQUEUE        241  /* (pid, sig, value) -> 0|-E: sigqueue(3),
+                                        the signal delivered with SI_QUEUE
+                                        and VALUE (finding 215) */
+#define ABI_SYS_LXSTATFS        242  /* (which, path|fd, struct statfs *) ->
+                                        0|-E: statfs(2) (WHICH 0) or
+                                        fstatfs(2) (1) in Linux's struct
+                                        statfs, the Linux arms' (finding
+                                        215) */
+#define ABI_SYS_FSYNC           243  /* (fd, datasync) -> 0|-E: fsync(2),
+                                        fdatasync(2) when DATASYNC (finding
+                                        215: shred synced every file) */
+#define ABI_SYS_ADJTIMEX        244  /* (struct timex *, Linux's x86-64
+                                        layout) -> clock state|-E:
+                                        adjtimex(2) -- a single-shot or NTP
+                                        offset SLEWED at 500 ppm, never a
+                                        jump; ADJ_SETOFFSET steps.
+                                        CAP_SYS_TIME to change anything
+                                        (EPERM). (finding 280) */
+#define ABI_SYS_PRLIMIT         245  /* (pid, resource, const uint64_t
+                                        new[2], uint64_t old[2] -- each
+                                        { soft, hard }) -> 0|-E: prlimit64(2), the
+                                        Linux personality's own table and
+                                        rules (include/tobyos/rlimit.h):
+                                        pid 0 the caller; EINVAL for a soft
+                                        limit over its hard one or a
+                                        resource past 15, EPERM to raise a
+                                        hard limit without root or the
+                                        open-file one past 1024. OLD is
+                                        written only on success. libtoby's
+                                        getrlimit/setrlimit (batch 47) */
+#define ABI_SYS_NR_MAX          245
+
+#define ABI_SHADOW_GET     0  /* arg: struct abi_shadow *out; root, or the
+                                 account's own user */
+#define ABI_SHADOW_AGE     1  /* arg: struct abi_shadow *in -- minage,
+                                 maxage, warn, inactive; -2 leaves one,
+                                 -1 empties it; root */
+#define ABI_SHADOW_LOCK    2  /* a '!' before the hash; root */
+#define ABI_SHADOW_UNLOCK  3  /* off again; -EINVAL if no password would be
+                                 left; root */
+#define ABI_SHADOW_DELETE  4  /* no password; root */
+#define ABI_SHADOW_EXPIRE  5  /* the last change 0: change it at login */
+#define ABI_SHADOW_SETHASH 6  /* arg: a hash made elsewhere, kept as it is
+                                 (chpasswd -e); root */
+
+struct abi_shadow {
+    int64_t lastchg;          /* days since 1970; -1 empty, 0 expired */
+    int64_t minage, maxage, warn, inactive, expire;   /* days; -1 empty */
+    int32_t state;            /* 0 no password, 1 a password, 2 locked */
+    int32_t _pad;
+};
+
+#define ABI_UTIME_NOW           ((1L << 30) - 1L)   /* Linux's values */
+#define ABI_UTIME_OMIT          ((1L << 30) - 2L)
+#define ABI_AT_SYMLINK_NOFOLLOW 0x100
+
+/* ABI_SYS_TIMES's answer, in ns. */
+struct abi_times {
+    uint64_t utime_ns, stime_ns;        /* the caller */
+    uint64_t cutime_ns, cstime_ns;      /* its reaped children, theirs incl. */
+};
+
+/* ABI_SYS_STATFS's answer: vfs_statfs, in bsize units. */
+struct abi_statfs {
+    uint64_t bsize;
+    uint64_t blocks;
+    uint64_t bfree;
+    uint64_t bavail;
+    uint64_t files;
+    uint64_t ffree;
+    uint32_t type_magic;    /* Linux f_type: TMPFS_MAGIC, 0xEF53, ... */
+    uint32_t namelen;
+};
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
@@ -1118,6 +1569,7 @@ _Static_assert(sizeof(struct abi_crash_header) ==
 #define ABI_WDOG_KIND_KERNEL_HANG    2u  /* PIT advanced but sched did not */
 #define ABI_WDOG_KIND_USER_HANG      3u  /* userland process not yielding */
 #define ABI_WDOG_KIND_MANUAL         4u  /* triggered by wdogtest --hang */
+#define ABI_WDOG_KIND_IDLE_STALL     5u  /* pid 0 / idle loop wedged   */
 
 struct abi_wdog_status {
     uint32_t enabled;                    /* 0/1                        */
@@ -1168,6 +1620,12 @@ struct abi_fscheck_report {
 /* ============================================================
  *  Service supervision (Milestone 28F)
  * ============================================================ */
+
+/* The most entries ABI_SYS_SVC_LIST will accept in one call. This existed
+ * only as a bare 64 inside the kernel's bounds check while /bin/ps asked for
+ * 128, so every single `ps` invocation came back -EINVAL and the tool had
+ * never once worked. Named here so the two sides share one number. */
+#define ABI_SVC_LIST_MAX  64
 
 #define ABI_SVC_NAME_MAX  16
 #define ABI_SVC_PATH_MAX  64
@@ -1332,6 +1790,12 @@ _Static_assert(sizeof(struct abi_dev_info) == 16 + ABI_DEVT_NAME_MAX +
 #define ABI_BLK_F_TOBYFS   0x10u  /* tobyfs superblock found             */
 #define ABI_BLK_F_RAM      0x20u  /* RAM-backed (contents lost on boot)  */
 #define ABI_BLK_F_GONE     0x40u  /* hardware removed                    */
+/* Removable media (USB mass storage). The one flag ABI_PROV_F_ERASE is
+ * gated on, so a listing must show it: it is the difference between "this
+ * stick is yours to reformat" and "this is a fixed disk and no flag will
+ * touch it". Reported in `flags` rather than a new struct field because
+ * abi_blk_info's layout is frozen at 160 bytes. */
+#define ABI_BLK_F_REMOVABLE 0x80u
 
 #define ABI_BLK_NAME_MAX   32
 #define ABI_BLK_MODEL_MAX  44
@@ -1372,6 +1836,84 @@ _Static_assert(sizeof(struct abi_blk_info) == 160,
  * does NOT unlock foreign filesystems / partition tables -- those are
  * refused unconditionally in the kernel. */
 #define ABI_PROV_F_FORCE   0x1u
+
+/* ERASE: reformat a REMOVABLE device that carries a foreign filesystem.
+ *
+ * 2026-08-25. Strictly stronger than FORCE and deliberately a separate
+ * bit, because it authorises DESTROYING SOMEBODY ELSE'S DATA. The guard's
+ * blanket "foreign is never writable" is right for anything automatic, and
+ * wrong as an absolute: an owner must be able to reformat their own USB
+ * stick, which is all `mkfs` has ever been.
+ *
+ * What it does NOT unlock, in the kernel, regardless of the flag:
+ *   - anything not marked blk_dev.removable -- an internal disk holding
+ *     someone's Windows install can never be reached this way;
+ *   - an iso9660 volume, i.e. the live boot medium we are running from;
+ *   - a device backing a live mount.
+ * The userspace caller is expected to name the device and confirm; the
+ * kernel re-checks all of the above regardless of what it was told. */
+#define ABI_PROV_F_ERASE   0x2u
+
+/* FORMAT_ONLY: lay a tobyfs filesystem across the WHOLE device and stop.
+ * No partition table, no /data takeover.
+ *
+ * 2026-08-25. Provisioning answers "make this my persistent /data", which
+ * is not the same question as "format this USB stick so I can put files on
+ * it" -- the second stick in a machine wants a filesystem and a mount
+ * point, not to become the system volume. A whole-disk tobyfs is what
+ * `mount -t tobyfs <dev> /mnt/usb` wants, and busybox's mount applet
+ * already ships.
+ *
+ * The guard is identical -- this flag changes WHAT IS WRITTEN, never WHO
+ * MAY BE WRITTEN TO. ERASE is still required for a foreign filesystem, and
+ * a fixed disk / the live boot medium / a mounted volume are still refused.
+ *
+ * Note the volume is a valid tobyfs, so a later boot with no other
+ * candidate can adopt it as /data through the existing whole-disk sweep.
+ * The CLI says so rather than letting that be a surprise. */
+#define ABI_PROV_F_FORMAT_ONLY 0x4u
+
+/* ERASE_ISO: also erase a device whose signature says iso9660.
+ *
+ * 2026-08-27. ERASE alone deliberately refuses iso9660, because a stick
+ * carrying an ISO is ASSUMED to be the live boot medium and erasing it
+ * destroys the running system. That assumption is a heuristic, not a
+ * fact: Limine reports no boot device, so tobyOS cannot tell the stick it
+ * booted from apart from a second stick that merely still has an old ISO
+ * on it. Reported from real hardware -- a spare stick that had once been
+ * written with Rufus could never be reclaimed, and the refusal was only
+ * visible in a GUI status bar.
+ *
+ * So the blanket refusal stays the default and this flag is the explicit
+ * override, valid ONLY together with ERASE and only on REMOVABLE media.
+ * It is a separate bit rather than a widening of ERASE precisely so that
+ * every existing caller keeps the safe behaviour it was written against.
+ *
+ * The caller is expected to have made the user type the device name. If
+ * they aim it at the stick they booted from, that stick is destroyed --
+ * the kernel and initrd are already in RAM, so the session survives and
+ * the next boot does not. */
+#define ABI_PROV_F_ERASE_ISO   0x8u
+
+/* REPLACE_DATA: also allow the device that currently backs /data.
+ *
+ * 2026-08-29. A mounted device is refused, which is right -- except that it
+ * made the ONE volume a user most wants to re-make unreachable. Once /data
+ * persists on a stick, that stick is mounted at every boot, so File Explorer
+ * and diskmgr both refuse it forever: the reward for setting up a persistent
+ * /data was losing the ability to re-format it. The only way out was to boot
+ * with the stick unplugged and hot-plug it afterwards.
+ *
+ * With this flag the kernel unmounts /data, formats, and mounts the fresh
+ * volume back at /data. Everything on it is destroyed -- settings, users, the
+ * SSH host key -- so the caller is expected to have made the user type the
+ * device name, exactly as ERASE does.
+ *
+ * Deliberately NARROW: it permits a device whose ONLY mount is /data. A
+ * device backing anything else (the live boot medium, /usb, a future second
+ * mount) stays refused, because "reformat my data volume" is a request the
+ * user can mean and "reformat something the system is using" is not. */
+#define ABI_PROV_F_REPLACE_DATA 0x10u
 
 struct abi_provision_req {
     char     dev[ABI_BLK_NAME_MAX];      /* whole-disk device name       */
@@ -1529,6 +2071,10 @@ _Static_assert(sizeof(struct abi_display_info) ==
  *  waitpid flags
  * ============================================================ */
 #define ABI_WNOHANG     0x1   /* don't block; return 0 if no child ready */
+#define ABI_WUNTRACED   0x2   /* also report job-control stops (status
+                               * 0x10000|sig -- the Linux 0x7f byte would
+                               * collide with a real `exit 127`) */
+#define ABI_WCONTINUED  0x4   /* also report SIGCONT resumes (status 0x20000) */
 
 /* ============================================================
  *  stat structure
@@ -1540,6 +2086,9 @@ _Static_assert(sizeof(struct abi_display_info) ==
 #define ABI_S_IFDIR     0x4000
 #define ABI_S_IFLNK     0xA000
 #define ABI_S_IFCHR     0x2000   /* character device (the /dev nodes) */
+#define ABI_S_IFIFO     0x1000   /* a pipe (fstat of one) */
+#define ABI_S_IFSOCK    0xC000   /* a socket (fstat of one) */
+#define ABI_S_IFBLK     0x6000
 
 #define ABI_S_ISLNK(m)  (((m) & ABI_S_IFMT) == ABI_S_IFLNK)
 
@@ -1563,9 +2112,47 @@ struct abi_stat {
     uint32_t mode;       /* ABI_S_IFMT bits + permission bits */
     uint32_t uid;
     uint32_t gid;
-    uint32_t _reserved0; /* padding for forward ABI growth */
-    uint64_t _reserved1[2];
+    /* 2026-09-08: the hard-link count, claimed out of the spare word this
+     * struct was carrying. `ls -l` printed a SYNTHETIC count (1 for files,
+     * 2 for directories) because there was nowhere for the real one to
+     * travel -- while the VFS had been reporting it since hard links
+     * landed. */
+    uint32_t nlink;
+    /* 2026-08-24: timestamps, in UNIX EPOCH SECONDS, claimed out of the
+     * two spare words this struct reserved for exactly this. sizeof is
+     * unchanged, so nothing built against the old layout shifts.
+     *
+     * Until now the native ABI had no way to REPORT a file time (and
+     * none to set one), which is why `touch -m` had nothing to preserve
+     * and native `ls -l` had nothing to print. 0 means the filesystem
+     * has no answer, matching struct vfs_stat. */
+    uint64_t mtime;      /* last data modification */
+    uint64_t atime;      /* last access (best effort) */
+    /* Inode identity, appended (the struct grows; libtoby translates
+     * field by field, so nothing shifts underneath userland). 0 means the
+     * filesystem has no answer -- callers fall back to comparing paths.
+     * Without these `test -ef` was path equality and could not see that
+     * two hard links name one file. */
+    uint64_t ino;
+    uint64_t dev;
+    /* 2026-10-12 (batch 25), reached only through ABI_SYS_XSTAT: what GNU
+     * stat, du and truncate -o ask of a file. The numbers are the Linux
+     * personality's, so a native tool and a Linux one agree about one
+     * file: 512-byte blocks for the size rounded up, an I/O block of 512
+     * (4096 for a device), and a device node's major and minor. */
+    uint64_t ctime;      /* last inode change, epoch seconds; 0 no answer */
+    uint64_t blocks;     /* 512-byte blocks */
+    uint32_t blksize;    /* the I/O block size */
+    uint32_t rdev_major; /* a device node's numbers; 0 for anything else */
+    uint32_t rdev_minor;
+    /* finding 239: the nanoseconds past mtime's, atime's and ctime's
+     * second, where the filesystem keeps them (tmpfs); 0 where not */
+    uint32_t mtime_ns;
+    uint32_t atime_ns;
+    uint32_t ctime_ns;
+    uint32_t _pad;
 };
+#define ABI_STAT_V1_SIZE 56  /* sizeof the struct up to and excluding ctime */
 
 /* ============================================================
  *  spawn()
@@ -1585,13 +2172,26 @@ struct abi_stat {
  *                    explicit fd is duped into the child's fd table
  *                    by the kernel, so the parent can close its own
  *                    copy independently after spawn returns.
- * `flags`          : reserved, must be 0 in v1.
+ * `flags`          : ABI_SPAWN_F_* below; 0 = none (every v1 caller).
  *
  * Returns: child pid (>0) on success; negative ABI_E* on failure.
  * Process is launched synchronously — when this call returns the
  * child is enqueued and ready to run. Use SYS_WAITPID to block on
  * the child's exit.
  */
+/* One descriptor above 2, handed to the child at a chosen number. `parent_fd`
+ * names a descriptor in the CALLER's table; the kernel clones it. */
+struct abi_spawn_fd {
+    int child_fd;
+    int parent_fd;
+};
+
+/* Bound on nextra, so the copy-in is finite: one per descriptor a process
+ * can have (PROC_NFDS). It was 16, and a spawn from a shell holding more
+ * than 16 descriptors above 2 -- now that tsh has them past 9 -- lost the
+ * rest without a word. */
+#define ABI_SPAWN_EXTRA_MAX 1024
+
 struct abi_spawn_req {
     const char         *path;
     char *const        *argv;       /* NULL-terminated */
@@ -1600,11 +2200,51 @@ struct abi_spawn_req {
     int                 fd1;
     int                 fd2;
     uint32_t            flags;
+    /* Descriptors above 2. Appended, and zero means NONE, so a caller that
+     * predates these fields is unaffected -- which is the only reason it is
+     * safe to grow a struct the syscall layer copies in wholesale. A shell
+     * needs them for `exec 3>file` and `cmd 8<<EOF`; nothing else passes any. */
+    uint32_t                    nextra;
+    const struct abi_spawn_fd  *extra;
 };
 
 /* fd0/fd1/fd2 sentinels for spawn_req. */
 #define ABI_SPAWN_FD_INHERIT   (-1)
 #define ABI_SPAWN_FD_CONSOLE   (-2)
+/* No descriptor at all: the child's slot is closed, as a forked shell's
+ * child has it after `<&-` (finding 234). */
+#define ABI_SPAWN_FD_CLOSED    (-3)
+
+/* spawn_req.flags: the child starts with SIGINT / SIGQUIT at the default
+ * (DFL) or ignored (IGN) whatever the caller has -- posix_spawn's
+ * SETSIGDEF and its opposite, for a shell's restore_original_signals
+ * (proc_spec.sig_default / sig_ignore). Without them an ignore is
+ * inherited and a handler is not. Any other bit is -EINVAL. */
+#define ABI_SPAWN_F_DFL_INT    0x1u
+#define ABI_SPAWN_F_DFL_QUIT   0x2u
+#define ABI_SPAWN_F_IGN_INT    0x4u
+#define ABI_SPAWN_F_IGN_QUIT   0x8u
+/* The child leads a NEW SESSION and process group (posix_spawn's
+ * POSIX_SPAWN_SETSID), and the pty on its fd 0, when that is one, is its
+ * controlling terminal -- as a session leader's first open of a terminal
+ * makes it, and as login_tty(3) leaves a terminal emulator's shell. Without
+ * it the child keeps its spawner's session and terminal: /bin/gui_term's
+ * shell had the CONSOLE's, so /dev/tty in the desktop's terminal window
+ * opened the console, and `cmd | less` there waited on it for its keys. */
+#define ABI_SPAWN_F_SETSID     0x10u
+/* MOVE, NOT COPY: a caller descriptor named in fd0/fd1/fd2 or an extra's
+ * parent_fd with ABI_SPAWN_FD_MOVE or'd into its number is the child's
+ * alone -- the kernel clones it into the child and closes the caller's
+ * before the child can run (sys_spawn holds the big lock throughout, and
+ * the child's first system call waits for it), only when the spawn
+ * succeeds. A shell's own redirection of a command -- `ls /proc/$$/fd >
+ * f` -- is opened by the shell, which spawns rather than forks, and was
+ * the shell's until the spawn returned, so a child that looked at once
+ * saw it (finding 618). The bit means something only with this flag; a
+ * kernel without the flag refuses it, -EINVAL, and the caller can spawn
+ * as before. */
+#define ABI_SPAWN_F_MOVEFDS    0x20u
+#define ABI_SPAWN_FD_MOVE      0x40000000
 
 /* ============================================================
  *  Networking helpers (already exported in older syscall.h, but
@@ -1636,6 +2276,24 @@ struct abi_dirent {
     uint32_t uid;
     uint32_t gid;
     uint32_t mode;
+};
+
+/* ABI_SYS_FS_READDIR2's entry (batch 31, finding 187). TYPE is Linux's
+ * d_type; INO is what lstat of the entry says its st_ino is. */
+#define ABI_DIRENT2_NAME_MAX 256
+#define ABI_DT2_UNKNOWN 0
+#define ABI_DT2_FIFO    1
+#define ABI_DT2_CHR     2
+#define ABI_DT2_DIR     4
+#define ABI_DT2_BLK     6
+#define ABI_DT2_REG     8
+#define ABI_DT2_LNK     10
+#define ABI_DT2_SOCK    12
+struct abi_dirent2 {
+    uint64_t ino;
+    uint32_t type;
+    uint32_t pad;
+    char     name[ABI_DIRENT2_NAME_MAX];
 };
 
 /* ============================================================
@@ -1679,6 +2337,9 @@ struct abi_dirent {
 #define ABI_AT_CLKTCK   17      /* frequency of times() ticks */
 #define ABI_AT_SECURE   23      /* nonzero if this is a secure exec */
 #define ABI_AT_RANDOM   25      /* ptr to 16 random bytes (libc stack canary) */
+#define ABI_AT_HWCAP2   26      /* extended capability mask (0: none claimed) */
+#define ABI_AT_MINSIGSTKSZ 51   /* minimum signal-frame stack (glibc sysconf) */
+#define ABI_AT_SYSINFO_EHDR 33  /* vDSO base address (2026-08-23) */
 /* Minimal x86-64 HWCAP: FPU|VME|DE|PSE|TSC|MSR|PAE|MCE|CX8|APIC|SEP|MTRR|
  * PGE|MCA|CMOV|PAT|PSE36|CLFLUSH|MMX|FXSR|SSE|SSE2 — enough for glibc/GLib
  * feature probes that abort when getauxval(AT_HWCAP) is missing entirely. */

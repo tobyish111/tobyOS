@@ -13,6 +13,11 @@
 int puff_gzip(uint8_t *dest, unsigned long *destlen,
               const uint8_t *src, unsigned long srclen);
 
+/* Inflate a BARE deflate stream -- no gzip or zlib wrapper. This is what
+ * a ZIP entry stores, which is why it is exposed rather than left static. */
+int puff_inflate_raw(uint8_t *dest, unsigned long *destlen,
+                     const uint8_t *src, unsigned long srclen);
+
 /* Inflate a zlib (RFC 1950) stream. Same in/out convention. */
 int puff_zlib(uint8_t *dest, unsigned long *destlen,
               const uint8_t *src, unsigned long srclen);

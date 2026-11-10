@@ -1,0 +1,2 @@
+[ present -nt absent ] || exit 1
+[ absent -ot present ] || exit 2

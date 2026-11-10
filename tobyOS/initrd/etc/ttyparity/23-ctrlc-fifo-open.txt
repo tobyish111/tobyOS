@@ -1,0 +1,12 @@
+# ^C IN A FIFO OPEN THE SHELL IS BLOCKED IN. `read x < fifo` -- the shell
+# opens the FIFO itself and waits there for a writer; no job, so the ^C is
+# the shell's own (the marker's wait for a new foreground runs out first).
+# bash's redir_open gives up without a word and the line unwinds with 130;
+# tsh said "/tmp/tp-fifo: I/O error" -- the EINTR its open shim mapped to
+# EIO (finding 124).
+rm -f /tmp/tp-fifo; mkfifo /tmp/tp-fifo
+read x < /tmp/tp-fifo; echo after-read
+%CTRLC%
+echo "fifo=$?"
+rm -f /tmp/tp-fifo
+exit 0

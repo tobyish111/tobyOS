@@ -9,6 +9,7 @@
  */
 
 #include <tobyos/proc.h>
+#include <tobyos/binfmt.h>
 #include <tobyos/sched.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
@@ -157,6 +158,18 @@ static __attribute__((noreturn)) void fork_child_entry(void) {
      * post-switch line -- release the proc this CPU switched away from
      * (see sched_finish_switch), or it stays on_cpu/unschedulable. */
     sched_finish_switch();
+    /* Phase F: the deferred CLONE_CHILD_SETTID stamp -- we are now IN the
+     * child's context, so the write breaks CoW into the child's own frame
+     * (a parent-side write would have changed the shared page under both).
+     * See proc.h set_child_tid for why glibc's fork() depends on this. */
+    if (p->set_child_tid) {
+        extern int pid_vnr(struct proc *);
+        int v = pid_vnr(p);
+        uint32_t vtid = (uint32_t)(v ? v : p->pid);
+        (void)copy_to_user((void *)(uintptr_t)p->set_child_tid,
+                           &vtid, sizeof vtid);
+        p->set_child_tid = 0;
+    }
     /* Load the child's FPU/SSE state (copied from the parent at fork time)
      * -- the switch that landed us here restored the previous proc's state. */
     fpu_restore(p->fpu_state);
@@ -165,9 +178,8 @@ static __attribute__((noreturn)) void fork_child_entry(void) {
 }
 
 static bool build_fork_kstack(struct proc *child) {
-    void *base = kmalloc(PROC_KSTACK_SZ);
+    void *base = proc_kstack_alloc();      /* zeroed */
     if (!base) return false;
-    memset(base, 0, PROC_KSTACK_SZ);
     child->kstack_base = base;
     child->kstack_top  = (uint8_t *)base + PROC_KSTACK_SZ;
 
@@ -453,6 +465,7 @@ long sys_fork(void) {
     /* Slice 15: the pids controller. Checked BEFORE claiming a slot so a denied
      * fork costs nothing and cannot leave a PROC_EMBRYO behind -- which, per the
      * slice-109 note directly above, is the state that must never leak. */
+    proc_reap_orphans();          /* exited orphans' slots, first */
     { long cgrc = cgroup_can_fork(parent);
       if (cgrc != 0) return cgrc; }
     struct proc *child = proc_slot_claim();
@@ -472,8 +485,12 @@ long sys_fork(void) {
     }
 
     /* Copy parent's proc struct as a starting point. */
-    int child_pid = (int)(child - g_proc);
+    int child_pid = proc_pid_alloc(child);
     memcpy(child, parent, sizeof(*child));
+    /* the limits the parent USES: a thread's own table is not them, its
+     * leader's is (proc_rlim; include/tobyos/rlimit.h) */
+    { struct tobyos_rlim *rl = proc_rlim(parent);
+      if (rl) { memcpy(child->rlim, rl, sizeof child->rlim); child->rlim_set = true; } }
 
     child->pid       = child_pid;
     child->ppid      = parent->pid;
@@ -481,6 +498,19 @@ long sys_fork(void) {
     child->wait_pid  = -1;
     child->exit_code = -1;
     child->next_ready = NULL;
+    /* NOT TRACED. ptrace state is per-process, and a tracer that did not
+     * ask for PTRACE_O_TRACEFORK/TRACECLONE does not know this child
+     * exists. Left copied from the parent, the child would park at its
+     * first syscall for a tracer that never looks at it (2026-09-01). */
+    child->tracer_pid      = 0;
+    child->ptrace_opts     = 0;
+    child->ptrace_stopped  = 0;
+    child->ptrace_syscall  = 0;
+    child->ptrace_atexit   = 0;
+    child->ptrace_stopsig  = 0;
+    child->ptrace_exc_regs = 0;
+    child->ptrace_orig_rax = 0;
+    child->ptrace_retval   = 0;
     /* Slice 39: the memcpy above copied the parent's LIVE scheduler linkage
      * -- on_cpu is 1 (the parent is running RIGHT NOW) and on_rq may be set.
      * A child born with on_cpu=1 is skipped by every picker FOREVER (nothing
@@ -489,6 +519,7 @@ long sys_fork(void) {
      * Observed: fork returned but the child never executed one instruction. */
     child->on_rq  = false;
     child->on_cpu = 0;
+    child->sched_trace_i = 0;          /* K1 trace: not the parent's events */
     child->vm_quiesce  = 0;
     child->vm_quiesced = 0;
     child->mm_owner    = 0;
@@ -507,6 +538,8 @@ long sys_fork(void) {
      * just did not stop working. */
     child->clone_ns_flags   = 0;
     child->clone_child_stack = 0;
+    child->clone_child_settid   = 0;   /* Phase F: staging, same rule */
+    child->clone_child_cleartid = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;
@@ -517,6 +550,14 @@ long sys_fork(void) {
     child->cpu_ns         = 0;
     child->syscall_count  = 0;
     child->last_switch_tsc = 0;
+    child->utick = child->stick = 0;
+    child->cutime_ns = child->cstime_ns = 0;
+    child->min_flt = child->maj_flt = 0;              /* finding 205 */
+    child->tg_dead_min_flt = child->tg_dead_maj_flt = 0;
+    child->cmin_flt = child->cmaj_flt = 0;
+    child->tg_dead_utime_ns = child->tg_dead_stime_ns = 0;
+    child->rep_utime_ns = child->rep_stime_ns = 0;
+    child->tg_rep_utime_ns = child->tg_rep_stime_ns = 0;
     child->sysprot_priv   = 0;
     /* Slice 8: the memcpy copied the parent's namespace POINTERS, which is the
      * correct inheritance -- but each one now has a second user, so take the
@@ -571,16 +612,44 @@ long sys_fork(void) {
     child->cr3       = new_pml4;
     child->owns_pml4 = true;
 
+    /* Whether this syscall entered holding the BKL -- read BEFORE
+     * tg_vm_quiesce, because tg_vm_quiesce RELEASES it and deliberately does
+     * not take it back. The `held` test in the block below runs after that,
+     * so it is always false: its bkl_enter never fires, and without the
+     * re-take after the block everything from here to the end of fork ran
+     * with NO BKL -- including the fd clone loop. See the note there. */
+    bool entry_bkl = bkl_held();
+
     /* Slice 88: park same-CR3 siblings before write-protecting their pages. */
     tg_vm_quiesce(parent);
 
-    /* Walk+WP under STW without the BKL: chrome's address space is huge and
+    /* Walk+WP under STW WITHOUT THE BKL: chrome's address space is huge and
      * holding the global lock across vmm_cow_fork freezes every other syscall
      * (including DevTools pipe I/O) for tens of seconds. Siblings are parked;
-     * page_ref atomics serialize with #PF CoW. Re-take BKL for VMA clone. */
+     * page_ref CAS ops serialize with #PF CoW (they were plain ++/-- until
+     * 2026-09-26 -- see page_fault.c).
+     *
+     * The BKL is NOT re-taken for mmap_cow_clone below, and does not need to
+     * be. This block used to read `held = bkl_held(); ... if (held)
+     * bkl_enter();` under a comment saying "Re-take BKL for VMA clone" -- but
+     * tg_vm_quiesce has already released the BKL (and sched_yield never
+     * leaves it held), so `held` was always false and that re-take never
+     * ran. Removed, because code that reads as locking and is not is exactly
+     * what hid the fd-clone race (see entry_bkl above).
+     *
+     * Why the clone is safe unlocked, in its one legal position:
+     *   - it reads, and sets CoW flags in, the PARENT's VMA table. Every
+     *     writer of that table is a thread of this address space, and every
+     *     one of them is parked by tg_vm_quiesce (a vfork child shares the
+     *     cr3, so it is parked too);
+     *   - it writes the CHILD's table, which nothing else can reach: the
+     *     child is not runnable yet, and the slot was cleared when its last
+     *     owner was reaped (mmap_cleanup_proc);
+     *   - it MUST run before tg_vm_resume: once siblings run they can map
+     *     regions the PTE snapshot never saw, and the child would inherit
+     *     VMAs its page tables lack. Taking the BKL here instead is the
+     *     slice-92 cycle (forker waits for the lock a parked sibling holds). */
     {
-        bool held = bkl_held();
-        if (held) bkl_exit();
 #ifdef CHROMIUM_BOOT
         kprintf("[fork] cow_fork begin pid=%d\n", parent->pid);
 #endif
@@ -588,17 +657,6 @@ long sys_fork(void) {
 #ifdef CHROMIUM_BOOT
         kprintf("[fork] cow_fork done pid=%d rc=%d\n", parent->pid, cow_rc);
 #endif
-        /* Slice 92: this bkl_enter is the actor edge of the freeze cycle --
-         * a sibling parked on vm_quiesce while holding the BKL wedged us
-         * here forever (before vm_quiesce_park_oncpu dropped it). Time it:
-         * if [fork] bkl re-take ever prints, some park point still holds
-         * the BKL and the cycle is back. */
-        uint64_t bkl_t0 = perf_now_ns();
-        if (held) bkl_enter();
-        uint64_t bkl_dt = perf_now_ns() - bkl_t0;
-        if (bkl_dt > 2000000000ull)
-            kprintf("[fork] bkl re-take after sweep took %lu ms pid=%d\n",
-                    (unsigned long)(bkl_dt / 1000000ull), parent->pid);
         /* VMA tables are tgid-keyed; chrome forks from a launcher THREAD. */
         int vma_pid = parent->is_thread ? parent->tgid : parent->pid;
         if (cow_rc == 0)
@@ -612,6 +670,28 @@ long sys_fork(void) {
             return -ABI_ENOMEM;
         }
     }
+
+    /* RE-TAKE THE BKL BEFORE TOUCHING THE FD TABLE.
+     *
+     * file_clone bumps pipe readers/writers, vfs_refs and socket refs, and
+     * those are plain ints whose ONLY guard is the BKL (file.h; proc.c's
+     * slice 89 note is this same bug on the exit path). This loop ran
+     * unlocked -- see entry_bkl above -- so a fork on one CPU could lose an
+     * update against a close on another. A lost pipe decrement frees the
+     * pipe while an alias still points at it; the next fork of that alias
+     * counts it back up on freed memory, and its close frees it AGAIN:
+     *
+     *   kfree(...): double free size=98272 by=X first=X   (X = file_close's
+     *   call of pipe_close_reader)                          pid 91 (bash)
+     *
+     * twice on real hardware (2026-09-25), during the Oils corpus, where
+     * bash forks constantly with pipes open. The file_clone tripwire in
+     * file.c named sys_fork as an unlocked caller in QEMU on every boot.
+     *
+     * Here, not earlier: tg_vm_resume has run, so no sibling is parked on
+     * vm_quiesce any more, and the slice-92 cycle (forker waits for the BKL
+     * while a parked sibling holds it) cannot form. */
+    if (entry_bkl && !bkl_held()) bkl_enter();
 
     /* Clone file descriptors from the table the parent actually USES.
      *
@@ -685,6 +765,20 @@ long sys_fork(void) {
      * every raw syscall(SYS_clone, flags, NULL, ...) caller wants -- and is why
      * ignoring a2 outright went unnoticed until glibc's clone() wrapper, whose
      * child-side pops its function pointer off this exact stack. */
+    /* Phase F: consume the staged tid addresses while the child is still
+     * EMBRYO (same race rule as the namespace flags above). CLEARTID is
+     * re-staged, never inherited: Linux clears a fork child's
+     * clear_child_tid unless the caller passed CLONE_CHILD_CLEARTID, and
+     * the memcpy above copied the parent's. SETTID is applied by
+     * fork_child_entry in the CHILD's context -- a parent-side write
+     * would land in the CoW-shared frame both sides still see. */
+    {
+        child->set_child_tid    = parent->clone_child_settid;
+        child->clear_child_tid  = parent->clone_child_cleartid;
+        parent->clone_child_settid   = 0;
+        parent->clone_child_cleartid = 0;
+    }
+
     {
         uint64_t cstk = parent->clone_child_stack;
         parent->clone_child_stack = 0;
@@ -695,10 +789,6 @@ long sys_fork(void) {
             cr->user_rsp = cstk;
         }
     }
-
-    /* Ready to run. */
-    child->state = PROC_READY;
-    sched_enqueue(child);
 
     /* SLICE 16: the child gets its OWN cr3 (vmm_cow_fork below), so it is its own
      * mm owner and is bulk-charged its parent's page count; cgroup_mem_charge bumps
@@ -714,6 +804,15 @@ long sys_fork(void) {
 
     kprintf("[fork] parent pid=%d -> child pid=%d cr3=0x%lx\n",
             parent->pid, child->pid, child->cr3);
+
+    /* READY TO RUN -- LAST. The line above was logged after the enqueue,
+     * and on the box each logged byte is port I/O: the parent spent it with
+     * the child already running, so the child all but always wrote first
+     * where bash's parent all but always does (Oils 2272, finding 201). The
+     * charge belongs before the enqueue too: a runnable child could fault
+     * before it was charged. */
+    child->state = PROC_READY;
+    sched_enqueue(child);
 
     return child->pid;  /* parent gets child PID */
 }
@@ -818,12 +917,17 @@ long sys_fork_share(void) {
                           ? proc_lookup(parent->tgid) : parent;
     if (!tg) tg = parent;
 
+    proc_reap_orphans();          /* exited orphans' slots, first */
     { long cgrc = cgroup_can_fork(parent); if (cgrc != 0) return cgrc; }  /* slice 15 */
     struct proc *child = proc_slot_claim();
     if (!child) return -ABI_ENOMEM;
 
-    int child_pid = (int)(child - g_proc);
+    int child_pid = proc_pid_alloc(child);
     memcpy(child, parent, sizeof(*child));
+    /* the limits the parent USES: a thread's own table is not them, its
+     * leader's is (proc_rlim; include/tobyos/rlimit.h) */
+    { struct tobyos_rlim *rl = proc_rlim(parent);
+      if (rl) { memcpy(child->rlim, rl, sizeof child->rlim); child->rlim_set = true; } }
 
     child->pid       = child_pid;
     child->ppid      = parent->pid;
@@ -831,13 +935,36 @@ long sys_fork_share(void) {
     child->wait_pid  = -1;
     child->exit_code = -1;
     child->next_ready = NULL;
+    /* NOT TRACED. ptrace state is per-process, and a tracer that did not
+     * ask for PTRACE_O_TRACEFORK/TRACECLONE does not know this child
+     * exists. Left copied from the parent, the child would park at its
+     * first syscall for a tracer that never looks at it (2026-09-01). */
+    child->tracer_pid      = 0;
+    child->ptrace_opts     = 0;
+    child->ptrace_stopped  = 0;
+    child->ptrace_syscall  = 0;
+    child->ptrace_atexit   = 0;
+    child->ptrace_stopsig  = 0;
+    child->ptrace_exc_regs = 0;
+    child->ptrace_orig_rax = 0;
+    child->ptrace_retval   = 0;
     child->on_rq  = false;
     child->on_cpu = 0;
+    child->sched_trace_i = 0;          /* K1 trace: not the parent's events */
     child->vm_quiesce  = 0;
     child->vm_quiesced = 0;
     /* Per-call clone staging must not be inherited -- see sys_fork. */
     child->clone_ns_flags    = 0;
     child->clone_child_stack = 0;
+    /* Phase F: consume the staged tid addresses (share path too -- Linux
+     * honours SETTID/CLEARTID for vfork-style clones; the stamp lands in
+     * the SHARED space, which is the correct semantics there). */
+    child->set_child_tid    = parent->clone_child_settid;
+    child->clear_child_tid  = parent->clone_child_cleartid;
+    child->clone_child_settid   = 0;
+    child->clone_child_cleartid = 0;
+    parent->clone_child_settid   = 0;
+    parent->clone_child_cleartid = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;
@@ -848,6 +975,14 @@ long sys_fork_share(void) {
     child->cpu_ns          = 0;
     child->syscall_count   = 0;
     child->last_switch_tsc = 0;
+    child->utick = child->stick = 0;
+    child->cutime_ns = child->cstime_ns = 0;
+    child->min_flt = child->maj_flt = 0;              /* finding 205 */
+    child->tg_dead_min_flt = child->tg_dead_maj_flt = 0;
+    child->cmin_flt = child->cmaj_flt = 0;
+    child->tg_dead_utime_ns = child->tg_dead_stime_ns = 0;
+    child->rep_utime_ns = child->rep_stime_ns = 0;
+    child->tg_rep_utime_ns = child->tg_rep_stime_ns = 0;
     child->sysprot_priv    = 0;
     child->cursys          = -1;   /* slice 113: see sys_fork */
     child->cursys_nat      = -1;
@@ -898,81 +1033,49 @@ long sys_fork_share(void) {
            (uint8_t *)parent->kstack_top - sizeof(struct syscall_regs),
            sizeof(struct syscall_regs));
 
-    /* clone(2) with an EXPLICIT child_stack takes precedence over the private
-     * stack below, and the distinction is the whole reason this is safe.
-     *
-     * Two different callers arrive here:
-     *
-     *   vfork() / clone(CLONE_VM|CLONE_VFORK) with child_stack == NULL. The
-     *     caller expects the child to run on the PARENT's stack. We give it a
-     *     private one instead -- a documented, pre-existing deviation that the
-     *     comment below explains and that the Chromium launcher path depends
-     *     on. UNCHANGED here.
+    /* Stack selection (TRUE vfork since 2026-08-23):
      *
      *   clone(fn, child_stack, CLONE_VM|CLONE_VFORK|SIGCHLD, arg) -- glibc's
      *     library wrapper. The caller supplied a stack PRECISELY so the child
      *     would not touch the parent's, and __clone's child side pops its entry
      *     function off it (`xor %ebp,%ebp; pop %rax; pop %rdi; call *%rax`).
-     *     Handing that child a fresh ZEROED stack makes it pop 0 and `call *0`
-     *     -- an instruction fetch at NULL, which is the rip=0/err=0x14 fault
-     *     already recorded against busybox `unshare -f`. Chromium's
-     *     ChrootToSafeEmptyDir (credentials.cc) is the same call, and it died
-     *     the same way.
+     *     Handing that child anything else makes it pop 0 and `call *0` --
+     *     the rip=0/err=0x14 fault recorded against busybox `unshare -f` and
+     *     Chromium's ChrootToSafeEmptyDir. Honoured, unchanged.
      *
-     * Honouring an explicitly supplied stack cannot disturb the first caller,
-     * because that caller supplies none. CLONE_VM means the address space is
-     * shared, so the pointer is valid in the child by construction. */
+     *   vfork() / clone(CLONE_VM|CLONE_VFORK) with child_stack == NULL: the
+     *     child runs on the PARENT'S OWN STACK -- the copied syscall_regs
+     *     already carry the parent's rsp, so "do nothing" is the whole
+     *     implementation. This is what vfork MEANS: the parent is suspended
+     *     (the fence-hardened wait loop below), the child pushes only below
+     *     the vfork frame, and every write it makes to locals in that frame
+     *     is visible to the parent when it resumes -- which is exactly the
+     *     channel `err = errno` exec-failure reporting uses.
+     *
+     *     HISTORY, because this replaced a load-bearing-looking shim: the
+     *     child used to get a PRIVATE 512 KiB stack mapped into the shared
+     *     CR3, added in the bring-up era when the parent's suspension was
+     *     racy -- with both sides live on one stack, the child smashed the
+     *     launcher's frame and the parent resumed at rip=0 (the crashpad
+     *     double-fork story). Slice 89's store-BLOCKED -> fence -> load-flag
+     *     protocol fixed the actual bug; the shim outlived its reason and
+     *     quietly broke the CONTRACT: an rsp-relative local written by the
+     *     child (exec errno, the classic) landed on the private stack the
+     *     parent never sees, and rsp-relative ARGUMENT reads in the child
+     *     found zeroed memory -- vfork+exec only survived where values
+     *     happened to sit in callee-saved registers. The deviation was
+     *     recorded as the standing debt "vfork private stack"; this is its
+     *     repayment. vfork_stack_va/pages stay as fields (always 0 now) so
+     *     vfork_child_done's teardown remains a no-op rather than a hazard. */
     uint64_t user_cstk = parent->clone_child_stack;
     parent->clone_child_stack = 0;
+    child->vfork_stack_va    = 0;
+    child->vfork_stack_pages = 0;
     if (user_cstk) {
         struct syscall_regs *cr =
             (struct syscall_regs *)((uint8_t *)child->kstack_top
                                     - sizeof(struct syscall_regs));
         cr->user_rsp = user_cstk;
-        child->vfork_stack_va = 0;      /* nothing for vfork_child_done to free */
-        child->vfork_stack_pages = 0;
-    } else
-    /* Private user stack in the shared CR3. Sharing the parent's RSP lets
-     * the child (crashpad double-fork, glibc) smash the launcher's frame;
-     * parent then resumes at rip=0. Map a fresh 512 KiB stack at a high VA
-     * keyed by child pid (visible to the parent too until vfork_child_done). */
-    {
-        const uint32_t np = 128; /* 512 KiB — glibc/crashpad probes past 32K */
-        uint64_t slot = 0x00007f0000000000ULL +
-                        ((uint64_t)child_pid * 0x200000ULL); /* 2 MiB slots */
-        uint64_t stack_va = slot;
-        uint64_t saved = vmm_set_editor_root(tg->cr3);
-        bool ok = true;
-        for (uint32_t i = 0; i < np; i++) {
-            uint64_t phys = pmm_alloc_page();
-            if (!phys) { ok = false; break; }
-            if (!vmm_map(stack_va + (uint64_t)i * PAGE_SIZE, phys, PAGE_SIZE,
-                         VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
-                pmm_free_page(phys);
-                ok = false;
-                break;
-            }
-            memset(pmm_phys_to_virt(phys), 0, PAGE_SIZE);
-        }
-        vmm_set_editor_root(saved);
-        if (!ok) {
-            for (int i = 0; i < PROC_NFDS; i++) {
-                if (child->fds[i]) file_close(child->fds[i]);
-                child->fds[i] = NULL;
-            }
-            if (child->kstack_base) kfree(child->kstack_base);
-            nsproxy_release(child);    /* slice 8 */
-            memset(child, 0, sizeof(*child));
-            child->state = PROC_UNUSED;
-            return -ABI_ENOMEM;
-        }
-        child->vfork_stack_va = stack_va;
-        child->vfork_stack_pages = np;
-        struct syscall_regs *cr =
-            (struct syscall_regs *)((uint8_t *)child->kstack_top
-                                    - sizeof(struct syscall_regs));
-        /* SysV ABI red zone is 128 bytes below RSP; leave headroom. */
-        cr->user_rsp = stack_va + (uint64_t)np * PAGE_SIZE - 256;
     }
 
     /* SLICE 16: NO charge here, and that is deliberate.
@@ -1051,12 +1154,17 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
      * spawning threads instead of forking -- that would make pids.max trivially
      * evadable by any threaded program. cgroup_nr_procs counts g_proc entries,
      * which is threads included, so the two agree. */
+    proc_reap_orphans();          /* exited orphans' slots, first */
     { long cgrc = cgroup_can_fork(parent); if (cgrc != 0) return cgrc; }
     struct proc *child = proc_slot_claim();
     if (!child) return -ABI_ENOMEM;
-    int child_pid = (int)(child - g_proc);
+    int child_pid = proc_pid_alloc(child);
 
     memcpy(child, parent, sizeof(*child));
+    /* a thread reads its leader's limits (proc_rlim); its own copy is
+     * only what it falls back to should the leader be gone */
+    { struct tobyos_rlim *rl = proc_rlim(tg);
+      if (rl) { memcpy(child->rlim, rl, sizeof child->rlim); child->rlim_set = true; } }
     child->pid        = child_pid;
     child->ppid       = parent->ppid;
     child->tgid       = tg->pid;                /* same thread group */
@@ -1067,14 +1175,41 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->vfork_parent = 0;
     child->vfork_child  = 0;
     child->detached   = true;
+    /* NOT TRACED. ptrace state is per-process, and a tracer that did not
+     * ask for PTRACE_O_TRACEFORK/TRACECLONE does not know this child
+     * exists. Left copied from the parent, the child would park at its
+     * first syscall for a tracer that never looks at it (2026-09-01). */
+    child->tracer_pid      = 0;
+    child->ptrace_opts     = 0;
+    child->ptrace_stopped  = 0;
+    child->ptrace_syscall  = 0;
+    child->ptrace_atexit   = 0;
+    child->ptrace_stopsig  = 0;
+    child->ptrace_exc_regs = 0;
+    child->ptrace_orig_rax = 0;
+    child->ptrace_retval   = 0;
     child->state      = PROC_EMBRYO;  /* memcpy copied parent's state */
     child->wait_pid   = -1;
     child->exit_code  = -1;
     child->next_ready = NULL;
+    /* NOT TRACED. ptrace state is per-process, and a tracer that did not
+     * ask for PTRACE_O_TRACEFORK/TRACECLONE does not know this child
+     * exists. Left copied from the parent, the child would park at its
+     * first syscall for a tracer that never looks at it (2026-09-01). */
+    child->tracer_pid      = 0;
+    child->ptrace_opts     = 0;
+    child->ptrace_stopped  = 0;
+    child->ptrace_syscall  = 0;
+    child->ptrace_atexit   = 0;
+    child->ptrace_stopsig  = 0;
+    child->ptrace_exc_regs = 0;
+    child->ptrace_orig_rax = 0;
+    child->ptrace_retval   = 0;
     /* Slice 39: same reset as sys_fork -- the memcpy copied the parent's
      * live on_cpu/on_rq, which would make this thread unschedulable. */
     child->on_rq  = false;
     child->on_cpu = 0;
+    child->sched_trace_i = 0;          /* K1 trace: not the parent's events */
     /* Per-call clone staging must not be inherited -- see sys_fork. */
     child->clone_ns_flags    = 0;
     child->clone_child_stack = 0;
@@ -1087,6 +1222,14 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->cpu_ns          = 0;
     child->syscall_count   = 0;
     child->last_switch_tsc = 0;
+    child->utick = child->stick = 0;
+    child->cutime_ns = child->cstime_ns = 0;
+    child->min_flt = child->maj_flt = 0;              /* finding 205 */
+    child->tg_dead_min_flt = child->tg_dead_maj_flt = 0;
+    child->cmin_flt = child->cmaj_flt = 0;
+    child->tg_dead_utime_ns = child->tg_dead_stime_ns = 0;
+    child->rep_utime_ns = child->rep_stime_ns = 0;
+    child->tg_rep_utime_ns = child->tg_rep_stime_ns = 0;
     child->sysprot_priv    = 0;
     child->cursys          = -1;   /* slice 113: see sys_fork */
     child->cursys_nat      = -1;
@@ -1162,12 +1305,12 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->clear_child_tid =
         (flags & 0x00200000u /* CLONE_CHILD_CLEARTID */) ? ctid : 0;
 
-    child->state = PROC_READY;
-    sched_enqueue(child);
     perf_count_proc_spawn();
-
     kprintf("[clone] thread tid=%d in tgid=%d (shared VM, stack=0x%lx)\n",
             child_pid, child->tgid, (unsigned long)stack);
+    /* runnable last, as sys_fork's child (finding 201) */
+    child->state = PROC_READY;
+    sched_enqueue(child);
     return child_pid;  /* caller gets the new tid */
 }
 
@@ -1182,11 +1325,12 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
  * new program. On failure returns a negative ABI error code.
  * =================================================================== */
 
-/* User-stack constants (must match proc.c). */
-#define USER_STACK_PAGES     8
-#define USER_STACK_BYTES     (USER_STACK_PAGES * PAGE_SIZE)
+/* User-stack constants. The SIZE comes from proc_user_stack_pages (proc.c):
+ * the 256 KiB a spawned program gets, plus what argv/envp take. It was a
+ * fixed 8 pages here under a "must match proc.c" that no longer did, so
+ * every execve'd program -- native or Linux, bash included -- ran on
+ * 32 KiB against spawn's 256, and argv/envp had to fit in the same 32. */
 #define USER_STACK_TOP_VA    0x0000800000000000ULL
-#define USER_STACK_TOP_PAGE  (USER_STACK_TOP_VA - USER_STACK_BYTES)
 #define USER_STACK_RSP_INIT  (USER_STACK_TOP_VA - 16)
 #define USER_HEAP_BASE       0x0000000010000000ULL
 #define USER_HEAP_MAX_BYTES  (256ULL * 1024ULL * 1024ULL)
@@ -1196,9 +1340,27 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
 #define IA32_KERNEL_GS_BASE_MSR 0xC0000102u
 
 /* Windows entry points are entered with a 256 KiB stack, matching proc.c's
- * build_user_stack (64 pages). The ELF execve path uses USER_STACK_PAGES (8),
- * but a Win32 CRT wants more headroom, so the PE arm maps its own. */
+ * build_user_stack (64 pages). The PE arm maps its own; the ELF arm sizes
+ * its stack with proc_user_stack_pages. */
 #define PE_STACK_PAGES  64
+
+/* POSIX: a successful exec closes every descriptor marked FD_CLOEXEC.
+ * Runs at the COMMIT point only -- a failed execve returns -1 with the
+ * caller's descriptors intact, which is what lets shells retry. Only the
+ * Linux personality sets bits, so a native or Win32 image pays one bitmap
+ * walk and closes nothing. Shared by the ELF and PE exec arms: exec is
+ * exec, whichever personality the new image lands in. */
+static void exec_close_cloexec_fds(struct proc *p) {
+    struct file **tab = proc_fds(p);
+    if (!tab) return;
+    for (int i = 0; i < PROC_NFDS; i++) {
+        if (tab[i] && fd_cloexec_get(p, i)) {
+            file_close(tab[i]);
+            tab[i] = 0;
+            fd_cloexec_set(p, i, 0);
+        }
+    }
+}
 
 /* ===================================================================
  * execve_pe -- the Windows-PE arm of sys_execve (Track X / X1).
@@ -1221,7 +1383,8 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
                       int image_borrowed,
                       const char *kpath, int kargc, char **kargv_buf,
                       uint64_t old_pml4, uint64_t new_pml4,
-                      uint64_t saved_cr3, uint64_t old_editor) {
+                      uint64_t saved_cr3, uint64_t old_editor,
+                      char **exec_argv, char **exec_envp) {
     struct pe_load_info pe_info = {0};
     int prc = pe_load_user(image, image_size, kargc, kargv_buf, &pe_info);
     if (!image_borrowed) kfree(image);   /* slice 112: initrd borrow */
@@ -1276,6 +1439,9 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
     p->win_heap_end = 0;
     p->clear_child_tid = 0;
 
+    /* FD_CLOEXEC acts on ANY successful exec, a .exe included. */
+    exec_close_cloexec_fds(p);
+
     /* Flip to the Win32 personality and install the PE's TEB + resource/TLS
      * metadata -- mirrors the PE arm of proc_spawn (proc.c). */
     p->personality      = ABI_PERS_WIN32;
@@ -1309,8 +1475,7 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
      * above RSP for the marshalling gate's MS-x64 stack-arg reads. */
     p->user_rsp   = ((USER_STACK_TOP_VA - 0x400) & ~0xFULL) - 8;
 
-    signal_init_proc(&p->sigstate);
-    p->pending_signals = 0;
+    signal_exec_reset(&p->sigstate);    /* pending signals survive exec */
 
     /* execve normally relies on do_switch having put this proc's GS base in the
      * SWAPGS shadow before it runs. But we are NOT going through the scheduler
@@ -1324,6 +1489,11 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
     kprintf("[execve] pid=%d now running Win32 PE '%s' entry=%p teb=%p "
             "rsp=%p\n", p->pid, p->name, (void *)p->user_entry,
             (void *)pe_info.teb, (void *)p->user_rsp);
+
+    /* sys_execve's argv/envp vectors: argv was consumed by pe_load_user,
+     * and this path does not return. */
+    kvec_free(exec_argv);
+    kvec_free(exec_envp);
 
     bkl_exit();
     proc_enter_user_asm(p->user_entry, p->user_rsp);
@@ -1364,6 +1534,29 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     }
     long plen = (long)strlen(kpath);
     if (plen == 0) return -ABI_EINVAL;
+    /* The path as the caller wrote it: a script's interpreter is given
+     * THAT, as Linux's binfmt_script gives bprm->filename -- `./script`
+     * sees $0 as "./script", not the absolute path this resolved it to
+     * (batch 30, logs/utilgate/env.sh). */
+    char upath[ABI_PATH_MAX];
+    if (strncpy_from_user(upath, path, sizeof upath) < 0) return -ABI_EFAULT;
+    upath[sizeof upath - 1] = 0;
+
+    /* THE EXECUTE BIT. execve checked none at all, so `touch f; ./f` as root
+     * ran a mode-0644 file: the exec succeeded, bash fell back to treating
+     * the empty file as a shell script, and the line exited 0 where real
+     * bash on Linux prints "Permission denied" and exits 126 (Oils POSIX
+     * case 1409). access(2) already had the rule right -- root still needs
+     * at least ONE x bit somewhere in the mode, everyone else needs their
+     * own -- and this asks that same function rather than restating it.
+     *
+     * Before the ELF is read, so a file nobody may run is refused rather
+     * than parsed. */
+    {
+        extern long lx_access_kpath(const char *kpath, int mode);
+        long xrc = lx_access_kpath(kpath, 1 /* X_OK */);
+        if (xrc != 0) return xrc;
+    }
 
     /* Resolve symlinks NOW, so everything downstream -- the ELF read, p->name
      * and above all p->exe_path -- refers to the REAL binary. Linux execve does
@@ -1387,25 +1580,43 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         }
     }
 
-    /* Copy argv into kernel buffers. Each user pointer-array slot and
-     * each string is read through an accessor; a bad slot just ends the
-     * vector (matching the old tolerant behaviour). */
-    int kargc = 0;
-    char *kargv_buf[ABI_ARGV_MAX];
-    static char kargv_pool[ABI_ARGV_MAX][ABI_ARG_MAX];
-
-    if (argv) {
-        for (int i = 0; i < ABI_ARGV_MAX; i++) {
-            uint64_t slot = 0;
-            if (get_user_u64(&slot, argv + i) != 0) break;
-            if (!slot) break;
-            if (strncpy_from_user(kargv_pool[kargc],
-                                  (const void *)(uintptr_t)slot,
-                                  ABI_ARG_MAX) < 0) break;
-            kargv_buf[kargc] = kargv_pool[kargc];
-            kargc++;
-        }
+    /* Copy argv and envp into kernel vectors, EXACTLY: every string whole,
+     * as many as there are, or E2BIG (kvec_copy_in). This copied at most
+     * 64 of each and the first 4 KiB of every string, and ran the program
+     * with whatever fitted -- no error anywhere. */
+    int kargc = 0, kenvc = 0;
+    char **kargv_buf = 0, **kenvp_buf = 0;
+    {
+        size_t budget = ABI_ARGS_TOTAL_MAX;
+        long vrc = kvec_copy_in(argv, &kargv_buf, &kargc, &budget);
+        if (vrc < 0) return vrc;
+        vrc = kvec_copy_in(envp, &kenvp_buf, &kenvc, &budget);
+        if (vrc < 0) { kvec_free(kargv_buf); return vrc; }
     }
+    /* PER CALL, NOT `static`. These were two static pools shared by every
+     * CPU, and an exec does not hold the BKL from the copy below to the
+     * last use: it DROPS it around proc_reap_group_threads, on every call
+     * from a normal process. A second exec on another CPU refilled the same
+     * pool in that window, and this one then built its stack from the other
+     * process's argv:
+     *
+     *     bash -c 'set -o | grep braceexpand | sed "s/^/X /"'
+     *       grep ran with sed's argv -> no match -> PIPESTATUS 0 1 0
+     *     ... | head -3 | tr '\t' _
+     *       "head: usage: head [-cds] string1 [string2]"  (tr's code, head's argv)
+     *       "tr: open \t: No such file or directory"      (head's code, tr's argv)
+     *
+     * Pipelines exec their stages at the same moment, which is when it
+     * fires. Found 2026-09-25 through the Oils 2202 flake, which f91a175's
+     * timing change made frequent on hardware. One block holds both pools;
+     * it is released on every exit -- the error returns, execve_pe, and just
+     * before the new image is entered. (Now two heap vectors, per call for
+     * the same reason.) */
+    /* The value FIRST, then the release: `EXEC_RETURN(execve_pe(...))`
+     * must run execve_pe while the vectors are still alive. */
+#define EXEC_RETURN(v) do { long exec_rv_ = (long)(v); \
+                            kvec_free(kargv_buf); kvec_free(kenvp_buf); \
+                            return exec_rv_; } while (0)
 
 #ifdef CHROMIUM_BOOT
     /* Slice 21 instrument: chrome re-execs /proc/self/exe for every typed child
@@ -1430,23 +1641,6 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     }
 #endif
 
-    /* Copy envp into kernel buffers. */
-    int kenvc = 0;
-    char *kenvp_buf[ABI_ENVP_MAX];
-    static char kenvp_pool[ABI_ENVP_MAX][ABI_ARG_MAX];
-
-    if (envp) {
-        for (int i = 0; i < ABI_ENVP_MAX; i++) {
-            uint64_t slot = 0;
-            if (get_user_u64(&slot, envp + i) != 0) break;
-            if (!slot) break;
-            if (strncpy_from_user(kenvp_pool[kenvc],
-                                  (const void *)(uintptr_t)slot,
-                                  ABI_ARG_MAX) < 0) break;
-            kenvp_buf[kenvc] = kenvp_pool[kenvc];
-            kenvc++;
-        }
-    }
 
     /* Read the ELF image from VFS. Slice 112: for an initrd (ramfs) file
      * this BORROWS a pointer into the resident tar instead of copying --
@@ -1455,6 +1649,8 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     void  *image      = NULL;
     size_t image_size = 0;
     int    img_borrowed = 0;
+    int    shebang_depth = 0;
+reread:;
 #ifdef CHROMIUM_BOOT
     xt_read = perf_now_ns();
 #endif
@@ -1464,8 +1660,89 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
 #endif
     if (rc != 0) {
         kprintf("[execve] cannot read '%s': %d\n", kpath, rc);
-        return -ABI_ENOENT;
+        /* A PATH THAT EXISTS BUT CANNOT BE READ AS AN IMAGE IS EACCES.
+         *
+         *     /                   bash on Linux: "Is a directory", 126
+         *                         bash here:     "No such file...", 127
+         *
+         * Linux execve returns EACCES for a directory (or any file that is
+         * not a regular one), and bash turns EACCES on a directory into
+         * "Is a directory" and 126. This returned ENOENT for every read
+         * failure, so a directory looked like a typo. ENOENT stays for a
+         * path that is really not there, ENOTDIR for a bad component. */
+        struct vfs_stat xs;
+        if (vfs_stat(kpath, &xs) == VFS_OK) EXEC_RETURN(-ABI_EACCES);
+        EXEC_RETURN(rc == VFS_ERR_NOTDIR ? -ABI_ENOTDIR : -ABI_ENOENT);
     }
+
+    /* "#!": the exec becomes the interpreter's, with the script's path as
+     * its argument, and the image is read again -- at most
+     * BINFMT_MAX_RECURSION times. The new argv -- interpreter, its option,
+     * the script path, then argv[1..] -- is packed into a vector of its
+     * own (kvec_pack: interp and kpath are about to be reused), and the
+     * old one is released whole. */
+    {
+        char interp[BINFMT_SHEBANG_MAX];
+        char optarg[BINFMT_SHEBANG_MAX];
+        int sb = binfmt_shebang(image, image_size, interp, sizeof interp,
+                                optarg, sizeof optarg);
+        if (sb != 0) {
+            if (!img_borrowed) kfree(image);
+            image = NULL;
+            if (sb < 0) EXEC_RETURN(-ABI_ENOEXEC);
+            if (shebang_depth >= BINFMT_MAX_RECURSION) EXEC_RETURN(-ABI_ELOOP);
+            int nmax = kargc + 4;
+            char **nargv = (char **)kmalloc((size_t)(nmax + 1) * sizeof(char *));
+            if (!nargv) EXEC_RETURN(-ABI_ENOMEM);
+            int nargc = binfmt_shebang_argv(interp, optarg[0] ? optarg : NULL,
+                                            shebang_depth == 0 ? upath : kpath,
+                                            kargc, kargv_buf, nargv, nmax);
+            if (nargc < 0) { kfree(nargv); EXEC_RETURN(-ABI_E2BIG); }
+            char **packed = kvec_pack(nargv, nargc);
+            kfree(nargv);                           /* borrowed pointers only */
+            if (!packed) EXEC_RETURN(-ABI_ENOMEM);
+            kvec_free(kargv_buf);
+            kargv_buf = packed;
+            kargc = nargc;
+            memcpy(kpath, interp, strlen(interp) + 1);
+            plen = (long)strlen(kpath);
+            shebang_depth++;
+            goto reread;
+        }
+    }
+
+    /* Neither a script, a PE image nor an ELF. ENOEXEC is what glibc's
+     * execvp and busybox's sh test for before running a file as a shell
+     * script themselves; the loader used to fail further down with a code
+     * that read as "no such file". Checked here, before de_thread and the
+     * page-table allocation, so a refusal leaves the caller intact. */
+    if (!pe_is_image(image, image_size) &&
+        (image_size < 4 || memcmp(image, "\x7f" "ELF", 4) != 0)) {
+        if (!img_borrowed) kfree(image);
+        EXEC_RETURN(-ABI_ENOEXEC);
+    }
+
+    /* ---- Phase F: POSIX de_thread (2026-08-22) -------------------------
+     * exec from the leader kills every other thread in the group BEFORE the
+     * new image is built. Until now an exec'd image ran with the old
+     * image's threads still scheduled -- on page tables the commit path was
+     * about to destroy. Placed here for the same reason as the setuid
+     * transition below: the image has been read, so the exec can no longer
+     * fail for the common (missing/unreadable file) reasons; Linux's
+     * de_thread sits at the equivalent point (flush_old_exec). A failure
+     * AFTER this point loses the siblings anyway -- exactly as on Linux,
+     * where past the point of no return a failed exec kills the process.
+     * The old image's robust-mutex registration is walked while its memory
+     * is still mapped, then dropped (glibc re-registers in the new image).
+     * exec from a NON-leader thread keeps its documented divergence (no
+     * pid takeover, siblings survive) -- nothing exercised does it. */
+    if (!p->is_thread) {
+        bool had_bkl = bkl_held();
+        if (had_bkl) bkl_exit();
+        proc_reap_group_threads(p, 0);
+        if (had_bkl) bkl_enter();
+    }
+    { extern void futex_robust_exit(struct proc *); futex_robust_exit(p); }
 
     /* ---- Linux slice 2: the set-user-ID-on-exec transition ----
      *
@@ -1512,6 +1789,13 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
                 kprintf("[execve] nosuid mount: ignoring set-id bits on '%s'\n",
                         kpath);
         }
+        /* The saved ids are the effective ones after any execve, as
+         * execve(2) says: a set-group-ID program that gives its group up
+         * with setgid(getgid()) before exec'ing another -- at's job runner,
+         * finding 267 -- must not leave that program able to take it back.
+         * They kept what they had. */
+        p->suid = p->uid;
+        p->sgid = p->gid;
     }
 
     /* Destroy the old user-half mappings and rebuild the address space.
@@ -1520,7 +1804,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     uint64_t new_pml4 = vmm_create_user_pml4();
     if (!new_pml4) {
         if (!img_borrowed) kfree(image);
-        return -ABI_ENOMEM;
+        EXEC_RETURN(-ABI_ENOMEM);
     }
 
     /* Switch to the new PML4 for loading. */
@@ -1534,9 +1818,12 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
      * process (e.g. a busybox `sh` pipeline stage) execve() a .exe, so a
      * single pipeline can mix Windows and Linux binaries. */
     if (pe_is_image(image, image_size)) {
-        return execve_pe(p, image, image_size, img_borrowed,
-                         kpath, kargc, kargv_buf,
-                         old_pml4, new_pml4, saved_cr3, old_editor);
+        /* execve_pe releases the pool itself before entering the new image
+         * (it does not return then); on failure it returns and we do. */
+        EXEC_RETURN(execve_pe(p, image, image_size, img_borrowed,
+                              kpath, kargc, kargv_buf,
+                              old_pml4, new_pml4, saved_cr3, old_editor,
+                              kargv_buf, kenvp_buf));
     }
 
     /* Check for PT_INTERP. */
@@ -1579,13 +1866,17 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
 #endif
         void *interp_image = NULL;
         size_t interp_size = 0;
-        int irc = vfs_read_all(interp_path, &interp_image, &interp_size);
+        /* borrowed from the initrd where it lies there, as the program is
+         * (finding 247: the loader's text is shared too) */
+        int interp_borrowed = 0;
+        int irc = vfs_read_all_ref(interp_path, &interp_image, &interp_size,
+                                   &interp_borrowed);
         if (irc != 0) {
             ok = false;
         } else {
             ok = elf_load_user_at(interp_image, interp_size,
                                   interp_load_base, &interp_info);
-            kfree(interp_image);
+            if (!interp_borrowed) kfree(interp_image);
         }
 #ifdef CHROMIUM_BOOT
         xt_interp = perf_now_ns() - xt_interp;
@@ -1597,12 +1888,15 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
 #ifdef CHROMIUM_BOOT
         xt_stack = perf_now_ns();
 #endif
-        p->user_stack_base  = USER_STACK_TOP_PAGE;
-        p->user_stack_pages = USER_STACK_PAGES;
-        for (size_t i = 0; i < USER_STACK_PAGES; i++) {
+        size_t spages = proc_user_stack_pages(kargc, kargv_buf,
+                                              kenvc, kenvp_buf);
+        uint64_t sbase = USER_STACK_TOP_VA - (uint64_t)spages * PAGE_SIZE;
+        p->user_stack_base  = sbase;
+        p->user_stack_pages = spages;
+        for (size_t i = 0; i < spages; i++) {
             uint64_t phys = pmm_alloc_page();
             if (!phys) { ok = false; break; }
-            if (!vmm_map(USER_STACK_TOP_PAGE + i * PAGE_SIZE, phys, PAGE_SIZE,
+            if (!vmm_map(sbase + i * PAGE_SIZE, phys, PAGE_SIZE,
                          VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
                 pmm_free_page(phys);
                 ok = false;
@@ -1613,7 +1907,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     }
 
     /* Build auxv + pack argv/envp onto user stack. */
-    struct abi_auxv aux[20];
+    struct abi_auxv aux[24];
     int auxc = 0;
     uint64_t user_rsp = USER_STACK_RSP_INIT;
 
@@ -1626,14 +1920,38 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         aux[auxc++] = (struct abi_auxv){ ABI_AT_ENTRY,  prog_info.entry   };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PAGESZ, PAGE_SIZE         };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_FLAGS,  0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,    0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,   0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,    0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,   0                 };
+        /* Real credentials at exec (2026-08-22; were hardcoded 0) --
+         * packed AFTER the setuid-on-exec credential update, so a suid
+         * image reports AT_SECURE=1 and glibc enters secure mode (drops
+         * LD_* env), which is the protection suid exists to keep. Same
+         * user-namespace reporting boundary as getuid/stat/procfs. */
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,
+                                         userns_cur_uid((uint32_t)p->ruid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,
+                                         userns_cur_uid((uint32_t)p->uid)  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,
+                                         userns_cur_gid((uint32_t)p->rgid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,
+                                         userns_cur_gid((uint32_t)p->gid)  };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP,  ABI_AT_HWCAP_X86_64_BASE };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP2, 0                };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_MINSIGSTKSZ, 2048       };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_CLKTCK, 100               };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE, 0                 };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE,
+                                         (p->uid != p->ruid ||
+                                          p->gid != p->rgid) ? 1u : 0u    };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_RANDOM, USER_STACK_TOP_VA - 16 };
+        /* vDSO (2026-08-23): map into the NEW image and advertise it.
+         * glibc reads AT_SYSINFO_EHDR at startup and routes
+         * clock_gettime/gettimeofday/time through the mapped code
+         * instead of syscalls. Absent (base 0) => entry omitted and
+         * glibc keeps its syscall fallback -- the pre-vDSO world. */
+        {
+            extern uint64_t vdso_map_root(uint64_t cr3);
+            uint64_t vb = vdso_map_root(new_pml4);
+            if (vb)
+                aux[auxc++] = (struct abi_auxv){ ABI_AT_SYSINFO_EHDR, vb };
+        }
 
         /* Pack using inline logic (we can't call proc.c's static pack_user_stack).
          * We build a minimal layout: argc, argv[], NULL, envp[], NULL,
@@ -1648,7 +1966,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         size_t pad_head    = 16;
 
         size_t total = pad_head + pool_padded + auxv_bytes + envp_bytes + argv_bytes + 8;
-        if (total + 64 > USER_STACK_BYTES) {
+        if (total + 64 > p->user_stack_pages * PAGE_SIZE) {
             ok = false;
         } else {
             uint64_t pool_va = USER_STACK_TOP_VA - pad_head - pool_padded;
@@ -1715,7 +2033,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         write_cr3(saved_cr3);
         vmm_set_editor_root(old_editor);
         vmm_destroy_user_pml4(new_pml4);
-        return -ABI_ENOMEM;
+        EXEC_RETURN(-ABI_ENOMEM);
     }
 
     /* Success -- point of no return. Destroy the old address space. */
@@ -1762,6 +2080,9 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
      * clear_child_tid carried over from the replaced image. */
     p->clear_child_tid = 0;
 
+    /* FD_CLOEXEC acts NOW -- past the commit, before the new image runs. */
+    exec_close_cloexec_fds(p);
+
     /* Update name from the new path. */
     const char *base = kpath;
     for (const char *c = kpath; *c; c++) if (*c == '/') base = c + 1;
@@ -1769,6 +2090,18 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     if (n >= PROC_NAME_MAX) n = PROC_NAME_MAX - 1;
     memcpy(p->name, base, n);
     p->name[n] = '\0';
+
+    /* /proc/<pid>/cmdline follows the NEW image's argv. */
+    { extern void proc_record_cmdline(struct proc *, int, char **);
+      proc_record_cmdline(p, kargc, kargv_buf); }
+
+    /* The last reader of kargv_buf/kenvp_buf -- the stack is packed and the
+     * cmdline recorded. Released here because a successful exec never
+     * returns (see EXEC_RETURN above). */
+    kvec_free(kargv_buf);
+    kvec_free(kenvp_buf);
+    kargv_buf = kenvp_buf = 0;
+#undef EXEC_RETURN
 
     /* B20 (procfs): re-point /proc/<pid>/exe at the new image. */
     {
@@ -1782,17 +2115,44 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     p->user_entry = has_interp ? interp_info.entry : prog_info.entry;
     p->user_rsp   = user_rsp;
 
-    /* Reset signals. */
-    signal_init_proc(&p->sigstate);
-    p->pending_signals = 0;
+    /* Reset signals as exec does: handlers only. A signal already pending
+     * -- one sent between fork and here -- is delivered to the new image.
+     * See signal_exec_reset. */
+    signal_exec_reset(&p->sigstate);
 
     kprintf("[execve] pid=%d now running '%s' entry=%p rsp=%p\n",
             p->pid, p->name, (void *)p->user_entry, (void *)p->user_rsp);
 
+    /* THE EXEC STOP. A tracer that asked to follow this process gets one
+     * chance to act after the new image is mapped and before a single
+     * instruction of it runs -- which is the only moment a debugger can
+     * write a breakpoint into text that does not exist yet at TRACEME time
+     * and is already executing a moment later.
+     *
+     * Linux delivers exactly this (a SIGTRAP after a successful exec) and
+     * every debugger depends on it. Without it `run` had nothing to wait
+     * for: the tracer called waitpid, the child ran to completion, and a
+     * debugger that never sees its target stop is a prompt with no program
+     * behind it.
+     *
+     * Parked here, inside the syscall and holding the BKL, exactly as the
+     * syscall-boundary stop does -- the frame GETREGS reports is execve's
+     * own, so a tracer reads the program's entry from the ELF rather than
+     * from rip, which is what it does anyway. */
     /* This path enters ring 3 directly and never returns to syscall_dispatch,
      * so release the BKL here (execve was called from a syscall holding it).
      * Idempotent if already released. */
     bkl_exit();
+
+    /* AFTER bkl_exit, and that ordering is the whole point: the stop parks
+     * this process with sched_yield, and yielding while holding the big
+     * kernel lock stops every other CPU too -- the machine went silent and
+     * the boot harness never reported at all. Parking here means the tracer
+     * can actually be scheduled to resume us. */
+    if (p->tracer_pid) {
+        extern void ptrace_exec_stop(struct proc *p);
+        ptrace_exec_stop(p);
+    }
 
     /* Jump to new program -- does not return. */
     proc_enter_user_asm(p->user_entry, p->user_rsp);

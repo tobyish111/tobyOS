@@ -1,0 +1,246 @@
+{
+  "jobs": {
+    "include": [
+      {
+        "addons": {
+          "apt": {
+            "packages": [
+              "python-dev"
+            ]
+          }
+        }, 
+        "name": "ovm-tarball", 
+        "language": "minimal", 
+        "script": "services/toil-worker.sh run-ovm-tarball", 
+        "cache": {
+          "directories": [
+            "_devbuild/cpython-full", 
+            "_deps/"
+          ]
+        }, 
+        "deploy": [
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "master"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }, 
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "dev/andy-27"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }, 
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "dev/andy-vb1"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }
+        ]
+      }, 
+      {
+        "dist": "xenial", 
+        "name": "dev-minimal", 
+        "language": "minimal", 
+        "deploy": [
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "master"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }, 
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "dev/andy-27"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }, 
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "dev/andy-vb1"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }
+        ], 
+        "cache": {
+          "pip": true, 
+          "directories": [
+            "_deps/"
+          ], 
+          "apt": true
+        }, 
+        "script": [
+          "services/toil-worker.sh run-dev-minimal"
+        ], 
+        "install": [
+          "pip install --user flake8 typing", 
+          "pip3 install --user mypy", 
+          "test/spec.sh link-busybox-ash"
+        ], 
+        "addons": {
+          "apt": {
+            "packages": [
+              "python-dev", 
+              "gawk", 
+              "libreadline-dev", 
+              "busybox-static", 
+              "mksh", 
+              "zsh", 
+              "python-pip", 
+              "python3-setuptools", 
+              "python3-pip"
+            ]
+          }
+        }, 
+        "env": [
+          "TRAVIS_SKIP="
+        ], 
+        "notifications": {
+          "on_failure": "change", 
+          "on_success": "change"
+        }
+      }, 
+      {
+        "script": [
+          "services/toil-worker.sh run-cpp"
+        ], 
+        "addons": {
+          "apt": {
+            "packages": [
+              "python3-pip", 
+              "python3-venv", 
+              "ninja-build", 
+              "valgrind", 
+              "busybox-static", 
+              "mksh", 
+              "zsh"
+            ]
+          }
+        }, 
+        "dist": "bionic", 
+        "name": "cpp", 
+        "env": [
+          "TRAVIS_SKIP="
+        ], 
+        "deploy": [
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "master"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }, 
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "dev/andy-27"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }, 
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "dev/andy-vb1"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }
+        ], 
+        "cache": {
+          "pip": true, 
+          "directories": [
+            "_deps/"
+          ], 
+          "apt": true
+        }
+      }, 
+      {
+        "addons": {
+          "apt": {
+            "packages": [
+              "r-base-core"
+            ]
+          }
+        }, 
+        "dist": "bionic", 
+        "name": "other-tests", 
+        "deploy": [
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "master"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }, 
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "dev/andy-27"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }, 
+          {
+            "skip_cleanup": true, 
+            "true": {
+              "branch": "dev/andy-vb1"
+            }, 
+            "provider": "script", 
+            "script": "services/travis.sh publish-html"
+          }
+        ], 
+        "script": [
+          "services/toil-worker.sh run-other-tests"
+        ], 
+        "cache": {
+          "pip": true, 
+          "apt": true
+        }
+      }
+    ]
+  }, 
+  "_publish_html": {
+    "deploy": [
+      {
+        "skip_cleanup": true, 
+        "true": {
+          "branch": "master"
+        }, 
+        "provider": "script", 
+        "script": "services/travis.sh publish-html"
+      }, 
+      {
+        "skip_cleanup": true, 
+        "true": {
+          "branch": "dev/andy-27"
+        }, 
+        "provider": "script", 
+        "script": "services/travis.sh publish-html"
+      }, 
+      {
+        "skip_cleanup": true, 
+        "true": {
+          "branch": "dev/andy-vb1"
+        }, 
+        "provider": "script", 
+        "script": "services/travis.sh publish-html"
+      }
+    ]
+  }
+}

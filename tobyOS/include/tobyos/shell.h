@@ -34,8 +34,106 @@ void shell_poll(void);
  * Lines longer than the shell's editor buffer are rejected. */
 void shell_run_test_line(const char *line);
 
+/* True once, right after a line run by shell_run_test_line/shell_poll asked
+ * the shell to exit (`exit`, or a `set -e` failure). The kernel shell itself
+ * keeps running; the caller decides what ending means -- tcp_shell closes
+ * the session. */
+bool shell_take_exit_request(void);
+
+/* True while the shell is still collecting the rest of a command or a
+ * here-document body: the caller should show the continuation prompt. */
+bool shell_input_pending(void);
+
+/* ^C typed while a kernel-shell line runs (tcp_shell.c): SIGINT to the
+ * foreground command, or the shell itself is interrupted. */
+void shell_kernel_interrupt(void);
+
+/* ^C typed at the kernel shell's prompt: the command being collected is
+ * thrown away and $? is 130. The caller discards its own typed line. */
+void shell_kernel_prompt_interrupt(void);
+
 /* Deliver an asynchronous signal to the shell (called from interrupt context
  * or the signal subsystem). The trap handler will run at the next safe point. */
 void shell_deliver_signal(int sig);
+
+/* True when `pid` is the process the shell itself runs as. Used by signal
+ * delivery to route a signal aimed at the shell to its trap dispatcher. */
+bool shell_owns_pid(int pid);
+
+/* ---- hosted entry points ------------------------------------------------
+ *
+ * shell.c is compiled twice: into the kernel (driven by shell_poll above) and
+ * into userspace /bin/tsh (driven by programs/tsh/host.c). One language, two
+ * hosts -- so the shell's expansion, arithmetic, globbing and control flow
+ * exist exactly once and cannot drift between the two.
+ *
+ * The host provides the other half of the seam: kmalloc, vfs_*, proc_spawn,
+ * file_*, kprintf. Real subsystems in the kernel; libtoby syscall wrappers in
+ * userspace. See programs/tsh/host.c. */
+
+/* Initialise state without printing a banner or prompt (scripts must emit
+ * nothing the oracle would not). `argv0` becomes $0. */
+void shell_init_hosted(const char *argv0);
+
+/* Declare whether this is a terminal session. Defaults to true, because the
+ * kernel shell always is; a script or `-c` must clear it. Alias expansion is
+ * keyed on this -- bash expands aliases interactively and ignores them in a
+ * script unless `shopt -s expand_aliases` says otherwise. */
+void shell_set_interactive_hosted(bool on);
+void shell_set_posix_hosted(bool on);
+
+/* The lowest stack address the shell may nest down to (see g_stack_floor in
+ * src/shell.c); host.c sets it from the process stack's limit. */
+void shell_set_stack_floor_hosted(unsigned long floor);
+
+/* Run a script file / a single -c line. Both return the exit status. */
+int  shell_run_script_hosted(const char *path);
+int  shell_run_line_hosted(const char *text);
+
+/* Is `set -o ignoreeof` on? The interactive read loop asks at each EOF. */
+bool shell_opt_ignoreeof_hosted(void);
+
+/* Read a shell variable (PS1/PS2 are rarely exported, so getenv cannot see
+ * them). NULL when unset. */
+const char *shell_get_var_hosted(const char *name);
+const char *shell_decode_prompt_hosted(const char *ps);
+
+/* Set a shell variable from the host wrapper (PPID at startup). */
+void shell_set_var_hosted(const char *name, const char *value);
+
+/* Continuation test for the interactive loop: 0 = complete, 1 = incomplete
+ * (join with a newline), 2 = backslash continuation (drop the backslash). */
+int shell_line_incomplete_hosted(const char *s);
+
+/* True after a line whose execution asked the shell to exit; *status gets
+ * the exit status. The interactive loop must check this after every line. */
+bool shell_wants_exit_hosted(int *status);
+
+/* Record one interactive line in the history ring (what `fc` lists). */
+void shell_history_add_hosted(const char *line);
+
+/* Reap + announce finished background jobs, bash-style; the interactive
+ * loop calls this right before each PS1. */
+void shell_notify_jobs_hosted(void);
+
+/* Set $1..$n before running. */
+int  shell_set_args_hosted(int argc, char **argv);
+/* Set $0 -- `sh -c CMD NAME` names the script NAME. */
+int  shell_set_param0_hosted(const char *name);
+/* ...and the shell's own name (the prompt's \s), as bash's -c does. */
+void shell_set_shell_name_hosted(const char *name);
+
+/* /bin/tsh's file shims (programs/tsh/host.c) answer in VFS_ERR_* codes;
+ * this one is theirs alone -- ENXIO, as /dev/tty is without a controlling
+ * terminal -- out of reach of both the VFS codes and the ABI errnos, which
+ * share the small negatives. The kernel never returns it. */
+#define SHELL_HOSTED_ERR_NXIO (-200)
+/* ...and EINTR: an open a ^C ended (host.c host_open), which the shell
+ * reports no error for, as bash's redirections do not -- the line unwinds. */
+#define SHELL_HOSTED_ERR_INTR (-201)
+/* ...and EMFILE: no descriptor free below the soft RLIMIT_NOFILE, which the
+ * kernel enforces since batch 47 -- musl's "No file descriptors available",
+ * where tsh said "I/O error". */
+#define SHELL_HOSTED_ERR_MFILE (-202)
 
 #endif /* TOBYOS_SHELL_H */

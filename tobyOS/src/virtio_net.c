@@ -90,6 +90,7 @@
  * read ISR). Same model as e1000 / blk_ata / blk_ahci / blk_nvme.
  */
 
+#include <tobyos/sched.h>    /* bkl_try_enter: the IRQ's receive drain */
 #include <tobyos/net.h>
 #include <tobyos/eth.h>
 #include <tobyos/pci.h>
@@ -402,7 +403,19 @@ static void vnet_irq_handler(void *ctx) {
     struct vnet_dev *d = (struct vnet_dev *)ctx;
     if (!d) return;
     d->irq_count++;
-    vnet_rx_drain_op(&d->net);
+    /* THE RECEIVE PATH IS THE BKL'S (finding 166). eth_recv runs IP and
+     * TCP, whose state -- a connection's receive ring above all -- tcp.c
+     * guards with the BKL alone. Run from this interrupt unguarded, it
+     * raced the reader: rx_push here against rx_pop in the SSH worker,
+     * and on the EliteDesk 4 of 40 841 KB uploads were cut off or
+     * garbled ("invalid encrypted packet_length"). With the BKL free the
+     * frames are taken now; otherwise they wait on the ring for the next
+     * drain under the BKL -- every pass of tcp_poll_until, pid 0's
+     * service tick. */
+    if (bkl_try_enter()) {
+        vnet_rx_drain_op(&d->net);
+        bkl_exit();
+    }
 }
 
 /* Post every RX descriptor to the avail ring up-front, then ring the

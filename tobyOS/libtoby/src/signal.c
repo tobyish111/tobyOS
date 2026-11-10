@@ -47,6 +47,14 @@ int kill(pid_t pid, int sig) {
     return (int)__toby_check(toby_sc2(ABI_SYS_KILL, (long)pid, (long)sig));
 }
 
+/* sigqueue(3), the kernel's: the value travels with the signal, si_code
+ * SI_QUEUE (finding 215; there was none, and kill -q's value went) */
+int sigqueue(pid_t pid, int sig, const union sigval value) {
+    uint64_t v = 0;
+    __builtin_memcpy(&v, &value, sizeof value);
+    return (int)__toby_check(toby_sc3(ABI_SYS_SIGQUEUE, (long)pid, (long)sig, (long)v));
+}
+
 int raise(int sig) {
     return kill(getpid(), sig);
 }
@@ -58,8 +66,28 @@ sighandler_t signal(int signum, sighandler_t handler) {
     return old.sa_handler;
 }
 
+/* signal() WITHOUT SA_RESTART: a blocked syscall returns EINTR rather than
+ * resuming transparently.
+ *
+ * 2026-08-25. signal()'s SA_RESTART is right for almost every handler and
+ * exactly wrong for an interactive reader. /bin/tsh armed SIGINT with it,
+ * so ^C at the prompt ran the handler and then RESUMED the blocked read():
+ * the half-typed line stayed, no newline appeared, no fresh prompt was
+ * drawn. The key did nothing observable, which is indistinguishable from
+ * ^C not being wired at all. Anything that must REACT to a signal mid-read
+ * -- a shell, a pager, an editor -- wants this one. */
+sighandler_t signal_norestart(int signum, sighandler_t handler) {
+    struct sigaction sa = { .sa_handler = handler, .sa_mask = 0, .sa_flags = 0 };
+    struct sigaction old = {0};
+    if (sigaction(signum, &sa, &old) < 0) return SIG_ERR;
+    return old.sa_handler;
+}
+
 int sigemptyset(sigset_t *set)  { if (set) *set = 0; return 0; }
 int sigfillset(sigset_t *set)   { if (set) *set = ~0UL; return 0; }
-int sigaddset(sigset_t *set, int n) { if (set && n > 0 && n < 64) { *set |= (1UL << n); return 0; } return -1; }
-int sigdelset(sigset_t *set, int n) { if (set && n > 0 && n < 64) { *set &= ~(1UL << n); return 0; } return -1; }
-int sigismember(const sigset_t *set, int n) { if (set && n > 0 && n < 64) return (*set >> n) & 1; return -1; }
+/* bit n for signal n, and signal 64 (SIGRTMAX) in bit 0, as the kernel
+ * keeps them (finding 195) */
+#define LT_SIGBIT(n) ((n) == 64 ? 1UL : (1UL << (n)))
+int sigaddset(sigset_t *set, int n) { if (set && n > 0 && n <= 64) { *set |= LT_SIGBIT(n); return 0; } return -1; }
+int sigdelset(sigset_t *set, int n) { if (set && n > 0 && n <= 64) { *set &= ~LT_SIGBIT(n); return 0; } return -1; }
+int sigismember(const sigset_t *set, int n) { if (set && n > 0 && n <= 64) return (*set & LT_SIGBIT(n)) != 0; return -1; }

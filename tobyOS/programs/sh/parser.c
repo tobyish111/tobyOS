@@ -574,7 +574,7 @@ static int exec_simple(struct simple_cmd *cmd) {
     if (cmd->redir_out) {
         int flags = O_WRONLY | O_CREAT;
         flags |= cmd->append_out ? O_APPEND : O_TRUNC;
-        fd_out = open(cmd->redir_out, flags, 0644);
+        fd_out = open(cmd->redir_out, flags, 0666);
         if (fd_out < 0) {
             fprintf(stderr, "sh: cannot open %s: %s\n", cmd->redir_out, strerror(errno));
             if (fd_in > 2) close(fd_in);
@@ -582,7 +582,7 @@ static int exec_simple(struct simple_cmd *cmd) {
         }
     }
     if (cmd->redir_err) {
-        fd_err = open(cmd->redir_err, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        fd_err = open(cmd->redir_err, O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (fd_err < 0) {
             fprintf(stderr, "sh: cannot open %s: %s\n", cmd->redir_err, strerror(errno));
             if (fd_in > 2) close(fd_in);

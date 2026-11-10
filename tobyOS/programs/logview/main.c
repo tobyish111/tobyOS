@@ -53,6 +53,27 @@ static int read_ring(void) {
     return n;
 }
 
+/* dmesg: the same ring, printed the way dmesg prints it -- one line per
+ * record, no table header and no trailing counter, because dmesg output is
+ * something scripts grep. There is no separate kernel ring to read: the
+ * structured log IS this kernel log, which is why dmesg is a personality of
+ * logview rather than a second reader of the same syscall. */
+static void print_dmesg(int n, unsigned int max_level, int tail, int show_time) {
+    int start = 0;
+    if (tail > 0 && n > tail) start = n - tail;
+    for (int i = start; i < n; i++) {
+        if (g_buf[i].level > max_level) continue;
+        if (show_time)
+            printf("[%10llu] %-5s %s: %s\n",
+                   (unsigned long long)g_buf[i].time_ms,
+                   tobylog_level_str(g_buf[i].level),
+                   g_buf[i].sub[0] ? g_buf[i].sub : "kernel", g_buf[i].msg);
+        else
+            printf("%-5s %s: %s\n", tobylog_level_str(g_buf[i].level),
+                   g_buf[i].sub[0] ? g_buf[i].sub : "kernel", g_buf[i].msg);
+    }
+}
+
 static void print_table(int n, unsigned int max_level, int tail) {
     int start = 0;
     if (tail > 0 && n > tail) start = n - tail;
@@ -197,6 +218,10 @@ static int cmd_boot(void) {
 }
 
 int main(int argc, char **argv) {
+    const char *base = argv[0] ? argv[0] : "logview";
+    for (const char *q = base; *q; q++) if (*q == 47) base = q + 1;
+    int is_dmesg = !strcmp(base, "dmesg");
+    int dm_time  = 1;
     int           json     = 0;
     int           tail     = 0;
     int           do_stats = 0;
@@ -206,6 +231,20 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
+        if (is_dmesg) {
+            /* dmesg spelling of the same three ideas. */
+            if (!strcmp(a, "-T") || !strcmp(a, "--ctime"))  { dm_time = 1; continue; }
+            if (!strcmp(a, "-t") || !strcmp(a, "--notime")) { dm_time = 0; continue; }
+            if (!strcmp(a, "-k") || !strcmp(a, "-x")) continue;
+            if (!strcmp(a, "-n") && i + 1 < argc) { i++; continue; }
+            if (!strcmp(a, "-c") || !strcmp(a, "--clear")) {
+                /* The ring is read by sequence number, not consumed, so
+                 * there is nothing to clear. Said, not silently accepted. */
+                fprintf(stderr, "dmesg: -c has nothing to clear: the log ring "
+                                "is read by sequence number, not consumed\n");
+                continue;
+            }
+        }
         if (!strcmp(a, "--json"))         json = 1;
         else if (!strcmp(a, "--stats"))   do_stats = 1;
         else if (!strcmp(a, "--persist")) do_persist = 1;
@@ -236,6 +275,7 @@ int main(int argc, char **argv) {
 
     int n = read_ring();
     if (n < 0) return 1;
+    if (is_dmesg && !json) { print_dmesg(n, max_level, tail, dm_time); return 0; }
     if (json) print_json(n, max_level, tail);
     else      print_table(n, max_level, tail);
     return 0;

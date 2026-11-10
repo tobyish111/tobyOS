@@ -342,6 +342,7 @@ long nsproxy_apply_clone_flags(struct proc *child, uint32_t flags) {
      * owner, so their position relative to this does not matter.) */
     if (want & CLONE_NEWUSER) {
         void *save = me->user_ns;
+        if (!userns_may_create()) return -ABI_EPERM;   /* finding 241 */
         void *ns = user_ns_create();          /* parented on the CALLER's ns */
         if (!ns) return -ABI_ENOMEM;
         void *old = child->user_ns;
@@ -375,7 +376,12 @@ long nsproxy_apply_clone_flags(struct proc *child, uint32_t flags) {
         mount_ns_put(old);
     }
     if (want & CLONE_NEWNET) {            /* slice 12 */
+        /* owned by the CHILD's user namespace -- borrowed for the call, as
+         * the mount namespace above (finding 257) */
+        void *save_un = me->user_ns;
+        me->user_ns = child->user_ns;
         void *ns = net_ns_create();
+        me->user_ns = save_un;
         if (!ns) return -ABI_ENOMEM;
         void *old = child->net_ns;
         child->net_ns = ns;
@@ -436,6 +442,7 @@ long ns_unshare(uint32_t flags) {
      * see userns_owns_mnt_ns() and the gates in syscall.c. A process that
      * unshares ONLY CLONE_NEWUSER can mount nothing real. */
     if (flags & CLONE_NEWUSER) {
+        if (!userns_may_create()) return -ABI_EPERM;   /* finding 241 */
         void *new_user = user_ns_create();
         if (!new_user) return -ABI_ENOMEM;
         void *old = p->user_ns;
@@ -465,7 +472,7 @@ long ns_unshare(uint32_t flags) {
         if (!new_ipc) { uts_ns_put(new_uts); return -ABI_ENOMEM; }
     }
     if (flags & CLONE_NEWPID) {
-        new_pid = pid_ns_create(p->pid_ns);
+        new_pid = pid_ns_create(p->pid_ns, p->user_ns);
         if (!new_pid) { uts_ns_put(new_uts); ipc_ns_put(new_ipc);
                         return -ABI_ENOMEM; }
     }

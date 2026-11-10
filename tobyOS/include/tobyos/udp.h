@@ -25,6 +25,8 @@ struct __attribute__((packed)) udp_hdr {
 
 /* Build a UDP datagram and send it. All ports are in network byte
  * order. Returns true on success. */
+bool udp_send_ttl(uint16_t src_port_be, uint32_t dst_ip_be, uint16_t dst_port_be,
+                  const void *payload, size_t payload_len, uint8_t ttl);
 bool udp_send(uint16_t src_port_be, uint32_t dst_ip_be, uint16_t dst_port_be,
               const void *payload, size_t payload_len);
 

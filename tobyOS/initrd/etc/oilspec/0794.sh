@@ -1,0 +1,1 @@
+compgen -A builtin g

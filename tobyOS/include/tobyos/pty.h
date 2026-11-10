@@ -39,15 +39,78 @@ struct file *pty_open_master(void);
 /* Open /dev/pts/<index>: return a SLAVE struct file for an existing pair.
  * Returns NULL if the index is invalid / not allocated. */
 struct file *pty_open_slave(int index);
+/* True while pair `index` exists and its master is open -- exactly when
+ * pty_open_slave(index) would succeed. /dev/pts lists these (devfs.c). */
+bool pty_slave_live(int index);
+
+/* CONTROLLING TERMINALS (struct proc's ctty). Each allocation of a pair's
+ * slot bumps its generation, so a session's reference to a pair that has
+ * since closed never reaches the next session's. */
+struct proc;
+uint32_t pty_gen_of(int index);
+bool     pty_ctty_live(int index, uint32_t gen);   /* still that pair */
+int      pty_fg_pgrp(int index);   /* its foreground group, 0 if unused */
+/* Batch 31 (finding 190): /dev/pts/N's owner and wall-clock times, and
+ * a login's chown of it (sshd's pty_setowner). */
+bool     pty_node_info(int index, uint32_t *uid, uint32_t *gid,
+                       uint64_t *atime, uint64_t *mtime, uint64_t *ctime);
+void     pty_set_owner(int index, uint32_t uid, uint32_t gid);
+/* Bytes the master can read now, and whether the slave is still open. */
+size_t   pty_master_pending(struct file *f, bool *slave_open);
+/* Make pair INDEX P's controlling terminal and its foreground group P's --
+ * sshd for a session, TIOCSCTTY, a session leader's first open. -EPERM (an
+ * ABI errno) unless P leads its session and has no terminal (or this one);
+ * FORCE skips that check (sshd setting up a session it just spawned). */
+long     pty_make_ctty(struct proc *p, int index, bool force);
 
 /* file.c backend dispatch (read/write/close/clone reference-count). */
 long pty_master_read (struct file *f, void *buf, size_t n);
+/* Returns the number of bytes ACCEPTED, which may be less than n when the
+ * input ring is full -- callers must retry the remainder. */
 long pty_master_write(struct file *f, const void *buf, size_t n);
+
+/* Master side end-of-input: slave reads return 0 once the ring drains,
+ * while the pty stays open for output. */
+void pty_master_input_eof(struct file *f);
 long pty_slave_read  (struct file *f, void *buf, size_t n);
 long pty_slave_write (struct file *f, const void *buf, size_t n);
 long pty_ioctl       (struct file *f, unsigned long cmd, unsigned long arg);
 void pty_close        (struct file *f);   /* drop one end's reference */
 void pty_clone_ref     (struct file *f);   /* dup/fork: bump end refcount */
+
+/* ---- kernel-side helpers (no userspace pointers involved) ------------
+ *
+ * The three calls above this point are the userspace path: pty_ioctl moves
+ * termios/winsize through copy_to_user/copy_from_user, and pty_master_read
+ * BLOCKS the calling process on a wait queue. Neither is usable from an
+ * in-kernel service such as the SSH server, which pumps bytes from
+ * net_service_tick() -- a context that runs on the syscall-return path and
+ * must never block. These are the same operations without those two
+ * assumptions. */
+
+/* Which pair does this master belong to? Needed to open the matching slave,
+ * since `struct pty` is private to pty.c. Returns -1 if `f` is not a master. */
+int  pty_index_of(struct file *f);
+/* The pair a master OR a slave end belongs to (its /dev/pts number), for
+ * fstat; -1 for anything else. */
+int  pty_file_index(struct file *f);
+
+/* Like pty_master_read, but never parks the caller. Returns:
+ *     > 0  bytes read
+ *       0  EOF -- the slave end is fully closed (the program on it exited)
+ *      -2  nothing buffered right now; try again next tick
+ * The 0-vs--2 split is the whole point: a poller must be able to tell "the
+ * shell has nothing to say yet" from "the shell is gone", and the blocking
+ * pty_master_read collapses both onto a wait. */
+long pty_master_read_nb(struct file *f, void *buf, size_t n);
+
+/* Set the slave's window size from kernel memory (SSH pty-req / window-change
+ * carry it in the protocol, not in a user buffer). */
+/* Raw mode: no canonical assembly, echo, signals or CR/LF translation.
+ * For a channel that is a byte pipe rather than a terminal. */
+void pty_set_raw(struct file *f);
+
+void pty_set_winsize(struct file *f, uint16_t cols, uint16_t rows);
 
 /* poll/select readiness for a PTY fd (master or slave). */
 bool pty_readable(struct file *f);

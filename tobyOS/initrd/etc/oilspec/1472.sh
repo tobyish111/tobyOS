@@ -1,0 +1,4 @@
+[[ ^ == ^ ]]
+echo caret $?
+[[ '!' == ! ]]
+echo bang $?

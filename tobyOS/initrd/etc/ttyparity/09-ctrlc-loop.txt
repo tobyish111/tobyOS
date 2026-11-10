@@ -1,0 +1,17 @@
+# ^C MUST ESCAPE A CONSTRUCT WITH NO CHILD PROCESS.
+#
+# The tty sends SIGINT to the foreground process GROUP, which is the whole
+# mechanism job control offers -- and it is not enough here. `:` is a
+# builtin, so this loop never forks: there is no child for the tty to
+# signal and the foreground group never leaves the shell. The interpreter
+# has to unwind its own loops. Without that, ^C here either does nothing
+# or (worse) leaves the loop spinning while every command inside it
+# returns early.
+#
+# `while :` and not `while true`: `true` may resolve through PATH to a
+# real /bin/true, which forks a child per iteration and would test the
+# job-control path (case 06) instead of the interpreter one.
+while :; do :; done
+%CTRLC%
+echo "loop=$?"
+exit 0

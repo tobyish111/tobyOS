@@ -55,12 +55,17 @@ static int count_fd(int fd, struct counts *c) {
     return 0;
 }
 
+/* GNU wc does NOT pad. This printed "%8ld", so the commonest use of wc in
+ * any script -- n=$(wc -l < file) -- yielded "       3" instead of "3",
+ * which then failed every numeric comparison and string test it was fed
+ * into. Counts are separated by a single space, the first one bare. */
 static void print_counts(const struct counts *c, const char *label) {
-    if (show_l) printf("%8ld", c->lines);
-    if (show_w) printf("%8ld", c->words);
-    if (show_c) printf("%8ld", c->chars);
+    int first = 1;
+    if (show_l) { printf("%ld", c->lines); first = 0; }
+    if (show_w) { printf(first ? "%ld" : " %ld", c->words); first = 0; }
+    if (show_c) { printf(first ? "%ld" : " %ld", c->chars); first = 0; }
     if (label)  printf(" %s", label);
-    putchar('\n');
+    putchar(10);
 }
 
 static void usage(void) { eprintf("usage: %s [-clw] [file ...]", argv0); }

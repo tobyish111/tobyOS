@@ -20,52 +20,8 @@
 
 /* ---- raw syscall trampolines ------------------------------------ */
 
-long toby_sc0(long n) {
-    long r;
-    __asm__ volatile ("syscall"
-                      : "=a"(r) : "0"(n) : "rcx", "r11", "memory");
-    return r;
-}
-long toby_sc1(long n, long a) {
-    long r;
-    __asm__ volatile ("syscall"
-                      : "=a"(r) : "0"(n), "D"(a) : "rcx", "r11", "memory");
-    return r;
-}
-long toby_sc2(long n, long a, long b) {
-    long r;
-    __asm__ volatile ("syscall"
-                      : "=a"(r) : "0"(n), "D"(a), "S"(b)
-                      : "rcx", "r11", "memory");
-    return r;
-}
-long toby_sc3(long n, long a, long b, long c) {
-    long r;
-    __asm__ volatile ("syscall"
-                      : "=a"(r) : "0"(n), "D"(a), "S"(b), "d"(c)
-                      : "rcx", "r11", "memory");
-    return r;
-}
-long toby_sc4(long n, long a, long b, long c, long d) {
-    long r;
-    register long r10 __asm__("r10") = d;
-    __asm__ volatile ("syscall"
-                      : "=a"(r)
-                      : "0"(n), "D"(a), "S"(b), "d"(c), "r"(r10)
-                      : "rcx", "r11", "memory");
-    return r;
-}
-long toby_sc5(long n, long a, long b, long c, long d, long e) {
-    long r;
-    register long r10 __asm__("r10") = d;
-    register long r8  __asm__("r8")  = e;
-    __asm__ volatile ("syscall"
-                      : "=a"(r)
-                      : "0"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8)
-                      : "rcx", "r11", "memory");
-    return r;
-}
-long toby_sc6(long n, long a, long b, long c, long d, long e, long f) {
+static inline long raw_sc6(long n, long a, long b, long c, long d, long e,
+                           long f) {
     long r;
     register long r10 __asm__("r10") = d;
     register long r8  __asm__("r8")  = e;
@@ -75,6 +31,47 @@ long toby_sc6(long n, long a, long b, long c, long d, long e, long f) {
                       : "0"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8), "r"(r9)
                       : "rcx", "r11", "memory");
     return r;
+}
+
+/* PENDING STDIO OUTPUT GOES OUT BEFORE THE PROCESS ENTERS THE KERNEL (K5).
+ * stdio buffers now (see stdio.c), and the native userland was written
+ * against unbuffered stdio: it mixes printf with raw write(2), prints and
+ * then forks, spawns, sleeps, waits or reads. Flushing here -- one load of
+ * __toby_stdio_pending when nothing is buffered -- keeps every byte a
+ * program printed ahead of every effect it causes afterwards, exactly as
+ * before; only runs of stdio calls with no syscall between them are
+ * coalesced. exit() and _exit() are syscalls too, so nothing printed is
+ * lost at exit. */
+#define STDIO_SYNC() \
+    do { if (__builtin_expect(__toby_stdio_pending, 0) && __toby_stdio_eager) \
+             __toby_stdio_flush_all(); } while (0)
+/* (A program that asked for glibc's rules -- __toby_stdio_like_glibc, the
+ * GNU-shaped commands -- is left alone: its output waits as glibc's would,
+ * and exit() writes it out; finding 225.) */
+
+long toby_sc_raw0(long n)                         { return raw_sc6(n, 0, 0, 0, 0, 0, 0); }
+long toby_sc_raw3(long n, long a, long b, long c) { return raw_sc6(n, a, b, c, 0, 0, 0); }
+
+long toby_sc0(long n) {
+    STDIO_SYNC(); return raw_sc6(n, 0, 0, 0, 0, 0, 0);
+}
+long toby_sc1(long n, long a) {
+    STDIO_SYNC(); return raw_sc6(n, a, 0, 0, 0, 0, 0);
+}
+long toby_sc2(long n, long a, long b) {
+    STDIO_SYNC(); return raw_sc6(n, a, b, 0, 0, 0, 0);
+}
+long toby_sc3(long n, long a, long b, long c) {
+    STDIO_SYNC(); return raw_sc6(n, a, b, c, 0, 0, 0);
+}
+long toby_sc4(long n, long a, long b, long c, long d) {
+    STDIO_SYNC(); return raw_sc6(n, a, b, c, d, 0, 0);
+}
+long toby_sc5(long n, long a, long b, long c, long d, long e) {
+    STDIO_SYNC(); return raw_sc6(n, a, b, c, d, e, 0);
+}
+long toby_sc6(long n, long a, long b, long c, long d, long e, long f) {
+    STDIO_SYNC(); return raw_sc6(n, a, b, c, d, e, f);
 }
 
 /* ---- POSIX-style return convention ------------------------------- *

@@ -1,0 +1,12 @@
+# ^C AT THE PROMPT -- not at a running job; case 06 covers that one.
+#
+# Here the shell ITSELF is blocked in read(). It must abandon whatever was
+# typed, print the newline bash prints (the tty has echoed "^C" with no
+# newline of its own), draw a fresh prompt, and set $? to 130. It must NOT
+# die, and it must NOT silently resume the read -- which is what tsh did
+# for as long as it armed SIGINT through signal(), whose SA_RESTART made
+# the keypress do nothing observable at all.
+echo before
+%CTRLC@%
+echo "after=$?"
+exit 0

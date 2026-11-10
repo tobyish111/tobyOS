@@ -1,0 +1,10 @@
+# A SYNTAX ERROR AT AN INTERACTIVE PROMPT IS REPORTED, $? BECOMES 2, AND THE
+# SHELL GOES ON. /bin/tsh used to quit on the typo; the in-kernel shell ran
+# nothing ever again. (The diagnostic's program-name prefix is normalised by
+# the runner; the rest of the message must match.)
+false
+done
+echo "after st=$?"
+fi; echo no
+echo "after2 st=$?"
+exit 0

@@ -652,9 +652,21 @@ bool vmm_protect(uint64_t virt, size_t bytes, uint32_t flags) {
              * refcounted copy-out and THEN grants write. */
             uint64_t prev = pt[i];
             uint64_t nf = leaf_flags;
+            uint64_t cow_add = 0;
             if (prev & PTE_COW_SW) nf &= ~PTE_RW;
+            else if ((nf & PTE_RW) && !(prev & PTE_SHARED_SW) &&
+                     v < 0x0000800000000000ULL &&
+                     page_ref_get(prev & PTE_ADDR_MASK) > 1) {
+                /* A private frame others still hold -- an initrd program's
+                 * text, shared by every process running it (finding 247) --
+                 * is made writable the CoW way: read-only and CoW-marked, so
+                 * the first write copies it out. Granting write here would
+                 * have let one process's store land in all of them. */
+                nf &= ~PTE_RW;
+                cow_add = PTE_COW_SW;
+            }
             pt[i] = (prev & (PTE_ADDR_MASK | PTE_SHARED_SW | PTE_COW_SW |
-                             PTE_DEMAND_SW | PTE_SWAP_SW)) | nf;
+                             PTE_DEMAND_SW | PTE_SWAP_SW)) | nf | cow_add;
             invlpg(v);
 #ifdef CHROMIUM_BOOT
             if (v < 0x0000800000000000ULL)
@@ -686,6 +698,32 @@ uint64_t vmm_translate(uint64_t virt) {
     pte_t *pt = phys_to_table(pde & PTE_ADDR_MASK);
     pte_t pte = pt[pt_idx(virt)];
     if (!(pte & PTE_P)) return 0;
+    return (pte & PTE_ADDR_MASK) | (virt & (PAGE_SIZE - 1));
+}
+
+/* Translate through an EXPLICIT PML4 root (a process cr3) without touching
+ * the editor borrow -- safe from BKL-free paths, which is what the futex
+ * PROCESS_SHARED keying needs (Phase F, 2026-08-22). Read-only walk,
+ * PRESENT leaves only. *shared_out (optional) reports the PTE_SHARED_SW
+ * software bit: a MAP_SHARED frame, identical in every process mapping it. */
+uint64_t vmm_translate_root(uint64_t cr3, uint64_t virt, int *shared_out) {
+    if (shared_out) *shared_out = 0;
+    if (!cr3) return 0;
+    pte_t *pml4 = phys_to_table(cr3 & PTE_ADDR_MASK);
+    pte_t *pdpt = next_table(pml4, pml4_idx(virt), 0, false);
+    if (!pdpt) return 0;
+    pte_t *pd = next_table(pdpt, pdpt_idx(virt), 0, false);
+    if (!pd) return 0;
+    pte_t pde = pd[pd_idx(virt)];
+    if (!(pde & PTE_P)) return 0;
+    if (pde & PTE_PS) {
+        if (shared_out) *shared_out = (pde & PTE_SHARED_SW) ? 1 : 0;
+        return (pde & ~PAGE_2M_MASK & PTE_ADDR_MASK) | (virt & PAGE_2M_MASK);
+    }
+    pte_t *pt = phys_to_table(pde & PTE_ADDR_MASK);
+    pte_t pte = pt[pt_idx(virt)];
+    if (!(pte & PTE_P)) return 0;
+    if (shared_out) *shared_out = (pte & PTE_SHARED_SW) ? 1 : 0;
     return (pte & PTE_ADDR_MASK) | (virt & (PAGE_SIZE - 1));
 }
 
@@ -851,12 +889,9 @@ static void free_subtree(uint64_t table_phys, int level) {
              * back to the PMM whenever a fork child exited -- the next
              * allocation recycled them under the parent. */
             uint64_t leaf = e & PTE_ADDR_MASK;
-            int refs = page_ref_get(leaf);
-            if (refs > 1) {
-                page_ref_dec(leaf);
-                continue;
-            }
-            if (refs == 1) page_ref_dec(leaf);
+            /* Drop our reference and learn, in the SAME atomic step, whether
+             * anyone else still holds one (see page_ref_dec_old). */
+            if (page_ref_dec_old(leaf) > 1) continue;
             pmm_free_page(leaf);
             continue;
         }

@@ -238,6 +238,15 @@ int kvsnprintf(char *dst, size_t cap, const char *fmt, va_list ap) {
             ksn_emit_uint(&s, u, 10, false, width, zero_pad, left_align);
             break;
         }
+        case 'o': {
+            /* The kernel prints file modes constantly and neither format
+             * core handled %o, so a mode assertion emitted the literal
+             * text "%o" and read as noise rather than a number. */
+            unsigned long u = is_long ? va_arg(ap, unsigned long)
+                                      : (unsigned long)va_arg(ap, unsigned);
+            ksn_emit_uint(&s, u, 8, false, width, zero_pad, left_align);
+            break;
+        }
         case 'x': {
             unsigned long u = is_long ? va_arg(ap, unsigned long)
                                       : (unsigned long)va_arg(ap, unsigned);

@@ -43,16 +43,53 @@ struct blk_dev;
 #define EXT4_EXT_MAGIC       0xF30Au
 
 /* INCOMPAT bits we either understand or know to refuse. */
+#define EXT4_FEATURE_INCOMPAT_COMPRESSION 0x0001u
 #define EXT4_FEATURE_INCOMPAT_FILETYPE   0x0002u   /* ok */
 #define EXT4_FEATURE_INCOMPAT_RECOVER    0x0004u   /* journal needs replay */
+#define EXT4_FEATURE_INCOMPAT_JOURNAL_DEV 0x0008u
+#define EXT4_FEATURE_INCOMPAT_META_BG    0x0010u
 #define EXT4_FEATURE_INCOMPAT_EXTENTS    0x0040u   /* ok, we walk these */
 #define EXT4_FEATURE_INCOMPAT_64BIT      0x0080u   /* ok if no high blocks */
+#define EXT4_FEATURE_INCOMPAT_MMP        0x0100u
 #define EXT4_FEATURE_INCOMPAT_FLEX_BG    0x0200u   /* ok */
+#define EXT4_FEATURE_INCOMPAT_EA_INODE   0x0400u
+#define EXT4_FEATURE_INCOMPAT_DIRDATA    0x1000u
+#define EXT4_FEATURE_INCOMPAT_CSUM_SEED  0x2000u   /* s_checksum_seed */
+#define EXT4_FEATURE_INCOMPAT_LARGEDIR   0x4000u
 #define EXT4_FEATURE_INCOMPAT_INLINE_DATA 0x8000u  /* refuse */
+#define EXT4_FEATURE_INCOMPAT_ENCRYPT    0x10000u
+#define EXT4_FEATURE_INCOMPAT_CASEFOLD   0x20000u
 
 /* COMPAT bits. HAS_JOURNAL means a JBD2 journal inode is present
  * (s_journal_inum); we drive it for crash-atomic writes + recovery. */
 #define EXT4_FEATURE_COMPAT_HAS_JOURNAL  0x0004u
+#define EXT4_FEATURE_COMPAT_EXT_ATTR     0x0008u
+#define EXT4_FEATURE_COMPAT_RESIZE_INODE 0x0010u   /* reserved GDT blocks */
+#define EXT4_FEATURE_COMPAT_DIR_INDEX    0x0020u   /* htree directories */
+#define EXT4_FEATURE_COMPAT_SPARSE_SUPER2 0x0200u
+#define EXT4_FEATURE_COMPAT_FAST_COMMIT  0x0400u
+#define EXT4_FEATURE_COMPAT_ORPHAN_FILE  0x1000u
+
+/* RO_COMPAT bits: a driver may read a volume with one it does not know,
+ * and must not write it (finding 271). */
+#define EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER  0x0001u
+#define EXT4_FEATURE_RO_COMPAT_LARGE_FILE    0x0002u
+#define EXT4_FEATURE_RO_COMPAT_BTREE_DIR     0x0004u
+#define EXT4_FEATURE_RO_COMPAT_HUGE_FILE     0x0008u
+#define EXT4_FEATURE_RO_COMPAT_GDT_CSUM      0x0010u   /* uninit_bg: CRC-16 */
+#define EXT4_FEATURE_RO_COMPAT_DIR_NLINK     0x0020u
+#define EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE   0x0040u
+#define EXT4_FEATURE_RO_COMPAT_QUOTA         0x0100u
+#define EXT4_FEATURE_RO_COMPAT_BIGALLOC      0x0200u
+#define EXT4_FEATURE_RO_COMPAT_METADATA_CSUM 0x0400u   /* CRC-32C */
+#define EXT4_FEATURE_RO_COMPAT_READONLY      0x1000u
+#define EXT4_FEATURE_RO_COMPAT_PROJECT       0x2000u
+#define EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT 0x10000u
+
+/* bg_flags */
+#define EXT4_BG_INODE_UNINIT  0x0001u   /* the inode bitmap is all clear */
+#define EXT4_BG_BLOCK_UNINIT  0x0002u   /* the block bitmap is the group's metadata */
+#define EXT4_BG_INODE_ZEROED  0x0004u   /* the inode table is zeroed */
 
 /* Conventional inode number of the JBD2 journal (s_journal_inum). */
 #define EXT4_JOURNAL_INODE   8u
@@ -69,8 +106,12 @@ struct blk_dev;
 #define EXT4_FT_DIR          2
 #define EXT4_FT_SYMLINK      7
 
-/* Inode i_flags bit we care about. */
+/* Inode i_flags bits we care about. */
+#define EXT4_INDEX_FL        0x00001000u   /* an htree directory */
+#define EXT4_HUGE_FILE_FL    0x00040000u   /* i_blocks in blocks, not sectors */
 #define EXT4_EXTENTS_FL      0x00080000u
+#define EXT4_EA_INODE_FL     0x00200000u
+#define EXT4_INLINE_DATA_FL  0x10000000u
 
 /* ---- superblock (1024 bytes, located at byte offset 1024) ----- */
 
@@ -134,16 +175,39 @@ struct ext4_super_block {
     uint32_t s_free_blocks_count_hi;
     uint16_t s_min_extra_isize;
     uint16_t s_want_extra_isize;
-
-    /* The real Linux ext4 SB has dozens of additional fields after this
-     * point (s_flags, s_mmp_*, s_first_error_*, s_mount_opts, ...). We
-     * never read them in this RO driver, so we collapse the rest into a
-     * single padding array sized so the struct is exactly 1024 bytes.
-     * Used fields above end at offset 352, so pad = 1024 - 352 = 672. */
-    uint8_t  s_padding[672];
+    uint32_t s_flags;              /* EXT4_FLAGS_*: the hash's signedness */
+    uint16_t s_raid_stride;
+    uint16_t s_mmp_interval;
+    uint64_t s_mmp_block;
+    uint32_t s_raid_stripe_width;
+    uint8_t  s_log_groups_per_flex;
+    uint8_t  s_checksum_type;      /* 1: CRC-32C */
+    uint16_t s_reserved_pad;
+    uint64_t s_kbytes_written;
+    /* snapshots, the first and last error, mount options, quota inodes */
+    uint8_t  s_snapshot_to_overhead[0x24C - 0x180];
+    uint32_t s_backup_bgs[2];      /* sparse_super2's two backup groups */
+    uint8_t  s_encrypt_to_prj_quota[0x270 - 0x254];
+    uint32_t s_checksum_seed;      /* INCOMPAT_CSUM_SEED: the sums' seed */
+    uint8_t  s_time_hi_and_errcodes[0x27C - 0x274];
+    uint16_t s_encoding;
+    uint16_t s_encoding_flags;
+    uint32_t s_orphan_file_inum;
+    uint32_t s_reserved[94];
+    uint32_t s_checksum;           /* CRC-32C of the bytes before it */
 };
 _Static_assert(sizeof(struct ext4_super_block) == 1024,
                "ext4 superblock must be exactly 1024 bytes");
+_Static_assert(__builtin_offsetof(struct ext4_super_block, s_flags) == 0x160, "s_flags");
+_Static_assert(__builtin_offsetof(struct ext4_super_block, s_checksum_type) == 0x175, "s_checksum_type");
+_Static_assert(__builtin_offsetof(struct ext4_super_block, s_backup_bgs) == 0x24C, "s_backup_bgs");
+_Static_assert(__builtin_offsetof(struct ext4_super_block, s_checksum_seed) == 0x270, "s_checksum_seed");
+_Static_assert(__builtin_offsetof(struct ext4_super_block, s_orphan_file_inum) == 0x280, "s_orphan_file_inum");
+_Static_assert(__builtin_offsetof(struct ext4_super_block, s_checksum) == 0x3FC, "s_checksum");
+
+/* s_flags: whether a name's characters hash as signed or unsigned */
+#define EXT4_FLAGS_SIGNED_HASH    0x0001u
+#define EXT4_FLAGS_UNSIGNED_HASH  0x0002u
 
 /* ---- group descriptor (32 or 64 bytes; we read both) ---------- */
 
@@ -190,9 +254,12 @@ _Static_assert(sizeof(struct ext4_group_desc_64) == 64,
                "ext4 64-byte group descriptor");
 
 /* ---- inode (128 or 256 bytes) --------------------------------- */
-/* We only read the first 128 bytes -- the extra ext4 fields beyond
- * that (i_file_acl_high, i_extra_isize, ...) aren't needed for RO
- * traversal. */
+/* The 128-byte core, then -- in an inode larger than that -- the fields
+ * i_extra_isize says it has: the nanoseconds of each time (finding 255),
+ * a creation time. Past them the inode holds extended attributes, so only
+ * what i_extra_isize covers is ever read or written (ext4.c); ext2.c keeps
+ * to the core. */
+#define EXT4_GOOD_OLD_INODE_SIZE 128u
 
 struct ext4_inode {
     uint16_t i_mode;
@@ -213,9 +280,22 @@ struct ext4_inode {
     uint32_t i_size_hi;            /* file sz high 32 bits */
     uint32_t i_obso_faddr;
     uint8_t  i_osd2[12];
+    /* the large inode's: 0 where the inode is the old 128 bytes, or where
+     * its i_extra_isize stops short of them */
+    uint16_t i_extra_isize;        /* bytes of these past the core */
+    uint16_t i_checksum_hi;
+    uint32_t i_ctime_extra;        /* nanoseconds << 2 | seconds' bits 32-33 */
+    uint32_t i_mtime_extra;
+    uint32_t i_atime_extra;
+    uint32_t i_crtime;             /* creation time (statx's btime) */
+    uint32_t i_crtime_extra;
+    uint32_t i_version_hi;
+    uint32_t i_projid;
 };
-_Static_assert(sizeof(struct ext4_inode) == 128,
+_Static_assert(__builtin_offsetof(struct ext4_inode, i_extra_isize) == 128,
                "ext4 inode core must be 128 bytes");
+_Static_assert(sizeof(struct ext4_inode) == 160,
+               "ext4 inode core + 32 bytes of extra fields");
 
 /* ---- extent tree ---------------------------------------------- */
 
@@ -269,6 +349,10 @@ int ext4_probe(struct blk_dev *dev);
  * (no journaling -- writes are not crash-atomic; a needs-recovery
  * image is still refused at mount). */
 int ext4_mount(const char *mount_point, struct blk_dev *dev);
+/* The same, read-only where RDONLY: a volume with a feature this driver
+ * cannot keep when it writes mounts only that way (VFS_ERR_INVAL for a
+ * read-write mount of one, as Linux's ext4 refuses it; finding 271). */
+int ext4_mount_ro(const char *mount_point, struct blk_dev *dev, bool rdonly);
 
 /* Format `dev` as a minimal single-block-group, 4 KiB-block, extents
  * ext4. `with_journal` adds a JBD2 journal (inode 8) so writes become
@@ -290,5 +374,12 @@ int ext4_self_test(void);
  * Returns 0 on all-pass. Emits [EXT4JT] markers. Called from kernel.c
  * under -DEXT4_JOURNAL_SELFTEST. */
 int ext4_journal_self_test(void);
+
+/* The mount's vfs_ops and the device under a mount of it, as the other
+ * block filesystems give them (provision_dev_mounted: an ext4 mount was
+ * not seen, so a mounted ext4 volume read as unmounted). */
+struct vfs_ops;
+const struct vfs_ops *ext4_ops_addr(void);
+struct blk_dev *ext4_blkdev_of(void *mnt);
 
 #endif /* TOBYOS_EXT4_H */

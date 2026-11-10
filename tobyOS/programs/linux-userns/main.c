@@ -46,6 +46,7 @@
 #include <fcntl.h>
 #include <sched.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #define NS_NEWNS       0x00020000
@@ -131,6 +132,13 @@ int main(void) {
 
     unsigned long long my_inum = ns_inum("user");
     int my_uid = k_getuid();
+    /* The mount points, made first (as root, before any child drops to
+     * 1000): Linux binds only onto a name that exists, so a missing one
+     * answers ENOENT before the privilege the guard checks is ever asked
+     * about. The test leaned on tobyOS's binding onto any name until
+     * finding 241. */
+    static const char *const mps[] = { "/evil", "/uns", "/unpriv", 0 };
+    for (int i = 0; mps[i]; i++) (void)mkdir(mps[i], 0755);
     printf("userns: start uid=%d user:[%llu]\n", my_uid, my_inum);
 
     /* marker used by the mount checks */
@@ -403,6 +411,7 @@ int main(void) {
     }
 
     { char p[256]; snprintf(p, sizeof p, "/data/%s", PROBE); (void)unlink(p); }
+    for (int i = 0; mps[i]; i++) (void)rmdir(mps[i]);
     printf("userns: BITS=0x%x (want 0xff)\n", bits);
     return bits;
 }

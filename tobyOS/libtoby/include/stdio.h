@@ -27,7 +27,7 @@ extern "C" {
 
 #define EOF             (-1)
 #define BUFSIZ          4096
-#define FILENAME_MAX    256
+#define FILENAME_MAX    4096   /* glibc's: Linux's PATH_MAX (finding 227) */
 #define FOPEN_MAX       16
 
 typedef struct __libtoby_FILE FILE;
@@ -58,13 +58,25 @@ int    getchar (void);
 int    getc    (FILE *f);
 int    fgetc   (FILE *f);
 char  *fgets   (char *s, int cap, FILE *f);
+/* POSIX getline/getdelim: a whole line (or up to DELIM), *LINEP grown
+ * with realloc as needed; the count, or -1 at end of file. */
+ssize_t getdelim(char **linep, size_t *capp, int delim, FILE *f);
+ssize_t getline (char **linep, size_t *capp, FILE *f);
 
 /* ---- file streams ------------------------------------------------- */
 FILE  *fopen   (const char *path, const char *mode);
+/* finding 215: a stream on an open descriptor, and a stream moved onto
+ * another file in place */
+FILE  *fdopen  (int fd, const char *mode);
+FILE  *freopen (const char *path, const char *mode, FILE *f);
 int    fclose  (FILE *f);
 size_t fread   (void *buf, size_t sz, size_t n, FILE *f);
 size_t fwrite  (const void *buf, size_t sz, size_t n, FILE *f);
 int    fflush  (FILE *f);
+/* libtoby: write pending output out only as glibc does -- full buffer, a
+ * line's end on a terminal, fflush, exit -- not before every system call,
+ * as the rest of the native userland has it (finding 225) */
+void   __toby_stdio_like_glibc(void);
 int    fseek   (FILE *f, long off, int whence);
 long   ftell   (FILE *f);
 void   rewind  (FILE *f);

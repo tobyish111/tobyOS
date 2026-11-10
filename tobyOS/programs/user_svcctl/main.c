@@ -1,8 +1,14 @@
 /* user_svcctl/main.c -- /bin/svcctl, enhanced service manager CLI.
  *
- * Provides start/stop/restart/status/log subcommands for managing
- * kernel-supervised services. Communicates via SYS_SVC_LIST for
- * reading and SYS_SLOG_WRITE/READ for commands and logs. */
+ * status and log are REAL: SYS_SVC_LIST reads the live registry and
+ * SYS_SLOG_READ reads the kernel log.
+ *
+ * start/stop/restart ARE NOT. They write a line to the system log, and
+ * nothing anywhere reads it back as a command -- the supervisor exposes
+ * no control syscall. They used to print "Requested start of X" and exit
+ * 0, which is indistinguishable from having worked; they now say what
+ * actually happened and exit nonzero. See /bin/systemctl, which refuses
+ * those verbs outright for the same reason. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,19 +21,15 @@
 #define SYS_SLOG_WRITE    59
 #define SYS_CLOCK_MS      48
 
-struct service_info {
-    char     name[32];
-    unsigned int kind;
-    unsigned int state;
-    int      pid;
-    unsigned int restarts;
-    unsigned long uptime_ms;
-};
-
-#define SVC_STATE_STOPPED  0
-#define SVC_STATE_RUNNING  1
-#define SVC_STATE_STARTING 2
-#define SVC_STATE_FAILED   3
+/* The service record is the ABI's own (2026-09-03). This file declared a
+ * private `struct service_info` -- a 32-byte name where the ABI has a
+ * 16-byte name and a 64-byte path, an `unsigned long uptime_ms` against the
+ * ABI's `last_start_ms` -- and asked for entries the kernel then refused.
+ * `svcctl status` had therefore never printed a service: it said "failed to
+ * query services" every time. The same hand-copied-struct bug took /bin/ps
+ * down on 2026-09-02; a struct shared across a syscall boundary has exactly
+ * one correct definition and it lives in the ABI header. */
+#include <tobyos_svc.h>
 
 struct slog_record {
     unsigned long seq;
@@ -37,14 +39,6 @@ struct slog_record {
     char          message[128];
 };
 
-static inline long sys_svc_list(struct service_info *out, unsigned int cap) {
-    long r;
-    __asm__ volatile("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_SVC_LIST), "D"(out), "S"((long)cap)
-        : "rcx", "r11", "memory");
-    return r;
-}
 
 static inline long sys_slog_read(struct slog_record *out, unsigned int cap,
                                   unsigned long since) {
@@ -75,16 +69,17 @@ static inline long sys_clock_ms(void) {
 
 static const char *state_str(unsigned int s) {
     switch (s) {
-    case SVC_STATE_STOPPED:  return "stopped";
-    case SVC_STATE_RUNNING:  return "running";
-    case SVC_STATE_STARTING: return "starting";
-    case SVC_STATE_FAILED:   return "failed";
+    case ABI_SVC_STATE_STOPPED:  return "stopped";
+    case ABI_SVC_STATE_RUNNING:  return "running";
+    case ABI_SVC_STATE_FAILED:   return "failed";
+    case ABI_SVC_STATE_BACKOFF:  return "backoff";
+    case ABI_SVC_STATE_DISABLED: return "disabled";
     default: return "unknown";
     }
 }
 
 static const char *kind_str(unsigned int k) {
-    return k == 0 ? "builtin" : "program";
+    return k == ABI_SVC_KIND_BUILTIN ? "builtin" : "program";
 }
 
 static void format_uptime(unsigned long ms, char *buf, int bufsz) {
@@ -97,30 +92,33 @@ static void format_uptime(unsigned long ms, char *buf, int bufsz) {
 /* ---- Commands --------------------------------------------------- */
 
 static int cmd_status(void) {
-    struct service_info svcs[32];
-    long count = sys_svc_list(svcs, 32);
+    struct abi_service_info svcs[ABI_SVC_LIST_MAX];
+    int count = tobysvc_list(svcs, ABI_SVC_LIST_MAX);
     if (count < 0) {
-        fprintf(stderr, "svcctl: failed to query services\n");
+        fprintf(stderr, "svcctl: failed to query services: %s\n", strerror(errno));
         return 1;
     }
+    unsigned long now = (unsigned long)sys_clock_ms();
 
     printf("%-16s %-8s %-10s %5s %8s %10s\n",
            "NAME", "KIND", "STATE", "PID", "RESTARTS", "UPTIME");
     printf("%-16s %-8s %-10s %5s %8s %10s\n",
            "----", "----", "-----", "---", "--------", "------");
 
-    for (long i = 0; i < count; i++) {
+    for (int i = 0; i < count; i++) {
         char up[32];
-        format_uptime(svcs[i].uptime_ms, up, sizeof(up));
+        /* last_start_ms is a boot-relative stamp; uptime is now minus then */
+        unsigned long st = (unsigned long)svcs[i].last_start_ms;
+        format_uptime((st && now > st) ? now - st : 0, up, sizeof(up));
         printf("%-16s %-8s %-10s %5d %8u %10s\n",
                svcs[i].name,
                kind_str(svcs[i].kind),
                state_str(svcs[i].state),
-               svcs[i].pid,
-               svcs[i].restarts,
+               (int)svcs[i].pid,
+               (unsigned)svcs[i].restart_count,
                up);
     }
-    printf("\n%ld service(s) total\n", count);
+    printf("\n%d service(s)\n", count);
     return 0;
 }
 
@@ -128,24 +126,29 @@ static int cmd_start(const char *name) {
     char msg[128];
     snprintf(msg, sizeof(msg), "svcctl: start %s", name);
     sys_slog_write(4, "svcctl", msg);
-    printf("Requested start of '%s' (via slog command)\n", name);
-    printf("Note: kernel service supervisor handles actual start.\n");
-    return 0;
+    printf("Logged a start request for '%s'.\n", name);
+    fprintf(stderr, "svcctl: NOTHING CONSUMES THAT LOG LINE. The supervisor "
+                    "exposes only SYS_SVC_LIST, which reads the registry; "
+                    "there is no start syscall, so the service was not "
+                    "started.\n");
+    return 1;
 }
 
 static int cmd_stop(const char *name) {
     char msg[128];
     snprintf(msg, sizeof(msg), "svcctl: stop %s", name);
     sys_slog_write(4, "svcctl", msg);
-    printf("Requested stop of '%s' (via slog command)\n", name);
-    return 0;
+    printf("Logged a stop request for '%s'.\n", name);
+    fprintf(stderr, "svcctl: NOTHING CONSUMES THAT LOG LINE. There is no stop "
+                    "syscall, so the service is still running.\n");
+    return 1;
 }
 
 static int cmd_restart(const char *name) {
     cmd_stop(name);
     usleep(500000);
     cmd_start(name);
-    return 0;
+    return 1;          /* neither half acted; do not report success */
 }
 
 static int cmd_log(const char *name, int num_entries) {

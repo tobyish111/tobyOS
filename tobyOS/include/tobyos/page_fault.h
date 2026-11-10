@@ -84,6 +84,13 @@ uint64_t *get_pte(uint64_t cr3, uint64_t virt_addr);
 /* Allocate a new page, copy 4KB from old_phys, update *new_pte. */
 bool cow_copy_page(uint64_t old_phys, uint64_t *pte);
 
+/* The frame behind user address VA of T, safe to write through from
+ * outside T (finding 256): a frame another address space still holds is
+ * copied into T's alone first. FORCE is ptrace's POKE (Linux's FOLL_FORCE:
+ * a read-only page too, kept read-only); without it -- process_vm_writev --
+ * a page T itself could not write is refused. 0 for no such page. */
+uint64_t vmm_frame_for_write(struct proc *t, uint64_t va, bool force);
+
 /* Get the vm_space for a given process. */
 struct vm_space *vm_space_for_proc(struct proc *p);
 
@@ -99,6 +106,13 @@ void page_ref_init(void);
 void page_ref_inc(uint64_t phys);
 void page_ref_dec(uint64_t phys);
 int  page_ref_get(uint64_t phys);
+/* Drop one reference and return the count BEFORE the drop (0 stays 0: an
+ * untracked single-owner frame). "Was I the last owner?" is `<= 1`, decided
+ * in the same atomic step as the decrement -- see page_fault.c. */
+int  page_ref_dec_old(uint64_t phys);
+/* A second owner appears (fork): 0 (untracked) -> 2, otherwise +1, as ONE
+ * atomic step. */
+void page_ref_share(uint64_t phys);
 
 /* COW fork: mark parent+child page tables for copy-on-write.
  * Walks user-space entries in parent_cr3, clears writable + sets COW

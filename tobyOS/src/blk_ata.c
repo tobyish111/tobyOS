@@ -1,4 +1,5 @@
-/* blk_ata.c -- ATA PIO driver for the IDE primary master.
+/* blk_ata.c -- ATA PIO driver for the IDE primary channel: its master,
+ * and its slave since finding 268 (ide0:slave, QEMU's -drive index=1).
  *
  * Milestone-21 update: this driver now lives under the PCI driver
  * registry. Its match table targets any storage.IDE controller
@@ -98,15 +99,26 @@ static int ata_wait_drq(void) {
     return -1;
 }
 
-/* Issue a single LBA28 command for `count` sectors at `lba`. Caller
- * does the per-sector PIO loop after this returns. */
-static int ata_issue(uint64_t lba, uint8_t count, uint8_t cmd) {
+/* The channel's two drives (finding 268: the second, index 1 to QEMU, was
+ * never looked for). SLAVE is the drive-select register's bit 4. */
+struct ata_drive { bool slave; };
+static struct ata_drive g_ata_drive[2] = { { false }, { true } };
+
+static bool ata_is_slave(const struct blk_dev *dev) {
+    const struct ata_drive *dr = dev ? (const struct ata_drive *)dev->priv : 0;
+    return dr && dr->slave;
+}
+
+/* Issue a single LBA28 command for `count` sectors at `lba` on the master
+ * or the slave. Caller does the per-sector PIO loop after this returns. */
+static int ata_issue(bool slave, uint64_t lba, uint8_t count, uint8_t cmd) {
     if (lba > 0x0FFFFFFFu) return -3;          /* outside LBA28 range */
 
     if (ata_wait_not_busy() != 0) return -1;
 
-    /* 0xE0: master, LBA-mode bit; bits 0..3 carry LBA[27:24]. */
-    outb(ATA_REG_DRIVE, 0xE0u | (uint8_t)((lba >> 24) & 0x0Fu));
+    /* 0xE0: master, LBA-mode bit (0xF0 the slave); bits 0..3 carry
+     * LBA[27:24]. */
+    outb(ATA_REG_DRIVE, (slave ? 0xF0u : 0xE0u) | (uint8_t)((lba >> 24) & 0x0Fu));
     ata_io_wait();
 
     outb(ATA_REG_FEAT,   0x00);
@@ -120,14 +132,14 @@ static int ata_issue(uint64_t lba, uint8_t count, uint8_t cmd) {
 
 static int ata_pio_read(struct blk_dev *dev, uint64_t lba,
                         uint32_t count, void *buf) {
-    (void)dev;
     if (count == 0) return 0;
+    bool slave = ata_is_slave(dev);
     /* IDE LBA28 sector count: 0 means "256". We split larger requests
      * into chunks of <=255 to keep the interface boring. */
     uint8_t  *out = (uint8_t *)buf;
     while (count > 0) {
         uint32_t chunk = count > 255 ? 255 : count;
-        if (ata_issue(lba, (uint8_t)chunk, ATA_CMD_READ_PIO) != 0) return -1;
+        if (ata_issue(slave, lba, (uint8_t)chunk, ATA_CMD_READ_PIO) != 0) return -1;
         for (uint32_t s = 0; s < chunk; s++) {
             if (ata_wait_drq() != 0) return -2;
             uint16_t *p = (uint16_t *)(out + s * BLK_SECTOR_SIZE);
@@ -143,12 +155,12 @@ static int ata_pio_read(struct blk_dev *dev, uint64_t lba,
 
 static int ata_pio_write(struct blk_dev *dev, uint64_t lba,
                          uint32_t count, const void *buf) {
-    (void)dev;
     if (count == 0) return 0;
+    bool slave = ata_is_slave(dev);
     const uint8_t *in = (const uint8_t *)buf;
     while (count > 0) {
         uint32_t chunk = count > 255 ? 255 : count;
-        if (ata_issue(lba, (uint8_t)chunk, ATA_CMD_WRITE_PIO) != 0) return -1;
+        if (ata_issue(slave, lba, (uint8_t)chunk, ATA_CMD_WRITE_PIO) != 0) return -1;
         for (uint32_t s = 0; s < chunk; s++) {
             if (ata_wait_drq() != 0) return -2;
             const uint16_t *p = (const uint16_t *)(in + s * BLK_SECTOR_SIZE);
@@ -174,8 +186,9 @@ static int ata_pio_write(struct blk_dev *dev, uint64_t lba,
  * quickly -- it exists so the generic blk_flush() durability barrier
  * works uniformly across every bus. */
 static int ata_pio_flush(struct blk_dev *dev) {
-    (void)dev;
     if (ata_wait_not_busy() != 0) return -1;
+    outb(ATA_REG_DRIVE, ata_is_slave(dev) ? 0xF0u : 0xE0u);   /* its drive's */
+    ata_io_wait();
     outb(ATA_REG_CMD, ATA_CMD_CACHE_FLUSH);
     if (ata_wait_not_busy() != 0) return -2;
     return 0;
@@ -191,20 +204,30 @@ static struct blk_dev g_ata_dev = {
     .name = "ide0:master",
     .ops  = &g_ata_ops,
     .sector_count = 0,
-    .priv = 0,
+    .priv = &g_ata_drive[0],
+};
+
+/* the channel's second drive (finding 268), registered after the master
+ * so it never comes before it -- /data and the boot's picks stay the
+ * master's */
+static struct blk_dev g_ata_dev_slave = {
+    .name = "ide0:slave",
+    .ops  = &g_ata_ops,
+    .sector_count = 0,
+    .priv = &g_ata_drive[1],
 };
 
 static bool g_ata_registered;
 
 /* IDENTIFY DEVICE: probe whether a drive is wired to the primary
- * master, and read its sector count out of words 60..61 of the
- * 256-word identification buffer. */
-static int ata_identify(uint64_t *out_sectors) {
+ * channel as BD's drive (master or slave), and read its sector count out
+ * of words 60..61 of the 256-word identification buffer. */
+static int ata_identify(struct blk_dev *bd, uint64_t *out_sectors) {
     /* Disable IRQs from the bus -- we poll. */
     outb(ATA_REG_DEVCTRL, 0x02);
 
     if (ata_wait_not_busy() != 0) return -1;
-    outb(ATA_REG_DRIVE, 0xA0);   /* select master, non-LBA */
+    outb(ATA_REG_DRIVE, ata_is_slave(bd) ? 0xB0 : 0xA0);   /* select, non-LBA */
     ata_io_wait();
 
     outb(ATA_REG_SECCNT, 0);
@@ -231,7 +254,7 @@ static int ata_identify(uint64_t *out_sectors) {
     /* Words 60..61 = 32-bit LBA28 max sector count. */
     uint32_t lba28 = ((uint32_t)id[61] << 16) | id[60];
     *out_sectors = lba28;
-    blk_model_from_ata_id(&g_ata_dev, id);
+    blk_model_from_ata_id(bd, id);
     return 0;
 }
 
@@ -259,7 +282,7 @@ static int ata_pci_probe(struct pci_dev *dev) {
     pci_dev_enable(dev, PCI_CMD_IO_SPACE);
 
     uint64_t sectors = 0;
-    int rc = ata_identify(&sectors);
+    int rc = ata_identify(&g_ata_dev, &sectors);
     if (rc != 0) {
         kprintf("[ata] %02x:%02x.%x: no primary-master IDE drive "
                 "(identify rc=%d)\n",
@@ -290,6 +313,17 @@ static int ata_pci_probe(struct pci_dev *dev) {
     blk_register(&g_ata_dev);
     dev->driver_data = &g_ata_dev;
     g_ata_registered = true;
+
+    /* the slave, if one answers (finding 268: QEMU's -drive index=1, which
+     * Linux names sdb, was not seen) */
+    uint64_t ss = 0;
+    if (ata_identify(&g_ata_dev_slave, &ss) == 0 && ss > 0 &&
+        ata_pio_read(&g_ata_dev_slave, 0, 1, scratch) == 0) {
+        g_ata_dev_slave.sector_count = ss;
+        kprintf("[ata] primary slave: %lu sectors (%lu KiB) -- PIO LBA28\n",
+                (unsigned long)ss, (unsigned long)(ss / 2));
+        blk_register(&g_ata_dev_slave);
+    }
     return 0;
 }
 

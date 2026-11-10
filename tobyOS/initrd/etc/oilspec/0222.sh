@@ -1,0 +1,2 @@
+empty=()
+argv.py "${empty[@]}"

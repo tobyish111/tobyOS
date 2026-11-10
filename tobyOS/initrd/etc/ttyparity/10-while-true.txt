@@ -1,0 +1,12 @@
+# Does `while true` actually loop? Asked because case 09's first draft used
+# it and the transcript showed tsh printing a PROMPT immediately after the
+# loop line -- i.e. the loop had already ended before the ^C was sent, so
+# the case was not testing what it claimed to.
+#
+# Bounded on purpose: this is a parity question about loop control, not an
+# interrupt test, and an unbounded loop that fails would hang the gate
+# rather than report.
+i=0
+while true; do i=$((i+1)); if [ $i -ge 3 ]; then break; fi; done
+echo "i=$i rc=$?"
+exit 0

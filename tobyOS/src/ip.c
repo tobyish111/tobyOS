@@ -17,6 +17,7 @@
  */
 
 #include <tobyos/ip.h>
+#include <tobyos/socket.h>  /* sock_deliver_raw */
 #include <tobyos/eth.h>
 #include <tobyos/arp.h>
 #include <tobyos/icmp.h>
@@ -198,6 +199,7 @@ static bool ip_recv_maybe_reassemble(const struct ip_hdr *h,
     s->have_unique += added;
 
     if (s->total > 0 && bm_complete(s)) {
+        sock_deliver_raw(s->src_ip, s->proto, s->buf, s->total);
         ip_deliver_l4(s->src_ip, s->proto, s->buf, s->total);
         memset(s, 0, sizeof(*s));
     }
@@ -205,6 +207,12 @@ static bool ip_recv_maybe_reassemble(const struct ip_hdr *h,
 }
 
 /* ---- send (with fragmentation) ----------------------------------- */
+
+/* Set for the duration of one ip_send_ttl(): every send runs under the BKL
+ * and the frame builder is the only reader, so a file-scope override is
+ * simpler (and no less correct) than threading a ttl through the fragment
+ * and routing layers. */
+static uint8_t g_ip_ttl_override;
 
 static bool ip_send_frame(uint32_t dst_ip_be, uint8_t proto,
                           const uint8_t mac[ETH_ADDR_LEN], uint16_t id_be,
@@ -219,7 +227,7 @@ static bool ip_send_frame(uint32_t dst_ip_be, uint8_t proto,
     h->total_len  = htons((uint16_t)(IP_HDR_LEN + payload_len));
     h->id         = id_be;
     h->flags_frag = htons(flags_frag_be);
-    h->ttl        = IP_DEFAULT_TTL;
+    h->ttl        = g_ip_ttl_override ? g_ip_ttl_override : IP_DEFAULT_TTL;
     h->proto      = proto;
     h->checksum   = 0;
     /* CUT 5: the SOURCE ADDRESS is namespace-relative.
@@ -245,9 +253,60 @@ static bool ip_send_frame(uint32_t dst_ip_be, uint8_t proto,
 static bool ip_send_routed(uint32_t dst_ip_be, uint32_t next_hop, uint8_t proto,
                            const void *payload, size_t payload_len);
 
+bool ip_send_ttl(uint32_t dst_ip_be, uint8_t proto,
+                 const void *payload, size_t payload_len, uint8_t ttl) {
+    uint8_t prev = g_ip_ttl_override;
+    g_ip_ttl_override = ttl;
+    bool ok = ip_send(dst_ip_be, proto, payload, payload_len);
+    g_ip_ttl_override = prev;
+    return ok;
+}
+
 bool ip_send(uint32_t dst_ip_be, uint8_t proto,
              const void *payload, size_t payload_len) {
     if (payload_len > IP_MAX_PAYLOAD_SEND) return false;
+
+    /* LOOPBACK (2026-08-22). 127/8 -- and our own unicast address, as
+     * Linux routes it -- delivers INLINE on the sender's stack, the veth
+     * model: by the time ip_send returns, the receiving socket's state
+     * has already advanced, so the caller's own wait loop sees it. The
+     * delivered src is the destination itself (src==dst), which keeps
+     * TCP's conn matching symmetric across both halves of a self-
+     * connection. NO loopback existed in this stack before (cut 1's
+     * founding measurement): 127.0.0.1 was routed at the gateway and
+     * died, so every local test server and localhost-only service was
+     * structurally impossible. Scoped to the namespace's own address
+     * space -- an empty net namespace is still refused at the socket
+     * boundary before reaching here. */
+    {
+        uint32_t me = net_my_ip();
+        if ((dst_ip_be & 0xFFu) == 127u || (me != 0 && dst_ip_be == me)) {
+            /* Raw sockets must see loopback too, or `ping 127.0.0.1` sends a
+             * request, the ICMP responder answers it, and the ping never sees
+             * either -- 100% loss on a machine talking to itself. This path
+             * returns BEFORE ip_send_frame, so the header a raw socket
+             * expects does not exist yet; it is built here, once, and only
+             * when something is actually listening. */
+            if (sock_any_raw_listener()) {
+                uint8_t lb[IP_HDR_LEN + 1500];
+                size_t n = payload_len < 1500 ? payload_len : 1500;
+                struct ip_hdr *lh = (struct ip_hdr *)lb;
+                memset(lh, 0, IP_HDR_LEN);
+                lh->ver_ihl   = 0x45;
+                lh->total_len = htons((uint16_t)(IP_HDR_LEN + n));
+                lh->ttl       = 64;
+                lh->proto     = proto;
+                lh->src_ip    = dst_ip_be;     /* src == dst on loopback */
+                lh->dst_ip    = dst_ip_be;
+                lh->checksum  = net_checksum(lh, IP_HDR_LEN);
+                memcpy(lb + IP_HDR_LEN, payload, n);
+                sock_deliver_raw(dst_ip_be, proto, lb, IP_HDR_LEN + n);
+            }
+            ip_deliver_l4(dst_ip_be, proto, (const uint8_t *)payload,
+                          payload_len);
+            return true;
+        }
+    }
 
     /* CUT 5 made this decision NAMESPACE-RELATIVE: "is this on my subnet, and
      * if not who is my gateway" was answered from the HOST's address, mask and
@@ -359,6 +418,7 @@ static bool ip_dst_is_for_us(uint32_t dst_ip_be) {
     uint32_t me   = net_my_ip();
     uint32_t mask = net_my_netmask();
     if (dst_ip_be == me) return true;
+    if ((dst_ip_be & 0xFFu) == 127u) return true;   /* loopback (2026-08-22) */
     if (dst_ip_be == IP_BROADCAST_BE) return true;
     if (me == 0) return true;
     if (mask) {
@@ -497,6 +557,13 @@ void ip_recv(const void *payload, size_t len) {
 
     const uint8_t *l4    = frame + IP_HDR_LEN;
     size_t         l4len = total - IP_HDR_LEN;
+
+    /* Raw sockets see the WHOLE datagram, header included, the way Linux
+     * hands SOCK_RAW its packets -- ping reads the IP header to get the
+     * TTL, and a sniffer needs the addresses. This runs BEFORE the L4
+     * dispatch and does not replace it: icmp_recv still answers pings
+     * addressed to us whether or not anything is watching. */
+    sock_deliver_raw(h->src_ip, h->proto, frame, total);
 
     ip_deliver_l4(h->src_ip, h->proto, l4, l4len);
 }

@@ -1,0 +1,183 @@
+"""gen_rltab.py -- write src/shell_rltab.inc, tsh's default readline tables,
+from what the guest's bash 5.2.15 PRINTS (logs/b12/guest-bash-binds.txt and
+logs/b12/guest-bash-lists.txt): `bind -m MAP -p` for emacs, vi-move and
+vi-insert, `bind -l`, and `compgen -A binding` before readline is set up.
+
+Every binding line `"KEYSEQ": FUNCTION` is translated here the way readline's
+rl_translate_keyseq does it (convert-meta on: \\M-x is ESC x), so the C side
+only walks bytes. A key sequence whose LAST key prints as \\000 is readline's
+ANYOTHERKEY slot (key 256, whose name _rl_get_keyname spells \\000) -- the
+function a longer binding shadowed, as vi-insert's ESC is shadowed by the
+arrow-key sequences; key 0 itself prints as \\C-@, so the two cannot be
+confused.
+
+Names readline maps to ONE function (vi-bWord and vi-backward-bigword, ...,
+yank-last-arg and bash's insert-last-argument) share a function id: a key
+bound under one is listed under both, as readline's dumper does.
+
+Run: python tools/agent/gen_rltab.py > src/shell_rltab.inc
+"""
+import re
+import sys
+
+BINDS = 'logs/b12/guest-bash-binds.txt'
+LISTS = 'logs/b12/guest-bash-lists.txt'
+
+ALIASES = [
+    ('vi-bWord', 'vi-backward-bigword'),
+    ('vi-bword', 'vi-backward-word'),
+    ('vi-eWord', 'vi-end-bigword'),
+    ('vi-fWord', 'vi-forward-bigword'),
+    ('vi-fword', 'vi-forward-word'),
+    ('yank-last-arg', 'insert-last-argument'),
+]
+
+
+def sections(text):
+    cur = None
+    out = {}
+    for line in text.split('\n'):
+        m = re.match(r'^=====(\S+)(?: (\S+))?$', line)
+        if m:
+            cur = m.group(2) if m.group(1) == 'MAP' else m.group(1)
+            out[cur] = []
+            continue
+        if cur is not None:
+            out[cur].append(line)
+    return out
+
+
+def translate(seq):
+    """readline's rl_translate_keyseq with convert-meta on; returns (bytes,
+    anyother) where anyother says the last key is the \\000 slot."""
+    out = []
+    i = 0
+    ctl = meta = False
+    last_was_any = False
+    while i < len(seq) or ctl or meta:
+        c = seq[i] if i < len(seq) else '\0'
+        any_here = False
+        raw = False         # an octal key from the dumper is ONE key, 128-255
+                            # included: emacs-standard binds them directly
+        if c == '\\' and i + 1 < len(seq):
+            i += 1
+            c = seq[i]
+            if c == 'C' and i + 1 < len(seq) and seq[i + 1] == '-':
+                i += 2
+                ctl = True
+                continue
+            if c == 'M' and i + 1 < len(seq) and seq[i + 1] == '-':
+                i += 2
+                meta = True
+                continue
+            esc = {'a': 7, 'b': 8, 'd': 127, 'e': 27, 'f': 12, 'n': 10,
+                   'r': 13, 't': 9, 'v': 11, '\\': 92}
+            if c in esc:
+                v = esc[c]
+            elif c in '01234567':
+                v = int(c)
+                j = i + 1
+                n = 2
+                while j < len(seq) and seq[j] in '01234567' and n:
+                    v = v * 8 + int(seq[j])
+                    j += 1
+                    n -= 1
+                if seq[i:j] == '000':
+                    any_here = True
+                raw = True
+                i = j - 1
+                v &= 0xff
+            elif c == 'x':
+                j = i + 1
+                n = 2
+                v = 0
+                while j < len(seq) and seq[j] in '0123456789abcdefABCDEF' and n:
+                    v = v * 16 + int(seq[j], 16)
+                    j += 1
+                    n -= 1
+                if n == 2:
+                    v = ord('x')
+                i = j - 1
+            else:
+                v = ord(c)
+        else:
+            v = ord(c)
+        if ctl:
+            v = 127 if v == ord('?') else (ord(chr(v).upper()) & 0x1f)
+            ctl = False
+        if meta:
+            v |= 0x80
+            meta = False
+            raw = False
+        if (v & 0x80) and not raw:
+            out += [27, v & 0x7f]
+        else:
+            out.append(v)
+        last_was_any = any_here
+        i += 1
+        if i > len(seq):
+            break
+    if last_was_any:
+        out = out[:-1]
+    return bytes(out), last_was_any
+
+
+def cstr(b):
+    return '"' + ''.join('\\x%02x' % x for x in b) + '"'
+
+
+def main():
+    sec = sections(open(BINDS, encoding='utf-8').read())
+    names = [n for n in sec['L'] if n.strip()]
+    pre = None
+    for line in open(LISTS, encoding='utf-8').read().split('\n'):
+        if line.startswith('== binding: '):
+            pre = [x for x in line[len('== binding: '):].split('|') if x]
+    assert pre, 'no pre-init binding list'
+    fid = {}
+    nfn = 0
+    for a, b in ALIASES:
+        assert a in names and b in names, (a, b)
+    alias_of = {}
+    for a, b in ALIASES:
+        alias_of[b] = a
+    for n in names:
+        if n in alias_of:
+            continue
+        fid[n] = nfn
+        nfn += 1
+    for b, a in alias_of.items():
+        fid[b] = fid[a]
+    w = sys.stdout.write
+    w('/* shell_rltab.inc -- GENERATED by tools/agent/gen_rltab.py; do not edit.\n')
+    w(' * The default readline state as the guest\'s bash 5.2.15 prints it:\n')
+    w(' * `bind -l` (the function names, readline\'s and the ones bash adds when\n')
+    w(' * it sets readline up), and `bind -m MAP -p` for emacs, vi-move and\n')
+    w(' * vi-insert, each key sequence already translated to its bytes. */\n\n')
+    w('#define RL_NFUNCS %d\n' % nfn)
+    w('struct rl_fname { const char *name; short fn; bool preinit; };\n')
+    w('static const struct rl_fname g_rl_fnames[] = {\n')
+    for n in names:
+        w('    { "%s", %d, %s },\n' % (n, fid[n], 'true' if n in pre else 'false'))
+    w('    { 0, 0, false },\n};\n\n')
+    w('enum { RL_MAP_EMACS, RL_MAP_VI_MOVE, RL_MAP_VI_INS };\n')
+    w('struct rl_defbind { unsigned char map; unsigned char len; bool any; short fn; const char *keys; };\n')
+    w('static const struct rl_defbind g_rl_defbinds[] = {\n')
+    count = 0
+    for mapname, mid in (('emacs', 'RL_MAP_EMACS'), ('vi-move', 'RL_MAP_VI_MOVE'),
+                         ('vi-insert', 'RL_MAP_VI_INS')):
+        for line in sec[mapname]:
+            m = re.match(r'^"(.*)": (\S+)$', line)
+            if not m:
+                continue
+            seq, fn = m.group(1), m.group(2)
+            b, anyk = translate(seq)
+            w('    { %s, %d, %s, %d, %s },\n' % (mid, len(b), 'true' if anyk else 'false',
+                                               fid[fn], cstr(b)))
+            count += 1
+    w('    { 0, 0, false, -1, 0 },\n};\n')
+    sys.stderr.write('names=%d funcs=%d preinit=%d bindings=%d\n'
+                     % (len(names), nfn, len(pre), count))
+
+
+main()

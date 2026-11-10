@@ -68,6 +68,9 @@ extern struct proc g_proc[];   /* reclaim scans for eviction candidates */
 /* The VMA's physical pages are owned by something else (a memfd) -- munmap must
  * unmap them but MUST NOT pmm_free them (the memfd frees them at close). */
 #define VMA_FLAG_NOFREE    0x20
+/* A shared file mapping from a descriptor that may not write: PROT_WRITE is
+ * refused, now and by a later mprotect (Linux's VM_MAYWRITE, finding 216). */
+#define VMA_FLAG_NOWRITE   0x40
 
 struct mmap_vma {
     uint64_t start;
@@ -87,6 +90,44 @@ struct vma_table {
 };
 
 static struct vma_table g_vma_tables[PROC_MAX];
+
+/* The table of mm key PID (proc_mm_pid's: a process's pid, its thread
+ * group's or its vfork parent's): the one in the slot that pid was given
+ * to. The pid WAS the slot until batch 26 (finding 146); now pids run to
+ * PID_MAX and the key goes through proc_pid_slot, which keeps answering for
+ * a key whose process is gone, as the slot index did. NULL for a number
+ * never handed out. */
+static struct vma_table *vt_of(int pid) {
+    int s = proc_pid_slot(pid);
+    return s < 0 ? 0 : &g_vma_tables[s];
+}
+
+/* /proc/<pid>/maps support (2026-08-22): a read-only snapshot API so
+ * procfs can render the REAL region table instead of the three-line
+ * fabrication it used to serve (which listed no libraries, no anon
+ * mappings, and misled every crash handler and sanitizer that walked
+ * its own address space). idx < 0 returns the count. */
+int mmap_vma_snapshot(struct proc *p, int idx, uint64_t *start,
+                      uint64_t *end, uint32_t *prot, uint32_t *flags) {
+    if (!p) return -1;
+    struct vma_table *vt = vt_of(proc_mm_pid(p));
+    if (!vt) return -1;
+    if (idx < 0) return vt->count;
+    if (idx >= vt->count) return -1;
+    *start = vt->entries[idx].start;
+    *end   = vt->entries[idx].end;
+    *prot  = vt->entries[idx].prot;
+    *flags = vt->entries[idx].flags;
+    return 0;
+}
+
+/* The Linux-personality brk range (this table's, not struct proc's). */
+void mmap_brk_range(struct proc *p, uint64_t *base, uint64_t *cur) {
+    struct vma_table *vt = vt_of(proc_mm_pid(p));
+    if (!vt) { *base = *cur = 0; return; }
+    *base = vt->brk_base;
+    *cur  = vt->brk_cur;
+}
 
 #ifdef CHROMIUM_BOOT
 /* Permission-transition ring (defined above sys_madvise_dontneed). */
@@ -139,7 +180,8 @@ static uint64_t aslr_mmap_start(void) {
 }
 
 void mmap_init_proc(int pid) {
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return;
     memset(vt, 0, sizeof(*vt));
     vt->mmap_hint = aslr_mmap_start();
 }
@@ -195,7 +237,8 @@ void mmap_debug_fault_vma(uint64_t addr) {
     struct proc *p = current_proc();
     if (!p) return;
     int pid = proc_mm_pid(p);
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return;
     /* Print EVERY covering entry, not just the first hit: overlapping VMAs
      * (two entries claiming one address, fault handler resolving against
      * whichever it scans first) are one of the candidate bug classes, and a
@@ -355,7 +398,8 @@ long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
     if (!p) return -1;
 
     int pid = proc_mm_pid(p);
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return -1;
     vma_compact_table(vt, pid);
 
     if (len == 0) return -22;
@@ -406,6 +450,16 @@ long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
      * while still PROT_NONE correctly can't be satisfied -> SIGSEGV). */
     if ((flags & VMA_FLAG_ANON) && prot != VMA_PROT_NONE) {
         uint32_t vmm_f = prot_to_vmm_flags(prot);
+        /* Phase F (2026-08-22): anonymous MAP_SHARED pages must carry
+         * PTE_SHARED_SW or fork CoWs them apart -- the demand-fault path
+         * (mmap_handle_page_fault) got this in slice 22, but THIS eager
+         * path is the one small anon mappings actually take, so every
+         * anon-shared page committed here silently diverged at the first
+         * post-fork write. Found live: a PROCESS_SHARED pthread mutex in
+         * anon-shared memory -- the child's lock landed in a private copy
+         * and the parent saw the mutex pristine (linux-thread2 shm-probe
+         * printed DIVERGED). Same bit the futex phys-keying reads. */
+        if (flags & VMA_FLAG_SHARED) vmm_f |= VMM_SHARED;
         /* Slice 95: chunk the commit. This loop (alloc + 4K memset + map,
          * per page, whole range) was the #1 residual BKL customer after the
          * mprotect fixes -- [lx-hold] mmap=28-48k Mcyc/min with single holds
@@ -448,7 +502,8 @@ long sys_mmap2(uint64_t addr, size_t length, int prot, int flags,
     if (!p) return -1;
 
     int pid = proc_mm_pid(p);
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return -1;
 
     if (length == 0) return -22;
     length = page_align_up(length);
@@ -710,7 +765,8 @@ int mem_reclaim_pages(int want) {
             continue;
         }
 
-        struct vma_table *vt = &g_vma_tables[key];
+        struct vma_table *vt = vt_of(key);
+        if (!vt) continue;
         struct mmap_free_batch fb = { .n = 0, .owner = p };
         bool swap_exhausted = false;
 
@@ -793,7 +849,8 @@ long sys_munmap(uint64_t addr, uint64_t len) {
     if (!p) return -1;
 
     int pid = proc_mm_pid(p);
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return -1;
     vma_compact_table(vt, pid);   /* slice 57: safe here -- no entry ptrs yet
                                    * (incl. the sys_mmap MAP_FIXED caller) */
 
@@ -832,13 +889,9 @@ long sys_munmap(uint64_t addr, uint64_t len) {
                      * corruption in whichever process kept the frame).
                      * Freeing is DEFERRED to fb so a TLB shootdown precedes
                      * reuse (see mmap_free_batch above). */
-                    int refs = page_ref_get(phys);
-                    if (refs > 1) {
-                        page_ref_dec(phys);
-                    } else {
-                        if (refs == 1) page_ref_dec(phys);
+                    /* One atomic step: see page_ref_dec_old. */
+                    if (page_ref_dec_old(phys) <= 1)
                         mmap_free_batch_push(&fb, phys);
-                    }
                 }
             }
         }
@@ -965,7 +1018,8 @@ long sys_madvise_dontneed(uint64_t addr, uint64_t len) {
     struct proc *p = current_proc();
     if (!p) return -1;
     int pid = proc_mm_pid(p);
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return -1;
     if (len == 0) return 0;
     addr = page_align_down(addr);
     len  = page_align_up(len);
@@ -988,13 +1042,10 @@ long sys_madvise_dontneed(uint64_t addr, uint64_t len) {
             if (!phys) continue;                        /* already absent */
             vmm_unmap(a, PAGE_SIZE);
             phys &= PAGE_MASK;
-            int refs = page_ref_get(phys);
-            if (refs > 1) {
-                page_ref_dec(phys);                     /* fork sibling keeps it */
-            } else {
-                if (refs == 1) page_ref_dec(phys);
-                mmap_free_batch_push(&fb, phys);        /* freed AFTER shootdown */
-            }
+            /* A fork sibling keeps it unless we were the last owner -- one
+             * atomic step (page_ref_dec_old); freed AFTER shootdown. */
+            if (page_ref_dec_old(phys) <= 1)
+                mmap_free_batch_push(&fb, phys);
         }
         vmm_set_editor_root(saved_root);
     }
@@ -1012,7 +1063,8 @@ long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
     if (!p) return -1;
 
     int pid = proc_mm_pid(p);
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return -1;
     vma_compact_table(vt, pid);   /* slice 57: before any entry lookup */
 
     if (len == 0) return -22;
@@ -1023,6 +1075,15 @@ long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
 #ifdef CHROMIUM_BOOT
     mprot_ring_note(addr, len, pid, prot);
 #endif
+
+    /* WRITE ON A MAPPING THAT MAY NOT BE WRITTEN: EACCES, before anything
+     * changes, as Linux's (finding 216). */
+    if (prot & VMA_PROT_WRITE)
+        for (int i = 0; i < vt->count; i++) {
+            const struct mmap_vma *v = &vt->entries[i];
+            if (rstart < v->end && rend > v->start && (v->flags & VMA_FLAG_NOWRITE))
+                return -13;
+        }
 
     /* Apply `prot` ONLY to the [rstart,rend) sub-range, SPLITTING any VMA it
      * partially covers. The demand-page handler reads the VMA's prot for a
@@ -1123,7 +1184,8 @@ long sys_brk2(uint64_t new_brk) {
     if (!p) return -1;
 
     int pid = proc_mm_pid(p);
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return -1;
 
     /* Query current brk */
     if (new_brk == 0)
@@ -1165,13 +1227,8 @@ long sys_brk2(uint64_t new_brk) {
                  * this frame. Freeing is DEFERRED behind a shootdown (see
                  * mmap_free_batch) so a reused frame can't be read via a
                  * stale TLB. */
-                int refs = page_ref_get(phys);
-                if (refs > 1) {
-                    page_ref_dec(phys);
-                } else {
-                    if (refs == 1) page_ref_dec(phys);
+                if (page_ref_dec_old(phys) <= 1)      /* see page_ref_dec_old */
                     mmap_free_batch_push(&fb, phys);
-                }
             }
         }
         vmm_set_editor_root(saved_root);
@@ -1189,7 +1246,8 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
     if (!p) return false;
 
     int pid = proc_mm_pid(p);
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return false;
     struct mmap_vma *v = vma_find_internal(vt, fault_addr);
 #ifdef CHROMIUM_BOOT
     /* Slice 38 iter 18: two deterministic fatal faults (browser main thread
@@ -1409,8 +1467,9 @@ bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
 /* ---- COW fork helper (original API) ---- */
 
 int mmap_cow_clone(int parent_pid, int child_pid) {
-    struct vma_table *parent_vt = &g_vma_tables[parent_pid];
-    struct vma_table *child_vt  = &g_vma_tables[child_pid];
+    struct vma_table *parent_vt = vt_of(parent_pid);
+    struct vma_table *child_vt  = vt_of(child_pid);
+    if (!parent_vt || !child_vt) return -1;
 
     memcpy(child_vt, parent_vt, sizeof(*child_vt));
 
@@ -1449,7 +1508,7 @@ int mmap2_cow_clone(int parent_pid, int child_pid) {
  * Called from proc_reap the moment vmm_destroy_user_pml4 runs -- i.e. when the
  * LAST user of this address space is gone, so no thread can still consult the
  * table. Before this was wired, nothing ever cleared g_vma_tables: the array is
- * keyed by proc_mm_pid(), pids ARE recycled g_proc[] slot indices, and reap
+ * keyed by the slot of proc_mm_pid(), slots are recycled, and reap
  * memset the struct proc while leaving the VMA table untouched. A recycled pid
  * therefore inherited the dead process's mappings, and mmap_handle_page_fault
  * would service a demand fault against one -- handing the new process a
@@ -1461,8 +1520,8 @@ int mmap2_cow_clone(int parent_pid, int child_pid) {
  * address space" sentinel, so the next user of this slot draws a NEW ASLR base
  * rather than inheriting the dead process's layout. */
 void mmap_cleanup_proc(int pid) {
-    if (pid < 0 || pid >= PROC_MAX) return;
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return;
     memset(vt, 0, sizeof(*vt));
     vt->mmap_hint = 0;
 }
@@ -1474,8 +1533,8 @@ void mmap2_cleanup_proc(int pid) {
 /* ---- Query ---- */
 
 uint64_t mmap2_mapped_bytes(int pid) {
-    if (pid < 0 || pid >= PROC_MAX) return 0;
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return 0;
     uint64_t total = 0;
     for (int i = 0; i < vt->count; i++) {
         total += vt->entries[i].end - vt->entries[i].start;
@@ -1566,8 +1625,7 @@ void memfd_unref(struct memfd *mf) {
              * unconditionally here (the pre-slice-38 code) recycled frames
              * other processes were still writing through. */
             uint64_t ph = mf->pages[i];
-            page_ref_dec(ph);
-            if (page_ref_get(ph) == 0)
+            if (page_ref_dec_old(ph) <= 1)            /* see page_ref_dec_old */
                 pmm_free_page(ph);
         }
     if (mf->pages) kfree(mf->pages);
@@ -1677,7 +1735,8 @@ long memfd_map(uint64_t addr, uint64_t len, uint32_t prot, uint32_t flags,
     struct proc *p = current_proc();
     if (!p || !mf) return -1;
     int pid = proc_mm_pid(p);
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return -1;
     if (len == 0) return -22;
     len = page_align_up(len);
     offset = page_align_down(offset);
@@ -1771,7 +1830,8 @@ long mmap_map_phys_user(uint64_t phys, uint64_t len) {
     struct proc *p = current_proc();
     if (!p || !phys || len == 0) return -22;
     int pid = proc_mm_pid(p);
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return -22;
     len = page_align_up(len);
     size_t np = (size_t)(len / PAGE_SIZE);
 
@@ -2000,7 +2060,8 @@ long shm_cache_mmap(struct shm_cache *sc, uint64_t addr, uint64_t len,
     struct proc *p = current_proc();
     if (!p || !sc) return -1;
     int pid = proc_mm_pid(p);
-    struct vma_table *vt = &g_vma_tables[pid];
+    struct vma_table *vt = vt_of(pid);
+    if (!vt) return -1;
     if (len == 0) return -22;
     len = page_align_up(len);
     offset = page_align_down(offset);

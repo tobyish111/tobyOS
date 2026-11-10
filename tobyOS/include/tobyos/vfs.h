@@ -31,8 +31,11 @@
 
 #include <tobyos/types.h>
 
-#define VFS_NAME_MAX 128
-#define VFS_PATH_MAX 256
+/* Linux's limits (finding 227): a name of up to 255 bytes, a path of up
+ * to 4095, each with its NUL. They were 128 and 256: a long path was
+ * ENAMETOOLONG where Linux takes it (tar's, pathchk's, ln's fixtures). */
+#define VFS_NAME_MAX 256
+#define VFS_PATH_MAX 4096
 /* M23D: bumped from 4 -> 8. We can simultaneously hold:
  *   /          ramfs (initrd)
  *   /data      tobyfs (GPT slot 2)
@@ -45,9 +48,10 @@
  * pivot_roots then mounts its own /proc, /sys, /dev, /dev/pts and /tmp needs
  * five slots of its own on top of the three the boot namespace already uses
  * (/, /proc, /data). At 8 that wall would have been hit by slice 16's container
- * runtime rather than by anything diagnosable. Costs ~288 bytes per extra slot
- * per namespace. */
-#define VFS_MAX_MOUNTS 16
+ * runtime rather than by anything diagnosable. Costs a path's worth (4 KiB)
+ * per extra slot per namespace. 16 was hit too: boot holds 10, and a fixture
+ * mounting six more in a namespace got ENOMEM (finding 233). */
+#define VFS_MAX_MOUNTS 64
 
 /* Slice 9: mount PROPAGATION type, per mount (Linux MS_PRIVATE/SHARED/SLAVE/
  * UNBINDABLE). PRIVATE is 0 so it stays the default for every mount that
@@ -103,6 +107,10 @@
 #define VFS_MODE_SETGID  02000u
 #define VFS_MODE_STICKY  01000u
 #define VFS_MODE_VALID   0x10000u
+/* struct vfs_stat's nlink for a node that has NO links left -- a removed
+ * working directory (finding 200): the stat emitters report 0, where a
+ * plain 0 means "not kept" and becomes 1 or 2 */
+#define VFS_NLINK_NONE   0xFFFFFFFFu
 
 enum vfs_type {
     VFS_TYPE_FILE    = 1,
@@ -112,6 +120,12 @@ enum vfs_type {
 
 #define VFS_SYMLINK_MAX   8   /* max symlink hops before ELOOP */
 #define VFS_ERR_LOOP      -13 /* too many symlink hops */
+#define VFS_ERR_XDEV      -15 /* hard link across mounts -> EXDEV (Phase G) */
+#define VFS_ERR_NOTEMPTY  -16 /* a directory with entries -> ENOTEMPTY (batch 31) */
+#define VFS_ERR_BUSY      -18 /* a mount point, which unlink, rmdir and rename
+                               * may not take -> EBUSY (finding 241) */
+#define VFS_ERR_BADF      -17 /* a descriptor not open for the access asked ->
+                               * EBADF (finding 216) */
 
 struct vfs_stat {
     enum vfs_type type;
@@ -144,6 +158,26 @@ struct vfs_stat {
     uint64_t      mtime;       /* last data modification */
     uint64_t      atime;       /* last access (best effort) */
     uint64_t      ctime;       /* last inode change */
+    /* ...and the nanoseconds past each second, for a filesystem that keeps
+     * them (finding 239: tmpfs); 0 for one that keeps whole seconds */
+    uint32_t      mtime_ns, atime_ns, ctime_ns;
+    /* INODE IDENTITY. 0 = "this filesystem has no answer", which is the
+     * honest report for a node-per-path filesystem and is what every
+     * driver except tobyfs gives today.
+     *
+     * It exists because two names for ONE file cannot be told apart
+     * without it: `test -ef` compared canonicalised PATHS, so two hard
+     * links to the same inode compared as different files -- the one
+     * question the operator exists to answer. A path hash cannot fix
+     * that (the Linux path's lx_ino_hash is exactly such a hash, and it
+     * gives the two names different inodes by construction); only the
+     * filesystem knows. Callers must fall back to path comparison when
+     * ino is 0 rather than treating unknown as equal. */
+    uint64_t      ino;
+    uint32_t      dev;         /* which mount; 0 = unknown */
+    /* A device node's numbers, when the mode says S_IFCHR or S_IFBLK
+     * (finding 214): devfs's own nodes, or one mknod made elsewhere. */
+    uint32_t      rmaj, rmin;
 };
 
 struct vfs_dirent {
@@ -153,6 +187,13 @@ struct vfs_dirent {
     uint32_t      uid;
     uint32_t      gid;
     uint32_t      mode;
+    /* The entry's inode, as the directory itself says it (finding 277):
+     * Linux's d_ino, taken from the entry, never by a stat of the name.
+     * 0 = the driver gives none, and readdir's callers stat the name. A
+     * driver that reads only the directory -- ext4's, as Linux's readdir
+     * does -- leaves size, uid and gid 0 and mode without VFS_MODE_VALID,
+     * its format bits alone; vfs_dirent_fill stats for the rest. */
+    uint64_t      ino;
 };
 
 /* Forward decls; concrete layout is opaque to callers and lives in
@@ -160,6 +201,7 @@ struct vfs_dirent {
  * `priv` slot; everything else is bookkeeping the VFS owns. */
 struct vfs_file;
 struct vfs_dir;
+struct vfs_statfs;          /* defined below (Phase H) */
 
 struct vfs_ops {
     int  (*open)    (void *mnt, const char *path, struct vfs_file *out);
@@ -182,6 +224,13 @@ struct vfs_ops {
     int  (*opendir) (void *mnt, const char *path, struct vfs_dir *out);
     int  (*closedir)(struct vfs_dir *d);
     int  (*readdir) (struct vfs_dir *d, struct vfs_dirent *out);
+    /* (optional) Pass over the next N entries readdir would give, as N
+     * readdirs would, without giving them; returns how many it passed
+     * (fewer at the directory's end). For the callers that open a
+     * directory again for each window of a listing -- READDIR2,
+     * getdents64 -- so a driver that knows where the Nth entry is need
+     * not read its way there (finding 277). NULL: vfs_seekdir reads. */
+    long (*seekdir) (struct vfs_dir *d, size_t n);
     int  (*stat)    (void *mnt, const char *path, struct vfs_stat *out);
     /* Optional. If NULL, vfs_chmod / vfs_chown return VFS_ERR_ROFS. */
     int  (*chmod)   (void *mnt, const char *path, uint32_t mode);
@@ -213,12 +262,70 @@ struct vfs_ops {
      * when NULL, vfs_symlink() falls back to the legacy in-RAM table (which is
      * global, capped, and lost on reboot -- fine for the read-only initrd,
      * useless for a real rootfs). */
-    int  (*symlink) (void *mnt, const char *path, const char *target);
+    /* UID and GID are the link's owner, the VFS's to decide as for create
+     * (a set-group-ID directory's group, finding 251) */
+    int  (*symlink) (void *mnt, const char *path, const char *target,
+                     uint32_t uid, uint32_t gid);
     /* M26E (optional). Called by vfs_unmount AFTER the slot is removed
      * from the mount table. Drivers free their per-mount state here
      * (cluster buffers, FS scratch, etc). NULL => the VFS just drops
      * the entry; the underlying state is leaked. */
     int  (*umount)  (void *mnt);
+    /* Phase G (optional): create a HARD link -- a second directory entry
+     * for oldpath's inode, within this mount. NULL => vfs_link answers
+     * VFS_ERR_ROFS (the filesystem has no inode indirection to link). */
+    int  (*link)    (void *mnt, const char *oldpath, const char *newpath);
+    /* Phase H (optional): real filesystem statistics. NULL => vfs_statfs
+     * reports honest zeros (namelen aside) instead of the fabricated
+     * 4 GiB tmpfs every mount used to claim. */
+    int  (*statfs)  (void *mnt, struct vfs_statfs *out);
+    /* Push everything this mount has buffered out to its backing device.
+     *
+     * NULL means "no backing device", which is the truth for tmpfs,
+     * ramfs, procfs and sysfs -- there is nothing durability could mean
+     * for them, so vfs_file_sync() answers OK. Every driver that DOES
+     * own a device implements this: the block cache is write-back, so
+     * without it fsync(2) reports durable while the bytes are still in
+     * RAM, and pulling the stick loses them. */
+    int  (*sync)    (void *mnt);
+    /* (optional) stat of an open handle: what `stat` would say of the file
+     * it holds -- the same inode and device, and the metadata as it is now
+     * -- found through the handle, so a file renamed or unlinked while open
+     * is still itself. NULL => the caller falls back to the path the file
+     * was opened by. See vfs_fstat. */
+    int  (*fstat)   (struct vfs_file *f, struct vfs_stat *out);
+    /* (optional) A device node's numbers, set on a node just created with
+     * S_IFCHR or S_IFBLK in its mode (vfs_mknod_dev, finding 214). NULL:
+     * the filesystem keeps no device nodes, and mknod of one is EPERM, as
+     * Linux's vfat says. */
+    int  (*setrdev) (void *mnt, const char *path, uint32_t maj, uint32_t min);
+    /* (optional) Extended attributes kept with the filesystem's nodes, as
+     * Linux's tmpfs keeps them (finding 225): enum xa_op on PATH -- the
+     * node itself, a final link not followed -- as xa_list_op answers.
+     * NULL: the VFS's path store holds them (src/xattr.c). */
+    long (*xattr)   (void *mnt, const char *path, int op, const char *name,
+                     void *buf, size_t sz, int flags);
+    /* (optional) utimes to the nanosecond (finding 239). NULL: utimes, the
+     * nanoseconds dropped, as a filesystem with coarser times drops them. */
+    int  (*utimens) (void *mnt, const char *path, uint64_t mtime, uint32_t mtime_ns,
+                     uint64_t atime, uint32_t atime_ns);
+    /* The filesystem's TYPE as Linux names it ("tmpfs", "proc", "ext4"):
+     * /proc/mounts' third field, mountinfo's, mount(8)'s "type". Every
+     * mount said "tobyos" (batch 31). NULL: "tobyos". */
+    const char *fsname;
+};
+
+/* Phase H: real per-mount statistics for statfs(2)/fstatfs(2). All
+ * counts in bsize units; a driver reports what it truly knows and
+ * leaves the rest zero. */
+struct vfs_statfs {
+    uint64_t bsize;
+    uint64_t blocks;
+    uint64_t bfree;
+    uint64_t files;
+    uint64_t ffree;
+    uint32_t type_magic;    /* Linux f_type value (TMPFS_MAGIC etc.) */
+    uint32_t namelen;
 };
 
 /* Per-handle state. The driver stuffs whatever it likes into `priv`
@@ -261,6 +368,20 @@ struct vfs_file {
      * read mode would otherwise be able to write through it if it
      * also held CAP_FILE_WRITE). */
     bool                  sysprot;
+    /* O_APPEND (2026-10-01): EVERY write goes to the current end of the
+     * file, not just the first. This used to be honoured only at open (the
+     * offset set to the size then), so two descriptions appending to one
+     * file overwrote each other -- `{ echo one; echo two >> f; echo three;
+     * } >> f` left "one three" where bash leaves all three lines. Drivers
+     * that know the live size (ramfs, tmpfs, tobyfs) move the offset there;
+     * file_write() does it for the rest from what the description knows.
+     * Sits in sysprot's padding: sizeof(struct vfs_file) does not move. */
+    bool                  append;
+    /* The flags (VFS_MNT_*) of the mount the file was opened through, set
+     * by vfs_open: read-only, noatime and the rest, which a driver needs
+     * to decide whether a read may write atime (finding 266). In the same
+     * padding. */
+    uint8_t               mnt_flags;
 };
 
 struct vfs_dir {
@@ -268,6 +389,16 @@ struct vfs_dir {
     void                 *mnt;
     void                 *priv;
     size_t                index;   /* driver-defined; usually next-entry idx */
+    /* vfs.c's own, for the MOUNT POINTS listed after the driver's entries
+     * (see vfs_readdir): the path given to vfs_opendir, the same path
+     * relative to its mount, and how far into the mount entries this handle
+     * has read (0 = still reading the driver). The path must outlive the
+     * handle -- the same contract sysfs_opendir already relies on. */
+    const char           *vpath;
+    const char           *vrel;
+    size_t                xpos;
+    /* the mount's VFS_MNT_* flags, as vfs_file's (finding 266) */
+    uint32_t              mnt_flags;
 };
 
 /* ---- mount table ----
@@ -291,6 +422,13 @@ int  vfs_mount(const char *mount_point, const struct vfs_ops *ops, void *mount_d
 #define VFS_MNT_NODEV    0x2u   /* ignore device nodes                     */
 #define VFS_MNT_NOEXEC   0x4u   /* refuse to execute anything here         */
 #define VFS_MNT_RDONLY   0x8u   /* refuse writes                           */
+/* When a read moves atime (finding 266), as Linux's MS_NOATIME,
+ * MS_NODIRATIME and MS_STRICTATIME say; none of them is relatime, Linux's
+ * default. The driver sees them on each handle (vfs_file.mnt_flags,
+ * vfs_dir.mnt_flags), and so never writes a read-only mount. */
+#define VFS_MNT_NOATIME     0x10u
+#define VFS_MNT_NODIRATIME  0x20u
+#define VFS_MNT_STRICTATIME 0x40u
 
 /* As vfs_mount(), but records mount flags. vfs_mount() is exactly this with
  * flags == 0, so all 13 existing callers keep their current behaviour. */
@@ -304,6 +442,9 @@ int  vfs_mount_flags(const char *mount_point, const struct vfs_ops *ops,
 /* Linux slice 6: set a path's timestamps (epoch seconds). VFS_ERR_ROFS if the
  * filesystem has no ->utimes, so callers can tell "stored" from "ignored". */
 int  vfs_utimes(const char *path, uint64_t mtime, uint64_t atime);
+/* Finding 239: the same to the nanosecond, where the filesystem keeps them */
+int  vfs_utimens(const char *path, uint64_t mtime, uint32_t mtime_ns,
+                 uint64_t atime, uint32_t atime_ns);
 
 /* Linux slice 6: set a path's length. VFS_ERR_ROFS if unsupported. */
 int  vfs_truncate(const char *path, uint64_t length);
@@ -311,6 +452,10 @@ int  vfs_truncate(const char *path, uint64_t length);
 /* Linux slice 6: truncate via an OPEN file handle. Updates f->size on success
  * so a subsequent fstat sees the new length. */
 int  vfs_file_truncate(struct vfs_file *f, uint64_t length);
+/* fsync(2)/fdatasync(2): flush this file's filesystem to its device.
+ * Filesystems with no device answer VFS_OK -- nothing to do is not a
+ * failure. */
+int  vfs_file_sync(struct vfs_file *f);
 
 int  vfs_mount_lookup(const char *mount_point,
                       const struct vfs_ops **ops_out, void **data_out);
@@ -319,6 +464,22 @@ int  vfs_mount_lookup(const char *mount_point,
  * The enforcement points -- execve's setuid transition today, open/write and
  * mknod later -- ask this rather than tracking mounts themselves. */
 uint32_t vfs_path_mount_flags(const char *path);
+/* Batch 31: whether two paths resolve through one mount (EXDEV's test). */
+bool vfs_same_mount(const char *a, const char *b);
+/* Batch 32 (finding 193): an AF_UNIX socket's node, S_IFSOCK | MODE. */
+int vfs_mksock(const char *path, uint32_t mode);
+/* Finding 214: a device node, MODE's format S_IFCHR or S_IFBLK, numbers
+ * MAJ:MIN. VFS_ERR_NOTPERM on a filesystem that keeps no device nodes. */
+int vfs_mknod_dev(const char *path, uint32_t mode, uint32_t maj, uint32_t min);
+/* Finding 225: an extended-attribute operation (enum xa_op) on PATH, the
+ * node itself: the filesystem's ->xattr, else the path store; ENOTSUP
+ * where Linux keeps none (proc, sysfs, devtmpfs, cgroup2, vfat, cifs).
+ * Returns what xa_list_op does -- an ABI-negative errno, not a VFS one. */
+long vfs_xattr(const char *path, int op, const char *name, void *buf,
+               size_t sz, int flags);
+/* Finding 241: bind SOURCE -- a mount's root, a directory inside one, or a
+ * file -- at TARGET, with FLAGS (VFS_MNT_*). */
+int vfs_bind(const char *target, const char *source, uint32_t flags);
 bool vfs_is_mounted(void);
 void vfs_dump_mounts(void);
 
@@ -366,19 +527,64 @@ typedef bool (*vfs_mount_walk_cb)(const char *mount_point,
                                   void *cookie);
 void vfs_iter_mounts(vfs_mount_walk_cb cb, void *cookie);
 
+/* Batch 31: the walk /proc/mounts and mountinfo need -- flags, the source
+ * a mount was made from (its block device's name, or the type for one
+ * without a device), propagation, and the slot as a stable id. */
+struct vfs_mount_info {
+    const char           *point;
+    const struct vfs_ops *ops;
+    void                 *data;
+    uint32_t              flags;       /* VFS_MNT_* */
+    const char           *source;
+    uint32_t              prop, peer_id, master_id;
+    int                   index;
+};
+typedef bool (*vfs_mount_info_cb)(const struct vfs_mount_info *mi, void *cookie);
+void vfs_iter_mounts_info(vfs_mount_info_cb cb, void *cookie);
+/* The source of the mount at MOUNT_POINT (a block filesystem's device). */
+int  vfs_mount_set_source(const char *mount_point, const char *source);
+
 /* ---- per-call wrappers ---- */
 
 int  vfs_open    (const char *path, struct vfs_file *out);
+/* WANT: VFS_WANT_READ / VFS_WANT_WRITE bits the access mode needs, 0 for
+ * none (the open that just created the file). vfs_open = WANT_READ. */
+int  vfs_open_access(const char *path, struct vfs_file *out, int want);
 int  vfs_close   (struct vfs_file *f);
 long vfs_read    (struct vfs_file *f, void *buf, size_t n);
 long vfs_write   (struct vfs_file *f, const void *buf, size_t n);
-int  vfs_create  (const char *path);
+int  vfs_create  (const char *path);          /* mode 0644 */
+/* MODE is the new file's permission bits, used as given: the caller has
+ * taken the umask off (the syscall layer, for a process's open). */
+int  vfs_create_mode(const char *path, uint32_t mode);
+/* A FIFO at PATH, permissions MODE (the caller's umask already applied). */
+int  vfs_mkfifo(const char *path, uint32_t mode);
 int  vfs_unlink  (const char *path);
+/* Phase G: hard link newpath -> oldpath's inode. Both paths must resolve
+ * inside the SAME mount (VFS_ERR_XDEV otherwise); VFS_ERR_ROFS when the
+ * filesystem has no ->link. */
+int  vfs_link    (const char *oldpath, const char *newpath);
+/* Phase H: real statfs for the mount containing `path`. Always succeeds
+ * for a resolvable path; drivers without ->statfs report honest zeros. */
+int  vfs_statfs  (const char *path, struct vfs_statfs *out);
+/* Slice 127: remove a path and, if it is a directory, everything under it.
+ * `force` ignores missing paths. `failed` (may be NULL) receives the path of
+ * the first entry that could not be removed, so callers can report something
+ * more useful than an errno. Refuses "/" outright. Depth-capped at 32. */
+int  vfs_rmtree  (const char *path, bool force, char *failed, size_t failed_cap);
 int  vfs_rename  (const char *oldpath, const char *newpath);
 int  vfs_mkdir   (const char *path);
 int  vfs_opendir (const char *path, struct vfs_dir *out);
 int  vfs_closedir(struct vfs_dir *d);
 int  vfs_readdir (struct vfs_dir *d, struct vfs_dirent *out);
+/* Pass over N entries, as N vfs_readdirs would (the driver's ->seekdir
+ * where it has one). Returns how many it passed. */
+size_t vfs_seekdir(struct vfs_dir *d, size_t n);
+/* E, an entry of directory DIR: where its driver gave only what the
+ * directory holds (mode without VFS_MODE_VALID, see struct vfs_dirent),
+ * its size, owner and mode from a stat of DIR/E->name -- for the
+ * listings that print them. */
+void vfs_dirent_fill(const char *dir, struct vfs_dirent *e);
 int  vfs_stat    (const char *path, struct vfs_stat *out);
 
 /* Permission management (milestone 15). Both require either uid 0 or
@@ -387,12 +593,18 @@ int  vfs_stat    (const char *path, struct vfs_stat *out);
  * filesystem doesn't support it (e.g. the read-only ramfs root). */
 int  vfs_chmod   (const char *path, uint32_t mode);
 int  vfs_chown   (const char *path, uint32_t uid, uint32_t gid);
+/* chown's answer for the link itself: a symbolic link in the last
+ * component is changed, not followed (vfs_chmod and vfs_chown follow) */
+int  vfs_lchown  (const char *path, uint32_t uid, uint32_t gid);
 
 /* Permission check used internally by the VFS wrappers and by the
  * proc subsystem before exec'ing a binary. `want` is a bitwise OR of
  * VFS_WANT_READ / VFS_WANT_WRITE / VFS_WANT_EXEC. Returns VFS_OK or
  * VFS_ERR_PERM (or a propagated stat error). uid 0 always passes. */
 int  vfs_perm_check(const char *path, int want);
+/* The same of a stat already in hand (batch 31: the path walk's search
+ * check, finding 188). */
+int  vfs_perm_check_st(const struct vfs_stat *st, int want);
 
 /* Convenience: read the entire file into a kmalloc'd buffer. The
  * caller owns *out_buf and must kfree() it. Returns VFS_OK on success;
@@ -423,6 +635,23 @@ int  vfs_resolve_path(const char *path, char *resolved, size_t resolved_sz);
  * see) and write the final target to `out`. Bounded hop count. Returns VFS_OK,
  * or the stat/readlink error. A non-symlink path is copied through unchanged. */
 int  vfs_follow_link(const char *path, char *out, size_t outsz);
+
+/* One hop of a link: the path it names (relative targets against the
+ * link's directory, absolute ones in the caller's root, `.`/`..` cleaned). */
+int  vfs_link_target(const char *link, char *out, size_t outsz);
+
+/* vfs_stat answers for a link ITSELF (lstat); this follows a link in the
+ * last component to what it names (stat). */
+int  vfs_stat_follow(const char *path, struct vfs_stat *out);
+
+/* What stat of an OPEN FILE answers -- the file the handle holds, renamed
+ * or unlinked since or not: the driver's fstat op, with the device filled
+ * in as vfs_stat fills it. VFS_ERR_INVAL when the driver has no fstat. */
+int  vfs_fstat(struct vfs_file *f, struct vfs_stat *out);
+
+/* The RAM symlink table's target for `path` (a link on a filesystem that
+ * cannot hold one), or NULL. */
+const char *vfs_symlink_table_target(const char *path);
 
 /* Pretty name for an error code (for diagnostics). */
 const char *vfs_strerror(int err);

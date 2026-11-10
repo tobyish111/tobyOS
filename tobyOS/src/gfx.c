@@ -83,6 +83,14 @@ static struct {
     int  dirty_x, dirty_y, dirty_w, dirty_h;
     bool dirty_full;
 
+    /* Parallel damage accumulator for REMOTE consumers (the VNC server).
+     * The compositor's accumulator above is cleared by display.c on every
+     * present, so a remote viewer sharing it would race the local display
+     * and silently lose damage -- whichever consumer ran first would eat
+     * the rect. This one is cleared only by gfx_remote_damage_take(). */
+    int  rdirty_x, rdirty_y, rdirty_w, rdirty_h;
+    bool rdirty_full;
+
     /* Global clip rectangle. When active, clip_rect() intersects every
      * primitive's target rect with this, so the compositor can scope a
      * whole paint pass to a damage region (damage-tracked compositing)
@@ -115,11 +123,57 @@ static inline void dirty_reset(void) {
     g.dirty_full = false;
 }
 
+/* Union a rect into the REMOTE accumulator. Mirrors dirty_union's
+ * promote-to-full heuristic so a remote viewer makes the same
+ * whole-screen call the local present path does. */
+static void rdirty_union(int x, int y, int w, int h) {
+    if (g.rdirty_full) return;
+    if (g.rdirty_w == 0 || g.rdirty_h == 0) {
+        g.rdirty_x = x; g.rdirty_y = y;
+        g.rdirty_w = w; g.rdirty_h = h;
+        return;
+    }
+    int x0 = g.rdirty_x, y0 = g.rdirty_y;
+    int x1 = g.rdirty_x + g.rdirty_w, y1 = g.rdirty_y + g.rdirty_h;
+    if (x     < x0) x0 = x;
+    if (y     < y0) y0 = y;
+    if (x + w > x1) x1 = x + w;
+    if (y + h > y1) y1 = y + h;
+    g.rdirty_x = x0; g.rdirty_y = y0;
+    g.rdirty_w = x1 - x0; g.rdirty_h = y1 - y0;
+    uint64_t area_dirty = (uint64_t)g.rdirty_w * (uint64_t)g.rdirty_h;
+    uint64_t area_full  = (uint64_t)g.width  * (uint64_t)g.height;
+    if (area_full && area_dirty * 100u >= area_full * 95u)
+        g.rdirty_full = true;
+}
+
+void gfx_remote_damage_all(void) {
+    g.rdirty_full = true;
+}
+
+bool gfx_remote_damage_take(int *x, int *y, int *w, int *h) {
+    if (!g.ready) return false;
+    if (!g.rdirty_full && (g.rdirty_w <= 0 || g.rdirty_h <= 0)) return false;
+    if (g.rdirty_full) {
+        if (x) *x = 0; if (y) *y = 0;
+        if (w) *w = (int)g.width; if (h) *h = (int)g.height;
+    } else {
+        if (x) *x = g.rdirty_x; if (y) *y = g.rdirty_y;
+        if (w) *w = g.rdirty_w; if (h) *h = g.rdirty_h;
+    }
+    g.rdirty_x = g.rdirty_y = g.rdirty_w = g.rdirty_h = 0;
+    g.rdirty_full = false;
+    return true;
+}
+
 /* Union the supplied rect into the accumulator. Caller is responsible
  * for clamping to the back buffer first (clip_rect does this) so we
  * don't ever store off-surface dirty coords. */
 static void dirty_union(int x, int y, int w, int h) {
     if (!g.ready || w <= 0 || h <= 0) return;
+    /* Ahead of the early-return below: once the LOCAL accumulator is full
+     * it stops recording, but the remote one may have been drained since. */
+    rdirty_union(x, y, w, h);
     if (g.dirty_full) return;        /* already covers everything */
     if (g.dirty_w == 0 || g.dirty_h == 0) {
         g.dirty_x = x; g.dirty_y = y;
@@ -162,6 +216,7 @@ void gfx_mark_dirty_rect(int x, int y, int w, int h) {
 void gfx_mark_dirty_full(void) {
     if (!g.ready) return;
     g.dirty_full = true;
+    g.rdirty_full = true;
 }
 
 void gfx_dirty_clear(void) {
@@ -335,6 +390,7 @@ void gfx_clear(uint32_t color) {
         : "+D"(dst), "+c"(qwords) : "a"(pair) : "memory");
     if (n & 1) g.back[n - 1] = color;
     g.dirty_full = true;
+    g.rdirty_full = true;
 }
 
 void gfx_set_pixel(int x, int y, uint32_t color) {
@@ -1231,6 +1287,7 @@ void gfx_set_backend(const struct gfx_backend *backend) {
      * Mark full so we don't accidentally call present_rect() on an
      * empty dirty rect after the swap. */
     g.dirty_full = true;
+    g.rdirty_full = true;
     kprintf("[gfx] backend = %s\n", g.backend->name);
 }
 

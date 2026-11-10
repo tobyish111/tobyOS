@@ -42,6 +42,7 @@
 #include <tobyos/percpu.h>
 #include <tobyos/perf.h>     /* slice 95: time-bounded shootdown ack waits */
 #include <tobyos/sched.h>
+#include <tobyos/signal.h>   /* signal_deliver_irq, for the AP timer */
 #include <tobyos/smp.h>      /* tlb_shootdown_remote: percpu walk */
 
 /* Single virtual page mapped to LAPIC MMIO. Same kernel virt for every
@@ -116,11 +117,18 @@ void apic_eoi(void) {
  * parked with IRQs off can't ack; we warn instead of deadlocking). */
 static volatile uint32_t g_tlb_gen[MAX_CPUS];
 
-/* Slice 94: wake-kick receiver -- nothing to do; the interrupt itself
- * broke the target's hlt, and its idle loop re-scans the queues next. */
+/* Slice 94: wake-kick receiver -- the interrupt itself broke the target's
+ * hlt, and its idle loop re-scans the queues next. It is also a signal's
+ * kick (signal.c signal_kick, finding 165): a process it interrupted at
+ * ring 3 takes its pending signals now, as the timer handler would give
+ * them at its next tick -- caught ones first, on the interrupted frame;
+ * EOI before, as there, since a default action may never return. */
 static void sched_wake_isr(struct regs *r) {
-    (void)r;
     apic_eoi();
+    if (r && (r->cs & 3) == 3) {
+        if (!signal_deliver_irq(r))
+            signal_deliver_if_pending();
+    }
 }
 
 void apic_sched_wake(uint8_t target_apic_id) {
@@ -179,6 +187,11 @@ static bool cpu_may_hold_cr3(const struct percpu *c, uint64_t cr3) {
  * [tlbto]). ack_timeouts = per-CPU 2M-spin round timeouts; giveups =
  * tlb_shootdown_remote returning after 2 un-acked rounds (see below). */
 uint64_t g_tlb_ack_timeouts, g_tlb_giveups;
+/* Slice 125: distribution behind the counter -- per-CPU timeout tallies and
+ * the worst observed wait, so the health line can distinguish scheduling
+ * noise from one wedged core. See the timeout site below. */
+uint64_t g_tlb_to_percpu[MAX_CPUS];
+uint64_t g_tlb_wait_max_ns;
 
 static void tlb_shootdown_self_ack(uint32_t me) {
     uint64_t cr3;
@@ -252,10 +265,37 @@ static bool tlb_shootdown_sync_filtered(uint64_t cr3) {
             if (((++spins & 0x3ffu) == 0) && perf_now_ns() > deadline) {
                 static uint32_t warns;
                 extern uint64_t g_tlb_ack_timeouts;
+                extern uint64_t g_tlb_to_percpu[MAX_CPUS];
+                extern uint64_t g_tlb_wait_max_ns;
                 __atomic_fetch_add(&g_tlb_ack_timeouts, 1, __ATOMIC_RELAXED);
+                /* Slice 125: WHICH cpu, and HOW LATE. The bare counter could
+                 * not tell "one host-descheduled vCPU under WHPX" (routine,
+                 * per the note above) from "one core genuinely wedged on real
+                 * hardware" -- and the EliteDesk logged 16 of these with the
+                 * WARN line capped at 8, so half the events were invisible
+                 * and the distribution entirely so. Per-CPU counts expose a
+                 * single sick core; the max wait says whether we missed the
+                 * 10 ms deadline by a hair or by a mile. Both are just
+                 * counters -- no behaviour change on this path. */
+                if (i < MAX_CPUS)
+                    __atomic_fetch_add(&g_tlb_to_percpu[i], 1, __ATOMIC_RELAXED);
+                {
+                    uint64_t waited = perf_now_ns() + 10000000ull - deadline;
+                    uint64_t prev = __atomic_load_n(&g_tlb_wait_max_ns,
+                                                    __ATOMIC_RELAXED);
+                    while (waited > prev &&
+                           !__atomic_compare_exchange_n(&g_tlb_wait_max_ns,
+                                                        &prev, waited, false,
+                                                        __ATOMIC_RELAXED,
+                                                        __ATOMIC_RELAXED))
+                        ;
+                }
                 if (warns < 8) {
                     warns++;
                     kprintf("[tlb] WARN: cpu%u shootdown ack timeout\n", i);
+                    if (warns == 8)
+                        kprintf("[tlb] WARN log CAP HIT (8) -- further "
+                                "timeouts counted in [tlb] health only\n");
                 }
                 all_acked = false;
                 break;
@@ -442,6 +482,23 @@ void apic_timer_calibrate_global(void) {
  * preempts when ring 3 was interrupted. */
 static void apic_timer_isr(struct regs *r) {
     apic_eoi();
+    /* CAUGHT SIGNALS FOR THE PROCESS RUNNING ON THIS CORE (2026-09-20).
+     *
+     * The PIT handler delivers a pending caught signal to a process it
+     * interrupted at ring 3 (signal_deliver_irq); the PIT fires on the BSP
+     * only. A CPU-bound process on an APPLICATION PROCESSOR took this
+     * interrupt instead, which only preempted it, so a handler-installing
+     * program spinning in user code on an AP never ran its handler: the
+     * signal stayed pending until its next syscall, which a spin never
+     * makes. /bin/sigregs hung on the four-core EliteDesk exactly there --
+     * its child blocked on an acknowledgement the parent's handler never
+     * got to send -- and passed on QEMU, where the parent happened to sit
+     * on the BSP. Same block as pit.c, same order: EOI first, because a
+     * default disposition may exit the process and never return. */
+    if (r && (r->cs & 3) == 3) {
+        if (!signal_deliver_irq(r))
+            signal_deliver_if_pending();
+    }
     sched_tick(r);
 }
 

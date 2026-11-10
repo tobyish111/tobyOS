@@ -23,6 +23,7 @@
 
 #include <tobyos/proc.h>
 #include <tobyos/sched.h>
+#include <tobyos/signal.h>   /* SIGMASK: the futex park's lost-wake guard */
 #include <tobyos/heap.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
@@ -43,10 +44,16 @@ static struct proc *thread_alloc_slot(void) {
     return proc_slot_claim();
 }
 
+static void thread_reap_detached(struct proc *leader);
+
 int thread_create(uint64_t entry, uint64_t arg,
                   uint64_t user_stack_top, uint64_t tls_base) {
     struct proc *leader = current_proc();
     if (!leader) return -1;
+
+    /* Reclaim detached siblings that have exited; see the header there.
+     * This is the moment their proc slots are about to be needed. */
+    thread_reap_detached(leader);
 
     /* Find the actual thread-group leader */
     struct proc *tg_leader = leader;
@@ -67,7 +74,7 @@ int thread_create(uint64_t entry, uint64_t arg,
     if (!t) return -1;
 
     proc_slot_wipe(t);       /* stays EMBRYO; upgraded to READY at end */
-    t->pid   = (int)(t - g_proc);
+    proc_pid_alloc(t);
     t->ppid  = tg_leader->ppid;
 
     /* Copy name with "+T" suffix */
@@ -83,7 +90,7 @@ int thread_create(uint64_t entry, uint64_t arg,
     t->owns_pml4 = false;  /* thread never frees the PML4 */
 
     /* Allocate a kernel stack for this thread */
-    t->kstack_base = kmalloc(PROC_KSTACK_SZ);
+    t->kstack_base = proc_kstack_alloc();
     if (!t->kstack_base) {
         t->state = PROC_UNUSED;
         return -1;
@@ -114,6 +121,7 @@ int thread_create(uint64_t entry, uint64_t arg,
     t->session_id = tg_leader->session_id;
     t->uid        = tg_leader->uid;
     t->gid        = tg_leader->gid;
+    t->umask      = tg_leader->umask;     /* a thread creates files as its process */
     t->caps       = tg_leader->caps;
     memcpy(t->sandbox_root, tg_leader->sandbox_root, PROC_SANDBOX_MAX);
 
@@ -252,6 +260,42 @@ void thread_exit(int code) {
     for (;;) hlt();
 }
 
+/* Reclaim detached threads of this group that have already exited.
+ *
+ * A DETACHED THREAD HAD NOBODY TO REAP IT. thread_exit sends it through
+ * proc_exit(), which leaves it PROC_TERMINATED -- and proc_reap() is only
+ * ever reached from proc_wait_ex(), which nothing calls for a thread. A
+ * joinable thread is fine (its joiner reaps it) and so is a thread that
+ * was ALREADY terminated when detach was called (thread_detach reaps it
+ * inline). The gap is the one in between: detach a RUNNING thread, let it
+ * exit, and its proc slot is gone for the life of the process.
+ *
+ * MEASURED ON REAL HARDWARE, 2026-09-12: /bin/tjoinchurn detaches every
+ * fourth round, and after 36 rounds -- 36 detached threads, against a proc
+ * table whose pids never got past 34 -- thread_create failed for the rest
+ * of the run. The counters froze at ran=144 joined=108 detached=36 while
+ * `failed` climbed by exactly one per round, which is what "the very first
+ * create in the round fails, forever" looks like.
+ *
+ * Swept HERE, at create time, because that is the moment the slot is
+ * about to be wanted; the same shape libtoby uses for the matching user
+ * stacks. A detached thread that has NOT exited is left alone -- it is
+ * still running. */
+static void thread_reap_detached(struct proc *leader) {
+    if (!leader) return;
+    int tg = leader->is_thread ? leader->tgid : leader->pid;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q == leader || !q->is_thread) continue;
+        if (q->tgid != tg) continue;
+        if (q->state != PROC_TERMINATED || !q->detached) continue;
+        sched_dequeue(q);
+        proc_wait_off_cpu(q);          /* yields if we hold the BKL */
+        proc_kstack_free(q);
+        q->state = PROC_UNUSED;
+    }
+}
+
 /* ---- Thread join ----------------------------------------------------- */
 
 int thread_join(int tid, int *out_code) {
@@ -276,9 +320,7 @@ int thread_join(int tid, int *out_code) {
         sched_dequeue(target);
         proc_wait_off_cpu(target);
         /* Free kernel stack */
-        if (target->kstack_base) kfree(target->kstack_base);
-        target->kstack_base = 0;
-        target->kstack_top  = 0;
+        proc_kstack_free(target);
         target->state = PROC_UNUSED;
         return 0;
     }
@@ -298,9 +340,7 @@ int thread_join(int tid, int *out_code) {
     if (target->state == PROC_TERMINATED) {
         sched_dequeue(target);
         proc_wait_off_cpu(target);
-        if (target->kstack_base) kfree(target->kstack_base);
-        target->kstack_base = 0;
-        target->kstack_top  = 0;
+        proc_kstack_free(target);
         target->state = PROC_UNUSED;
     }
 
@@ -322,9 +362,7 @@ int thread_detach(int tid) {
     if (target->state == PROC_TERMINATED) {
         sched_dequeue(target);
         proc_wait_off_cpu(target);
-        if (target->kstack_base) kfree(target->kstack_base);
-        target->kstack_base = 0;
-        target->kstack_top  = 0;
+        proc_kstack_free(target);
         target->state = PROC_UNUSED;
     }
     return 0;
@@ -491,6 +529,29 @@ static bool futex_unlink_self(uint64_t cr3, uint64_t addr,
     return was_linked;
 }
 
+/* PROCESS_SHARED keying (Phase F, 2026-08-22). A futex word in a
+ * MAP_SHARED page is the same futex in every process that maps it, so
+ * its key must not mention any address space: key = (0, physical addr)
+ * -- cr3 0 can never be a real process root, so the space cannot
+ * collide with private keys. Private mappings keep (cr3, vaddr): CoW
+ * twins share frames until first write, and keying them by phys would
+ * false-match two logically-distinct futexes across fork.
+ *
+ * Gated on the absence of FUTEX_PRIVATE_FLAG -- glibc stamps it on every
+ * process-private op (chrome's ~400k/min all carry it), so the page-walk
+ * cost lands only on genuinely pshared primitives. The walk requires the
+ * page PRESENT; every keyed path either pre-touched the word (WAIT) or
+ * follows a userspace write of it (the futex protocol: change the word,
+ * then wake), and MAP_SHARED frames are mapped eagerly and never CoW'd
+ * or evicted, so a missed translation (fall back to the private key) is
+ * theoretical -- but would only split waiter/waker, never corrupt. */
+static void futex_key_adjust(int op, uint64_t *cr3, uint64_t *addr) {
+    if (op & 0x80) return;               /* FUTEX_PRIVATE_FLAG */
+    int shared = 0;
+    uint64_t phys = vmm_translate_root(*cr3, *addr, &shared);
+    if (phys && shared) { *cr3 = 0; *addr = phys; }
+}
+
 int futex_fast(uint32_t *uaddr, int op, uint32_t val, long *out) {
     struct proc *caller = current_proc();
     if (!caller) return 0;
@@ -506,6 +567,7 @@ int futex_fast(uint32_t *uaddr, int op, uint32_t val, long *out) {
     }
     if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
         uint64_t cr3 = caller->cr3;
+        futex_key_adjust(op, &cr3, &addr);
         uint64_t flags = spin_lock_irqsave(&g_futex_lock);
         uint32_t idx = futex_hash(cr3, addr);
         struct futex_entry *e = g_futex_hash[idx];
@@ -529,11 +591,27 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
     int cmd = op & 0x7f;   /* strip FUTEX_PRIVATE_FLAG(128)/CLOCK_REALTIME(256) */
     int priv = op & ~0x7f; /* preserve PRIVATE / CLOCK_REALTIME for recursion */
 
+#ifdef FUTEX_TRACE
+    /* Diagnostic (opt-in -DFUTEX_TRACE): every futex op, capped. Only sane
+     * on low-traffic boots (chrome does ~400k/min); indispensable when a
+     * two-thread handshake (NPTL setxid) dies somewhere between four ops. */
+    { static int fxt = 0;
+      if (fxt < 96) { fxt++;
+          kprintf("[fxt] pid=%d op=%d(cmd=%d) addr=0x%lx val=%u to=%d\n",
+                  caller->pid, op, cmd, (unsigned long)addr, val,
+                  utimeout ? 1 : 0); } }
+#endif
+
     /* Pre-touch the futex word OUTSIDE the spinlock so any CoW/demand #PF
      * resolves with IRQs on; the locked re-read below then can't fault
      * (per-copy uaccess: each read opens its own stac window). */
     uint32_t cur_val;
     if (copy_from_user(&cur_val, uaddr, sizeof(cur_val)) != 0) return -14;
+
+    /* AFTER the pre-touch, so a first-use word is present for the walk;
+     * every keying below (find/create, unlink, wake, requeue) sees the
+     * adjusted pair and cross-process pshared waiters/wakers meet. */
+    futex_key_adjust(op, &cr3, &addr);
 
     if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
         /* Compute the wake deadline (monotonic ns). NULL => infinite. FUTEX_WAIT
@@ -628,6 +706,35 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
         caller->futex_timed_out   = false;
         caller->next_wait = e->waiters;
         e->waiters = caller;
+        /* LOST-WAKE GUARD (2026-08-22, found live by linux-nptl bit2).
+         * signal_send force-wakes a BLOCKED waiter -- but a signal that
+         * lands while this thread is RUNNING (mid-way through handling a
+         * spurious wake, exactly where glibc's setxid broadcast caught the
+         * barrier waiter) performs no wake at all, and a DEADLINE-LESS park
+         * has no sweep to ever revisit it: the signal sat pending forever,
+         * the broadcaster waited for an ack forever, and the whole machine
+         * went idle-forever. So: never complete a park with a deliverable
+         * signal pending. Checked AFTER the BLOCKED store, with a full
+         * fence ordering that store before the pending load, so the send
+         * side either saw BLOCKED (and woke us) or its pending store is
+         * visible here. Returning 0 is a legal spurious wake -- glibc
+         * re-checks its condition, and the syscall exit path delivers the
+         * handler first, which is the entire point. */
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        {
+            uint64_t pend  = caller->pending_signals;
+            uint64_t deliv = (pend & ~caller->sigstate.mask) |
+                             (pend & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP)));
+            if (deliv) {
+                struct proc **pp = &e->waiters;
+                while (*pp && *pp != caller) pp = &(*pp)->next_wait;
+                if (*pp) { *pp = caller->next_wait; caller->next_wait = 0; }
+                caller->state             = PROC_RUNNING;
+                caller->futex_deadline_ns = 0;
+                spin_unlock_irqrestore(&g_futex_lock, flags);
+                return 0;
+            }
+        }
         spin_unlock_irqrestore(&g_futex_lock, flags);
         sched_yield();     /* woken by FUTEX_WAKE or the timeout sweep */
         /* Slice 92: if we are still on the waiter list, the wake was
@@ -733,6 +840,12 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
         if (!e->waiters) futex_free_entry(e);
 
         spin_unlock_irqrestore(&g_futex_lock, flags);
+#ifdef FUTEX_TRACE
+        { static int fxw = 0;
+          if (fxw < 96) { fxw++;
+              kprintf("[fxt] pid=%d WAKE addr=0x%lx val=%u -> woken=%d\n",
+                      caller->pid, (unsigned long)addr, val, woken); } }
+#endif
         if (handoff) {
             bool had_bkl = bkl_held();
             if (had_bkl) bkl_exit();      /* never yield holding the BKL */
@@ -1017,6 +1130,90 @@ void futex_forget_proc(struct proc *p) {
     spin_unlock_irqrestore(&g_futex_lock, flags);
 }
 
+/* ---- glibc robust-mutex death protocol (Phase F, 2026-08-22) ----------
+ *
+ * set_robust_list(2) registers a userspace linked list of the mutexes a
+ * thread currently holds; the KERNEL walks it when the thread dies and
+ * stamps FUTEX_OWNER_DIED into each held word so the next lock() returns
+ * EOWNERDEAD instead of hanging forever. Before this, set_robust_list was
+ * `return 0` -- the exact accept-and-ignore shape this arc hunts: glibc
+ * believed the kernel had its back, and every PTHREAD_MUTEX_ROBUST user
+ * (PostgreSQL shared buffers, SAP, pulseaudio) would deadlock on the
+ * first owner crash.
+ *
+ * Layout (x86-64 glibc): head+0 = list.next (self-pointing when empty),
+ * head+8 = futex_offset (signed! entry -> futex word), head+16 =
+ * list_op_pending (a mutex mid-acquire/release when death struck).
+ *
+ * Must run while the dying proc's USER MEMORY is still mapped: early in
+ * proc_exit, and in the group-reap loop before futex_forget_proc (the
+ * reaper shares the group's cr3, so the copies resolve). A corrupt or
+ * cyclic list just ends the walk -- it is userspace's list, and the
+ * kernel owes it exactly one bounded traversal. */
+
+static void futex_wake_key(uint64_t cr3, uint64_t addr) {
+    uint64_t flags = spin_lock_irqsave(&g_futex_lock);
+    uint32_t idx = futex_hash(cr3, addr);
+    struct futex_entry *e = g_futex_hash[idx];
+    while (e && !(e->key_cr3 == cr3 && e->key_addr == addr)) e = e->next;
+    if (e && e->waiters) {
+        struct proc *w = e->waiters;
+        e->waiters = w->next_wait;
+        w->next_wait = 0;
+        w->futex_deadline_ns = 0;
+        w->state = PROC_READY;
+        sched_enqueue(w);
+        if (!e->waiters) futex_free_entry(e);
+    }
+    spin_unlock_irqrestore(&g_futex_lock, flags);
+}
+
+static void futex_robust_stamp(struct proc *p, uint64_t waddr, uint32_t tid) {
+    if (!waddr || (waddr & 3)) return;
+    uint32_t w = 0;
+    if (copy_from_user(&w, (const void *)(uintptr_t)waddr, sizeof w) != 0)
+        return;
+    if ((w & FUTEX_TID_MASK) != tid) return;   /* not held by the deceased */
+    uint32_t neu = (w & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+    if (copy_to_user((void *)(uintptr_t)waddr, &neu, sizeof neu) != 0)
+        return;
+    /* Wake one waiter under BOTH possible keys: a robust mutex can be
+     * process-private (siblings key by (cr3, vaddr)) or pshared (key by
+     * phys). Waking a key with no entry is a no-op, so trying both is
+     * cheaper than re-deriving which flavour glibc used. */
+    futex_wake_key(p->cr3, waddr);
+    {
+        int shared = 0;
+        uint64_t phys = vmm_translate_root(p->cr3, waddr, &shared);
+        if (phys && shared) futex_wake_key(0, phys);
+    }
+}
+
+void futex_robust_exit(struct proc *p) {
+    if (!p || !p->robust_list_head) return;
+    uint64_t head = p->robust_list_head;
+    p->robust_list_head = 0;
+    uint64_t next = 0, pend = 0;
+    int64_t  off  = 0;
+    if (copy_from_user(&next, (const void *)(uintptr_t)head, 8) != 0) return;
+    if (copy_from_user(&off,  (const void *)(uintptr_t)(head + 8), 8) != 0) return;
+    if (copy_from_user(&pend, (const void *)(uintptr_t)(head + 16), 8) != 0) return;
+    uint32_t tid = 0;
+    { extern int pid_vnr(struct proc *);
+      int v = pid_vnr(p); tid = (uint32_t)(v ? v : p->pid) & FUTEX_TID_MASK; }
+    uint64_t entry = next;
+    for (int guard = 0; entry && entry != head && guard < 64; guard++) {
+        uint64_t nxt = 0;
+        if (copy_from_user(&nxt, (const void *)(uintptr_t)entry, 8) != 0)
+            break;
+        if (entry != pend)         /* op_pending is stamped once, below */
+            futex_robust_stamp(p, (uint64_t)((int64_t)entry + off), tid);
+        entry = nxt;
+    }
+    if (pend)
+        futex_robust_stamp(p, (uint64_t)((int64_t)pend + off), tid);
+}
+
 #ifdef CHROMIUM_BOOT
 /* Slice 56 tick-liveness counters, dumped by waitt_dump()'s [tick] line: how
  * often the futex timeout sweep actually RAN (it has no driver of its own --
@@ -1119,6 +1316,31 @@ void poll_wait_block(void) {
     /* On return we've been spliced out (by poll_wake_all or signal_send). */
 }
 
+/* EVERY NOTIFY, COUNTED -- coalesced or not, with waiters or without -- so
+ * a waiter that looks at its sources and THEN parks can tell whether an
+ * event came in between: poll_wait_block_since(the count it read before
+ * looking) parks only if none did. Parking unconditionally after a scan
+ * lost that event until the 20 ms sweep. A kernel worker that serves
+ * several sources (the SSH server: its TCP connection, the shell's pty or
+ * pipes) parks this way instead of spinning on sched_yield (finding 191).
+ * The count is atomic; the check and the park are BKL-serialised with
+ * every notify, as the list is. */
+static uint64_t g_poll_seq;
+/* A notify the 100 us coalescer held back: poll_tick wakes for it at its
+ * next call instead of at the next 20 ms sweep. Without this, a source that
+ * became ready just after a waiter re-scanned and parked again -- inside
+ * the coalescing window -- waited out the sweep (finding 191). */
+static bool g_poll_deferred;
+
+uint64_t poll_event_seq(void) {
+    return __atomic_load_n(&g_poll_seq, __ATOMIC_ACQUIRE);
+}
+
+void poll_wait_block_since(uint64_t seen) {
+    if (poll_event_seq() != seen) return;   /* something happened: re-scan */
+    poll_wait_block();
+}
+
 /* Requeue every blocked poller so it re-scans. BKL-held by every caller
  * (poll_tick's sites), so no extra lock is needed -- same convention as
  * pipe.c/socket.c wq_wake_all. The CURRENT proc is left parked: poll_tick runs
@@ -1145,6 +1367,34 @@ void poll_wake_all(void) {
     }
 }
 
+/* Halt-loop only (sched_yield's halt-in-place arm): if the CURRENT proc is
+ * itself a parked poller, unlink it so the caller can resume it for a
+ * re-scan. poll_wake_all deliberately keeps current parked -- a poller must
+ * not self-wake on the very yield that parks it -- but the proc halting in
+ * place is whoever blocked LAST, and when that is the poller there is no
+ * other proc left to run a sweep FOR it: skipping current there turns
+ * "machine idle" into "machine dead" (the LXPOSIX poll(timerfd) wedge,
+ * 2026-08-22). Caller MUST hold the BKL, same as poll_wake_all. Returns 1
+ * if current was unlinked (caller resumes it), 0 otherwise. */
+int poll_unpark_current(void) {
+    struct proc *cur = current_proc();
+    if (!cur || cur->wait_head != &g_poll_waiters) return 0;
+    struct proc **pp = &g_poll_waiters;
+    while (*pp) {
+        if (*pp == cur) {
+            *pp = cur->next_wait;
+            cur->next_wait = 0;
+            cur->wait_head = 0;
+            return 1;
+        }
+        pp = &(*pp)->next_wait;
+    }
+    /* wait_head said poll but the list disagrees -- clear the stale
+     * back-pointer rather than leave it dangling. */
+    cur->wait_head = 0;
+    return 0;
+}
+
 /* ---- Slice 67 (perf tier 2, final step): EVENT-DRIVEN poll wakeups ----
  *
  * MEASURED (slice 66): epoll_wait held the BKL ~0.77 ms PER CALL --
@@ -1163,12 +1413,37 @@ void poll_wake_all(void) {
  * lost wakeup). Notifies are coalesced at 100us so a burst of arriving
  * packets cannot turn into a wake storm of its own.
  * Callers MUST hold the BKL (same convention as poll_wake_all). */
+/* A coalesced notify still wakes the KERNEL workers parked on the list (the
+ * SSH server): the coalescer exists for user pollers, each of which
+ * re-scans every descriptor it watches under the BKL; a worker's pass is
+ * cheap, and holding its wake until poll_tick -- up to a timer tick on an
+ * idle BSP -- made every SSH round trip and every pty write wait for one
+ * (finding 191: 1 MB through a pty 28% slower, a session 19 ms longer). */
+static void poll_wake_kernel_waiters(void) {
+    struct proc *cur = current_proc();
+    struct proc **pp = &g_poll_waiters;
+    while (*pp) {
+        struct proc *w = *pp;
+        if (w == cur || !w->is_kernel) { pp = &w->next_wait; continue; }
+        *pp = w->next_wait;
+        w->next_wait = 0;
+        w->wait_head = 0;
+        if (w->state == PROC_BLOCKED) { w->state = PROC_READY; sched_enqueue(w); }
+    }
+}
+
 void poll_event_notify(void) {
     static uint64_t last_ns;
+    __atomic_fetch_add(&g_poll_seq, 1, __ATOMIC_ACQ_REL);
     if (!g_poll_waiters) return;              /* nobody parked: free */
     uint64_t now = perf_now_ns();
-    if (now - last_ns < 100000ull) return;    /* coalesce bursts (100us) */
+    if (now - last_ns < 100000ull) {          /* coalesce bursts (100us) */
+        g_poll_deferred = true;               /* ...to poll_tick, not lost */
+        poll_wake_kernel_waiters();
+        return;
+    }
     last_ns = now;
+    g_poll_deferred = false;
 #ifdef CHROMIUM_BOOT
     g_poll_event_wakes++;
 #endif
@@ -1183,8 +1458,10 @@ void poll_tick(void) {
     static uint64_t last_ns;
     if (!g_poll_waiters) return;
     uint64_t now = perf_now_ns();
-    if (now - last_ns < 20000000ull) return;  /* >= ~20 ms since last sweep */
+    /* >= ~20 ms since the last sweep -- or a notify was held back */
+    if (now - last_ns < 20000000ull && !g_poll_deferred) return;
     last_ns = now;
+    g_poll_deferred = false;
 #ifdef CHROMIUM_BOOT
     g_poll_tick_wakes++;
 #endif
