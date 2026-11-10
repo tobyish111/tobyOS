@@ -141,8 +141,10 @@ struct pe_tls_dir64 {
  * usual PE ImageBase (0x140000000), so it can't collide with either. */
 #define WIN32_SHIM_BASE    0x0000000030000000ULL
 /* C18a: the shim region grew from 1 to 2 pages -- the procaddr table (one 10-byte
- * thunk per shim) crossed the 4 KiB page once the shim count passed ~300. */
-#define WIN32_SHIM_BYTES   (2u * PAGE_SIZE)
+ * thunk per shim) crossed the 4 KiB page once the shim count passed ~300.
+ * W1: 6 pages -- the procaddr table may fill pages 1-3 and pages 4-5 hold the
+ * missing-import stubs (layout in pe.h). */
+#define WIN32_SHIM_BYTES   (WIN32_SHIM_PAGES * PAGE_SIZE)
 #define WIN32_THUNK_SIZE   10
 #define WIN32_GATE_IMM_OFF 0x6e     /* offset of the syscall-number imm32 (C11: 10-arg gate) */
 
@@ -220,7 +222,9 @@ static const uint8_t g_win32_gate[] = {
  *   0xC0  DispatchMessage trampoline (C7)
  *   0x100 dialog modal-loop trampoline (C14: DialogBoxParamA, 106 bytes)
  *   0x1F0 dialog-service gate-thunk (C14: __toby_dlgsvc, 10 bytes)
- *   0x200 per-import thunks (10 bytes each)
+ *   0x200 (unused since W1 -- imports bind to the procaddr table)
+ *   0xE00 setjmp / 0xE80 longjmp leaf stubs (C19b)
+ *   0x1000.. procaddr table (one thunk per shim); 0x4000.. missing-import stubs
  * See WIN32_THREAD_WRAPPER_VA / WIN32_DLG_TRAMP_VA in pe.h for the user VAs. */
 #define WIN32_WRAPPER_OFF   0x80
 #define WIN32_DLGTRAMP_OFF  0x100     /* C14: DialogBoxParamA trampoline */
@@ -440,8 +444,68 @@ static uint64_t win32_user_stub_va(const char *dll, const char *func) {
     return 0;
 }
 
-/* Build the gate + per-import thunks into the (already mapped, RW) shim
- * page, then bind every imported IAT slot to its thunk. All user-memory
+/* W1: the missing-import stubs (pages 4-5 of the shim area; layout in pe.h).
+ * Each is
+ *   mov rcx, <user VA of "DLL!function">   ; 48 B9 imm64
+ *   mov eax, <__toby_missing shim index>    ; B8 imm32
+ *   jmp gate                                ; E9 rel32
+ * and lands in w32_toby_missing (syscall.c), which names the function and
+ * ends the process. Nothing the program passed matters: the call does not
+ * return. Caller holds the uaccess window. */
+struct pe_missing_area {
+    uint64_t next_stub, next_name;
+    int      idx;                  /* __toby_missing's shim index, or -1 */
+};
+
+static void pe_emit_missing_stub(uint64_t stub_va, uint64_t name_va, int idx) {
+    uint8_t t[WIN32_MISSING_STUB_SIZE];
+    uint32_t i32 = (uint32_t)idx;
+    int32_t rel = (int32_t)((int64_t)WIN32_SHIM_BASE -
+                            (int64_t)(stub_va + WIN32_MISSING_STUB_SIZE));
+    t[0]  = 0x48; t[1] = 0xB9; memcpy(&t[2], &name_va, 8);   /* mov rcx, imm64 */
+    t[10] = 0xB8; memcpy(&t[11], &i32, 4);                   /* mov eax, imm32 */
+    t[15] = 0xE9; memcpy(&t[16], &rel, 4);                   /* jmp rel32 gate */
+    memcpy((void *)stub_va, t, sizeof(t));
+}
+
+/* Stub 0 is the shared fallback for when the stub or the name area is full;
+ * its text names no function. */
+static void pe_missing_init(struct pe_missing_area *m) {
+    static const char fallback[] = "an import (the missing-import area is full)";
+    m->idx = win32_shim_index("kernel32.dll", "__toby_missing");
+    m->next_stub = WIN32_MISSING_STUB_VA;
+    m->next_name = WIN32_MISSING_NAMES_VA;
+    if (m->idx < 0) return;
+    memcpy((void *)m->next_name, fallback, sizeof(fallback));
+    pe_emit_missing_stub(m->next_stub, m->next_name, m->idx);
+    m->next_name += sizeof(fallback);
+    m->next_stub += WIN32_MISSING_STUB_SIZE;
+}
+
+/* The VA an import nothing implements is bound to: its own stub naming
+ * "dll!func", or stub 0 when an area is full, or 0 if the kernel has no
+ * __toby_missing shim (the pre-W1 behaviour). */
+static uint64_t pe_missing_stub(struct pe_missing_area *m, const char *dll,
+                                const char *func) {
+    if (m->idx < 0) return 0;
+    size_t dl = strlen(dll), fl = strlen(func), need = dl + 1 + fl + 1;
+    if (m->next_stub + WIN32_MISSING_STUB_SIZE > WIN32_MISSING_NAMES_VA ||
+        m->next_name + need > WIN32_MISSING_END_VA)
+        return WIN32_MISSING_STUB_VA;
+    uint64_t name = m->next_name;
+    memcpy((void *)name, dll, dl);
+    *(char *)(name + dl) = '!';
+    memcpy((void *)(name + dl + 1), func, fl);
+    *(char *)(name + dl + 1 + fl) = '\0';
+    m->next_name += need;
+    uint64_t stub = m->next_stub;
+    pe_emit_missing_stub(stub, name, m->idx);
+    m->next_stub += WIN32_MISSING_STUB_SIZE;
+    return stub;
+}
+
+/* Build the gate + trampolines + the procaddr table into the (already mapped,
+ * RW) shim area, then bind every imported IAT slot. All user-memory
  * access here is under the caller's uaccess window. `udir` points at the
  * data-directory array in the *original* (kernel) image buffer; the image
  * has already been copied to load_base so RVAs resolve in user memory. */
@@ -505,8 +569,6 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
     memcpy((void *)(WIN32_SHIM_BASE + WIN32_FGATE_OFF), fgate, WIN32_FGATE_SIZE);
     uaccess_end(uf);
 
-    int next_thunk = 0;     /* next free thunk slot in the page */
-
     if (num_dirs <= PE_DIR_IMPORT) return true;     /* no imports at all */
     uint32_t import_rva = udir[PE_DIR_IMPORT].rva;
     if (!import_rva) return true;
@@ -514,7 +576,13 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
     const struct pe_import_desc *imp =
         (const struct pe_import_desc *)(load_base + import_rva);
 
+    /* W1: how many procaddr slots fit before the missing-import stubs. */
+    const uint64_t pa_cap = (WIN32_MISSING_STUB_VA - WIN32_PROCADDR_BASE_VA) /
+                            WIN32_PROCADDR_STRIDE;
+
     unsigned long uf2 = uaccess_begin();
+    struct pe_missing_area miss;
+    pe_missing_init(&miss);
     for (; imp->name_rva; imp++) {
         const char *dll = (const char *)(load_base + imp->name_rva);
 
@@ -527,12 +595,15 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
         for (int k = 0; names[k]; k++) {
             uint64_t ent = names[k];
             int idx = -1;
-            const char *fname = "<ordinal>";
+            char ordname[16];
+            const char *fname = ordname;
 
             if (!(ent & PE_ORDINAL_FLAG)) {
                 /* hint(2) + name(NUL-terminated) at RVA */
                 fname = (const char *)(load_base + (uint32_t)ent + 2);
                 idx = win32_shim_index(dll, fname);
+            } else {
+                ksnprintf(ordname, sizeof(ordname), "#%u", (unsigned)(ent & 0xFFFFu));
             }
 
             /* Some imports are bound to a USER-MODE stub in the shim page
@@ -547,43 +618,40 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
                 continue;
             }
 
+            if (idx >= 0 && (uint64_t)idx >= pa_cap) {
+                kprintf("[pe] shim#%d for %s!%s is past the procaddr table "
+                        "(%lu slots)\n", idx, dll, fname, (unsigned long)pa_cap);
+                idx = -1;
+            }
+
             if (idx < 0) {
                 /* Self-identifying gap, exactly like Track B's unhandled
-                 * syscall log. The slot stays 0 -> calling it faults. */
-                kprintf("[pe] unresolved import %s!%s\n", dll, fname);
-                iat[k] = 0;
+                 * syscall log. W1: the slot is bound to a stub that names the
+                 * import and ends the process when it is called; before W1 it
+                 * stayed 0 and the call jumped to address 0. */
+                iat[k] = pe_missing_stub(&miss, dll, fname);
+                kprintf("[pe] unresolved import %s!%s -> missing-stub@%p\n",
+                        dll, fname, (void *)iat[k]);
                 continue;
             }
 
-            /* Emit a 10-byte thunk and bind the IAT slot to it. Guard against
-             * the per-import region (0x100..) growing into the procaddr table. */
-            uint64_t thunk_off = WIN32_THUNK_BASE +
-                                 (uint64_t)next_thunk * WIN32_THUNK_SIZE;
-            if (thunk_off + WIN32_THUNK_SIZE > WIN32_PROCADDR_OFF) {
-                kprintf("[pe] too many imports (%d) -- thunk region full\n",
-                        next_thunk);
-                iat[k] = 0;
-                continue;
-            }
-            pe_emit_gate_thunk(thunk_off, (uint32_t)idx);
-            iat[k] = WIN32_SHIM_BASE + thunk_off;   /* bind the IAT slot */
-            next_thunk++;
-
+            /* W1: bind straight to the shim's procaddr thunk (emitted below,
+             * before the process runs) -- one thunk per function, shared. */
+            iat[k] = WIN32_PROCADDR_BASE_VA + (uint64_t)idx * WIN32_PROCADDR_STRIDE;
             kprintf("[pe]   bind %s!%s -> shim#%d thunk@%p\n",
-                    dll, fname, idx, (void *)(WIN32_SHIM_BASE + thunk_off));
+                    dll, fname, idx, (void *)iat[k]);
         }
     }
 
     /* C9: pre-generate a thunk for EVERY shim so GetProcAddress can return a
      * callable pointer for any name-resolved shim index (slot i at
-     * WIN32_PROCADDR_BASE_VA + i*WIN32_THUNK_SIZE). Bounded by the page end. */
+     * WIN32_PROCADDR_BASE_VA + i*WIN32_PROCADDR_STRIDE); since W1 every import
+     * binds to these too. Bounded by the missing-import stubs (pa_cap). */
     int nshims = win32_shim_count();
-    uint64_t pa_end = WIN32_PROCADDR_OFF +
-                      (uint64_t)nshims * WIN32_THUNK_SIZE;
-    if (pa_end > WIN32_SHIM_BYTES) {
-        kprintf("[pe] WARNING: procaddr table (%d shims) overruns shim region\n",
-                nshims);
-        nshims = (int)((WIN32_SHIM_BYTES - WIN32_PROCADDR_OFF) / WIN32_THUNK_SIZE);
+    if ((uint64_t)nshims > pa_cap) {
+        kprintf("[pe] WARNING: procaddr table (%d shims) overruns its %lu slots\n",
+                nshims, (unsigned long)pa_cap);
+        nshims = (int)pa_cap;
     }
     for (int i = 0; i < nshims; i++)
         pe_emit_gate_thunk(WIN32_PROCADDR_OFF + (uint64_t)i * WIN32_THUNK_SIZE,

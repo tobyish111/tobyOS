@@ -129,11 +129,29 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
  * name at runtime. Slot i lives at WIN32_PROCADDR_BASE_VA + i*WIN32_PROCADDR_STRIDE
  * (each slot is the same 10-byte `mov eax,i; jmp gate` thunk an IAT import gets).
  * C18a: the shim count crossed ~300 (SQLite's CRT breadth), so the shim region is
- * now 2 pages (0x2000) and the procaddr table starts at the 2nd page (0x1000):
- * per-import thunks get 0x200..0x1000 (~358) and the procaddr table 0x1000..0x2000
- * (~409) -- both bounds are checked in pe_loader.c. */
+ * now 2 pages (0x2000) and the procaddr table starts at the 2nd page (0x1000).
+ * W1 (docs/roadmap-2026-11.md): an import of a shimmed function binds STRAIGHT to
+ * that shim's procaddr slot -- one thunk per function, shared by every importer --
+ * so the old per-import thunk area (0x200..0xE00) is unused and the procaddr table
+ * may fill pages 1-3 (0x1000..0x4000, up to 1228 shims; the bound is checked in
+ * pe_loader.c). */
 #define WIN32_PROCADDR_BASE_VA   0x0000000030001000ULL
 #define WIN32_PROCADDR_STRIDE    10
+
+/* W1: the shim area is 6 pages. Pages 4-5 hold the MISSING-IMPORT stubs: an import
+ * no shim implements binds to a 20-byte stub
+ *     mov rcx, <user VA of its "DLL!function" text> ; mov eax, <__toby_missing> ;
+ *     jmp gate
+ * at WIN32_MISSING_STUB_VA + n*20, its text at WIN32_MISSING_NAMES_VA.. . The shim
+ * reports the name and ends the process with STATUS_ENTRYPOINT_NOT_FOUND instead
+ * of the call jumping to address 0. Stub 0 is the shared fallback for when either
+ * area is full. */
+#define WIN32_SHIM_PAGES         6u
+#define WIN32_MISSING_STUB_VA    0x0000000030004000ULL
+#define WIN32_MISSING_STUB_SIZE  20
+#define WIN32_MISSING_NAMES_VA   0x0000000030005000ULL
+#define WIN32_MISSING_END_VA     0x0000000030006000ULL
+#define WIN32_STATUS_ENTRYPOINT_NOT_FOUND 0xC0000139u
 
 /* Resolve "dll!func" to the kernel-side Win32 shim index used to bind an
  * IAT thunk (case-insensitive dll match, exact func match). Returns the

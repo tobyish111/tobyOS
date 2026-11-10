@@ -18674,6 +18674,30 @@ static long w32_one (uint64_t *a) { (void)a; return 1; }
 static long w32_exit (uint64_t *a) { proc_exit_group((int)(uint32_t)a[0]); return 0; }
 static long w32_abort(uint64_t *a) { (void)a; proc_exit_group(3); return 0; }
 
+/* W1 (docs/roadmap-2026-11.md): every import no shim implements is bound by
+ * the loader to a stub that lands here with a[0] = the user VA of its
+ * "DLL!function" text (pe_loader.c, pe_missing_stub). Windows refuses to
+ * start such a program (STATUS_ENTRYPOINT_NOT_FOUND); tobyOS finds out at the
+ * call, so it names the function -- on the program's stderr and in the kernel
+ * log -- and ends the whole process with that status. Before W1 the IAT slot
+ * was 0 and the call jumped to address 0. */
+static long w32_toby_missing(uint64_t *a) {
+    char name[128];
+    if (strncpy_from_user(name, (const char *)(uintptr_t)a[0], sizeof(name)) < 0)
+        memcpy(name, "an import", sizeof("an import"));
+    struct proc *p = current_proc();
+    const char *prog = p ? p->name : "?";
+    kprintf("[pe] unimplemented import called: %s (pid %d '%s')\n",
+            name, p ? p->pid : -1, prog);
+    char msg[256];
+    int n = ksnprintf(msg, sizeof(msg), "%s: %s is not implemented by tobyOS\n",
+                      prog, name);
+    if (n > (int)sizeof(msg) - 1) n = (int)sizeof(msg) - 1;
+    if (n > 0) (void)win32_fd_write(2, msg, (size_t)n);
+    proc_exit_group((int)WIN32_STATUS_ENTRYPOINT_NOT_FOUND);
+    return 0;       /* unreached */
+}
+
 /* The Win32 process heap: a per-proc bump allocator over anonymous user
  * memory (sys_mmap). Never reclaims (free() is a no-op), so every block is
  * fresh + zeroed -- which also makes calloc == malloc. */
@@ -25026,6 +25050,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "ole32.dll", "__toby_com_AddRef",         w32_com_AddRef },
     { "ole32.dll", "__toby_com_Release",        w32_com_Release },
     { "ole32.dll", "__toby_com_Add",            w32_com_Add },
+    /* W1: the missing-import stubs' target (pe_loader.c); never a real export. */
+    { "kernel32.dll", "__toby_missing",         w32_toby_missing },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 
