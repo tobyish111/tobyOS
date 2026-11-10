@@ -651,6 +651,32 @@ static void mmap_free_batch_push(struct mmap_free_batch *b, uint64_t phys) {
     cgroup_mem_uncharge(b->owner, 1);           /* slice 16 */
 }
 
+/* W4 (Track C, FreeLibrary -- src/pe_loader.c): unmap [addr, addr+len) of the
+ * CURRENT process and free the frames, for pages the PE loader mapped itself
+ * (pe_map_user: pmm_alloc_page + vmm_map, no VMA, never charged to a cgroup --
+ * hence the batch's NULL owner, so nothing is uncharged). The frames go back
+ * through the batch above, so none is reissued before the TLB shootdown; a
+ * frame a fork sibling still shares is only dropped. No VMA is touched, and no
+ * caller outside the PE loader uses it. */
+void mmap_unmap_loader_pages(uint64_t addr, uint64_t len) {
+    struct proc *p = current_proc();
+    if (!p || len == 0) return;
+    addr = page_align_down(addr);
+    len  = page_align_up(len);
+    struct mmap_free_batch fb = { .n = 0, .owner = NULL };
+    uint64_t saved_root = vmm_set_editor_root(p->cr3);
+    for (uint64_t a = addr; a < addr + len; a += PAGE_SIZE) {
+        uint64_t phys = vmm_translate(a);
+        if (!phys) continue;
+        vmm_unmap(a, PAGE_SIZE);
+        phys &= PAGE_MASK;
+        if (page_ref_dec_old(phys) <= 1)
+            mmap_free_batch_push(&fb, phys);
+    }
+    vmm_set_editor_root(saved_root);
+    mmap_free_batch_flush(&fb);                 /* shootdown, THEN free */
+}
+
 /* ---- page reclaim: evict private-anonymous pages to swap ----------------
  *
  * This lives in mmap.c ON PURPOSE. Eviction ends in "clear a live PTE and

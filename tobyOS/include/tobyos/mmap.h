@@ -37,6 +37,10 @@ long sys_mprotect2(uint64_t addr, size_t length, int prot);
  * the VMA stays and the next touch demand-faults a fresh zero page. */
 long sys_madvise_dontneed(uint64_t addr, uint64_t len);
 long sys_brk2(uint64_t new_brk);
+/* W4 (Track C): unmap [addr, addr+len) of the current process -- pages the PE
+ * loader mapped itself, outside any VMA (FreeLibrary) -- and free their frames
+ * after the TLB shootdown, as munmap does. */
+void mmap_unmap_loader_pages(uint64_t addr, uint64_t len);
 
 /* Process lifecycle hooks */
 void mmap2_init_proc(int pid);
