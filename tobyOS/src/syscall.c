@@ -18241,6 +18241,26 @@ static long win32_fd_write(int fd, const char *buf, size_t len) {
     return file_write(f, buf, len);
 }
 
+/* W2: GetLastError's value lives in each THREAD's TEB at 0x68 (LastErrorValue,
+ * where Windows x64 keeps it), reached through the calling thread's GS base --
+ * every Win32 thread has its own TEB (C16e), the main thread's is
+ * WIN32_TEB_BASE. Before W2 it was one kernel global shared by every thread of
+ * every Windows process, so a worker's error overwrote its main thread's, and
+ * one program's overwrote another's. */
+#define WIN32_TEB_LASTERR_OFF 0x68
+static void win32_set_last_error(uint32_t code) {
+    struct proc *p = current_proc();
+    if (!p || !p->gs_base) return;
+    (void)copy_to_user((void *)(uintptr_t)(p->gs_base + WIN32_TEB_LASTERR_OFF), &code, 4);
+}
+static uint32_t win32_get_last_error(void) {
+    struct proc *p = current_proc();
+    uint32_t code = 0;
+    if (p && p->gs_base)
+        (void)copy_from_user(&code, (const void *)(uintptr_t)(p->gs_base + WIN32_TEB_LASTERR_OFF), 4);
+    return code;
+}
+
 /* C23: UTF-16 (user) -> narrow (kernel) string, defined later; the printf
  * core uses it for %ls/%S. */
 static int win32_wstr_to_k(uint64_t uwide, char *out, int cap);
@@ -23286,10 +23306,9 @@ static long w32_ExpandEnvironmentStringsA(uint64_t *a) {
 #define WSAHOST_NOT_FOUND_ 11001
 
 static int g_wsa_lasterror = 0;
-/* C18a: the Win32 thread-last-error (GetLastError/SetLastError). Set by file
- * shims so SQLite's winAccess can tell ERROR_FILE_NOT_FOUND apart from a real
- * I/O error. Defined here (early) so the wide-file shims below can set it. */
-static uint32_t g_win32_lasterr = 0;
+/* C18a: the Win32 last-error codes the file shims set (so SQLite's winAccess
+ * can tell ERROR_FILE_NOT_FOUND apart from a real I/O error). W2: the value is
+ * per thread, in the TEB -- win32_set_last_error, up by win32_fd_write. */
 #define WIN32_ERR_FILE_NOT_FOUND 2u
 #define WIN32_ERR_ALREADY_EXISTS 183u
 
@@ -23689,8 +23708,8 @@ static long w32_GetFileAttributesW(uint64_t *a) {
     char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0], wp, sizeof(wp));
     char kp[ABI_PATH_MAX]; win32_xlate_winpath(wp, kp, sizeof(kp));
     struct vfs_stat vs;
-    if (vfs_stat(kp, &vs) != VFS_OK) { g_win32_lasterr = WIN32_ERR_FILE_NOT_FOUND; return (long)0xFFFFFFFFu; }
-    g_win32_lasterr = 0;
+    if (vfs_stat(kp, &vs) != VFS_OK) { win32_set_last_error(WIN32_ERR_FILE_NOT_FOUND); return (long)0xFFFFFFFFu; }
+    win32_set_last_error(0);
     return (vs.type == VFS_TYPE_DIR) ? 0x10 : 0x80;
 }
 /* GetFileAttributesExW(name, infoLevel, lpFileInformation) ->
@@ -23699,14 +23718,14 @@ static long w32_GetFileAttributesExW(uint64_t *a) {
     char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0], wp, sizeof(wp));
     char kp[ABI_PATH_MAX]; win32_xlate_winpath(wp, kp, sizeof(kp));
     struct vfs_stat vs;
-    if (vfs_stat(kp, &vs) != VFS_OK) { g_win32_lasterr = WIN32_ERR_FILE_NOT_FOUND; return 0; }
+    if (vfs_stat(kp, &vs) != VFS_OK) { win32_set_last_error(WIN32_ERR_FILE_NOT_FOUND); return 0; }
     uint8_t b[36]; memset(b, 0, sizeof(b));
     uint32_t attr = (vs.type == VFS_TYPE_DIR) ? 0x10u : 0x80u;
     memcpy(&b[0], &attr, 4);
     uint32_t szlo = (uint32_t)vs.size, szhi = (uint32_t)(vs.size >> 32);
     memcpy(&b[28], &szhi, 4); memcpy(&b[32], &szlo, 4);
     (void)copy_to_user((void *)(uintptr_t)a[2], b, sizeof(b));
-    g_win32_lasterr = 0;
+    win32_set_last_error(0);
     return 1;
 }
 static long w32_DeleteFileW(uint64_t *a) {
@@ -24380,9 +24399,9 @@ static long w32_GetDiskFreeSpaceW(uint64_t *a){return w32_GetDiskFreeSpaceA(a);}
 static long w32_SetFileTime(uint64_t *a){(void)a;return 1;}
 /* Real GetLastError/SetLastError (was a 0 stub). SQLite's winOpen/winAccess read
  * it to distinguish created-vs-existing files and ERROR_FILE_NOT_FOUND from a
- * real I/O error. (g_win32_lasterr is defined up by g_wsa_lasterror.) */
-static long w32_GetLastError(uint64_t *a){(void)a;return (long)g_win32_lasterr;}
-static long w32_SetLastError(uint64_t *a){g_win32_lasterr=(uint32_t)a[0];return 0;}
+ * real I/O error. W2: the value is the calling thread's (TEB 0x68). */
+static long w32_GetLastError(uint64_t *a){(void)a;return (long)win32_get_last_error();}
+static long w32_SetLastError(uint64_t *a){win32_set_last_error((uint32_t)a[0]);return 0;}
 
 /* ================= C19c: minimal COM / ole32 (TIGHTLY SCOPED) =================
  * A DELIBERATELY NARROW slice -- NOT a real COM runtime. tobyOS supports exactly
