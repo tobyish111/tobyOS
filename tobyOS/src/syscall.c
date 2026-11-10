@@ -22779,19 +22779,48 @@ static long w32_LoadLibraryA(uint64_t *a) { return w32_GetModuleHandleA(a); }
  * require()d, which resolves to NULL here -- pure-Lua require still works.) */
 static long w32_LoadLibraryExA(uint64_t *a) { return w32_GetModuleHandleA(a); }
 
-/* kernel32!GetModuleFileNameA(hModule, lpFilename, nSize) -> length. Returns the
- * running PE's path; Lua's package lib calls this to derive the default
- * package.path/cpath prefix. (C19b) */
-static long w32_GetModuleFileNameA(uint64_t *a) {
-    uint64_t buf = a[1]; uint32_t cap = (uint32_t)a[2];
-    if (!buf || !cap) return 0;
-    const char *path = "C:\\win-lua.exe";
-    uint32_t n = 0; while (path[n]) n++;
-    if (n > cap - 1) n = cap - 1;
-    if (copy_to_user((void *)(uintptr_t)buf, path, n) != 0) return 0;
-    char z = 0; (void)copy_to_user((void *)(uintptr_t)(buf + n), &z, 1);
-    return (long)n;
+static int win32_k_to_wstr(uint64_t uwide, const char *s, int cap);   /* defined with the wide shims */
+
+/* kernel32!GetModuleFileNameA/W(hModule, lpFilename, nSize) -> DWORD. W2: the
+ * module's real path in its Windows form -- the .exe's (hModule NULL or its
+ * base) from the path it was started by, a built-in DLL's under
+ * C:\Windows\System32. A name that does not fit is cut to nSize-1 characters
+ * and its NUL, the call returns nSize and sets ERROR_INSUFFICIENT_BUFFER, as
+ * Microsoft documents; an unknown module is ERROR_MOD_NOT_FOUND. Before W2
+ * every program was "C:\win-lua.exe" (the name C19b's Lua happened to need),
+ * and the W form did not exist. Lua's package library derives its default
+ * paths from it. */
+static long win32_module_file_name(uint64_t *a, bool wide) {
+    uint64_t hmod = a[0], buf = a[1];
+    uint32_t cap = (uint32_t)a[2];
+    struct proc *p = current_proc();
+    struct proc *lead = (p && p->is_thread) ? proc_lookup(p->tgid) : p;
+    char name[ABI_PATH_MAX];
+    int n = -1;
+    if (hmod == 0 || (lead && hmod == lead->win_image_base)) {
+        if (lead && lead->exe_path[0])
+            n = win32_k_to_winpath(lead->exe_path, name, sizeof name);
+    } else if ((hmod & WIN32_HMODULE_MASK) == WIN32_HMODULE_TAG) {
+        const char *dll = win32_shim_dll((int)(uint32_t)(hmod & 0xFFFFFFFFu));
+        if (dll) {
+            n = ksnprintf(name, sizeof name, "C:\\Windows\\System32\\%s", dll);
+            if (n >= (int)sizeof name) n = -1;
+        }
+    }
+    if (n < 0) { win32_set_last_error(126 /* ERROR_MOD_NOT_FOUND */); return 0; }
+    if (!buf || cap == 0) { win32_set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */); return 0; }
+    bool cut = (uint32_t)n >= cap;
+    if (cut) {                                    /* cut to nSize-1 + NUL */
+        name[cap - 1] = '\0';
+        n = (int)cap - 1;
+        win32_set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */);
+    }
+    if (wide) (void)win32_k_to_wstr(buf, name, (int)cap);
+    else if (copy_to_user((void *)(uintptr_t)buf, name, (size_t)n + 1) != 0) return 0;
+    return cut ? (long)cap : (long)n;
 }
+static long w32_GetModuleFileNameA(uint64_t *a) { return win32_module_file_name(a, false); }
+static long w32_GetModuleFileNameW(uint64_t *a) { return win32_module_file_name(a, true); }
 
 /* kernel32!FreeLibrary(hModule) -> TRUE (no real DLL refcount to drop). */
 static long w32_FreeLibrary(uint64_t *a) { (void)a; return 1; }
@@ -25290,6 +25319,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetCurrentDirectoryA",   w32_GetCurrentDirectoryA },
     { "kernel32.dll", "GetCurrentDirectoryW",   w32_GetCurrentDirectoryW },
     { "kernel32.dll", "SetCurrentDirectoryA",   w32_SetCurrentDirectoryA },
+    { "kernel32.dll", "GetModuleFileNameW",     w32_GetModuleFileNameW },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 
