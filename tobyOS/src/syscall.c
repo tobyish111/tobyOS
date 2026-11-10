@@ -22538,12 +22538,19 @@ static long w32_GetCurrentProcessId(uint64_t *a) {
     return p ? (long)(p->is_thread ? p->tgid : p->pid) : 0;
 }
 
-/* kernel32!GetModuleHandleA(name) -> HMODULE. NULL name = this module (the
- * exe's ImageBase). A named DLL we provide -> a tagged handle carrying a shim
- * index that maps back to the DLL name; an unknown DLL -> NULL. */
+/* kernel32!GetModuleHandleA(name) -> HMODULE. NULL name = this module: the
+ * .exe's base AS LOADED (W1: a DYNAMIC_BASE .exe -- every default clang/mingw
+ * link -- is slid by C24, and this returned the fixed preferred base
+ * 0x140000000). A named DLL we provide -> a tagged handle carrying a shim index
+ * that maps back to the DLL name; an unknown DLL -> NULL. */
 static long w32_GetModuleHandleA(uint64_t *a) {
     uint64_t name = a[0];
-    if (name == 0) return (long)WIN32_PE_IMAGE_BASE;
+    if (name == 0) {
+        struct proc *p = current_proc();
+        struct proc *lead = (p && p->is_thread) ? proc_lookup(p->tgid) : p;
+        if (lead && lead->win_image_base) return (long)lead->win_image_base;
+        return (long)WIN32_PE_IMAGE_BASE;
+    }
     char dll[64];
     if (strncpy_from_user(dll, (const char *)(uintptr_t)name, sizeof(dll)) < 0)
         return 0;
