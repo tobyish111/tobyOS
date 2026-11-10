@@ -19020,6 +19020,185 @@ static long w32_wcsrchr(uint64_t *a) {
  * O_* + sys_open; ReadFile/WriteFile/CloseHandle forward to sys_read/write/
  * close. */
 
+/* ===== W2: Windows paths (docs/roadmap-2026-11.md) ==========================
+ * ONE translation from a Windows path to a tobyOS path, used by every shim that
+ * takes a path, and one back. The forms are the ones Microsoft documents ("File
+ * path formats on Windows systems"):
+ *   X:\a\b         drive-absolute           X:a\b   drive-relative
+ *   \a\b           root-relative: the current drive's root
+ *   a\b .\a ..\a   relative to the current directory
+ *   \\?\X:\a  \\.\X:\a   DOS device paths to a drive: the prefix is dropped
+ *   \\server\share\...   UNC: there is no network redirector (ERROR_BAD_NETPATH)
+ * '/' and '\' both separate and repeated separators collapse; "." and ".."
+ * segments resolve (".." stops at the drive's root); a last segment loses its
+ * trailing periods and spaces (not under \\?\); the drive letter is
+ * case-insensitive.
+ * Drives: C: is /data, the writable volume every existing program uses; Z: is
+ * the whole tree (/), as Wine maps it; any other letter is no drive
+ * (ERROR_PATH_NOT_FOUND). The current directory is the process's own working
+ * directory (p->cwd) seen through the same table -- under /data it is on C:,
+ * anywhere else on Z: -- so a Windows program and the Linux or native program
+ * that started it agree on where they are.
+ * The reserved name NUL -- alone or with an extension, in any directory, any
+ * case, not under \\?\ -- is /dev/null.
+ * Before W2 three copies of an inline translation mapped EVERY drive letter to
+ * /data, left a relative path relative (so the kernel-side VFS calls, which
+ * take absolute paths, missed it), and sent \foo to tobyOS's /foo. */
+#define WIN32_ERR_FILE_NOT_FOUND      2u     /* (also defined with the wide shims) */
+#define WIN32_ERR_PATH_NOT_FOUND      3u
+#define WIN32_ERR_BAD_NETPATH         53u
+#define WIN32_ERR_FILENAME_EXCED_RANGE 206u
+#define WIN32_ERR_DIRECTORY           267u
+
+static bool win32_is_sep(char c) { return c == '\\' || c == '/'; }
+static bool win32_is_letter(char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
+static char win32_upper(char c) { return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
+
+/* A tobyOS absolute path in its Windows form: under /data on C:, else on Z:.
+ * Returns the length, or -1 if it does not fit. */
+static int win32_k_to_winpath(const char *kpath, char *out, int cap) {
+    const char *rest = kpath;
+    char drive = 'Z';
+    if (strncmp(kpath, "/data", 5) == 0 && (kpath[5] == '\0' || kpath[5] == '/')) {
+        drive = 'C';
+        rest = kpath + 5;
+    }
+    if (cap < 4) return -1;
+    int n = 0;
+    out[n++] = drive; out[n++] = ':'; out[n++] = '\\';
+    while (*rest == '/') rest++;
+    for (; *rest; rest++) {
+        if (n >= cap - 1) return -1;
+        out[n++] = (*rest == '/') ? '\\' : *rest;
+    }
+    if (n > 3 && out[n - 1] == '\\') n--;
+    out[n] = '\0';
+    return n;
+}
+
+/* The current directory in its Windows form. */
+static int win32_cwd_winpath(char *out, int cap) {
+    struct proc *p = current_proc();
+    return win32_k_to_winpath((p && p->cwd[0]) ? p->cwd : "/", out, cap);
+}
+
+/* Append the segments of `p` (up to NUL) to the normalized path `out` (the part
+ * after "X:", "" for the root, each segment as "\seg"), resolving "." and "..".
+ * `trim_last`: drop the last segment's trailing periods and spaces when `p`
+ * does not end in a separator. Returns the new length, or -1 if it overflows. */
+static int win32_path_push(char *out, int n, int cap, const char *p, bool trim_last) {
+    while (*p) {
+        while (win32_is_sep(*p)) p++;
+        if (!*p) break;
+        const char *seg = p;
+        while (*p && !win32_is_sep(*p)) p++;
+        int len = (int)(p - seg);
+        bool last = (*p == '\0');
+        if (len == 1 && seg[0] == '.') continue;
+        if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            while (n > 0 && out[n - 1] != '\\') n--;
+            if (n > 0) n--;                      /* the '\' itself */
+            continue;
+        }
+        if (last && trim_last)
+            while (len > 0 && (seg[len - 1] == '.' || seg[len - 1] == ' ')) len--;
+        if (len == 0) continue;
+        if (n + 1 + len >= cap) return -1;
+        out[n++] = '\\';
+        memcpy(out + n, seg, (size_t)len);
+        n += len;
+    }
+    out[n] = '\0';
+    return n;
+}
+
+/* A Windows path -> its full, normalized Windows form "X:\a\b" in `full` (the
+ * drive is NOT checked: GetFullPathName names any letter). *verbatim says it
+ * came as \\?\. Returns the length, or -(Win32 error). */
+static int win32_path_full(const char *wpath, char *full, int cap, bool *verbatim) {
+    const char *s = wpath;
+    *verbatim = false;
+    if (!s[0]) return -(int)WIN32_ERR_PATH_NOT_FOUND;
+    if (win32_is_sep(s[0]) && win32_is_sep(s[1]) && (s[2] == '?' || s[2] == '.') &&
+        win32_is_sep(s[3])) {
+        *verbatim = (s[2] == '?');
+        s += 4;
+        if (!(win32_is_letter(s[0]) && s[1] == ':'))
+            return -(int)WIN32_ERR_PATH_NOT_FOUND;   /* a device, not a drive */
+    } else if (win32_is_sep(s[0]) && win32_is_sep(s[1])) {
+        return -(int)WIN32_ERR_BAD_NETPATH;          /* \\server\share */
+    }
+    char cw[ABI_PATH_MAX];
+    int cn = win32_cwd_winpath(cw, sizeof cw);
+    if (cn < 0) return -(int)WIN32_ERR_FILENAME_EXCED_RANGE;
+    if (cap < 4) return -(int)WIN32_ERR_FILENAME_EXCED_RANGE;
+    char drive;
+    const char *base = "";                  /* the directory the path starts in */
+    if (win32_is_letter(s[0]) && s[1] == ':') {
+        drive = win32_upper(s[0]);
+        if (!win32_is_sep(s[2]) && drive == cw[0]) base = cw + 2;   /* X:rel on the current drive */
+        s += 2;
+    } else {
+        drive = cw[0];
+        if (!win32_is_sep(s[0])) base = cw + 2;                     /* plain relative */
+    }
+    full[0] = drive; full[1] = ':';
+    int n = win32_path_push(full + 2, 0, cap - 2, base, false);
+    if (n >= 0) n = win32_path_push(full + 2, n, cap - 2, s, !*verbatim);
+    if (n < 0 || n + 3 >= cap) return -(int)WIN32_ERR_FILENAME_EXCED_RANGE;
+    if (n == 0) { full[2] = '\\'; full[3] = '\0'; return 3; }
+    return n + 2;
+}
+
+/* "NUL" or "NUL.<ext>", any case: the reserved null device. */
+static bool win32_is_nul_segment(const char *seg) {
+    return (seg[0] | 0x20) == 'n' && (seg[1] | 0x20) == 'u' && (seg[2] | 0x20) == 'l' &&
+           (seg[3] == '\0' || seg[3] == '.');
+}
+
+/* A full Windows path (from win32_path_full) -> the tobyOS path. Returns its
+ * length, or -(Win32 error) for a letter that is no drive. */
+static int win32_path_map(const char *full, bool verbatim, char *kp, int cap) {
+    if (!verbatim) {
+        const char *last = full + 2;
+        for (const char *q = full + 2; *q; q++) if (*q == '\\') last = q + 1;
+        if (*last && win32_is_nul_segment(last)) {
+            memcpy(kp, "/dev/null", 10);
+            return 9;
+        }
+    }
+    const char *prefix;
+    if (full[0] == 'C') prefix = "/data";
+    else if (full[0] == 'Z') prefix = "";
+    else return -(int)WIN32_ERR_PATH_NOT_FOUND;
+    int n = 0;
+    for (const char *r = prefix; *r; r++) kp[n++] = *r;
+    const char *rest = full + 2;
+    if (rest[0] == '\\' && rest[1] == '\0') rest++;            /* the drive's root */
+    for (; *rest; rest++) {
+        if (n >= cap - 1) return -(int)WIN32_ERR_FILENAME_EXCED_RANGE;
+        kp[n++] = (*rest == '\\') ? '/' : *rest;
+    }
+    if (n == 0) kp[n++] = '/';                                  /* Z:\ is / */
+    kp[n] = '\0';
+    return n;
+}
+
+/* A Windows path (kernel string) -> an absolute tobyOS path in kp. Returns the
+ * length, or -(Win32 error) with kp = "" and that error set as the calling
+ * thread's last error. */
+static int win32_winpath_to_k(const char *wpath, char *kp, int cap) {
+    char full[ABI_PATH_MAX];
+    bool verbatim;
+    int n = win32_path_full(wpath, full, sizeof full, &verbatim);
+    if (n >= 0) n = win32_path_map(full, verbatim, kp, cap);
+    if (n < 0) {
+        kp[0] = '\0';
+        win32_set_last_error((uint32_t)-n);
+    }
+    return n;
+}
+
 /* kernel32!CreateFileA(name, access, share, sec, disposition, flags, template)
  * -> HANDLE (== fd) or INVALID_HANDLE_VALUE. */
 static long w32_CreateFileA(uint64_t *a) {
@@ -19028,19 +19207,10 @@ static long w32_CreateFileA(uint64_t *a) {
     if (pn < 0) return (long)WIN32_INVALID_HANDLE;
     wpath[sizeof(wpath) - 1] = '\0';
 
-    /* Windows path -> tobyOS path. A drive letter "X:" maps to tobyOS's
-     * writable mount /data (the root ramfs is a read-only initrd), and '\'
-     * becomes '/'. A path with no drive is left relative to the cwd. */
+    /* Windows path -> tobyOS path (W2: the one translation above). */
     char kp[ABI_PATH_MAX];
-    int si = 0, di = 0;
-    if (wpath[0] && wpath[1] == ':') {
-        for (const char *r = "/data"; *r && di < (int)sizeof(kp) - 1; r++) kp[di++] = *r;
-        si = 2;
-        if (wpath[si] != '\\' && wpath[si] != '/' && di < (int)sizeof(kp) - 1) kp[di++] = '/';
-    }
-    for (; wpath[si] && di < (int)sizeof(kp) - 1; si++)
-        kp[di++] = (wpath[si] == '\\') ? '/' : wpath[si];
-    kp[di] = '\0';
+    int di = win32_winpath_to_k(wpath, kp, sizeof kp);
+    if (di < 0) return (long)WIN32_INVALID_HANDLE;
 
     /* Hand sys_open a USER pointer: stage the translated path in the CRT page. */
     uint64_t ubuf = WIN32_CRT_DATA_BASE + WIN32_CRT_PATHBUF;
@@ -21077,22 +21247,15 @@ static long w32_SetPixel(uint64_t *a) {
  * Path-taking ops translate the Windows path; some stage it into the CRT scratch
  * for the user-pointer syscalls, others call the kernel-side VFS directly. */
 
-/* Translate a Windows path into an absolute tobyOS kernel path: a drive letter
- * "X:" -> the writable /data mount, '\' -> '/'. Returns the length, or -1. */
+/* Translate a (user) Windows path into an absolute tobyOS kernel path (W2: the
+ * one translation, win32_winpath_to_k). Returns the length, or -1 with the
+ * last error set. */
 static int win32_translate_path_k(const char *wpath_user, char *kp, int cap) {
     char wpath[ABI_PATH_MAX];
     if (strncpy_from_user(wpath, wpath_user, sizeof(wpath)) < 0) return -1;
     wpath[sizeof(wpath) - 1] = '\0';
-    int si = 0, di = 0;
-    if (wpath[0] && wpath[1] == ':') {
-        for (const char *r = "/data"; *r && di < cap - 1; r++) kp[di++] = *r;
-        si = 2;
-        if (wpath[si] != '\\' && wpath[si] != '/' && di < cap - 1) kp[di++] = '/';
-    }
-    for (; wpath[si] && di < cap - 1; si++)
-        kp[di++] = (wpath[si] == '\\') ? '/' : wpath[si];
-    kp[di] = '\0';
-    return di;
+    int di = win32_winpath_to_k(wpath, kp, cap);
+    return di < 0 ? -1 : di;
 }
 
 /* Translate + stage a Windows path into the CRT-page scratch; returns a USER
@@ -21192,12 +21355,7 @@ static long win32_shell_folder(uint64_t upath, int csidl, int create) {
     if (copy_to_user((void *)(uintptr_t)upath, p, n + 1) != 0) return 0;
     if (create || (csidl & 0x8000)) {      /* CSIDL_FLAG_CREATE */
         char kp[ABI_PATH_MAX];
-        int di = 0;
-        for (const char *r = "/data"; *r; r++) kp[di++] = *r;
-        for (size_t i = 2; i < n && di < (int)sizeof(kp) - 1; i++)   /* skip "C:" */
-            kp[di++] = (p[i] == '\\') ? '/' : p[i];
-        kp[di] = '\0';
-        win32_mkdir_p_k(kp);
+        if (win32_winpath_to_k(p, kp, sizeof kp) > 0) win32_mkdir_p_k(kp);
     }
     return 1;
 }
@@ -21268,7 +21426,10 @@ static long w32_GetFileAttributesA(uint64_t *a) {
     if (win32_translate_path_k((const char *)(uintptr_t)a[0], kp, sizeof(kp)) < 0)
         return (long)0xFFFFFFFFu;
     struct vfs_stat vs;
-    if (vfs_stat(kp, &vs) != VFS_OK) return (long)0xFFFFFFFFu; /* INVALID_FILE_ATTRIBUTES */
+    if (vfs_stat(kp, &vs) != VFS_OK) {            /* INVALID_FILE_ATTRIBUTES */
+        win32_set_last_error(WIN32_ERR_FILE_NOT_FOUND);
+        return (long)0xFFFFFFFFu;
+    }
     return (vs.type == VFS_TYPE_DIR) ? 0x10 /* DIRECTORY */ : 0x80 /* NORMAL */;
 }
 
@@ -23665,18 +23826,11 @@ static long w32_WideCharToMultiByte(uint64_t *a) {
 }
 
 /* ---- wide file APIs (SQLite's WinNT VFS) ---- */
-/* Translate a KERNEL Windows path string ("X:\..") into a tobyOS path (drive ->
- * /data, '\\' -> '/'). Mirrors w32_CreateFileA's inline logic for the W side. */
+/* Translate a KERNEL Windows path string into a tobyOS path for the W side and
+ * the CRT (W2: the one translation, win32_winpath_to_k -- kp is "" and the
+ * last error set when it fails). */
 static int win32_xlate_winpath(const char *wpath, char *kp, int cap) {
-    int si = 0, di = 0;
-    if (wpath[0] && wpath[1] == ':') {
-        for (const char *r = "/data"; *r && di < cap - 1; r++) kp[di++] = *r;
-        si = 2;
-        if (wpath[si] != '\\' && wpath[si] != '/' && di < cap - 1) kp[di++] = '/';
-    }
-    for (; wpath[si] && di < cap - 1; si++) kp[di++] = (wpath[si] == '\\') ? '/' : wpath[si];
-    kp[di] = '\0';
-    return di;
+    return win32_winpath_to_k(wpath, kp, cap);
 }
 /* Open a KERNEL Windows path with the CreateFile access/disposition encoding. */
 static long win32_open_winpath(const char *wpath, uint32_t access, uint32_t disp) {
@@ -23706,7 +23860,8 @@ static long w32_CreateFileW(uint64_t *a) {
 }
 static long w32_GetFileAttributesW(uint64_t *a) {
     char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0], wp, sizeof(wp));
-    char kp[ABI_PATH_MAX]; win32_xlate_winpath(wp, kp, sizeof(kp));
+    char kp[ABI_PATH_MAX];
+    if (win32_xlate_winpath(wp, kp, sizeof(kp)) < 0) return (long)0xFFFFFFFFu;  /* W2: error set */
     struct vfs_stat vs;
     if (vfs_stat(kp, &vs) != VFS_OK) { win32_set_last_error(WIN32_ERR_FILE_NOT_FOUND); return (long)0xFFFFFFFFu; }
     win32_set_last_error(0);
@@ -23716,7 +23871,8 @@ static long w32_GetFileAttributesW(uint64_t *a) {
  * WIN32_FILE_ATTRIBUTE_DATA { DWORD attr; FILETIME c/a/w; DWORD szHi/szLo }. */
 static long w32_GetFileAttributesExW(uint64_t *a) {
     char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0], wp, sizeof(wp));
-    char kp[ABI_PATH_MAX]; win32_xlate_winpath(wp, kp, sizeof(kp));
+    char kp[ABI_PATH_MAX];
+    if (win32_xlate_winpath(wp, kp, sizeof(kp)) < 0) return 0;                  /* W2: error set */
     struct vfs_stat vs;
     if (vfs_stat(kp, &vs) != VFS_OK) { win32_set_last_error(WIN32_ERR_FILE_NOT_FOUND); return 0; }
     uint8_t b[36]; memset(b, 0, sizeof(b));
@@ -23736,35 +23892,95 @@ static long w32_DeleteFileW(uint64_t *a) {
     if (copy_to_user((void *)(uintptr_t)ubuf, kp, (size_t)di + 1) != 0) return 0;
     return (sys_unlink((const char *)(uintptr_t)ubuf) == 0) ? 1 : 0;
 }
-/* GetFullPathNameW(name, nBuf, buf, &filePart): we treat the input as already
- * absolute and copy it through, pointing filePart at the basename. */
-static long w32_GetFullPathNameW(uint64_t *a) {
-    char wp[ABI_PATH_MAX]; int n = win32_wstr_to_k(a[0], wp, sizeof(wp));
-    int cap = (int)(uint32_t)a[1];
-    if (a[2] && cap > 0) {
-        int w = win32_k_to_wstr(a[2], wp, cap) - 1;   /* code units excl NUL */
-        if (a[3]) {                                    /* lpFilePart */
-            int base = 0; for (int i = 0; i < n; i++) if (wp[i] == '\\' || wp[i] == '/') base = i + 1;
-            uint64_t fp = a[2] + (uint64_t)base * 2;
-            (void)copy_to_user((void *)(uintptr_t)a[3], &fp, 8);
-        }
-        (void)w;
-    }
-    return n;                                          /* required/!written length in chars */
-}
-static long w32_GetFullPathNameA(uint64_t *a) {
-    char wp[ABI_PATH_MAX]; (void)strncpy_from_user(wp, (const char *)(uintptr_t)a[0], sizeof(wp));
-    int n = (int)strlen(wp);
-    int cap = (int)(uint32_t)a[1];
-    if (a[2] && cap > 0) {
-        int w = n < cap - 1 ? n : cap - 1;
-        (void)copy_to_user((void *)(uintptr_t)a[2], wp, (size_t)w);
-        char z = 0; (void)copy_to_user((void *)(uintptr_t)(a[2] + w), &z, 1);
-        if (a[3]) { int base = 0; for (int i = 0; i < n; i++) if (wp[i] == '\\' || wp[i] == '/') base = i + 1;
-                    uint64_t fp = a[2] + (uint64_t)base; (void)copy_to_user((void *)(uintptr_t)a[3], &fp, 8); }
-    }
+/* ---- W2: the current directory, full paths, the drive list ----
+ * The string-returning calls below follow Microsoft's buffer contract: when the
+ * string (and its NUL) fits, it is copied and the length WITHOUT the NUL is
+ * returned; when it does not, nothing is copied and the size needed INCLUDING
+ * the NUL is returned. `wide` = the caller's buffer is UTF-16 (counts are in
+ * code units; the wide helpers here are ASCII, one unit per byte). */
+static long win32_put_string(const char *s, int n, uint64_t ubuf, uint32_t cap, bool wide) {
+    if (!ubuf || cap < (uint32_t)n + 1) return n + 1;
+    if (wide) (void)win32_k_to_wstr(ubuf, s, (int)cap);
+    else if (copy_to_user((void *)(uintptr_t)ubuf, s, (size_t)n + 1) != 0) return 0;
     return n;
 }
+
+/* kernel32!GetCurrentDirectoryA/W(nBufferLength, lpBuffer) -> DWORD. Before W2
+ * neither existed (a program importing one could not run past the call). */
+static long win32_get_cwd(uint64_t *a, bool wide) {
+    char cw[ABI_PATH_MAX];
+    int n = win32_cwd_winpath(cw, sizeof cw);
+    if (n < 0) { win32_set_last_error(WIN32_ERR_FILENAME_EXCED_RANGE); return 0; }
+    return win32_put_string(cw, n, a[1], (uint32_t)a[0], wide);
+}
+static long w32_GetCurrentDirectoryA(uint64_t *a) { return win32_get_cwd(a, false); }
+static long w32_GetCurrentDirectoryW(uint64_t *a) { return win32_get_cwd(a, true); }
+
+/* kernel32!SetCurrentDirectoryA/W(lpPathName) -> BOOL: the process's working
+ * directory itself (chdir_kpath), so relative paths -- the shims' and the
+ * kernel's -- and any child it starts see it. A missing directory is
+ * ERROR_FILE_NOT_FOUND (ERROR_PATH_NOT_FOUND when its parent is missing too), a
+ * file is ERROR_DIRECTORY, and the directory does not change. Before W2 the W
+ * form returned TRUE and did nothing, and the A form did not exist. */
+static long win32_set_cwd(const char *wpath) {
+    char kp[ABI_PATH_MAX];
+    if (win32_winpath_to_k(wpath, kp, sizeof kp) < 0) return 0;
+    struct vfs_stat vs;
+    if (vfs_stat(kp, &vs) != VFS_OK) {
+        char parent[ABI_PATH_MAX];
+        int n = (int)strlen(kp);
+        memcpy(parent, kp, (size_t)n + 1);
+        while (n > 1 && parent[n - 1] != '/') n--;
+        parent[n > 1 ? n - 1 : 1] = '\0';
+        win32_set_last_error(vfs_stat(parent, &vs) == VFS_OK ? WIN32_ERR_FILE_NOT_FOUND
+                                                             : WIN32_ERR_PATH_NOT_FOUND);
+        return 0;
+    }
+    if (vs.type != VFS_TYPE_DIR) { win32_set_last_error(WIN32_ERR_DIRECTORY); return 0; }
+    if (chdir_kpath(kp) != 0) { win32_set_last_error(5 /* ERROR_ACCESS_DENIED */); return 0; }
+    return 1;
+}
+static long w32_SetCurrentDirectoryA(uint64_t *a) {
+    char wp[ABI_PATH_MAX];
+    if (strncpy_from_user(wp, (const char *)(uintptr_t)a[0], sizeof wp) < 0) return 0;
+    return win32_set_cwd(wp);
+}
+static long w32_SetCurrentDirectoryW(uint64_t *a) {
+    char wp[ABI_PATH_MAX];
+    win32_wstr_to_k(a[0], wp, sizeof wp);
+    return win32_set_cwd(wp);
+}
+
+/* kernel32!GetFullPathNameA/W(lpFileName, nBufferLength, lpBuffer, lpFilePart)
+ * -> DWORD: the name made absolute against the current directory and
+ * normalized (win32_path_full), with *lpFilePart at its last segment (NULL when
+ * it names a drive's root). The drive is not checked -- the call only computes
+ * a name. Before W2 both copied the input through unchanged. */
+static long win32_full_path(const char *wp, uint64_t *a, bool wide) {
+    char full[ABI_PATH_MAX];
+    bool verbatim;
+    int n = win32_path_full(wp, full, sizeof full, &verbatim);
+    if (n < 0) { win32_set_last_error((uint32_t)-n); return 0; }
+    long r = win32_put_string(full, n, a[2], (uint32_t)a[1], wide);
+    if (r == n && a[3]) {                          /* copied: point lpFilePart */
+        int base = 0;
+        for (int i = 0; i < n; i++) if (full[i] == '\\') base = i + 1;
+        uint64_t fp = (base < n) ? a[2] + (uint64_t)base * (wide ? 2 : 1) : 0;
+        (void)copy_to_user((void *)(uintptr_t)a[3], &fp, 8);
+    }
+    return r;
+}
+static long w32_GetFullPathNameW(uint64_t *a) {
+    char wp[ABI_PATH_MAX];
+    win32_wstr_to_k(a[0], wp, sizeof(wp));
+    return win32_full_path(wp, a, true);
+}
+static long w32_GetFullPathNameA(uint64_t *a) {
+    char wp[ABI_PATH_MAX];
+    if (strncpy_from_user(wp, (const char *)(uintptr_t)a[0], sizeof(wp)) < 0) return 0;
+    return win32_full_path(wp, a, false);
+}
+
 /* GetTempPathW/A -> "C:\\" (maps to /data). Returns length in chars. */
 static long w32_GetTempPathW(uint64_t *a) {
     int cap = (int)(uint32_t)a[0];
@@ -23776,7 +23992,6 @@ static long w32_GetTempPathA(uint64_t *a) {
     if (a[1] && cap >= 4) { (void)copy_to_user((void *)(uintptr_t)a[1], "C:\\", 4); }
     return 3;
 }
-static long w32_SetCurrentDirectoryW(uint64_t *a) { (void)a; return 1; }
 static long w32_FindFirstFileW(uint64_t *a) { (void)a; g_wsa_lasterror = 2; return (long)WIN32_INVALID_HANDLE; }
 /* GetFileType(h): real fds -> DISK(1); std handles -> CHAR(2). */
 static long w32_GetFileType(uint64_t *a) { return ((int)a[0] < 3) ? 2 : 1; }
@@ -25071,6 +25286,10 @@ static const struct win32_shim g_win32_shims[] = {
     { "ole32.dll", "__toby_com_Add",            w32_com_Add },
     /* W1: the missing-import stubs' target (pe_loader.c); never a real export. */
     { "kernel32.dll", "__toby_missing",         w32_toby_missing },
+    /* W2 (docs/roadmap-2026-11.md). */
+    { "kernel32.dll", "GetCurrentDirectoryA",   w32_GetCurrentDirectoryA },
+    { "kernel32.dll", "GetCurrentDirectoryW",   w32_GetCurrentDirectoryW },
+    { "kernel32.dll", "SetCurrentDirectoryA",   w32_SetCurrentDirectoryA },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 
