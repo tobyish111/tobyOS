@@ -2527,6 +2527,23 @@ $(W28)/dll28m.dll: $(W28)/dll28m.c
 $(W28)/libdll28m.a: $(W28)/dll28m.dll
 $(W28)/win-dllm28.exe: $(W28)/mainm.c $(W28)/libdll28m.a
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $(W28)/mainm.c -L$(W28) -ldll28m
+# Track C/W4: DLLs at run time. win-plug29.exe imports no DLL from disk; it
+# LoadLibrary's plug29a.dll from beside it (/bin; plug29a.def exports
+# plug_secret by ordinal only) and, from /bin/plug29/, plug29b.dll (which
+# imports plug29c.dll from that directory), plug29f.dll (DllMain fails) and
+# notpe.dll (a text file, not an image). Exit 29.
+W29 := programs/win-plug29
+$(W29)/plug29a.dll: $(W29)/plug29a.c $(W29)/plug29a.def
+	$(CC) --target=x86_64-w64-mingw32 -O1 -shared -o $@ $(W29)/plug29a.c $(W29)/plug29a.def
+$(W29)/plug29c.dll: $(W29)/plug29c.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -shared -o $@ $< -Wl,--out-implib,$(W29)/libplug29c.a
+$(W29)/libplug29c.a: $(W29)/plug29c.dll
+$(W29)/plug29b.dll: $(W29)/plug29b.c $(W29)/libplug29c.a
+	$(CC) --target=x86_64-w64-mingw32 -O1 -shared -o $@ $(W29)/plug29b.c -L$(W29) -lplug29c
+$(W29)/plug29f.dll: $(W29)/plug29f.c $(W29)/libplug29c.a
+	$(CC) --target=x86_64-w64-mingw32 -O1 -shared -o $@ $(W29)/plug29f.c -L$(W29) -lplug29c
+$(W29)/win-plug29.exe: $(W29)/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
 
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
@@ -3054,6 +3071,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-dll28/win-dllf28.exe \
                programs/win-dll28/dll28f.dll \
                programs/win-dll28/win-dllm28.exe \
+               programs/win-plug29/win-plug29.exe \
+               programs/win-plug29/plug29a.dll \
+               programs/win-plug29/plug29b.dll \
+               programs/win-plug29/plug29c.dll \
+               programs/win-plug29/plug29f.dll \
+               programs/win-plug29/notpe.txt \
                programs/win-xprod/win-xprod.exe \
                programs/win-xcons/win-xcons.exe \
                programs/win-xfilter/win-xfilter.exe \
@@ -3230,6 +3253,13 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-dll28/win-dllf28.exe              $(INITRD_STAGE)/bin/win-dllf28.exe
 	cp programs/win-dll28/dll28f.dll                  $(INITRD_STAGE)/bin/dll28f.dll
 	cp programs/win-dll28/win-dllm28.exe              $(INITRD_STAGE)/bin/win-dllm28.exe
+	mkdir -p $(INITRD_STAGE)/bin/plug29
+	cp programs/win-plug29/win-plug29.exe            $(INITRD_STAGE)/bin/win-plug29.exe
+	cp programs/win-plug29/plug29a.dll               $(INITRD_STAGE)/bin/plug29a.dll
+	cp programs/win-plug29/plug29b.dll               $(INITRD_STAGE)/bin/plug29/plug29b.dll
+	cp programs/win-plug29/plug29c.dll               $(INITRD_STAGE)/bin/plug29/plug29c.dll
+	cp programs/win-plug29/plug29f.dll               $(INITRD_STAGE)/bin/plug29/plug29f.dll
+	cp programs/win-plug29/notpe.txt                 $(INITRD_STAGE)/bin/plug29/notpe.dll
 	cp programs/win-xprod/win-xprod.exe               $(INITRD_STAGE)/bin/win-xprod.exe
 	cp programs/win-xcons/win-xcons.exe               $(INITRD_STAGE)/bin/win-xcons.exe
 	cp programs/win-xfilter/win-xfilter.exe           $(INITRD_STAGE)/bin/win-xfilter.exe
@@ -4222,6 +4252,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-path27.exe bin/win-lerr27.exe                         \
 	    bin/win-dll28.exe bin/dll28b.dll bin/dll28c.dll               \
 	    bin/win-dllf28.exe bin/dll28f.dll bin/win-dllm28.exe          \
+	    bin/win-plug29.exe bin/plug29a.dll bin/plug29/plug29b.dll      \
+	    bin/plug29/plug29c.dll bin/plug29/plug29f.dll bin/plug29/notpe.dll \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \

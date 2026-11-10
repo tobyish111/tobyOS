@@ -1,0 +1,2 @@
+win-plug29 (Track C, W4) loads this file as /bin/plug29/notpe.dll. It is not
+a PE image, so LoadLibrary must fail with ERROR_BAD_EXE_FORMAT.

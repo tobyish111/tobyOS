@@ -1,0 +1,8 @@
+EXPORTS
+    plug_name
+    plug_add
+    plug_attaches
+    plug_hinst
+    plug_reserved
+    plug_on_detach
+    plug_secret @5 NONAME

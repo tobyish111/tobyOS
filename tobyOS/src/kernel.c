@@ -7744,9 +7744,14 @@ void _start(void) {
 
 #if defined(WINPE26A_BOOT) || defined(WINPE26B_BOOT) || defined(WINPE26C_BOOT) || \
     defined(WINPE27A_BOOT) || defined(WINPE27B_BOOT) || defined(WINPE28A_BOOT) || \
-    defined(WINPE28B_BOOT) || defined(WINPE28C_BOOT)
+    defined(WINPE28B_BOOT) || defined(WINPE28C_BOOT) || defined(WINPE29A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
-     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W3:
+     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W4:
+     *   29A /bin/win-plug29.exe: LoadLibrary/GetProcAddress/GetModuleHandle/
+     *       GetModuleFileName/FreeLibrary on DLLs from disk -- search order and
+     *       its flags, DllMain arguments and order, reference counts, unload,
+     *       a failing DllMain, the documented errors (25 checks), exit 29.
+     * W3:
      *   28A /bin/win-dll28.exe: imports from /bin/dll28b.dll and dll28c.dll --
      *       DllMain order, a forwarder, an ordinal import, a relocated DLL; 28.
      *   28B /bin/win-dllf28.exe: dll28f's DllMain fails -> 0xC0000142.
@@ -7795,6 +7800,10 @@ void _start(void) {
 #ifdef WINPE28C_BOOT
             { "WINPE28C", "/bin/win-dllm28.exe", "win-dllm28.exe", (int)0xC0000135u,
               "a DLL that is not on disk stops the process before main" },
+#endif
+#ifdef WINPE29A_BOOT
+            { "WINPE29A", "/bin/win-plug29.exe", "win-plug29.exe", 29,
+              "DLLs at run time: LoadLibrary, GetProcAddress, FreeLibrary (25 checks)" },
 #endif
         };
         win32_gui_set_log(true);
