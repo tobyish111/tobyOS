@@ -6892,15 +6892,38 @@ void _start(void) {
         if (fpid < 0) {
             kprintf("[WINPE18C] VERDICT: FAIL reason=spawn\n");
         } else {
+            /* The program paints, Sleeps 8000 ms and destroys its window, so
+             * the measurement must land inside that hold. The ink is read from
+             * the window's OWN pixel buffer, which the paint fills without the
+             * desktop compositing, so these waits only yield the CPU: on a
+             * loaded host (2026-11-10) winpe8_pump_ms's per-pass gui_tick
+             * overshot by tens of seconds -- the window was gone before the
+             * measurement, every ink count 0, while the program exited 18. */
+            uint64_t hz18 = pit_hz(); if (hz18 == 0) hz18 = 100;
             int wfd = -1;
-            for (int i = 0; i < 120 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(fpid); }
+            for (uint64_t end = pit_ticks() + 6 * hz18; wfd < 0 && pit_ticks() < end; ) {
+                wfd = win32_gui_window_fd(fpid);
+                if (wfd < 0) sched_yield();
+            }
             if (wfd < 0) {
                 kprintf("[WINPE18C] VERDICT: FAIL reason=nowindow\n");
                 signal_send_to_pid(fpid, SIGKILL); (void)proc_wait(fpid);
             } else {
-                winpe8_pump_ms(1000);   /* WM_PAINT -> all four faces rasterized + drawn */
                 uint32_t bg = win32_gui_fill_color_fd(wfd);
                 int rt, rb, bt, bb, it, ib, qt, qb;
+                /* Painted = the LAST face's row (bold italic, drawn last in the
+                 * same WM_PAINT) has text: some ink, but well under half the
+                 * region (the baseline's is 3430 of 560x54 = 30240). An
+                 * UNPAINTED window counts every pixel as ink (30240 -- nothing
+                 * matches the fill colour yet), so "any ink" is not enough.
+                 * Rows 0-1, which the verdict compares, are complete by then.
+                 * Give up after ~20 s. */
+                for (uint64_t end = pit_ticks() + 20 * hz18; pit_ticks() < end; ) {
+                    bg = win32_gui_fill_color_fd(wfd);
+                    int q = win32_gui_ink_stats(wfd, 12, Y0 + 3 * DY - 2, RW, RH, bg, &qt, &qb);
+                    if (q > 0 && q < RW * RH / 2) break;
+                    sched_yield();
+                }
                 int ink_reg = win32_gui_ink_stats(wfd, 12, Y0 + 0 * DY - 2, RW, RH, bg, &rt, &rb);
                 int ink_bld = win32_gui_ink_stats(wfd, 12, Y0 + 1 * DY - 2, RW, RH, bg, &bt, &bb);
                 int ink_itl = win32_gui_ink_stats(wfd, 12, Y0 + 2 * DY - 2, RW, RH, bg, &it, &ib);
