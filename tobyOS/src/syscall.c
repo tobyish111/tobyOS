@@ -22787,10 +22787,14 @@ static long w32_memset(uint64_t *a) {
 
 /* ---- C9: runtime API resolution (GetModuleHandle / GetProcAddress / LoadLibrary) ----
  * Real software resolves APIs at runtime by name, not just via the static IAT.
- * tobyOS has no real DLLs -- it IS the Win32 implementation -- so a module
- * HANDLE is a tagged token carrying a shim-table index whose .dll names the
- * module, and GetProcAddress returns the address of the loader-generated
- * marshalling thunk for the resolved shim (callable in CPL3 like any import). */
+ * A DLL tobyOS implements itself (kernel32, user32, ...) has no image: its
+ * module HANDLE is a tagged token carrying a shim-table index whose .dll names
+ * the module, and GetProcAddress returns the address of the loader-generated
+ * marshalling thunk for the resolved shim (callable in CPL3 like any import).
+ * W4: a DLL from disk -- loaded with the process (W3) or by LoadLibrary -- is
+ * a real module, its handle its base, and these shims ask the run-time loader
+ * (pe_loader.c's pe_rt_*) about it. LoadLibraryA/W/ExA/ExW and FreeLibrary are
+ * CPL3 stubs (they call DllMain) whose kernel half is __toby_ldr below. */
 #define WIN32_HMODULE_TAG   0x7D00000000000000ull  /* distinct from brush 0x7B / thread 0x74 / FILE* 0xF11E */
 #define WIN32_HMODULE_MASK  0xFF00000000000000ull
 #define WIN32_PE_IMAGE_BASE 0x0000000140000000ull  /* all tobyOS PEs load here (delta 0) */
@@ -22806,48 +22810,140 @@ static long w32_GetCurrentProcessId(uint64_t *a) {
     return p ? (long)(p->is_thread ? p->tgid : p->pid) : 0;
 }
 
-/* kernel32!GetModuleHandleA(name) -> HMODULE. NULL name = this module: the
- * .exe's base AS LOADED (W1: a DYNAMIC_BASE .exe -- every default clang/mingw
- * link -- is slid by C24, and this returned the fixed preferred base
- * 0x140000000). A named DLL we provide -> a tagged handle carrying a shim index
- * that maps back to the DLL name; an unknown DLL -> NULL. */
-static long w32_GetModuleHandleA(uint64_t *a) {
-    uint64_t name = a[0];
-    if (name == 0) {
-        struct proc *p = current_proc();
-        struct proc *lead = (p && p->is_thread) ? proc_lookup(p->tgid) : p;
-        if (lead && lead->win_image_base) return (long)lead->win_image_base;
-        return (long)WIN32_PE_IMAGE_BASE;
-    }
-    char dll[64];
-    if (strncpy_from_user(dll, (const char *)(uintptr_t)name, sizeof(dll)) < 0)
-        return 0;
-    int idx = win32_dll_first_index(dll);
-    if (idx < 0) return 0;                       /* NULL: not a DLL we implement */
-    return (long)(WIN32_HMODULE_TAG | (uint64_t)(uint32_t)idx);
+/* The calling process's .exe base AS LOADED (W1: a DYNAMIC_BASE .exe -- every
+ * default clang/mingw link -- is slid by C24). */
+static uint64_t win32_exe_base(void) {
+    struct proc *p = current_proc();
+    struct proc *lead = (p && p->is_thread) ? proc_lookup(p->tgid) : p;
+    if (lead && lead->win_image_base) return lead->win_image_base;
+    return WIN32_PE_IMAGE_BASE;
 }
 
-/* kernel32!LoadLibraryA(name) -> HMODULE. Nothing to actually load (tobyOS *is*
- * the implementation); same resolution as GetModuleHandleA, NULL if unknown. */
-static long w32_LoadLibraryA(uint64_t *a) { return w32_GetModuleHandleA(a); }
+/* A module name argument (A or W) as a kernel string; false if unreadable. */
+static bool win32_module_arg(uint64_t uname, bool wide, char *out, int cap) {
+    if (wide) {
+        (void)win32_wstr_to_k(uname, out, cap);
+        return true;
+    }
+    if (strncpy_from_user(out, (const char *)(uintptr_t)uname, (size_t)cap) < 0) return false;
+    out[cap - 1] = '\0';
+    return true;
+}
 
-/* kernel32!LoadLibraryExA(name, hFile, flags) -> HMODULE. The extra args don't
- * change which built-in DLL we resolve; same as LoadLibraryA on a[0]. (C19b:
- * real Lua's package loader imports this; it only matters if a C module is
- * require()d, which resolves to NULL here -- pure-Lua require still works.) */
-static long w32_LoadLibraryExA(uint64_t *a) { return w32_GetModuleHandleA(a); }
+/* A built-in DLL's handle for module name `name` (any path ignored): 1 with
+ * *h set if tobyOS implements it, 0 if not. An API-set name no shim names
+ * (api-ms-win-*) is built in but has no handle: *h = 0. */
+static int win32_builtin_module(const char *name, uint64_t *h) {
+    char key[64];
+    if (pe_module_name(name, key, sizeof key) < 0 || !win32_dll_is_builtin(key)) return 0;
+    int idx = win32_dll_first_index(key);
+    *h = idx >= 0 ? (WIN32_HMODULE_TAG | (uint64_t)(uint32_t)idx) : 0;
+    return 1;
+}
+
+/* kernel32!GetModuleHandleA/W(name) -> HMODULE. NULL name = this module (the
+ * .exe). A DLL tobyOS implements -> its tagged handle. Otherwise (W4) a module
+ * that is loaded -- the .exe, a DLL loaded with the process or by LoadLibrary
+ * -- by file name (".dll" added when there is no extension, compared without
+ * case) or, given a path, by its full path; anything else is NULL with
+ * ERROR_MOD_NOT_FOUND, as Microsoft documents. No reference is taken. */
+static long win32_module_handle(uint64_t uname, bool wide) {
+    if (uname == 0) return (long)win32_exe_base();
+    char name[ABI_PATH_MAX];
+    if (!win32_module_arg(uname, wide, name, sizeof name) || !name[0]) {
+        win32_set_last_error(126 /* ERROR_MOD_NOT_FOUND */);
+        return 0;
+    }
+    uint64_t h = 0;
+    if (!win32_builtin_module(name, &h)) {
+        bool path = false;
+        for (const char *q = name; *q; q++) if (*q == '\\' || *q == '/') path = true;
+        if (path) {
+            char kp[ABI_PATH_MAX], wp[ABI_PATH_MAX];
+            if (win32_winpath_to_k(name, kp, sizeof kp) >= 0 &&
+                win32_k_to_winpath(kp, wp, sizeof wp) > 0)
+                h = pe_rt_find(0, wp);
+        } else {
+            h = pe_rt_find(name, 0);
+        }
+    }
+    if (!h) win32_set_last_error(126 /* ERROR_MOD_NOT_FOUND */);
+    return (long)h;
+}
+static long w32_GetModuleHandleA(uint64_t *a) { return win32_module_handle(a[0], false); }
+static long w32_GetModuleHandleW(uint64_t *a) { return win32_module_handle(a[0], true); }
+
+/* W4: kernel32!__toby_ldr(op, a, b, buf) -- the kernel half of the CPL3
+ * LoadLibrary and FreeLibrary stubs (logs/w32/w4-ldr.S, where the ops are
+ * described; buf is on the stub's stack). Not a Windows API. */
+static long win32_ldr_load(uint64_t uname, uint32_t flags, bool wide, uint64_t buf) {
+    uint64_t zero = 0;
+    if (copy_to_user((void *)(uintptr_t)buf, &zero, 8) != 0) return 0;
+    char name[ABI_PATH_MAX];
+    if (!uname || !win32_module_arg(uname, wide, name, sizeof name) || !name[0]) {
+        win32_set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+        return 0;
+    }
+    /* a DLL tobyOS implements: its handle, wherever the path points (Windows
+     * resolves these from the system directory too) */
+    uint64_t h = 0;
+    if (win32_builtin_module(name, &h)) {
+        if (!h) win32_set_last_error(126 /* ERROR_MOD_NOT_FOUND */);
+        return (long)h;
+    }
+    struct pe_rt_req rq = { .name = 0, .kpath = 0, .flags = flags };
+    char kp[ABI_PATH_MAX];
+    bool absolute = (name[0] && name[1] == ':') || name[0] == '\\' || name[0] == '/';
+    if (absolute) {
+        if (win32_winpath_to_k(name, kp, sizeof kp) < 0) {
+            win32_set_last_error(126 /* ERROR_MOD_NOT_FOUND */);
+            return 0;
+        }
+        rq.kpath = kp;
+    } else {
+        for (char *q = name; *q; q++) if (*q == '\\') *q = '/';
+        rq.name = name;
+    }
+    uint32_t err = 0;
+    uint64_t base = pe_rt_load(&rq, buf, &err);
+    if (!base) win32_set_last_error(err ? err : 126);
+    return (long)base;
+}
+static long w32_toby_ldr(uint64_t *a) {
+    uint64_t hmod = a[1], buf = a[3];
+    bool builtin = (hmod & WIN32_HMODULE_MASK) == WIN32_HMODULE_TAG;
+    switch (a[0]) {
+    case 1:                                       /* LOAD(name, flags | wide << 32, buf) */
+        return win32_ldr_load(a[1], (uint32_t)a[2], (a[2] >> 32) != 0, buf);
+    case 2:                                       /* ATTACHED(hmod, failed, buf) */
+        if (builtin) return (long)hmod;
+        return (long)pe_rt_attached(hmod, (int64_t)a[2], buf);
+    case 3: {                                     /* FREE(hmod, 0, buf) */
+        if (builtin) return 1;                    /* nothing to unload */
+        uint32_t err = 0;
+        int r = pe_rt_free(hmod, buf, &err);
+        if (!r) win32_set_last_error(err ? err : 126);
+        return r;
+    }
+    case 4:                                       /* UNMAP(error, 0, buf) */
+        pe_rt_unmap(buf);
+        if (a[1]) { win32_set_last_error((uint32_t)a[1]); return 0; }
+        return 1;
+    }
+    return 0;
+}
 
 static int win32_k_to_wstr(uint64_t uwide, const char *s, int cap);   /* defined with the wide shims */
 
 /* kernel32!GetModuleFileNameA/W(hModule, lpFilename, nSize) -> DWORD. W2: the
  * module's real path in its Windows form -- the .exe's (hModule NULL or its
  * base) from the path it was started by, a built-in DLL's under
- * C:\Windows\System32. A name that does not fit is cut to nSize-1 characters
- * and its NUL, the call returns nSize and sets ERROR_INSUFFICIENT_BUFFER, as
- * Microsoft documents; an unknown module is ERROR_MOD_NOT_FOUND. Before W2
- * every program was "C:\win-lua.exe" (the name C19b's Lua happened to need),
- * and the W form did not exist. Lua's package library derives its default
- * paths from it. */
+ * C:\Windows\System32, and (W4) a DLL from disk's from where it was loaded. A
+ * name that does not fit is cut to nSize-1 characters and its NUL, the call
+ * returns nSize and sets ERROR_INSUFFICIENT_BUFFER, as Microsoft documents; an
+ * unknown module is ERROR_MOD_NOT_FOUND. Before W2 every program was
+ * "C:\win-lua.exe" (the name C19b's Lua happened to need), and the W form did
+ * not exist. Lua's package library derives its default paths from it. */
 static long win32_module_file_name(uint64_t *a, bool wide) {
     uint64_t hmod = a[0], buf = a[1];
     uint32_t cap = (uint32_t)a[2];
@@ -22864,6 +22960,8 @@ static long win32_module_file_name(uint64_t *a, bool wide) {
             n = ksnprintf(name, sizeof name, "C:\\Windows\\System32\\%s", dll);
             if (n >= (int)sizeof name) n = -1;
         }
+    } else {
+        n = pe_rt_module_path(hmod, name, sizeof name);
     }
     if (n < 0) { win32_set_last_error(126 /* ERROR_MOD_NOT_FOUND */); return 0; }
     if (!buf || cap == 0) { win32_set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */); return 0; }
@@ -22880,27 +22978,38 @@ static long win32_module_file_name(uint64_t *a, bool wide) {
 static long w32_GetModuleFileNameA(uint64_t *a) { return win32_module_file_name(a, false); }
 static long w32_GetModuleFileNameW(uint64_t *a) { return win32_module_file_name(a, true); }
 
-/* kernel32!FreeLibrary(hModule) -> TRUE (no real DLL refcount to drop). */
-static long w32_FreeLibrary(uint64_t *a) { (void)a; return 1; }
-
-/* kernel32!GetProcAddress(hModule, lpProcName) -> FARPROC. Resolves the function
- * by name within the module's DLL and returns the address of its pre-generated
- * marshalling thunk. Ordinal imports (MAKEINTRESOURCE) and unknown names -> NULL. */
+/* kernel32!GetProcAddress(hModule, lpProcName) -> FARPROC. lpProcName is a
+ * name, or an ordinal in its low word (MAKEINTRESOURCE). A DLL tobyOS
+ * implements: the function's CPL3 stub or shim thunk, by name (W4: so
+ * GetProcAddress(kernel32, "LoadLibraryA") is the stub that calls DllMain).
+ * Otherwise (W4) the export of the loaded module -- hModule NULL is the .exe --
+ * by name or ordinal, following forwarders to modules already loaded. NULL
+ * with ERROR_PROC_NOT_FOUND when there is no such export, ERROR_MOD_NOT_FOUND
+ * when no module is loaded at hModule. */
 static long w32_GetProcAddress(uint64_t *a) {
     uint64_t hmod  = a[0];
     uint64_t pname = a[1];
-    if ((hmod & WIN32_HMODULE_MASK) != WIN32_HMODULE_TAG)
-        return 0;                                /* exe base / unknown handle */
-    if (pname == 0 || (pname >> 16) == 0)
-        return 0;                                /* NULL or an ordinal */
-    const char *dll = win32_shim_dll((int)(uint32_t)(hmod & 0xFFFFFFFFu));
-    if (!dll) return 0;
-    char fn[96];
-    if (strncpy_from_user(fn, (const char *)(uintptr_t)pname, sizeof(fn)) < 0)
-        return 0;
-    int idx = win32_shim_index(dll, fn);
-    if (idx < 0 || idx >= win32_shim_count()) return 0;
-    return (long)(WIN32_PROCADDR_BASE_VA + (uint64_t)idx * WIN32_PROCADDR_STRIDE);
+    bool by_ord = (pname >> 16) == 0;
+    char fn[256];
+    if (!by_ord) {
+        if (strncpy_from_user(fn, (const char *)(uintptr_t)pname, sizeof(fn)) < 0) {
+            win32_set_last_error(127 /* ERROR_PROC_NOT_FOUND */);
+            return 0;
+        }
+        fn[sizeof fn - 1] = '\0';
+    }
+    if ((hmod & WIN32_HMODULE_MASK) == WIN32_HMODULE_TAG) {
+        const char *dll = win32_shim_dll((int)(uint32_t)(hmod & 0xFFFFFFFFu));
+        uint64_t va = (dll && !by_ord) ? win32_builtin_proc_va(dll, fn) : 0;
+        if (!va) win32_set_last_error(dll ? 127 /* ERROR_PROC_NOT_FOUND */
+                                          : 126 /* ERROR_MOD_NOT_FOUND */);
+        return (long)va;
+    }
+    if (hmod == 0) hmod = win32_exe_base();
+    uint32_t err = 0;
+    uint64_t va = pe_rt_proc(hmod, by_ord ? 0 : fn, by_ord ? (uint32_t)pname : 0, &err);
+    if (!va) win32_set_last_error(err ? err : 127);
+    return (long)va;
 }
 
 typedef long (*win32_shim_fn)(uint64_t *args);
@@ -25094,11 +25203,9 @@ static const struct win32_shim g_win32_shims[] = {
 
     /* ---- C9: runtime API resolution (kernel32) ---- */
     { "kernel32.dll", "GetModuleHandleA",    w32_GetModuleHandleA },
+    { "kernel32.dll", "GetModuleHandleW",    w32_GetModuleHandleW },   /* W4 */
     { "kernel32.dll", "GetProcAddress",      w32_GetProcAddress },
-    { "kernel32.dll", "LoadLibraryA",        w32_LoadLibraryA },
-    { "kernel32.dll", "LoadLibraryExA",      w32_LoadLibraryExA },
     { "kernel32.dll", "GetModuleFileNameA",  w32_GetModuleFileNameA },
-    { "kernel32.dll", "FreeLibrary",         w32_FreeLibrary },
     { "kernel32.dll", "GetCurrentProcessId", w32_GetCurrentProcessId },
 
     /* ---- C11: more GDI (gdi32) ---- */
@@ -25426,6 +25533,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetWindowsDirectoryW",   w32_GetWindowsDirectoryW },
     /* W3: the loader's failure path's target (pe_loader.c); never a real export. */
     { "kernel32.dll", "__toby_loadfail",        w32_toby_loadfail },
+    /* W4: LoadLibrary/FreeLibrary's kernel half (their CPL3 stubs call it). */
+    { "kernel32.dll", "__toby_ldr",           w32_toby_ldr },
     /* W3: a DLL CRT's own atexit table (_execute_onexit_table is a CPL3 stub). */
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_onexit_table",  w32_initialize_onexit_table },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_register_onexit_function", w32_register_onexit_function },

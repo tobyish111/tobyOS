@@ -64,7 +64,13 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
  * a header, the init list (one 24-byte entry per DLL to call at
  * DLL_PROCESS_ATTACH, in order), the module records (64 bytes each, the .exe
  * first) and the strings they point at. The init trampoline and the fail entry
- * hard-code the VA and the header offsets. */
+ * hard-code the VA and the header offsets. W4: the table is the loader's state
+ * between calls too -- LoadLibrary and FreeLibrary read it, change it and write
+ * it back -- so a record carries its reference count, a slot's strings have a
+ * fixed place (a freed slot is reused without growing anything), and the
+ * cursors of the missing-import area and the TLS area live in it. Being user
+ * memory, it is checked on every read: a program that scribbles on it can make
+ * its own LoadLibrary fail, never the kernel. */
 #define WIN32_MODTAB_BASE      0x0000000031008000ULL
 #define WIN32_MODTAB_BYTES     (2u * 4096u)
 #define WIN32_MAX_MODULES      16
@@ -73,12 +79,22 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_MT_INIT_COUNT    0x010   /* u32: entries in the init list        */
 #define WIN32_MT_FAIL_TEXT     0x018   /* u64: VA of the load failure's text   */
 #define WIN32_MT_FAIL_STATUS   0x020   /* u32: its NTSTATUS                    */
-#define WIN32_MT_MOD_COUNT     0x024   /* u32: module records                  */
+#define WIN32_MT_MOD_COUNT     0x024   /* u32: record slots in use (high water) */
+#define WIN32_MT_LDR           0x028   /* u64: W4: __toby_ldr's thunk          */
 #define WIN32_MT_INIT_LIST     0x040   /* {u64 entry, u64 base, u64 name VA}   */
 #define WIN32_MT_INIT_STRIDE   24
+#define WIN32_MT_MISS_STUB     0x1C0   /* u64: W4: next free missing-import stub */
+#define WIN32_MT_MISS_NAME     0x1C8   /* u64: W4: next free byte of their names */
+#define WIN32_MT_TLS_NEXT      0x1D0   /* u64: W4: next free byte of the TLS area */
+#define WIN32_MT_TLS_END       0x1D8   /* u64: W4: end of the mapped TLS area    */
+#define WIN32_MT_TLS_USED      0x1E0   /* u32: W4: TLS slots in use (bit n = n)  */
 #define WIN32_MT_MODS          0x200   /* module records                       */
 #define WIN32_MT_MOD_STRIDE    64
-#define WIN32_MT_STRINGS       0x600   /* names and Windows paths              */
+#define WIN32_MT_STRINGS       0x600   /* W4: each slot's name + Windows path  */
+#define WIN32_MT_STR_STRIDE    0x180   /*   name at +0, path at +WIN32_MT_NAME_MAX */
+#define WIN32_MT_NAME_MAX      64
+#define WIN32_MT_PATH_MAX      (WIN32_MT_STR_STRIDE - WIN32_MT_NAME_MAX)
+#define WIN32_MT_FAIL_AREA     0x1E00  /* W4: the process-start failure's text */
 #define WIN32_MTM_BASE         0x00    /* u64 */
 #define WIN32_MTM_SIZE         0x08    /* u64 */
 #define WIN32_MTM_ENTRY        0x10    /* u64: 0 if none */
@@ -87,16 +103,68 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_MTM_EXPORT_RVA   0x28    /* u32 */
 #define WIN32_MTM_EXPORT_SIZE  0x2C    /* u32 */
 #define WIN32_MTM_FLAGS        0x30    /* u32 */
+#define WIN32_MTM_REFS         0x34    /* u32: W4: LoadLibrary + import references */
+#define WIN32_MTM_TLS_SLOT     0x38    /* u32: W4: its TLS slot, 0 if none (the .exe's is 0) */
 #define WIN32_MTM_FLAG_DLL     1u
+#define WIN32_MTM_FLAG_PINNED  2u      /* W4: loaded with the process: never unloaded */
+#define WIN32_MTM_FLAG_INITED  4u      /* W4: its DLL_PROCESS_ATTACH was called      */
+#define WIN32_MTM_FLAG_UNLOAD  8u      /* W4: between FreeLibrary's DETACH and unmap */
 
 /* W3: CPL3 routines in the shim area's page 0 (the space W1 freed). */
 #define WIN32_INIT_TRAMP_VA    0x0000000030000200ULL   /* DllMains, then the .exe */
 #define WIN32_FAIL_ENTRY_VA    0x0000000030000280ULL   /* a load failure's entry  */
 #define WIN32_ONEXIT_EXEC_VA   0x00000000300002C0ULL   /* _execute_onexit_table   */
+/* W4: LoadLibrary and FreeLibrary run in CPL3 (they call DllMain); the source
+ * is logs/w32/w4-ldr.S. Each entry point's VA, and the stubs' extent. */
+#define WIN32_LDR_STUBS_VA     0x0000000030000300ULL
+#define WIN32_LDR_LOADA_VA     (WIN32_LDR_STUBS_VA + 0x00)   /* LoadLibraryA   */
+#define WIN32_LDR_LOADW_VA     (WIN32_LDR_STUBS_VA + 0x08)   /* LoadLibraryW   */
+#define WIN32_LDR_LOADEXA_VA   (WIN32_LDR_STUBS_VA + 0x18)   /* LoadLibraryExA */
+#define WIN32_LDR_LOADEXW_VA   (WIN32_LDR_STUBS_VA + 0x20)   /* LoadLibraryExW */
+#define WIN32_LDR_FREE_VA      (WIN32_LDR_STUBS_VA + 0x98)   /* FreeLibrary    */
+#define WIN32_LDR_BUF_MAX      WIN32_MAX_MODULES             /* {entry, base} pairs */
 
 #define WIN32_STATUS_DLL_NOT_FOUND        0xC0000135u
 #define WIN32_STATUS_DLL_INIT_FAILED      0xC0000142u
 #define WIN32_STATUS_INVALID_IMAGE_FORMAT 0xC000007Bu
+#define WIN32_STATUS_NO_MEMORY            0xC0000017u
+
+/* W4: the run-time loader (src/pe_loader.c), for the shims in src/syscall.c.
+ * Each works on the CURRENT process's module table and returns a Win32 error
+ * code through *err (0 on success). A module name is a file name ("x.dll",
+ * "x" -- ".dll" is added -- or "x." for no extension), matched without case. */
+struct pe_rt_req {
+    const char *name;    /* a file name or a relative path ('/'-separated), or NULL */
+    const char *kpath;   /* an absolute tobyOS path, or NULL                       */
+    uint32_t    flags;   /* LoadLibraryEx's dwFlags                                */
+};
+/* LoadLibrary's kernel half: the module's base (0 on failure); ubuf gets the
+ * entry points the stub must call at DLL_PROCESS_ATTACH. */
+uint64_t pe_rt_load(const struct pe_rt_req *rq, uint64_t ubuf, uint32_t *err);
+/* After the DllMains: failed = index of the one that returned FALSE, or -1.
+ * Returns hmod, or 0 with ubuf = the modules to detach and unmap. */
+uint64_t pe_rt_attached(uint64_t hmod, int64_t failed, uint64_t ubuf);
+/* FreeLibrary's kernel half: 0 bad handle (*err set), 1 done, 2 ubuf = the
+ * modules to detach and then unmap (pe_rt_unmap). */
+int pe_rt_free(uint64_t hmod, uint64_t ubuf, uint32_t *err);
+/* Unmap the modules ubuf lists that FreeLibrary or a failed load released. */
+void pe_rt_unmap(uint64_t ubuf);
+/* GetModuleHandle: a loaded module's base by file name or by Windows path
+ * (winpath non-NULL: its full path, compared without case), or 0. */
+uint64_t pe_rt_find(const char *name, const char *winpath);
+/* GetProcAddress: an export of the loaded module at `base`, by name (or, name
+ * NULL, by ordinal); 0 if there is no such module (*err 126) or export (127). */
+uint64_t pe_rt_proc(uint64_t base, const char *name, uint32_t ord, uint32_t *err);
+/* GetModuleFileName: the Windows path of the loaded module at `base`. Returns
+ * its length, or -1 if no module is loaded there. */
+int pe_rt_module_path(uint64_t base, char *out, int cap);
+/* An import from a DLL tobyOS implements itself: its CPL3 stub or its shim's
+ * procaddr thunk, or 0 (GetProcAddress on a built-in module uses this). */
+uint64_t win32_builtin_proc_va(const char *dll, const char *func);
+/* A module name ("x", "x.dll", "dir\x.DLL", "x.") as the loader keys it: the
+ * file name, lower case, ".dll" added when there is no extension and a
+ * trailing '.' dropped. Returns its length, or -1 if it does not fit. */
+int pe_module_name(const char *in, char *out, int cap);
 
 /* W3 (src/syscall.c): 1 if tobyOS implements DLL `dll` itself -- a shim names
  * it, or it is an API-set name (api-ms-win-*, ext-ms-win-*) -- so the loader

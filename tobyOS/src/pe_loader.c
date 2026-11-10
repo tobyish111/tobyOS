@@ -40,6 +40,8 @@
 #include <tobyos/perf.h>
 #include <tobyos/vfs.h>
 #include <tobyos/heap.h>
+#include <tobyos/proc.h>
+#include <tobyos/mmap.h>
 
 /* IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: the PE opted into ASLR (C24). */
 #define PE_DLLCHAR_DYNAMIC_BASE 0x0040u
@@ -226,7 +228,8 @@ static const uint8_t g_win32_gate[] = {
  *   0xC0  DispatchMessage trampoline (C7)
  *   0x100 dialog modal-loop trampoline (C14: DialogBoxParamA, 106 bytes)
  *   0x1F0 dialog-service gate-thunk (C14: __toby_dlgsvc, 10 bytes)
- *   0x200 (unused since W1 -- imports bind to the procaddr table)
+ *   0x200 init trampoline, 0x280 fail entry, 0x2C0 _execute_onexit_table (W3)
+ *   0x300 LoadLibraryA/W/ExA/ExW + FreeLibrary (W4, 335 bytes)
  *   0xE00 setjmp / 0xE80 longjmp leaf stubs (C19b)
  *   0x1000.. procaddr table (one thunk per shim); 0x4000.. missing-import stubs
  * See WIN32_THREAD_WRAPPER_VA / WIN32_DLG_TRAMP_VA in pe.h for the user VAs. */
@@ -448,6 +451,12 @@ static uint64_t win32_user_stub_va(const char *dll, const char *func) {
     /* W3: running a DLL CRT's onexit table calls the program's functions. */
     if (strcmp(func, "_execute_onexit_table") == 0)
         return WIN32_ONEXIT_EXEC_VA;
+    /* W4: LoadLibrary and FreeLibrary call DllMain. */
+    if (strcmp(func, "LoadLibraryA") == 0)   return WIN32_LDR_LOADA_VA;
+    if (strcmp(func, "LoadLibraryW") == 0)   return WIN32_LDR_LOADW_VA;
+    if (strcmp(func, "LoadLibraryExA") == 0) return WIN32_LDR_LOADEXA_VA;
+    if (strcmp(func, "LoadLibraryExW") == 0) return WIN32_LDR_LOADEXW_VA;
+    if (strcmp(func, "FreeLibrary") == 0)    return WIN32_LDR_FREE_VA;
     return 0;
 }
 
@@ -553,6 +562,42 @@ static const uint8_t g_win32_onexit_exec[] = {
     0xeb, 0xeb, 0x31, 0xc0, 0x48, 0x89, 0x07, 0x48, 0x89, 0x47, 0x08, 0x48,
     0x89, 0x47, 0x10, 0x48, 0x83, 0xc4, 0x20, 0x5f, 0x5e, 0x5b, 0xc3,
 };
+/* W4: LoadLibraryA/W/ExA/ExW and FreeLibrary (logs/w32/w4-ldr.S; the entry
+ * points' offsets are pe.h's WIN32_LDR_*_VA). Each calls the kernel through
+ * __toby_ldr's thunk, read from the module table, so nothing is patched. */
+static const uint8_t g_win32_ldr_stubs[] = {
+    0x45, 0x31, 0xc0, 0x45, 0x31, 0xc9, 0xeb, 0x1e, 0x45, 0x31, 0xc0, 0x41,
+    0xb9, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x13, 0x0f, 0x1f, 0x44, 0x00, 0x00,
+    0x45, 0x31, 0xc9, 0xeb, 0x09, 0x0f, 0x1f, 0x00, 0x41, 0xb9, 0x01, 0x00,
+    0x00, 0x00, 0x53, 0x56, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00, 0x48,
+    0x89, 0xca, 0x45, 0x89, 0xc0, 0x49, 0xc1, 0xe1, 0x20, 0x4d, 0x09, 0xc8,
+    0x4c, 0x8d, 0x4c, 0x24, 0x20, 0xb9, 0x01, 0x00, 0x00, 0x00, 0x48, 0xb8,
+    0x28, 0x80, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0xff, 0x10, 0x48, 0x85,
+    0xc0, 0x0f, 0x84, 0x91, 0x00, 0x00, 0x00, 0x48, 0x89, 0xc3, 0x48, 0x8d,
+    0x4c, 0x24, 0x20, 0xba, 0x01, 0x00, 0x00, 0x00, 0xe8, 0x89, 0x00, 0x00,
+    0x00, 0x4c, 0x63, 0xc0, 0x48, 0x89, 0xda, 0x4c, 0x8d, 0x4c, 0x24, 0x20,
+    0xb9, 0x02, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x28, 0x80, 0x00, 0x31, 0x00,
+    0x00, 0x00, 0x00, 0xff, 0x10, 0x48, 0x85, 0xc0, 0x75, 0x5e, 0xbe, 0x5a,
+    0x04, 0x00, 0x00, 0xeb, 0x30, 0x0f, 0x1f, 0x00, 0x53, 0x56, 0x48, 0x81,
+    0xec, 0x28, 0x01, 0x00, 0x00, 0x48, 0x89, 0xca, 0x45, 0x31, 0xc0, 0x4c,
+    0x8d, 0x4c, 0x24, 0x20, 0xb9, 0x03, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x28,
+    0x80, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0xff, 0x10, 0x48, 0x83, 0xf8,
+    0x02, 0x75, 0x29, 0x31, 0xf6, 0x48, 0x8d, 0x4c, 0x24, 0x20, 0x31, 0xd2,
+    0xe8, 0x25, 0x00, 0x00, 0x00, 0x89, 0xf2, 0x45, 0x31, 0xc0, 0x4c, 0x8d,
+    0x4c, 0x24, 0x20, 0xb9, 0x04, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x28, 0x80,
+    0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0xff, 0x10, 0x48, 0x81, 0xc4, 0x28,
+    0x01, 0x00, 0x00, 0x5e, 0x5b, 0xc3, 0x53, 0x56, 0x57, 0x41, 0x54, 0x48,
+    0x83, 0xec, 0x28, 0x48, 0x89, 0xce, 0x89, 0xd7, 0x48, 0x8b, 0x1e, 0x45,
+    0x31, 0xe4, 0x49, 0x39, 0xdc, 0x73, 0x2c, 0x4c, 0x89, 0xe0, 0x48, 0xc1,
+    0xe0, 0x04, 0x4c, 0x8b, 0x54, 0x06, 0x08, 0x48, 0x8b, 0x4c, 0x06, 0x10,
+    0x4d, 0x85, 0xd2, 0x74, 0x11, 0x89, 0xfa, 0x45, 0x31, 0xc0, 0x41, 0xff,
+    0xd2, 0x83, 0xff, 0x01, 0x75, 0x04, 0x85, 0xc0, 0x74, 0x0c, 0x49, 0xff,
+    0xc4, 0xeb, 0xcf, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xeb, 0x03, 0x44, 0x89,
+    0xe0, 0x48, 0x83, 0xc4, 0x28, 0x41, 0x5c, 0x5f, 0x5e, 0x5b, 0xc3,
+};
+#define WIN32_LDR_STUBS_OFF ((uint64_t)(WIN32_LDR_STUBS_VA - WIN32_SHIM_BASE))
+_Static_assert(WIN32_MT_LDR == 0x28, "the LoadLibrary stubs hard-code __toby_ldr's slot");
+_Static_assert(WIN32_LDR_BUF_MAX == 16, "the LoadLibrary stubs' buffer holds 16 pairs");
 #define WIN32_ONEXIT_EXEC_OFF ((uint64_t)(WIN32_ONEXIT_EXEC_VA - WIN32_SHIM_BASE))
 #define WIN32_INIT_TRAMP_OFF ((uint64_t)(WIN32_INIT_TRAMP_VA - WIN32_SHIM_BASE))
 #define WIN32_FAIL_ENTRY_OFF ((uint64_t)(WIN32_FAIL_ENTRY_VA - WIN32_SHIM_BASE))
@@ -629,11 +674,14 @@ static void pe_setup_shim_area(void) {
                    "init trampoline overruns the fail entry");
     _Static_assert(WIN32_FAIL_ENTRY_OFF + sizeof(g_win32_fail_entry) <= WIN32_ONEXIT_EXEC_OFF,
                    "fail entry overruns the onexit stub");
-    _Static_assert(WIN32_ONEXIT_EXEC_OFF + sizeof(g_win32_onexit_exec) <= WIN32_SETJMP_OFF,
-                   "onexit stub overruns the setjmp stub");
+    _Static_assert(WIN32_ONEXIT_EXEC_OFF + sizeof(g_win32_onexit_exec) <= WIN32_LDR_STUBS_OFF,
+                   "onexit stub overruns the LoadLibrary stubs");
+    _Static_assert(WIN32_LDR_STUBS_OFF + sizeof(g_win32_ldr_stubs) <= WIN32_SETJMP_OFF,
+                   "the LoadLibrary stubs overrun the setjmp stub");
     memcpy((void *)WIN32_INIT_TRAMP_VA, g_win32_init_tramp, sizeof(g_win32_init_tramp));
     memcpy((void *)WIN32_FAIL_ENTRY_VA, g_win32_fail_entry, sizeof(g_win32_fail_entry));
     memcpy((void *)WIN32_ONEXIT_EXEC_VA, g_win32_onexit_exec, sizeof(g_win32_onexit_exec));
+    memcpy((void *)WIN32_LDR_STUBS_VA, g_win32_ldr_stubs, sizeof(g_win32_ldr_stubs));
 
     /* C9: a thunk for EVERY shim, so GetProcAddress can return a callable
      * pointer for any shim resolved by name (slot i at WIN32_PROCADDR_BASE_VA
@@ -671,63 +719,128 @@ static void pe_setup_shim_area(void) {
  * Windows uses (STATUS_DLL_NOT_FOUND, STATUS_INVALID_IMAGE_FORMAT). An import
  * a DLL does not export binds to a missing-import stub (W1), as for shims.
  * The record of what was mapped -- the module table -- lives in user memory,
- * as Windows' loader data does (in the PEB). */
+ * as Windows' loader data does (in the PEB).
+ *
+ * W4: the same loader at run time (LoadLibrary/FreeLibrary/GetProcAddress/
+ * GetModuleHandle/GetModuleFileName; the pe_rt_* functions at the end). A call
+ * rebuilds the loader's state from the module table, does its work, and writes
+ * the table back. LoadLibrary's DllMains, and FreeLibrary's, run in CPL3: the
+ * stubs in g_win32_ldr_stubs call the kernel, then the entry points the kernel
+ * lists, then the kernel again. A module keeps a reference count -- one per
+ * LoadLibrary and one per module whose imports name it -- and FreeLibrary
+ * unloads it when that reaches 0, with every module it imports that reaches 0
+ * too, each after its DLL_PROCESS_DETACH; the modules loaded with the process
+ * stay loaded (Windows' static dependencies stay too). Not yet: a loader lock
+ * (two threads loading at once can lose a record -- W5, with thread attach),
+ * TLS for a run-time DLL on threads other than the main one (W5), mapping as
+ * data (LOAD_LIBRARY_AS_DATAFILE and its kin fail with ERROR_NOT_SUPPORTED). */
 
 enum { PE_MOD_MAPPED, PE_MOD_BINDING, PE_MOD_DONE };
 
 struct pe_mod {
-    char     name[64];         /* lower-case file name, e.g. "dll28c.dll" */
-    uint64_t base, size;
+    char     name[WIN32_MT_NAME_MAX];   /* lower-case file name, e.g. "dll28c.dll" */
+    uint64_t base, size;       /* base 0: a free slot */
     uint64_t entry;            /* AddressOfEntryPoint as a VA, 0 if none */
     uint32_t export_rva, export_size;
     uint32_t import_rva, import_size;
     uint32_t tls_rva, tls_size;
     uint64_t name_va, path_va; /* the module table's copies */
+    uint32_t flags;            /* WIN32_MTM_FLAG_* other than DLL (W4) */
+    uint32_t refs;             /* W4: references (meaningless when pinned) */
+    uint32_t tls_slot;         /* W4: its TLS slot, 0 if none */
     int      state;
     bool     is_dll;
+    bool     fresh;            /* W4: mapped by this call -- unmapped if it fails */
 };
 
 struct pe_ctx {
     struct pe_mod mod[WIN32_MAX_MODULES];
-    int      n;
+    int      n;                         /* slots in use (the high-water mark) */
     int      init[WIN32_MAX_MODULES];   /* DLLs to initialize, in order */
     int      ninit;
     char     exe_dir[ABI_PATH_MAX];
+    char     load_dir[ABI_PATH_MAX];    /* W4: LoadLibraryEx's DLL directory */
     const char *cwd;
+    const char *dirs[4];                /* the search order */
+    int      ndirs;
     uint64_t next_base;                 /* where a DLL goes when its base is taken */
-    uint64_t str;                       /* next free byte of the table's strings */
     bool     failed;
+    uint32_t fail_status;               /* W4: the first failure's NTSTATUS */
+    bool     rt;                        /* W4: a run-time call (see pe_uread) */
+    bool     no_load;                   /* W4: GetProcAddress: map nothing */
+    bool     miss_open;                 /* W4: the missing-import pages are writable */
     struct pe_missing_area miss;
-    int      tls_slots;                 /* TLS slots handed to DLLs (0 is the .exe's) */
+    uint32_t tls_used;                  /* bit n: TLS slot n is taken (0 is the .exe's) */
     uint64_t tls_next, tls_end;         /* next free byte / end of the mapped TLS area */
-    struct pe_load_info *out;           /* the .exe's TLS facts go here */
+    struct pe_load_info *out;           /* the .exe's TLS facts go here (process start) */
 };
 
-/* Copy [src, src+n) of USER memory the loader mapped (the caller has checked
- * the range is inside a module), and the reverse. */
-static void pe_uread(void *dst, uint64_t src, size_t n) {
+#define WIN32_TLS_SLOTS ((int)(WIN32_TLS_BLK_OFF / 8))
+_Static_assert(WIN32_TLS_SLOTS <= 32, "tls_used is a 32-bit map");
+_Static_assert(WIN32_MT_INIT_LIST + WIN32_MAX_MODULES * WIN32_MT_INIT_STRIDE <= WIN32_MT_MISS_STUB,
+               "the init list overruns the loader state");
+_Static_assert(WIN32_MT_TLS_USED + 4 <= WIN32_MT_MODS, "the loader state overruns the records");
+_Static_assert(WIN32_MT_MODS + WIN32_MAX_MODULES * WIN32_MT_MOD_STRIDE <= WIN32_MT_STRINGS,
+               "the records overrun the strings");
+_Static_assert(WIN32_MTM_TLS_SLOT + 4 <= WIN32_MT_MOD_STRIDE, "a record overruns its stride");
+_Static_assert(WIN32_MT_STRINGS + WIN32_MAX_MODULES * WIN32_MT_STR_STRIDE <= WIN32_MT_FAIL_AREA,
+               "the strings overrun the failure text");
+_Static_assert(WIN32_MT_FAIL_AREA < WIN32_MODTAB_BYTES, "the failure text is outside the table");
+
+/* User memory the loader reads and writes. At process start it is the new
+ * address space the loader has just mapped, while current_proc() is still the
+ * PARENT (so copy_*_user's probes would walk the wrong page tables): plain
+ * copies in a uaccess window, as in W3. At run time (W4) it is the program's
+ * own memory -- the module table, the images -- which the program may have
+ * changed or unmapped, so every access goes through copy_from_user /
+ * copy_to_user, which check the pages first; a failed read gives zeros. */
+static bool pe_uread(const struct pe_ctx *c, void *dst, uint64_t src, size_t n) {
+    if (c->rt) {
+        if (copy_from_user(dst, (const void *)(uintptr_t)src, n) == 0) return true;
+        memset(dst, 0, n);
+        return false;
+    }
     unsigned long f = uaccess_begin();
     memcpy(dst, (const void *)src, n);
     uaccess_end(f);
+    return true;
 }
-static void pe_uwrite(uint64_t dst, const void *src, size_t n) {
+static bool pe_uwrite(const struct pe_ctx *c, uint64_t dst, const void *src, size_t n) {
+    if (c->rt) return copy_to_user((void *)(uintptr_t)dst, src, n) == 0;
     unsigned long f = uaccess_begin();
     memcpy((void *)dst, src, n);
     uaccess_end(f);
+    return true;
 }
 /* A NUL-terminated string at user `src`, which must end before `limit`.
- * Returns its length, or -1 if it does not fit `cap` or runs past `limit`. */
-static int pe_ustr(char *dst, int cap, uint64_t src, uint64_t limit) {
+ * Returns its length, or -1 if it does not fit `cap`, runs past `limit` or
+ * cannot be read. Reads at most a page at a time. */
+static int pe_ustr(const struct pe_ctx *c, char *dst, int cap, uint64_t src, uint64_t limit) {
     int n = 0;
-    unsigned long f = uaccess_begin();
-    for (; src + (uint64_t)n < limit && n < cap; n++) {
-        char ch = *(const char *)(src + (uint64_t)n);
-        dst[n] = ch;
-        if (!ch) break;
+    while (n < cap && src + (uint64_t)n < limit) {
+        uint64_t a = src + (uint64_t)n;
+        uint64_t chunk = PAGE_SIZE - (a & (PAGE_SIZE - 1));
+        if (chunk > (uint64_t)(cap - n)) chunk = (uint64_t)(cap - n);
+        if (chunk > limit - a) chunk = limit - a;
+        if (!pe_uread(c, dst + n, a, chunk)) break;
+        for (uint64_t i = 0; i < chunk; i++, n++)
+            if (!dst[n]) return n;
     }
-    uaccess_end(f);
-    if (n >= cap || src + (uint64_t)n >= limit) { dst[cap - 1] = '\0'; return -1; }
-    return n;
+    dst[cap - 1] = '\0';
+    return -1;
+}
+/* Page-table edits (vmm_map/vmm_protect/vmm_translate) act on the vmm's
+ * EDITOR ROOT, which is per CPU and the kernel's by default. At process start
+ * the spawn path has set it to the new address space for the whole load. At
+ * run time (W4) each edit sets it to the calling process's for its own span
+ * -- never across a file read, which can sleep and resume on another CPU. */
+static uint64_t pe_root_enter(const struct pe_ctx *c) {
+    if (!c->rt) return 0;
+    struct proc *p = current_proc();
+    return vmm_set_editor_root(p ? p->cr3 : 0);
+}
+static void pe_root_leave(const struct pe_ctx *c, uint64_t saved) {
+    if (c->rt) (void)vmm_set_editor_root(saved);
 }
 static bool pe_rva_ok(const struct pe_mod *m, uint64_t rva, uint64_t len) {
     return rva < m->size && len <= m->size - rva;
@@ -738,26 +851,106 @@ static bool pe_ieq(const char *a, const char *b) {
     return *a == *b;
 }
 
-/* The module table's string area (user memory): copy `s`, return its VA (0
- * when the area is full). */
-static uint64_t pe_mt_string(struct pe_ctx *c, const char *s) {
-    size_t n = strlen(s) + 1;
-    if (c->str + n > WIN32_MODTAB_BASE + WIN32_MODTAB_BYTES) return 0;
-    uint64_t va = c->str;
-    pe_uwrite(va, s, n);
-    c->str += n;
-    return va;
+/* W4 (pe.h): the loader's key for a module name. Before W4 the loader kept
+ * up to 59 characters of a longer name; a name that long now fails. */
+int pe_module_name(const char *in, char *out, int cap) {
+    const char *b = in;
+    for (const char *q = in; *q; q++) if (*q == '\\' || *q == '/') b = q + 1;
+    int n = 0;
+    bool dot = false;
+    for (; b[n]; n++) {
+        if (n >= cap - 5) return -1;              /* room for ".dll" and the NUL */
+        out[n] = pe_lower(b[n]);
+        if (b[n] == '.') dot = true;
+    }
+    if (n == 0) return -1;
+    if (out[n - 1] == '.') {                      /* "x." -- a name with no extension */
+        if (--n == 0) return -1;
+        out[n] = '\0';
+        return n;
+    }
+    if (!dot) { memcpy(out + n, ".dll", 5); return n + 4; }
+    out[n] = '\0';
+    return n;
 }
 
-/* Record the first load failure: its text goes to the module table, where the
- * fail entry finds it. */
+/* Slot mi's strings in the module table: fixed places (W4), so a slot freed
+ * by FreeLibrary is reused without the string area growing. */
+static uint64_t pe_slot_name_va(int mi) {
+    return WIN32_MODTAB_BASE + WIN32_MT_STRINGS + (uint64_t)mi * WIN32_MT_STR_STRIDE;
+}
+static uint64_t pe_slot_path_va(int mi) { return pe_slot_name_va(mi) + WIN32_MT_NAME_MAX; }
+
+/* Write module mi's name and Windows path to its slot. A path too long for the
+ * slot is left out (GetModuleFileName then fails for that module). */
+static void pe_slot_strings(struct pe_ctx *c, int mi, const char *winpath) {
+    struct pe_mod *m = &c->mod[mi];
+    m->name_va = pe_slot_name_va(mi);
+    (void)pe_uwrite(c, m->name_va, m->name, strlen(m->name) + 1);
+    m->path_va = 0;
+    if (winpath && strlen(winpath) + 1 <= WIN32_MT_PATH_MAX) {
+        m->path_va = pe_slot_path_va(mi);
+        (void)pe_uwrite(c, m->path_va, winpath, strlen(winpath) + 1);
+    }
+}
+
+/* Record the first load failure. At process start its text goes to the module
+ * table, where the fail entry finds it; at run time LoadLibrary turns the
+ * status into the calling thread's last error. */
 static void pe_fail(struct pe_ctx *c, uint32_t status, const char *text) {
     if (c->failed) return;
     c->failed = true;
+    c->fail_status = status;
     kprintf("[pe] load failure (0x%08x): %s\n", status, text);
-    uint64_t va = pe_mt_string(c, text);
-    pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_FAIL_TEXT, &va, 8);
-    pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_FAIL_STATUS, &status, 4);
+    if (c->rt) return;
+    uint64_t va = WIN32_MODTAB_BASE + WIN32_MT_FAIL_AREA;
+    size_t n = strlen(text), room = WIN32_MODTAB_BYTES - WIN32_MT_FAIL_AREA - 1;
+    if (n > room) n = room;
+    char nul = '\0';
+    (void)pe_uwrite(c, va, text, n);
+    (void)pe_uwrite(c, va + n, &nul, 1);
+    (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_FAIL_TEXT, &va, 8);
+    (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_FAIL_STATUS, &status, 4);
+}
+
+/* The loaded module named `name` (a pe_module_name key), or -1. */
+static int pe_loaded(const struct pe_ctx *c, const char *name) {
+    for (int i = 0; i < c->n; i++)
+        if (c->mod[i].base && strcmp(c->mod[i].name, name) == 0) return i;
+    return -1;
+}
+/* The module loaded at `base`, or -1. */
+static int pe_by_base(const struct pe_ctx *c, uint64_t base) {
+    if (!base) return -1;
+    for (int i = 0; i < c->n; i++)
+        if (c->mod[i].base == base) return i;
+    return -1;
+}
+/* The loaded module whose Windows path is `winpath` (without case), or -1. */
+static int pe_loaded_path(const struct pe_ctx *c, const char *winpath) {
+    char p[WIN32_MT_PATH_MAX];
+    for (int i = 0; i < c->n; i++) {
+        const struct pe_mod *m = &c->mod[i];
+        if (!m->base || !m->path_va) continue;
+        if (pe_ustr(c, p, sizeof p, m->path_va, m->path_va + WIN32_MT_PATH_MAX) > 0 &&
+            pe_ieq(p, winpath))
+            return i;
+    }
+    return -1;
+}
+/* A free slot for a new module, or -1 when all are taken. */
+static int pe_slot_alloc(struct pe_ctx *c) {
+    for (int i = 0; i < WIN32_MAX_MODULES; i++) {
+        if (i < c->n && c->mod[i].base) continue;
+        memset(&c->mod[i], 0, sizeof c->mod[i]);
+        return i;
+    }
+    return -1;
+}
+/* A reference to module mi (W4): a LoadLibrary, or a module whose imports
+ * name it. A module loaded with the process is pinned and not counted. */
+static void pe_ref(struct pe_ctx *c, int mi) {
+    if (!(c->mod[mi].flags & WIN32_MTM_FLAG_PINNED)) c->mod[mi].refs++;
 }
 
 /* ---- headers, placement, protection -------------------------------------- */
@@ -794,7 +987,8 @@ static struct pe_data_dir pe_dir(const struct pe_hdr *h, int i) {
 }
 
 /* Copy headers + sections into the (mapped, RW) image span at `base` and apply
- * the base relocations for `delta` = base - preferred base. */
+ * the base relocations for `delta` = base - preferred base. The span was just
+ * mapped by this loader, at process start and at run time alike. */
 static void pe_place(const void *image, size_t size, const struct pe_hdr *h,
                      uint64_t base, int64_t delta, uint64_t size_of_image) {
     unsigned long uf = uaccess_begin();
@@ -851,18 +1045,21 @@ static void pe_place(const void *image, size_t size, const struct pe_hdr *h,
 
 /* W^X for a mapped module: headers read-only, each section per its flags
  * (read from the module's own mapped headers). */
-static void pe_protect(const struct pe_mod *m) {
+static void pe_protect(const struct pe_ctx *c, const struct pe_mod *m) {
     uint32_t lfanew;
-    pe_uread(&lfanew, m->base + 0x3C, 4);
+    pe_uread(c, &lfanew, m->base + 0x3C, 4);
     if (!pe_rva_ok(m, lfanew, 4 + sizeof(struct coff_header))) return;
     struct coff_header coff;
-    pe_uread(&coff, m->base + lfanew + 4, sizeof coff);
+    pe_uread(c, &coff, m->base + lfanew + 4, sizeof coff);
     uint64_t secs = (uint64_t)lfanew + 4 + sizeof coff + coff.opt_header_size;
     if (!pe_rva_ok(m, secs, (uint64_t)coff.num_sections * sizeof(struct pe_section))) return;
+    /* (the reads below are of the module's own present pages: they cannot
+     * sleep, so the editor root may stay set across the loop) */
+    uint64_t root = pe_root_enter(c);
     (void)vmm_protect(m->base, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_NX);
     for (uint16_t i = 0; i < coff.num_sections; i++) {
         struct pe_section s;
-        pe_uread(&s, m->base + secs + (uint64_t)i * sizeof s, sizeof s);
+        pe_uread(c, &s, m->base + secs + (uint64_t)i * sizeof s, sizeof s);
         if (s.virtual_size == 0 || s.virtual_addr >= m->size) continue;
         uint64_t lo = m->base + (s.virtual_addr & ~(PAGE_SIZE - 1));
         uint64_t hi = m->base + round_up((uint64_t)s.virtual_addr + s.virtual_size, PAGE_SIZE);
@@ -872,19 +1069,23 @@ static void pe_protect(const struct pe_mod *m) {
         if (!(s.characteristics & PE_SCN_MEM_EXECUTE)) f |= VMM_NX;
         (void)vmm_protect(lo, hi - lo, f);
     }
+    pe_root_leave(c, root);
 }
 
 /* ---- TLS (C18b, per module since W3) --------------------------------------
  * The pointer array at WIN32_TLS_BASE has one slot per module: the .exe's is
  * slot 0 (its _tls_index is 0, as before W3), each DLL with a TLS directory
- * gets the next slot. The MAIN thread's blocks are laid out after the array;
- * threads made by CreateThread copy the .exe's block only -- DLL slots on
- * them are W5's. */
+ * gets a free slot (W4: FreeLibrary gives it back). The MAIN thread's blocks
+ * are laid out after the array; threads made by CreateThread copy the .exe's
+ * block only -- DLL slots on them are W5's. */
 static bool pe_tls_map(struct pe_ctx *c, uint64_t end) {
     uint64_t need = round_up(end, PAGE_SIZE);
     if (need > WIN32_MODTAB_BASE) return false;
     if (need <= c->tls_end) return true;
-    if (!pe_map_user(c->tls_end, need)) return false;
+    uint64_t root = pe_root_enter(c);
+    bool ok = pe_map_user(c->tls_end, need);
+    pe_root_leave(c, root);
+    if (!ok) return false;
     unsigned long uf = uaccess_begin();
     memset((void *)c->tls_end, 0, need - c->tls_end);
     uaccess_end(uf);
@@ -892,12 +1093,13 @@ static bool pe_tls_map(struct pe_ctx *c, uint64_t end) {
     return true;
 }
 
-static void pe_setup_tls(struct pe_ctx *c, struct pe_mod *m) {
+static void pe_setup_tls(struct pe_ctx *c, int mi) {
+    struct pe_mod *m = &c->mod[mi];
     if (!m->tls_rva || m->tls_size < sizeof(struct pe_tls_dir64) ||
         !pe_rva_ok(m, m->tls_rva, sizeof(struct pe_tls_dir64)))
         return;
     struct pe_tls_dir64 t;
-    pe_uread(&t, m->base + m->tls_rva, sizeof t);
+    pe_uread(c, &t, m->base + m->tls_rva, sizeof t);
     uint64_t raw_size = (t.raw_end > t.raw_start) ? (t.raw_end - t.raw_start) : 0;
     uint64_t total = raw_size + (uint64_t)t.zero_fill;
     uint64_t img_end = m->base + m->size;
@@ -906,10 +1108,14 @@ static void pe_setup_tls(struct pe_ctx *c, struct pe_mod *m) {
                 m->name, (void *)t.raw_start, (unsigned long)raw_size, (unsigned long)total);
         return;
     }
-    int slot = m->is_dll ? ++c->tls_slots : 0;
-    if (slot >= (int)(WIN32_TLS_BLK_OFF / 8)) {
-        kprintf("[pe] .tls of %s: no TLS slot left (%d)\n", m->name, slot);
-        return;
+    int slot = 0;                                 /* the process's .exe: slot 0 */
+    if (mi != 0) {
+        for (slot = 1; slot < WIN32_TLS_SLOTS && (c->tls_used & (1u << slot)); slot++)
+            ;
+        if (slot >= WIN32_TLS_SLOTS) {
+            kprintf("[pe] .tls of %s: no TLS slot left\n", m->name);
+            return;
+        }
     }
     total = round_up(total, 16);
     uint64_t blk = c->tls_next;
@@ -918,21 +1124,24 @@ static void pe_setup_tls(struct pe_ctx *c, struct pe_mod *m) {
         return;
     }
     if (total) {
+        /* the module was just mapped and the block just made sure of */
         unsigned long uf = uaccess_begin();
         memcpy((void *)blk, (const void *)t.raw_start, raw_size);
         if (total > raw_size) memset((void *)(blk + raw_size), 0, total - raw_size);
         uaccess_end(uf);
         c->tls_next = blk + total;
     }
+    c->tls_used |= 1u << slot;
+    m->tls_slot = (uint32_t)slot;
     uint64_t slot_va = WIN32_TLS_BASE + (uint64_t)slot * 8;
     uint64_t blk_or_0 = total ? blk : 0;
-    pe_uwrite(slot_va, &blk_or_0, 8);
+    (void)pe_uwrite(c, slot_va, &blk_or_0, 8);
     uint32_t idx = (uint32_t)slot;
     if (t.index_addr >= m->base && t.index_addr + 4 <= img_end)
-        pe_uwrite(t.index_addr, &idx, 4);            /* _tls_index */
+        (void)pe_uwrite(c, t.index_addr, &idx, 4);    /* _tls_index */
     uint64_t arr = WIN32_TLS_BASE;
-    pe_uwrite(WIN32_TEB_BASE + WIN32_TEB_TLSPTR, &arr, 8);
-    if (!m->is_dll) {
+    (void)pe_uwrite(c, WIN32_TEB_BASE + WIN32_TEB_TLSPTR, &arr, 8);
+    if (mi == 0 && c->out) {
         c->out->tls_raw_va   = t.raw_start;
         c->out->tls_raw_size = raw_size;
         c->out->tls_total    = total;
@@ -944,6 +1153,27 @@ static void pe_setup_tls(struct pe_ctx *c, struct pe_mod *m) {
     kprintf("[pe] .tls of %s: slot %d raw=%p size=0x%lx total=0x%lx blk=%p\n",
             m->name, slot, (void *)t.raw_start, (unsigned long)raw_size,
             (unsigned long)total, (void *)blk_or_0);
+}
+
+/* W4: give module m's TLS slot back (FreeLibrary, or a failed LoadLibrary) --
+ * and its block, when it is the last one handed out (so a DLL loaded and freed
+ * again and again reuses one block). Reads m's TLS directory: call it before
+ * m is unmapped. */
+static void pe_tls_release(struct pe_ctx *c, struct pe_mod *m) {
+    if (!m->tls_slot || m->tls_slot >= (uint32_t)WIN32_TLS_SLOTS) return;
+    uint64_t slot_va = WIN32_TLS_BASE + (uint64_t)m->tls_slot * 8;
+    uint64_t blk = 0, zero = 0;
+    pe_uread(c, &blk, slot_va, 8);
+    (void)pe_uwrite(c, slot_va, &zero, 8);
+    c->tls_used &= ~(1u << m->tls_slot);
+    m->tls_slot = 0;
+    if (!blk || !m->tls_rva || !pe_rva_ok(m, m->tls_rva, sizeof(struct pe_tls_dir64))) return;
+    struct pe_tls_dir64 t;
+    if (!pe_uread(c, &t, m->base + m->tls_rva, sizeof t)) return;
+    uint64_t raw = (t.raw_end > t.raw_start) ? (t.raw_end - t.raw_start) : 0;
+    uint64_t total = round_up(raw + (uint64_t)t.zero_fill, 16);
+    if (blk >= WIN32_TLS_BASE + WIN32_TLS_BLK_OFF && blk + total == c->tls_next)
+        c->tls_next = blk;
 }
 
 /* ---- import resolution ----------------------------------------------------- */
@@ -958,6 +1188,11 @@ static uint64_t pe_builtin_import(const char *dll, const char *fname) {
     int idx = win32_shim_index(dll, fname);
     if (idx < 0 || (uint64_t)idx >= WIN32_PA_CAP) return 0;
     return WIN32_PROCADDR_BASE_VA + (uint64_t)idx * WIN32_PROCADDR_STRIDE;
+}
+/* W4 (pe.h): the same, for GetProcAddress on a built-in module -- so it
+ * returns LoadLibraryA's CPL3 stub, not a shim that would skip DllMain. */
+uint64_t win32_builtin_proc_va(const char *dll, const char *func) {
+    return (dll && func) ? pe_builtin_import(dll, func) : 0;
 }
 
 static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed_by);
@@ -977,7 +1212,7 @@ static uint64_t pe_export_lookup(struct pe_ctx *c, int mi, const char *name,
     if (depth > 8 || !m->export_rva || m->export_size < sizeof ed ||
         !pe_rva_ok(m, m->export_rva, sizeof ed))
         return 0;
-    pe_uread(&ed, m->base + m->export_rva, sizeof ed);
+    pe_uread(c, &ed, m->base + m->export_rva, sizeof ed);
     uint32_t idx;
     if (name) {
         if (!pe_rva_ok(m, ed.names, (uint64_t)ed.nnames * 4) ||
@@ -989,10 +1224,10 @@ static uint64_t pe_export_lookup(struct pe_ctx *c, int mi, const char *name,
         while (lo < hi) {                  /* the name table is sorted (spec) */
             mid = lo + (hi - lo) / 2;
             uint32_t nrva;
-            pe_uread(&nrva, m->base + ed.names + (uint64_t)mid * 4, 4);
+            pe_uread(c, &nrva, m->base + ed.names + (uint64_t)mid * 4, 4);
             char cand[256];
             if (!pe_rva_ok(m, nrva, 1) ||
-                pe_ustr(cand, sizeof cand, m->base + nrva, m->base + m->size) < 0)
+                pe_ustr(c, cand, sizeof cand, m->base + nrva, m->base + m->size) < 0)
                 return 0;
             int cmp = 0;
             for (int i = 0; ; i++) {
@@ -1005,7 +1240,7 @@ static uint64_t pe_export_lookup(struct pe_ctx *c, int mi, const char *name,
         }
         if (!found) return 0;
         uint16_t o;
-        pe_uread(&o, m->base + ed.ords + (uint64_t)mid * 2, 2);
+        pe_uread(c, &o, m->base + ed.ords + (uint64_t)mid * 2, 2);
         idx = o;
     } else {
         if (ord < ed.base) return 0;
@@ -1013,12 +1248,12 @@ static uint64_t pe_export_lookup(struct pe_ctx *c, int mi, const char *name,
     }
     if (idx >= ed.nfuncs || !pe_rva_ok(m, ed.funcs, (uint64_t)ed.nfuncs * 4)) return 0;
     uint32_t frva;
-    pe_uread(&frva, m->base + ed.funcs + (uint64_t)idx * 4, 4);
+    pe_uread(c, &frva, m->base + ed.funcs + (uint64_t)idx * 4, 4);
     if (!frva || !pe_rva_ok(m, frva, 1)) return 0;
     if (frva >= m->export_rva && frva < m->export_rva + m->export_size) {
         /* A forwarder: "DLL.name" or "DLL.#ordinal". */
         char fw[160];
-        if (pe_ustr(fw, sizeof fw, m->base + frva, m->base + m->size) < 0) return 0;
+        if (pe_ustr(c, fw, sizeof fw, m->base + frva, m->base + m->size) < 0) return 0;
         int dot = -1;
         for (int i = 0; fw[i]; i++) if (fw[i] == '.') dot = i;
         if (dot <= 0 || !fw[dot + 1]) return 0;
@@ -1034,6 +1269,9 @@ static uint64_t pe_export_lookup(struct pe_ctx *c, int mi, const char *name,
             for (const char *q = ffn + 1; *q >= '0' && *q <= '9'; q++) ford = ford * 10 + (uint32_t)(*q - '0');
         int fj = pe_find_or_load(c, fdll, m->name);
         if (fj < 0) return 0;
+        /* W4: no import names a DLL reached this way, so nothing would ever
+         * release it: it stays loaded. */
+        if (c->rt) c->mod[fj].flags |= WIN32_MTM_FLAG_PINNED;
         return pe_export_lookup(c, fj, ffn[0] == '#' ? NULL : ffn, ford, depth + 1);
     }
     return m->base + frva;
@@ -1072,47 +1310,20 @@ static bool pe_try_dir(const char *dir, const char *name, char *path, int cap,
     return found && vfs_read_all_ref(path, img, sz, borrowed) == VFS_OK;
 }
 
-/* The module for DLL `dll`: already loaded, or found, mapped and bound now.
- * Returns its index, or -1 with the failure recorded. */
-static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed_by) {
-    if (c->failed) return -1;
-    /* the file name, lower case, ".dll" added when it has no extension */
-    const char *b = dll;
-    for (const char *q = dll; *q; q++) if (*q == '\\' || *q == '/') b = q + 1;
-    char name[64];
-    int n = 0;
-    bool dot = false;
-    for (; b[n] && n < (int)sizeof name - 5; n++) {
-        name[n] = pe_lower(b[n]);
-        if (b[n] == '.') dot = true;
-    }
-    name[n] = '\0';
-    if (!dot) memcpy(name + n, ".dll", 5);
-    for (int i = 0; i < c->n; i++)
-        if (strcmp(c->mod[i].name, name) == 0) return i;
-
+/* Map the image read from `path` (img/sz, borrowed or kmalloc'd -- consumed
+ * here) as module `name`, then bind it. Returns its index, or -1 with the
+ * failure recorded. */
+static int pe_map_file(struct pe_ctx *c, const char *name, const char *path,
+                       void *img, size_t sz, int borrowed, const char *needed_by) {
     char text[200];
-    if (c->n >= WIN32_MAX_MODULES) {
+    int mi = pe_slot_alloc(c);
+    if (mi < 0) {
+        if (!borrowed) kfree(img);
         ksnprintf(text, sizeof text, "%s cannot be loaded: more than %d modules (needed by %s)",
                   name, WIN32_MAX_MODULES, needed_by);
-        pe_fail(c, WIN32_STATUS_DLL_NOT_FOUND, text);
+        pe_fail(c, WIN32_STATUS_NO_MEMORY, text);
         return -1;
     }
-
-    const char *dirs[4] = { c->exe_dir, "/data/Windows/System32", "/data/Windows", c->cwd };
-    char path[ABI_PATH_MAX];
-    void *img = 0;
-    size_t sz = 0;
-    int borrowed = 0;
-    bool got = false;
-    for (int i = 0; i < 4 && !got; i++)
-        if (dirs[i] && dirs[i][0]) got = pe_try_dir(dirs[i], name, path, sizeof path, &img, &sz, &borrowed);
-    if (!got) {
-        ksnprintf(text, sizeof text, "%s was not found (needed by %s)", name, needed_by);
-        pe_fail(c, WIN32_STATUS_DLL_NOT_FOUND, text);
-        return -1;
-    }
-
     struct pe_hdr h;
     uint64_t pref = 0, soi = 0, base = 0;
     bool ok = pe_parse(img, sz, &h);
@@ -1129,6 +1340,7 @@ static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed
     }
     struct pe_data_dir rd = pe_dir(&h, PE_DIR_BASERELOC);
     bool has_reloc = rd.rva && rd.size;
+    uint64_t root = pe_root_enter(c);            /* placement: nothing here sleeps */
     base = pref;
     if (!pe_range_free(base, base + soi)) {
         base = 0;
@@ -1138,6 +1350,7 @@ static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed
             }
         }
         if (!base) {
+            pe_root_leave(c, root);
             if (!borrowed) kfree(img);
             ksnprintf(text, sizeof text, "%s cannot be placed: its base %p is taken%s (needed by %s)",
                       name, (void *)pref, has_reloc ? "" : " and it has no relocations", needed_by);
@@ -1147,16 +1360,18 @@ static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed
         c->next_base = round_up(base + soi, 0x10000);
     }
     if (!pe_map_user(base, base + soi)) {
+        pe_root_leave(c, root);
         if (!borrowed) kfree(img);
+        /* a partial mapping is unmapped with the module (W4) or the process */
+        if (c->rt) mmap_unmap_loader_pages(base, soi);
         ksnprintf(text, sizeof text, "%s: out of memory mapping it (needed by %s)", name, needed_by);
-        pe_fail(c, WIN32_STATUS_DLL_NOT_FOUND, text);
+        pe_fail(c, WIN32_STATUS_NO_MEMORY, text);
         return -1;
     }
+    pe_root_leave(c, root);
     pe_place(img, sz, &h, base, (int64_t)(base - pref), soi);
 
-    int mi = c->n++;
     struct pe_mod *m = &c->mod[mi];
-    memset(m, 0, sizeof *m);
     memcpy(m->name, name, strlen(name) + 1);
     m->base = base;
     m->size = soi;
@@ -1167,9 +1382,13 @@ static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed
     d = pe_dir(&h, PE_DIR_TLS);    m->tls_rva = d.rva;    m->tls_size = d.size;
     m->is_dll = (h.coff->characteristics & PE_FILE_DLL) != 0;
     m->state = PE_MOD_MAPPED;
-    m->name_va = pe_mt_string(c, name);
+    m->fresh = c->rt;
+    /* Loaded with the process: pinned, and its entry is called by the init
+     * trampoline before the .exe's. At run time: neither, yet. */
+    m->flags = c->rt ? 0 : (WIN32_MTM_FLAG_PINNED | (m->entry ? WIN32_MTM_FLAG_INITED : 0));
+    if (mi >= c->n) c->n = mi + 1;
     char wp[ABI_PATH_MAX];
-    if (win32_kpath_to_winpath(path, wp, sizeof wp) > 0) m->path_va = pe_mt_string(c, wp);
+    pe_slot_strings(c, mi, win32_kpath_to_winpath(path, wp, sizeof wp) > 0 ? wp : 0);
     if (!borrowed) kfree(img);
     kprintf("[pe] DLL %s from %s at %p (preferred %p%s), needed by %s\n",
             name, path, (void *)base, (void *)pref,
@@ -1179,9 +1398,63 @@ static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed
     return mi;
 }
 
+/* The module for DLL `dll`: already loaded, or found, mapped and bound now.
+ * Returns its index, or -1 with the failure recorded. */
+static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed_by) {
+    if (c->failed) return -1;
+    char name[WIN32_MT_NAME_MAX];
+    char text[200];
+    if (pe_module_name(dll, name, sizeof name) < 0) {
+        ksnprintf(text, sizeof text, "%s: the name is too long (needed by %s)", dll, needed_by);
+        pe_fail(c, WIN32_STATUS_DLL_NOT_FOUND, text);
+        return -1;
+    }
+    int li = pe_loaded(c, name);
+    if (li >= 0) return li;
+    if (c->no_load) {
+        ksnprintf(text, sizeof text, "%s is not loaded (needed by %s)", name, needed_by);
+        pe_fail(c, WIN32_STATUS_DLL_NOT_FOUND, text);
+        return -1;
+    }
+    char path[ABI_PATH_MAX];
+    void *img = 0;
+    size_t sz = 0;
+    int borrowed = 0;
+    bool got = false;
+    for (int i = 0; i < c->ndirs && !got; i++)
+        if (c->dirs[i] && c->dirs[i][0])
+            got = pe_try_dir(c->dirs[i], name, path, sizeof path, &img, &sz, &borrowed);
+    if (!got) {
+        ksnprintf(text, sizeof text, "%s was not found (needed by %s)", name, needed_by);
+        pe_fail(c, WIN32_STATUS_DLL_NOT_FOUND, text);
+        return -1;
+    }
+    return pe_map_file(c, name, path, img, sz, borrowed, needed_by);
+}
+
+/* An import a module's DLL does not export: bind it to a missing-import stub
+ * (W1). At run time (W4) the stubs' pages are read-only and executable, so
+ * they are opened for writing for the rest of the call (pe_rt_end closes
+ * them). */
+static uint64_t pe_missing_bind(struct pe_ctx *c, const char *dll, const char *fname) {
+    if (c->rt && !c->miss_open) {
+        uint64_t root = pe_root_enter(c);
+        (void)vmm_protect(WIN32_MISSING_STUB_VA, WIN32_MISSING_END_VA - WIN32_MISSING_STUB_VA,
+                          VMM_PRESENT | VMM_USER | VMM_WRITE);
+        pe_root_leave(c, root);
+        c->miss_open = true;
+    }
+    unsigned long uf = uaccess_begin();
+    uint64_t va = pe_missing_stub(&c->miss, dll, fname);
+    uaccess_end(uf);
+    return va;
+}
+
 /* Bind module mi's imports (loading the DLLs they name), then set up its TLS,
  * tighten its pages, and queue its entry point for initialization -- after
- * every DLL it imports, since those were bound (and queued) inside the loop. */
+ * every DLL it imports, since those were bound (and queued) inside the loop.
+ * W4: at run time each import descriptor naming a DLL on disk is a reference
+ * to that DLL (pe_rt_release drops the same ones). */
 static int pe_bind_module(struct pe_ctx *c, int mi) {
     c->mod[mi].state = PE_MOD_BINDING;
     if (c->mod[mi].import_rva && pe_rva_ok(&c->mod[mi], c->mod[mi].import_rva, sizeof(struct pe_import_desc))) {
@@ -1189,17 +1462,18 @@ static int pe_bind_module(struct pe_ctx *c, int mi) {
             struct pe_mod *m = &c->mod[mi];      /* re-read: c->mod is stable, m is a view */
             if (!pe_rva_ok(m, off, sizeof(struct pe_import_desc))) break;
             struct pe_import_desc desc;
-            pe_uread(&desc, m->base + off, sizeof desc);
+            pe_uread(c, &desc, m->base + off, sizeof desc);
             if (!desc.name_rva) break;
             char dll[80];
             if (!pe_rva_ok(m, desc.name_rva, 1) ||
-                pe_ustr(dll, sizeof dll, m->base + desc.name_rva, m->base + m->size) < 0)
+                pe_ustr(c, dll, sizeof dll, m->base + desc.name_rva, m->base + m->size) < 0)
                 break;
             bool builtin = win32_dll_is_builtin(dll);
             int dj = -1;
             if (!builtin) {
                 dj = pe_find_or_load(c, dll, m->name);
                 if (dj < 0) return -1;
+                if (c->rt) pe_ref(c, dj);
             }
             uint64_t iat   = m->base + desc.first_thunk;
             uint64_t names = m->base + (desc.original_first_thunk ? desc.original_first_thunk
@@ -1209,14 +1483,14 @@ static int pe_bind_module(struct pe_ctx *c, int mi) {
                     !pe_rva_ok(m, (iat - m->base) + k * 8, 8))
                     break;
                 uint64_t ent;
-                pe_uread(&ent, names + k * 8, 8);
+                pe_uread(c, &ent, names + k * 8, 8);
                 if (!ent) break;
                 char fname[128];
                 bool by_ord = (ent & PE_ORDINAL_FLAG) != 0;
                 if (by_ord) {
                     ksnprintf(fname, sizeof fname, "#%u", (unsigned)(ent & 0xFFFFu));
                 } else if (!pe_rva_ok(m, (uint32_t)ent + 2, 1) ||
-                           pe_ustr(fname, sizeof fname, m->base + (uint32_t)ent + 2,
+                           pe_ustr(c, fname, sizeof fname, m->base + (uint32_t)ent + 2,
                                    m->base + m->size) < 0) {
                     ksnprintf(fname, sizeof fname, "(bad name)");
                 }
@@ -1229,51 +1503,530 @@ static int pe_bind_module(struct pe_ctx *c, int mi) {
                     kprintf("[pe]   bind %s!%s -> %s@%p\n", dll, fname,
                             builtin ? "shim" : c->mod[dj].name, (void *)va);
                 } else {
-                    unsigned long uf = uaccess_begin();
-                    va = pe_missing_stub(&c->miss, dll, fname);
-                    uaccess_end(uf);
+                    va = pe_missing_bind(c, dll, fname);
                     kprintf("[pe] unresolved import %s!%s -> missing-stub@%p\n",
                             dll, fname, (void *)va);
                 }
-                pe_uwrite(iat + k * 8, &va, 8);
+                (void)pe_uwrite(c, iat + k * 8, &va, 8);
             }
         }
     }
     struct pe_mod *m = &c->mod[mi];
-    pe_setup_tls(c, m);
-    pe_protect(m);
+    pe_setup_tls(c, mi);
+    pe_protect(c, m);
     m->state = PE_MOD_DONE;
     if (m->is_dll && m->entry && c->ninit < WIN32_MAX_MODULES)
         c->init[c->ninit++] = mi;
     return 0;
 }
 
-/* The module table's header, records and init list, from the loader's state. */
-static void pe_write_modtab(struct pe_ctx *c, uint64_t exe_entry) {
-    uint32_t nmod = (uint32_t)c->n, ninit = (uint32_t)c->ninit;
-    pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_EXE_ENTRY, &exe_entry, 8);
-    pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_INIT_COUNT, &ninit, 4);
-    pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_MOD_COUNT, &nmod, 4);
-    for (int i = 0; i < c->ninit; i++) {
-        const struct pe_mod *m = &c->mod[c->init[i]];
-        uint64_t e[3] = { m->entry, m->base, m->name_va };
-        pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_INIT_LIST + (uint64_t)i * WIN32_MT_INIT_STRIDE, e, sizeof e);
-    }
-    for (int i = 0; i < c->n; i++) {
+/* The module table's records and the loader's cursors, from the loader's
+ * state: every slot, a free one as zeros. */
+static void pe_commit(struct pe_ctx *c) {
+    uint32_t nmod = (uint32_t)c->n;
+    (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_MOD_COUNT, &nmod, 4);
+    uint64_t st[4] = { c->miss.next_stub, c->miss.next_name, c->tls_next, c->tls_end };
+    (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_MISS_STUB, st, sizeof st);
+    (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_TLS_USED, &c->tls_used, 4);
+    for (int i = 0; i < WIN32_MAX_MODULES; i++) {
         const struct pe_mod *m = &c->mod[i];
         uint8_t r[WIN32_MT_MOD_STRIDE];
         memset(r, 0, sizeof r);
-        uint32_t flags = m->is_dll ? WIN32_MTM_FLAG_DLL : 0;
-        memcpy(r + WIN32_MTM_BASE, &m->base, 8);
-        memcpy(r + WIN32_MTM_SIZE, &m->size, 8);
-        memcpy(r + WIN32_MTM_ENTRY, &m->entry, 8);
-        memcpy(r + WIN32_MTM_NAME, &m->name_va, 8);
-        memcpy(r + WIN32_MTM_PATH, &m->path_va, 8);
-        memcpy(r + WIN32_MTM_EXPORT_RVA, &m->export_rva, 4);
-        memcpy(r + WIN32_MTM_EXPORT_SIZE, &m->export_size, 4);
-        memcpy(r + WIN32_MTM_FLAGS, &flags, 4);
-        pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_MODS + (uint64_t)i * WIN32_MT_MOD_STRIDE, r, sizeof r);
+        if (i < c->n && m->base) {
+            uint32_t flags = m->flags | (m->is_dll ? WIN32_MTM_FLAG_DLL : 0);
+            memcpy(r + WIN32_MTM_BASE, &m->base, 8);
+            memcpy(r + WIN32_MTM_SIZE, &m->size, 8);
+            memcpy(r + WIN32_MTM_ENTRY, &m->entry, 8);
+            memcpy(r + WIN32_MTM_NAME, &m->name_va, 8);
+            memcpy(r + WIN32_MTM_PATH, &m->path_va, 8);
+            memcpy(r + WIN32_MTM_EXPORT_RVA, &m->export_rva, 4);
+            memcpy(r + WIN32_MTM_EXPORT_SIZE, &m->export_size, 4);
+            memcpy(r + WIN32_MTM_FLAGS, &flags, 4);
+            memcpy(r + WIN32_MTM_REFS, &m->refs, 4);
+            memcpy(r + WIN32_MTM_TLS_SLOT, &m->tls_slot, 4);
+        }
+        (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_MODS + (uint64_t)i * WIN32_MT_MOD_STRIDE, r, sizeof r);
     }
+}
+
+/* At process start: the header, the init list and the records. */
+static void pe_write_modtab(struct pe_ctx *c, uint64_t exe_entry) {
+    uint32_t ninit = (uint32_t)c->ninit;
+    (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_EXE_ENTRY, &exe_entry, 8);
+    (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_INIT_COUNT, &ninit, 4);
+    for (int i = 0; i < c->ninit; i++) {
+        const struct pe_mod *m = &c->mod[c->init[i]];
+        uint64_t e[3] = { m->entry, m->base, m->name_va };
+        (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_INIT_LIST + (uint64_t)i * WIN32_MT_INIT_STRIDE, e, sizeof e);
+    }
+    pe_commit(c);
+}
+
+/* ===== W4: the run-time loader ============================================== */
+
+/* LoadLibraryEx's dwFlags (Microsoft's LoadLibraryExW documentation). */
+#define LLF_DONT_RESOLVE_DLL_REFERENCES    0x00000001u
+#define LLF_AS_DATAFILE                    0x00000002u
+#define LLF_WITH_ALTERED_SEARCH_PATH       0x00000008u
+#define LLF_AS_IMAGE_RESOURCE              0x00000020u
+#define LLF_AS_DATAFILE_EXCLUSIVE          0x00000040u
+#define LLF_SEARCH_DLL_LOAD_DIR            0x00000100u
+#define LLF_SEARCH_APPLICATION_DIR         0x00000200u
+#define LLF_SEARCH_USER_DIRS               0x00000400u
+#define LLF_SEARCH_SYSTEM32                0x00000800u
+#define LLF_SEARCH_DEFAULT_DIRS            0x00001000u
+#define LLF_SEARCH_MASK                    0x00001F00u
+#define LLF_AS_DATA (LLF_DONT_RESOLVE_DLL_REFERENCES | LLF_AS_DATAFILE | \
+                     LLF_AS_IMAGE_RESOURCE | LLF_AS_DATAFILE_EXCLUSIVE)
+
+#define W32E_NOT_ENOUGH_MEMORY  8u
+#define W32E_INVALID_DATA       13u
+#define W32E_NOT_SUPPORTED      50u
+#define W32E_INVALID_PARAMETER  87u
+#define W32E_MOD_NOT_FOUND      126u
+#define W32E_PROC_NOT_FOUND     127u
+#define W32E_BAD_EXE_FORMAT     193u
+
+/* The module table's slot records name in-range user memory? (They are the
+ * program's to change: a record that is not is refused, not followed.) */
+static bool pe_rt_range_ok(uint64_t base, uint64_t size) {
+    if ((base | size) & (PAGE_SIZE - 1)) return false;
+    if (size == 0 || size >= (1ULL << 32)) return false;
+    if (base < 0x10000ULL || base + size > 0x0000800000000000ULL) return false;
+    if (base < 0x32000000ULL && base + size > 0x30000000ULL) return false;
+    return true;
+}
+
+/* Module m's import and TLS directories, from its mapped headers. */
+static void pe_rt_dirs_of(struct pe_ctx *c, struct pe_mod *m) {
+    uint32_t lfanew = 0;
+    pe_uread(c, &lfanew, m->base + 0x3C, 4);
+    struct coff_header coff;
+    struct pe_opt_header64 opt;
+    uint64_t at = (uint64_t)lfanew + 4;
+    if (!pe_rva_ok(m, at, sizeof coff + sizeof opt)) return;
+    pe_uread(c, &coff, m->base + at, sizeof coff);
+    pe_uread(c, &opt, m->base + at + sizeof coff, sizeof opt);
+    struct pe_data_dir d[PE_DIR_TLS + 1];
+    memset(d, 0, sizeof d);
+    uint32_t nd = opt.num_data_dirs < (uint32_t)(PE_DIR_TLS + 1) ? opt.num_data_dirs
+                                                                 : (uint32_t)(PE_DIR_TLS + 1);
+    uint64_t dirs = at + sizeof coff + sizeof opt;
+    if (nd && pe_rva_ok(m, dirs, (uint64_t)nd * sizeof d[0]))
+        pe_uread(c, d, m->base + dirs, (size_t)nd * sizeof d[0]);
+    m->import_rva = d[PE_DIR_IMPORT].rva; m->import_size = d[PE_DIR_IMPORT].size;
+    m->tls_rva    = d[PE_DIR_TLS].rva;    m->tls_size    = d[PE_DIR_TLS].size;
+}
+
+/* A run-time call's loader state, rebuilt from the current process's module
+ * table. NULL, with *err set, when the process has none (or it does not hold
+ * together), or there is no memory. */
+static struct pe_ctx *pe_rt_begin(uint32_t *err) {
+    struct proc *p = current_proc();
+    struct proc *lead = (p && p->is_thread) ? proc_lookup(p->tgid) : p;
+    *err = W32E_INVALID_DATA;
+    if (!p || !lead || !lead->win_image_base) return 0;
+    struct pe_ctx *c = kmalloc(sizeof *c);
+    if (!c) { *err = W32E_NOT_ENOUGH_MEMORY; return 0; }
+    memset(c, 0, sizeof *c);
+    c->rt = true;
+
+    uint32_t nmod = 0, used = 0;
+    uint64_t st[4];
+    if (!pe_uread(c, &nmod, WIN32_MODTAB_BASE + WIN32_MT_MOD_COUNT, 4) ||
+        !pe_uread(c, st, WIN32_MODTAB_BASE + WIN32_MT_MISS_STUB, sizeof st) ||
+        !pe_uread(c, &used, WIN32_MODTAB_BASE + WIN32_MT_TLS_USED, 4) ||
+        nmod == 0 || nmod > WIN32_MAX_MODULES)
+        goto bad;
+    c->n = (int)nmod;
+
+    /* the cursors: any that does not hold together reads as "full" */
+    c->miss.idx = win32_shim_index("kernel32.dll", "__toby_missing");
+    c->miss.next_stub = st[0];
+    c->miss.next_name = st[1];
+    if (st[0] < WIN32_MISSING_STUB_VA || st[0] > WIN32_MISSING_NAMES_VA ||
+        (st[0] - WIN32_MISSING_STUB_VA) % WIN32_MISSING_STUB_SIZE != 0 ||
+        st[1] < WIN32_MISSING_NAMES_VA || st[1] > WIN32_MISSING_END_VA) {
+        c->miss.next_stub = WIN32_MISSING_NAMES_VA;
+        c->miss.next_name = WIN32_MISSING_END_VA;
+    }
+    c->tls_next = st[2];
+    c->tls_end  = st[3];
+    if ((c->tls_end & (PAGE_SIZE - 1)) || c->tls_end < WIN32_TLS_BASE ||
+        c->tls_end > WIN32_MODTAB_BASE || c->tls_next < WIN32_TLS_BASE + WIN32_TLS_BLK_OFF ||
+        c->tls_next > WIN32_MODTAB_BASE) {
+        c->tls_end = WIN32_MODTAB_BASE;
+        c->tls_next = WIN32_MODTAB_BASE;
+    }
+    c->tls_used = used | 1u;                      /* slot 0 is the .exe's */
+
+    for (int i = 0; i < c->n; i++) {
+        uint8_t r[WIN32_MT_MOD_STRIDE];
+        if (!pe_uread(c, r, WIN32_MODTAB_BASE + WIN32_MT_MODS + (uint64_t)i * WIN32_MT_MOD_STRIDE, sizeof r))
+            goto bad;
+        struct pe_mod *m = &c->mod[i];
+        uint64_t path_va;
+        uint32_t flags;
+        memcpy(&m->base, r + WIN32_MTM_BASE, 8);
+        if (!m->base) continue;                   /* a free slot */
+        memcpy(&m->size, r + WIN32_MTM_SIZE, 8);
+        memcpy(&m->entry, r + WIN32_MTM_ENTRY, 8);
+        memcpy(&path_va, r + WIN32_MTM_PATH, 8);
+        memcpy(&m->export_rva, r + WIN32_MTM_EXPORT_RVA, 4);
+        memcpy(&m->export_size, r + WIN32_MTM_EXPORT_SIZE, 4);
+        memcpy(&flags, r + WIN32_MTM_FLAGS, 4);
+        memcpy(&m->refs, r + WIN32_MTM_REFS, 4);
+        memcpy(&m->tls_slot, r + WIN32_MTM_TLS_SLOT, 4);
+        if (!pe_rt_range_ok(m->base, m->size) || (i == 0 && (flags & WIN32_MTM_FLAG_DLL)) ||
+            m->tls_slot >= (uint32_t)WIN32_TLS_SLOTS)
+            goto bad;
+        m->is_dll  = (flags & WIN32_MTM_FLAG_DLL) != 0;
+        m->flags   = flags & ~WIN32_MTM_FLAG_DLL;
+        if (i == 0) m->flags |= WIN32_MTM_FLAG_PINNED;
+        m->state   = PE_MOD_DONE;
+        m->name_va = pe_slot_name_va(i);
+        m->path_va = path_va ? pe_slot_path_va(i) : 0;
+        if (pe_ustr(c, m->name, sizeof m->name, m->name_va, m->name_va + WIN32_MT_NAME_MAX) <= 0)
+            goto bad;
+        for (char *q = m->name; *q; q++) *q = pe_lower(*q);
+        pe_rt_dirs_of(c, m);
+    }
+
+    /* the search order's places: the .exe's directory and the current one */
+    {
+        const char *ep = lead->exe_path[0] ? lead->exe_path : "/";
+        int last = 0;
+        for (int i = 0; ep[i]; i++) if (ep[i] == '/') last = i;
+        int dn = last > 0 ? last : 1;
+        if (dn >= (int)sizeof c->exe_dir) dn = (int)sizeof c->exe_dir - 1;
+        memcpy(c->exe_dir, ep, (size_t)dn);
+        c->exe_dir[dn] = '\0';
+    }
+    c->cwd = p->cwd[0] ? p->cwd : "/";
+    c->next_base = 0x0000000200000000ULL;
+    *err = 0;
+    return c;
+bad:
+    kprintf("[pe] the module table of pid %d does not hold together -- refusing the call\n", p->pid);
+    kfree(c);
+    return 0;
+}
+
+/* End a run-time call: close the missing-import pages again, free the state. */
+static void pe_rt_end(struct pe_ctx *c) {
+    if (c->miss_open) {
+        uint64_t root = pe_root_enter(c);
+        (void)vmm_protect(WIN32_MISSING_STUB_VA, WIN32_MISSING_END_VA - WIN32_MISSING_STUB_VA,
+                          VMM_PRESENT | VMM_USER);
+        pe_root_leave(c, root);
+    }
+    kfree(c);
+}
+
+/* A failed LoadLibrary: unmap every module this call mapped. Their records were
+ * never written, and the table's cursors are left as they were (what the call
+ * took from the missing-import and TLS areas is simply taken again). */
+static void pe_rt_rollback(struct pe_ctx *c) {
+    for (int i = 0; i < c->n; i++) {
+        struct pe_mod *m = &c->mod[i];
+        if (!m->base || !m->fresh) continue;
+        pe_tls_release(c, m);
+        mmap_unmap_loader_pages(m->base, m->size);
+        kprintf("[pe] LoadLibrary failed: unmapped %s at %p\n", m->name, (void *)m->base);
+        memset(m, 0, sizeof *m);
+    }
+}
+
+/* Drop a reference to module mi. When none is left it joins `list` (to be
+ * detached and unmapped), and so does every module it imports that has none
+ * left after it -- a module after all its importers, the order Windows
+ * detaches in. A pinned module, or one already listed, is left alone. */
+static void pe_rt_release(struct pe_ctx *c, int mi, int *list, int *nl) {
+    struct pe_mod *m = &c->mod[mi];
+    if (!m->base || (m->flags & (WIN32_MTM_FLAG_PINNED | WIN32_MTM_FLAG_UNLOAD))) return;
+    if (m->refs > 0) m->refs--;
+    if (m->refs > 0) return;
+    m->flags |= WIN32_MTM_FLAG_UNLOAD;
+    if (*nl < WIN32_MAX_MODULES) list[(*nl)++] = mi;
+    if (!m->import_rva) return;
+    for (uint64_t k = 0; k < 512; k++) {
+        uint64_t off = m->import_rva + k * sizeof(struct pe_import_desc);
+        if (!pe_rva_ok(m, off, sizeof(struct pe_import_desc))) break;
+        struct pe_import_desc desc;
+        if (!pe_uread(c, &desc, m->base + off, sizeof desc) || !desc.name_rva) break;
+        char dll[80], key[WIN32_MT_NAME_MAX];
+        if (!pe_rva_ok(m, desc.name_rva, 1) ||
+            pe_ustr(c, dll, sizeof dll, m->base + desc.name_rva, m->base + m->size) < 0)
+            break;
+        if (win32_dll_is_builtin(dll) || pe_module_name(dll, key, sizeof key) < 0) continue;
+        int j = pe_loaded(c, key);
+        if (j >= 0 && j != mi) pe_rt_release(c, j, list, nl);
+    }
+}
+
+/* ubuf <- {count, {entry, base}...} for `list`: the entry when the module's
+ * DLL_PROCESS_ATTACH was called (so it gets its DETACH), else 0 (unmapped
+ * without a call). */
+static bool pe_rt_put_list(struct pe_ctx *c, uint64_t ubuf, const int *list, int nl) {
+    uint64_t b[1 + 2 * WIN32_LDR_BUF_MAX];
+    b[0] = (uint64_t)nl;
+    for (int k = 0; k < nl; k++) {
+        const struct pe_mod *m = &c->mod[list[k]];
+        b[1 + 2 * k] = (m->flags & WIN32_MTM_FLAG_INITED) ? m->entry : 0;
+        b[2 + 2 * k] = m->base;
+    }
+    return copy_to_user((void *)(uintptr_t)ubuf, b, 8 + (size_t)nl * 16) == 0;
+}
+/* The {entry, base} pairs at ubuf (count clamped to the buffer). */
+static int pe_rt_get_list(uint64_t ubuf, uint64_t *b) {
+    if (copy_from_user(b, (const void *)(uintptr_t)ubuf, 8) != 0) return 0;
+    int n = b[0] > WIN32_LDR_BUF_MAX ? 0 : (int)b[0];
+    if (n && copy_from_user(b + 1, (const void *)(uintptr_t)(ubuf + 8), (size_t)n * 16) != 0) return 0;
+    return n;
+}
+
+static uint32_t pe_rt_status_err(uint32_t status) {
+    switch (status) {
+    case WIN32_STATUS_INVALID_IMAGE_FORMAT: return W32E_BAD_EXE_FORMAT;
+    case WIN32_STATUS_NO_MEMORY:            return W32E_NOT_ENOUGH_MEMORY;
+    default:                                return W32E_MOD_NOT_FOUND;
+    }
+}
+
+/* Split a '/'-path into its directory (dir, "/" for the root) and file. */
+static const char *pe_split(const char *path, char *dir, int cap) {
+    int last = -1;
+    for (int i = 0; path[i]; i++) if (path[i] == '/') last = i;
+    int dn = last > 0 ? last : (last == 0 ? 1 : 0);
+    if (dn >= cap) dn = cap - 1;
+    memcpy(dir, path, (size_t)dn);
+    dir[dn] = '\0';
+    return path + last + 1;
+}
+
+uint64_t pe_rt_load(const struct pe_rt_req *rq, uint64_t ubuf, uint32_t *err) {
+    uint64_t zero = 0;
+    *err = 0;
+    if (copy_to_user((void *)(uintptr_t)ubuf, &zero, 8) != 0) { *err = W32E_INVALID_PARAMETER; return 0; }
+    uint32_t fl = rq->flags;
+    const char *spec = rq->kpath ? rq->kpath : rq->name;
+    if (!spec || !spec[0]) { *err = W32E_INVALID_PARAMETER; return 0; }
+    if (fl & LLF_AS_DATA) {
+        kprintf("[pe] LoadLibraryEx(%s, 0x%x): mapping as data is not implemented\n", spec, fl);
+        *err = W32E_NOT_SUPPORTED;
+        return 0;
+    }
+    /* documented: the altered order cannot be combined with the SEARCH flags,
+     * and DLL_LOAD_DIR needs a fully qualified path */
+    if (((fl & LLF_WITH_ALTERED_SEARCH_PATH) && (fl & LLF_SEARCH_MASK)) ||
+        ((fl & LLF_SEARCH_DLL_LOAD_DIR) && !rq->kpath)) {
+        *err = W32E_INVALID_PARAMETER;
+        return 0;
+    }
+    char name[WIN32_MT_NAME_MAX];
+    if (pe_module_name(spec, name, sizeof name) < 0) { *err = W32E_MOD_NOT_FOUND; return 0; }
+    struct pe_ctx *c = pe_rt_begin(err);
+    if (!c) return 0;
+
+    /* The search order for this call (and the DLLs it pulls in). */
+    if (rq->kpath) (void)pe_split(rq->kpath, c->load_dir, sizeof c->load_dir);
+    if (fl & LLF_SEARCH_MASK) {
+        if (fl & LLF_SEARCH_DEFAULT_DIRS)
+            fl |= LLF_SEARCH_APPLICATION_DIR | LLF_SEARCH_USER_DIRS | LLF_SEARCH_SYSTEM32;
+        if (fl & LLF_SEARCH_DLL_LOAD_DIR)    c->dirs[c->ndirs++] = c->load_dir;
+        if (fl & LLF_SEARCH_APPLICATION_DIR) c->dirs[c->ndirs++] = c->exe_dir;
+        /* LLF_SEARCH_USER_DIRS: AddDllDirectory's list -- there is none yet */
+        if (fl & LLF_SEARCH_SYSTEM32)        c->dirs[c->ndirs++] = "/data/Windows/System32";
+    } else {
+        c->dirs[c->ndirs++] = ((fl & LLF_WITH_ALTERED_SEARCH_PATH) && rq->kpath) ? c->load_dir
+                                                                               : c->exe_dir;
+        c->dirs[c->ndirs++] = "/data/Windows/System32";
+        c->dirs[c->ndirs++] = "/data/Windows";
+        c->dirs[c->ndirs++] = c->cwd;
+    }
+
+    const char *who = c->mod[0].name;
+    bool bare = !rq->kpath;
+    for (const char *q = spec; bare && *q; q++) if (*q == '/') bare = false;
+    int mi = bare ? pe_loaded(c, name) : -1;      /* a bare name: the loaded list first */
+    if (mi < 0) {
+        char path[ABI_PATH_MAX], dir[ABI_PATH_MAX], wp[ABI_PATH_MAX];
+        void *img = 0;
+        size_t sz = 0;
+        int borrowed = 0;
+        bool got = false;
+        if (rq->kpath) {
+            (void)pe_split(rq->kpath, dir, sizeof dir);
+            got = pe_try_dir(dir[0] ? dir : "/", name, path, sizeof path, &img, &sz, &borrowed);
+        } else {
+            /* "If a relative path is specified, the entire relative path is
+             * appended to every token in the DLL search path." */
+            char rel[ABI_PATH_MAX];
+            (void)pe_split(spec, rel, sizeof rel);
+            for (int i = 0; i < c->ndirs && !got; i++) {
+                if (!c->dirs[i] || !c->dirs[i][0]) continue;
+                const char *d = c->dirs[i];
+                if (rel[0]) {
+                    ksnprintf(dir, sizeof dir, "%s%s%s", d, d[strlen(d) - 1] == '/' ? "" : "/", rel);
+                    d = dir;
+                }
+                got = pe_try_dir(d, name, path, sizeof path, &img, &sz, &borrowed);
+            }
+        }
+        if (!got) {
+            kprintf("[pe] LoadLibrary(%s): not found\n", spec);
+            *err = W32E_MOD_NOT_FOUND;
+            pe_rt_end(c);
+            return 0;
+        }
+        /* the same file already loaded (a path that names it, not its name) */
+        if (win32_kpath_to_winpath(path, wp, sizeof wp) > 0) mi = pe_loaded_path(c, wp);
+        if (mi >= 0) {
+            if (!borrowed) kfree(img);
+        } else {
+            mi = pe_map_file(c, name, path, img, sz, borrowed, who);
+        }
+    }
+    if (c->failed || mi < 0) {
+        pe_rt_rollback(c);
+        *err = pe_rt_status_err(c->fail_status);
+        pe_rt_end(c);
+        return 0;
+    }
+    pe_ref(c, mi);                                /* this LoadLibrary's reference */
+
+    /* the entry points to call: the DLLs this call mapped, dependencies first */
+    uint64_t b[1 + 2 * WIN32_LDR_BUF_MAX];
+    b[0] = (uint64_t)c->ninit;
+    for (int k = 0; k < c->ninit; k++) {
+        b[1 + 2 * k] = c->mod[c->init[k]].entry;
+        b[2 + 2 * k] = c->mod[c->init[k]].base;
+    }
+    if (copy_to_user((void *)(uintptr_t)ubuf, b, 8 + (size_t)c->ninit * 16) != 0) {
+        pe_rt_rollback(c);
+        *err = W32E_INVALID_PARAMETER;
+        pe_rt_end(c);
+        return 0;
+    }
+    pe_commit(c);
+    uint64_t base = c->mod[mi].base;
+    kprintf("[pe] LoadLibrary(%s) -> %s at %p, refs %u, %d to initialize\n", spec,
+            c->mod[mi].name, (void *)base, c->mod[mi].refs, c->ninit);
+    pe_rt_end(c);
+    return base;
+}
+
+uint64_t pe_rt_attached(uint64_t hmod, int64_t failed, uint64_t ubuf) {
+    uint32_t err;
+    uint64_t zero = 0;
+    struct pe_ctx *c = pe_rt_begin(&err);
+    if (!c) {
+        (void)copy_to_user((void *)(uintptr_t)ubuf, &zero, 8);
+        return failed < 0 ? hmod : 0;
+    }
+    uint64_t b[1 + 2 * WIN32_LDR_BUF_MAX];
+    int n = pe_rt_get_list(ubuf, b);
+    /* the DllMains that were called -- the one that refused too: Windows calls
+     * it again with DLL_PROCESS_DETACH */
+    int upto = (failed < 0 || failed >= n) ? n : (int)failed + 1;
+    for (int k = 0; k < upto; k++) {
+        int j = pe_by_base(c, b[2 + 2 * k]);
+        if (j >= 0) c->mod[j].flags |= WIN32_MTM_FLAG_INITED;
+    }
+    if (failed < 0) {
+        pe_commit(c);
+        pe_rt_end(c);
+        return hmod;
+    }
+    /* A DllMain refused: drop this load's reference. */
+    int list[WIN32_MAX_MODULES], nl = 0;
+    int mi = pe_by_base(c, hmod);
+    if (mi >= 0) pe_rt_release(c, mi, list, &nl);
+    kprintf("[pe] LoadLibrary: DllMain %d of %d refused DLL_PROCESS_ATTACH -- unloading %d module(s)\n",
+            (int)failed, n, nl);
+    if (!pe_rt_put_list(c, ubuf, list, nl)) (void)copy_to_user((void *)(uintptr_t)ubuf, &zero, 8);
+    pe_commit(c);
+    pe_rt_end(c);
+    return 0;
+}
+
+int pe_rt_free(uint64_t hmod, uint64_t ubuf, uint32_t *err) {
+    struct pe_ctx *c = pe_rt_begin(err);
+    if (!c) return 0;
+    int mi = pe_by_base(c, hmod);
+    if (mi < 0) {
+        *err = W32E_MOD_NOT_FOUND;
+        pe_rt_end(c);
+        return 0;
+    }
+    int list[WIN32_MAX_MODULES], nl = 0;
+    pe_rt_release(c, mi, list, &nl);
+    if (nl && !pe_rt_put_list(c, ubuf, list, nl)) {
+        *err = W32E_INVALID_PARAMETER;
+        pe_rt_end(c);
+        return 0;
+    }
+    pe_commit(c);
+    if (nl)
+        kprintf("[pe] FreeLibrary(%s): unloading %d module(s)\n", c->mod[mi].name, nl);
+    pe_rt_end(c);
+    return nl ? 2 : 1;
+}
+
+void pe_rt_unmap(uint64_t ubuf) {
+    uint32_t err;
+    struct pe_ctx *c = pe_rt_begin(&err);
+    if (!c) return;
+    uint64_t b[1 + 2 * WIN32_LDR_BUF_MAX];
+    int n = pe_rt_get_list(ubuf, b);
+    for (int k = 0; k < n; k++) {
+        int j = pe_by_base(c, b[2 + 2 * k]);
+        if (j < 0 || !(c->mod[j].flags & WIN32_MTM_FLAG_UNLOAD)) continue;
+        struct pe_mod *m = &c->mod[j];
+        pe_tls_release(c, m);
+        mmap_unmap_loader_pages(m->base, m->size);
+        kprintf("[pe] unloaded %s from %p\n", m->name, (void *)m->base);
+        memset(m, 0, sizeof *m);
+    }
+    while (c->n > 1 && !c->mod[c->n - 1].base) c->n--;
+    pe_commit(c);
+    pe_rt_end(c);
+}
+
+uint64_t pe_rt_find(const char *name, const char *winpath) {
+    uint32_t err;
+    struct pe_ctx *c = pe_rt_begin(&err);
+    if (!c) return 0;
+    int mi = -1;
+    char key[WIN32_MT_NAME_MAX];
+    if (winpath) mi = pe_loaded_path(c, winpath);
+    else if (name && pe_module_name(name, key, sizeof key) >= 0) mi = pe_loaded(c, key);
+    uint64_t base = mi >= 0 ? c->mod[mi].base : 0;
+    pe_rt_end(c);
+    return base;
+}
+
+uint64_t pe_rt_proc(uint64_t base, const char *name, uint32_t ord, uint32_t *err) {
+    struct pe_ctx *c = pe_rt_begin(err);
+    if (!c) return 0;
+    c->no_load = true;
+    int mi = pe_by_base(c, base);
+    uint64_t va = 0;
+    if (mi < 0) *err = W32E_MOD_NOT_FOUND;
+    else if (!(va = pe_export_lookup(c, mi, name, ord, 0))) *err = W32E_PROC_NOT_FOUND;
+    pe_rt_end(c);
+    return va;
+}
+
+int pe_rt_module_path(uint64_t base, char *out, int cap) {
+    uint32_t err;
+    struct pe_ctx *c = pe_rt_begin(&err);
+    if (!c) return -1;
+    int mi = pe_by_base(c, base), n = -1;
+    if (mi >= 0 && c->mod[mi].path_va)
+        n = pe_ustr(c, out, cap, c->mod[mi].path_va, c->mod[mi].path_va + WIN32_MT_PATH_MAX);
+    pe_rt_end(c);
+    return n;
 }
 
 int pe_load_user(const void *image, size_t size, int argc, char **argv,
@@ -1439,9 +2192,9 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
     c->out       = out;
     c->cwd       = (env && env->cwd) ? env->cwd : "/";
     c->next_base = 0x0000000200000000ULL;
-    c->str       = WIN32_MODTAB_BASE + WIN32_MT_STRINGS;
     c->tls_next  = WIN32_TLS_BASE + WIN32_TLS_BLK_OFF;
     c->tls_end   = WIN32_TLS_BASE;
+    c->tls_used  = 1u;                            /* slot 0 is the .exe's */
     out->tls_raw_va = out->tls_raw_size = out->tls_total = out->tls_index = 0;
     {
         const char *ep = (env && env->exe_kpath) ? env->exe_kpath : "/";
@@ -1465,11 +2218,17 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         d = pe_dir(&h, PE_DIR_IMPORT); x->import_rva = d.rva; x->import_size = d.size;
         d = pe_dir(&h, PE_DIR_TLS);    x->tls_rva = d.rva;    x->tls_size = d.size;
         x->is_dll = false;
-        x->name_va = pe_mt_string(c, x->name);
-        char wp[ABI_PATH_MAX];
-        if (env && env->exe_kpath && win32_kpath_to_winpath(env->exe_kpath, wp, sizeof wp) > 0)
-            x->path_va = pe_mt_string(c, wp);
+        x->flags  = WIN32_MTM_FLAG_PINNED;
         c->n = 1;
+        char wp[ABI_PATH_MAX];
+        bool have_wp = env && env->exe_kpath && win32_kpath_to_winpath(env->exe_kpath, wp, sizeof wp) > 0;
+        pe_slot_strings(c, 0, have_wp ? wp : 0);
+        /* the DLL search order (W4: LoadLibraryEx builds its own per call) */
+        c->dirs[0] = c->exe_dir;
+        c->dirs[1] = "/data/Windows/System32";
+        c->dirs[2] = "/data/Windows";
+        c->dirs[3] = c->cwd;
+        c->ndirs = 4;
     }
     {
         unsigned long uf = uaccess_begin();
@@ -1478,7 +2237,12 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         int li = win32_shim_index("kernel32.dll", "__toby_loadfail");
         uint64_t lf = (li >= 0 && (uint64_t)li < WIN32_PA_CAP)
             ? WIN32_PROCADDR_BASE_VA + (uint64_t)li * WIN32_PROCADDR_STRIDE : 0;
-        pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_LOADFAIL, &lf, 8);
+        (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_LOADFAIL, &lf, 8);
+        /* W4: the LoadLibrary/FreeLibrary stubs' way into the kernel */
+        int ri = win32_shim_index("kernel32.dll", "__toby_ldr");
+        uint64_t ldr = (ri >= 0 && (uint64_t)ri < WIN32_PA_CAP)
+            ? WIN32_PROCADDR_BASE_VA + (uint64_t)ri * WIN32_PROCADDR_STRIDE : 0;
+        (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_LDR, &ldr, 8);
     }
 
     (void)pe_bind_module(c, 0);
