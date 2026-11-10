@@ -24010,6 +24010,45 @@ static long w32_GetFullPathNameA(uint64_t *a) {
     return win32_full_path(wp, a, false);
 }
 
+/* kernel32!GetLogicalDrives() -> the drive bitmask: C: (bit 2) and Z: (bit 25),
+ * the two drives win32_path_map knows. */
+static long w32_GetLogicalDrives(uint64_t *a) { (void)a; return (long)((1u << 2) | (1u << 25)); }
+
+/* kernel32!GetDriveTypeA/W(lpRootPathName) -> DRIVE_FIXED (3) for C: and Z:,
+ * DRIVE_NO_ROOT_DIR (1) for any other; NULL is the current directory's drive. */
+static long win32_drive_type(const char *root) {
+    char d;
+    if (!root || !root[0]) {
+        char cw[ABI_PATH_MAX];
+        if (win32_cwd_winpath(cw, sizeof cw) < 0) return 1;
+        d = cw[0];
+    } else if (win32_is_letter(root[0]) && root[1] == ':') {
+        d = win32_upper(root[0]);
+    } else {
+        return 1;
+    }
+    return (d == 'C' || d == 'Z') ? 3 : 1;
+}
+static long w32_GetDriveTypeA(uint64_t *a) {
+    char r[8] = {0};
+    if (a[0] && strncpy_from_user(r, (const char *)(uintptr_t)a[0], sizeof r) < 0) return 1;
+    return win32_drive_type(a[0] ? r : NULL);
+}
+static long w32_GetDriveTypeW(uint64_t *a) {
+    char r[8] = {0};
+    if (a[0]) win32_wstr_to_k(a[0], r, sizeof r);
+    return win32_drive_type(a[0] ? r : NULL);
+}
+
+/* GetSystemDirectoryA/W(lpBuffer, uSize) -> "C:\Windows\System32", and
+ * GetWindowsDirectoryA/W -> "C:\Windows", under the buffer contract above. The
+ * names are Windows'; tobyOS keeps no files there (C: is /data). */
+#define WIN32_SYSDIR "C:\\Windows\\System32"
+#define WIN32_WINDIR "C:\\Windows"
+static long w32_GetSystemDirectoryA(uint64_t *a)  { return win32_put_string(WIN32_SYSDIR, 19, a[0], (uint32_t)a[1], false); }
+static long w32_GetSystemDirectoryW(uint64_t *a)  { return win32_put_string(WIN32_SYSDIR, 19, a[0], (uint32_t)a[1], true); }
+static long w32_GetWindowsDirectoryA(uint64_t *a) { return win32_put_string(WIN32_WINDIR, 10, a[0], (uint32_t)a[1], false); }
+static long w32_GetWindowsDirectoryW(uint64_t *a) { return win32_put_string(WIN32_WINDIR, 10, a[0], (uint32_t)a[1], true); }
 /* GetTempPathW/A -> "C:\\" (maps to /data). Returns length in chars. */
 static long w32_GetTempPathW(uint64_t *a) {
     int cap = (int)(uint32_t)a[0];
@@ -25320,6 +25359,13 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetCurrentDirectoryW",   w32_GetCurrentDirectoryW },
     { "kernel32.dll", "SetCurrentDirectoryA",   w32_SetCurrentDirectoryA },
     { "kernel32.dll", "GetModuleFileNameW",     w32_GetModuleFileNameW },
+    { "kernel32.dll", "GetLogicalDrives",       w32_GetLogicalDrives },
+    { "kernel32.dll", "GetDriveTypeA",          w32_GetDriveTypeA },
+    { "kernel32.dll", "GetDriveTypeW",          w32_GetDriveTypeW },
+    { "kernel32.dll", "GetSystemDirectoryA",    w32_GetSystemDirectoryA },
+    { "kernel32.dll", "GetSystemDirectoryW",    w32_GetSystemDirectoryW },
+    { "kernel32.dll", "GetWindowsDirectoryA",   w32_GetWindowsDirectoryA },
+    { "kernel32.dll", "GetWindowsDirectoryW",   w32_GetWindowsDirectoryW },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 
