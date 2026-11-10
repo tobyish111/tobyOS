@@ -38,6 +38,8 @@
 #include <tobyos/pe.h>
 #include <tobyos/abi/abi.h>
 #include <tobyos/perf.h>
+#include <tobyos/vfs.h>
+#include <tobyos/heap.h>
 
 /* IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: the PE opted into ASLR (C24). */
 #define PE_DLLCHAR_DYNAMIC_BASE 0x0040u
@@ -100,6 +102,7 @@ struct pe_import_desc {
 
 struct pe_base_reloc { uint32_t page_rva, block_size; } __attribute__((packed));
 
+#define PE_DIR_EXPORT      0   /* W3: a DLL's export directory */
 #define PE_DIR_IMPORT      1
 #define PE_DIR_RESOURCE    2   /* C14: .rsrc (RT_DIALOG dialog templates) */
 #define PE_DIR_BASERELOC   5
@@ -122,6 +125,7 @@ struct pe_tls_dir64 {
 } __attribute__((packed));
 
 #define PE_MACHINE_AMD64   0x8664
+#define PE_FILE_DLL        0x2000  /* COFF characteristics: IMAGE_FILE_DLL */
 #define PE_OPT_MAGIC_PE32P 0x020B
 
 #define PE_RELOC_ABSOLUTE  0
@@ -504,13 +508,50 @@ static uint64_t pe_missing_stub(struct pe_missing_area *m, const char *dll,
     return stub;
 }
 
-/* Build the gate + trampolines + the procaddr table into the (already mapped,
- * RW) shim area, then bind every imported IAT slot. All user-memory
- * access here is under the caller's uaccess window. `udir` points at the
- * data-directory array in the *original* (kernel) image buffer; the image
- * has already been copied to load_base so RVAs resolve in user memory. */
-static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udir,
-                               uint32_t num_dirs) {
+/* W1: how many procaddr slots fit before the missing-import stubs. */
+#define WIN32_PA_CAP ((WIN32_MISSING_STUB_VA - WIN32_PROCADDR_BASE_VA) / WIN32_PROCADDR_STRIDE)
+
+/* W3: the CPL3 routines the loader starts a process through (assembled offline
+ * from logs/w32/w3-tramp.S with clang --target=x86_64-elf, bytes taken with
+ * objcopy). Both read the module table at its fixed VA (WIN32_MODTAB_BASE,
+ * 0x31008000), so neither needs patching.
+ *   init trampoline (WIN32_INIT_TRAMP_VA): for each entry of the init list,
+ *   call entry(hinstDLL = base, DLL_PROCESS_ATTACH, lpvReserved = 1 -- a
+ *   static load), in dependency order; a FALSE return calls __toby_loadfail
+ *   with the DLL's name and STATUS_DLL_INIT_FAILED; then jump to the .exe's
+ *   entry with RSP as at process start (RSP%16 == 8). Each DllMain is called
+ *   with RSP%16 == 8 and 32 bytes of shadow space, as the x64 ABI wants.
+ *   fail entry (WIN32_FAIL_ENTRY_VA): call __toby_loadfail with the loader's
+ *   failure text and status from the module table. */
+static const uint8_t g_win32_init_tramp[] = {
+    0x48, 0x83, 0xec, 0x28, 0x48, 0xbb, 0x40, 0x80, 0x00, 0x31, 0x00, 0x00,
+    0x00, 0x00, 0x48, 0xb8, 0x00, 0x80, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00,
+    0x8b, 0x70, 0x10, 0x85, 0xf6, 0x74, 0x1d, 0x48, 0x8b, 0x4b, 0x08, 0xba,
+    0x01, 0x00, 0x00, 0x00, 0x41, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xff, 0x13,
+    0x85, 0xc0, 0x74, 0x18, 0x48, 0x83, 0xc3, 0x18, 0xff, 0xce, 0xeb, 0xdf,
+    0x48, 0x83, 0xc4, 0x28, 0x48, 0xb8, 0x00, 0x80, 0x00, 0x31, 0x00, 0x00,
+    0x00, 0x00, 0xff, 0x20, 0x48, 0x8b, 0x4b, 0x10, 0xba, 0x42, 0x01, 0x00,
+    0xc0, 0x48, 0xb8, 0x00, 0x80, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0xff,
+    0x50, 0x08, 0x0f, 0x0b,
+};
+static const uint8_t g_win32_fail_entry[] = {
+    0x48, 0x83, 0xec, 0x28, 0x48, 0xb8, 0x00, 0x80, 0x00, 0x31, 0x00, 0x00,
+    0x00, 0x00, 0x48, 0x8b, 0x48, 0x18, 0x8b, 0x50, 0x20, 0xff, 0x50, 0x08,
+    0x0f, 0x0b,
+};
+#define WIN32_INIT_TRAMP_OFF ((uint64_t)(WIN32_INIT_TRAMP_VA - WIN32_SHIM_BASE))
+#define WIN32_FAIL_ENTRY_OFF ((uint64_t)(WIN32_FAIL_ENTRY_VA - WIN32_SHIM_BASE))
+_Static_assert(WIN32_MODTAB_BASE == 0x31008000ULL, "the trampolines hard-code the module table's VA");
+_Static_assert(WIN32_MT_INIT_LIST == 0x40 && WIN32_MT_INIT_COUNT == 0x10 &&
+               WIN32_MT_LOADFAIL == 0x08 && WIN32_MT_FAIL_TEXT == 0x18 &&
+               WIN32_MT_FAIL_STATUS == 0x20 && WIN32_MT_INIT_STRIDE == 24,
+               "the trampolines hard-code the module table's layout");
+
+/* Lay down the marshalling gates, the user-mode trampolines and the procaddr
+ * table (one thunk per shim) in the (already mapped, RW) shim area. None of it
+ * depends on a module, so it runs once per process before any import is bound
+ * (W3: split out of the old pe_resolve_imports). */
+static void pe_setup_shim_area(void) {
     /* Lay down the marshalling gate at the top of the shim page and patch
      * in the dispatch syscall number. */
     uint8_t gate[WIN32_GATE_SIZE];
@@ -567,130 +608,670 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
     _Static_assert(WIN32_FGATE_OFF + WIN32_FGATE_SIZE <= WIN32_DLGSVC_THUNK_OFF,
                    "float gate overruns the dlgsvc thunk slot");
     memcpy((void *)(WIN32_SHIM_BASE + WIN32_FGATE_OFF), fgate, WIN32_FGATE_SIZE);
-    uaccess_end(uf);
+    /* W3: the init trampoline and the fail entry, in the area W1 freed. */
+    _Static_assert(WIN32_INIT_TRAMP_OFF >= WIN32_THUNK_BASE &&
+                   WIN32_INIT_TRAMP_OFF + sizeof(g_win32_init_tramp) <= WIN32_FAIL_ENTRY_OFF,
+                   "init trampoline overruns the fail entry");
+    _Static_assert(WIN32_FAIL_ENTRY_OFF + sizeof(g_win32_fail_entry) <= WIN32_SETJMP_OFF,
+                   "fail entry overruns the setjmp stub");
+    memcpy((void *)WIN32_INIT_TRAMP_VA, g_win32_init_tramp, sizeof(g_win32_init_tramp));
+    memcpy((void *)WIN32_FAIL_ENTRY_VA, g_win32_fail_entry, sizeof(g_win32_fail_entry));
 
-    if (num_dirs <= PE_DIR_IMPORT) return true;     /* no imports at all */
-    uint32_t import_rva = udir[PE_DIR_IMPORT].rva;
-    if (!import_rva) return true;
-
-    const struct pe_import_desc *imp =
-        (const struct pe_import_desc *)(load_base + import_rva);
-
-    /* W1: how many procaddr slots fit before the missing-import stubs. */
-    const uint64_t pa_cap = (WIN32_MISSING_STUB_VA - WIN32_PROCADDR_BASE_VA) /
-                            WIN32_PROCADDR_STRIDE;
-
-    unsigned long uf2 = uaccess_begin();
-    struct pe_missing_area miss;
-    pe_missing_init(&miss);
-    for (; imp->name_rva; imp++) {
-        const char *dll = (const char *)(load_base + imp->name_rva);
-
-        /* INT (names) if present, else the IAT doubles as the name table. */
-        uint64_t *iat = (uint64_t *)(load_base + imp->first_thunk);
-        const uint64_t *names = imp->original_first_thunk
-            ? (const uint64_t *)(load_base + imp->original_first_thunk)
-            : iat;
-
-        for (int k = 0; names[k]; k++) {
-            uint64_t ent = names[k];
-            int idx = -1;
-            char ordname[16];
-            const char *fname = ordname;
-
-            if (!(ent & PE_ORDINAL_FLAG)) {
-                /* hint(2) + name(NUL-terminated) at RVA */
-                fname = (const char *)(load_base + (uint32_t)ent + 2);
-                idx = win32_shim_index(dll, fname);
-            } else {
-                ksnprintf(ordname, sizeof(ordname), "#%u", (unsigned)(ent & 0xFFFFu));
-            }
-
-            /* Some imports are bound to a USER-MODE stub in the shim page
-             * rather than a kernel gate-thunk, because they must call back
-             * into CPL3 code (e.g. DispatchMessage -> the window's WndProc).
-             * Bind those straight to the stub VA. */
-            uint64_t stub = win32_user_stub_va(dll, fname);
-            if (stub) {
-                iat[k] = stub;
-                kprintf("[pe]   bind %s!%s -> user-stub@%p\n",
-                        dll, fname, (void *)stub);
-                continue;
-            }
-
-            if (idx >= 0 && (uint64_t)idx >= pa_cap) {
-                kprintf("[pe] shim#%d for %s!%s is past the procaddr table "
-                        "(%lu slots)\n", idx, dll, fname, (unsigned long)pa_cap);
-                idx = -1;
-            }
-
-            if (idx < 0) {
-                /* Self-identifying gap, exactly like Track B's unhandled
-                 * syscall log. W1: the slot is bound to a stub that names the
-                 * import and ends the process when it is called; before W1 it
-                 * stayed 0 and the call jumped to address 0. */
-                iat[k] = pe_missing_stub(&miss, dll, fname);
-                kprintf("[pe] unresolved import %s!%s -> missing-stub@%p\n",
-                        dll, fname, (void *)iat[k]);
-                continue;
-            }
-
-            /* W1: bind straight to the shim's procaddr thunk (emitted below,
-             * before the process runs) -- one thunk per function, shared. */
-            iat[k] = WIN32_PROCADDR_BASE_VA + (uint64_t)idx * WIN32_PROCADDR_STRIDE;
-            kprintf("[pe]   bind %s!%s -> shim#%d thunk@%p\n",
-                    dll, fname, idx, (void *)iat[k]);
-        }
-    }
-
-    /* C9: pre-generate a thunk for EVERY shim so GetProcAddress can return a
-     * callable pointer for any name-resolved shim index (slot i at
-     * WIN32_PROCADDR_BASE_VA + i*WIN32_PROCADDR_STRIDE); since W1 every import
-     * binds to these too. Bounded by the missing-import stubs (pa_cap). */
+    /* C9: a thunk for EVERY shim, so GetProcAddress can return a callable
+     * pointer for any shim resolved by name (slot i at WIN32_PROCADDR_BASE_VA
+     * + i*WIN32_PROCADDR_STRIDE); since W1 every import of a shim binds to
+     * these too. Bounded by the missing-import stubs. */
     int nshims = win32_shim_count();
-    if ((uint64_t)nshims > pa_cap) {
+    if ((uint64_t)nshims > WIN32_PA_CAP) {
         kprintf("[pe] WARNING: procaddr table (%d shims) overruns its %lu slots\n",
-                nshims, (unsigned long)pa_cap);
-        nshims = (int)pa_cap;
+                nshims, (unsigned long)WIN32_PA_CAP);
+        nshims = (int)WIN32_PA_CAP;
     }
     for (int i = 0; i < nshims; i++)
         pe_emit_gate_thunk(WIN32_PROCADDR_OFF + (uint64_t)i * WIN32_THUNK_SIZE,
                            (uint32_t)i);
+    uaccess_end(uf);
+}
 
-    uaccess_end(uf2);
+/* ===== W3: DLLs from disk (docs/roadmap-2026-11.md) ========================
+ * From Microsoft's PE format specification (the import directory, the export
+ * directory with its name/ordinal/address tables and forwarder strings, base
+ * relocations) and "Dynamic-link library search order". When an import names a
+ * DLL tobyOS does not implement itself (win32_dll_is_builtin), the loader
+ * finds the file, maps it at its preferred base -- or relocates it when that is
+ * taken -- binds its own imports the same way (recursively), and resolves the
+ * importer's IAT from its export table: by name (binary search of the sorted
+ * name table), by ordinal, and through forwarders ("DLL.name" / "DLL.#n").
+ * Search order, the desktop default with safe search: the .exe's directory,
+ * the system directory (C:\Windows\System32), the Windows directory, the
+ * current directory (PATH: not yet). A file name is matched exactly, then
+ * case-insensitively, as Windows' file system would. Each DLL's entry point
+ * is called at DLL_PROCESS_ATTACH by the init trampoline, in dependency order
+ * (a DLL after every DLL it imports), before the .exe's own entry. A DLL that
+ * is not found, is not a PE32+ x64 image, or cannot be placed starts the
+ * process at the fail entry: it says so on stderr and ends with the status
+ * Windows uses (STATUS_DLL_NOT_FOUND, STATUS_INVALID_IMAGE_FORMAT). An import
+ * a DLL does not export binds to a missing-import stub (W1), as for shims.
+ * The record of what was mapped -- the module table -- lives in user memory,
+ * as Windows' loader data does (in the PEB). */
+
+enum { PE_MOD_MAPPED, PE_MOD_BINDING, PE_MOD_DONE };
+
+struct pe_mod {
+    char     name[64];         /* lower-case file name, e.g. "dll28c.dll" */
+    uint64_t base, size;
+    uint64_t entry;            /* AddressOfEntryPoint as a VA, 0 if none */
+    uint32_t export_rva, export_size;
+    uint32_t import_rva, import_size;
+    uint32_t tls_rva, tls_size;
+    uint64_t name_va, path_va; /* the module table's copies */
+    int      state;
+    bool     is_dll;
+};
+
+struct pe_ctx {
+    struct pe_mod mod[WIN32_MAX_MODULES];
+    int      n;
+    int      init[WIN32_MAX_MODULES];   /* DLLs to initialize, in order */
+    int      ninit;
+    char     exe_dir[ABI_PATH_MAX];
+    const char *cwd;
+    uint64_t next_base;                 /* where a DLL goes when its base is taken */
+    uint64_t str;                       /* next free byte of the table's strings */
+    bool     failed;
+    struct pe_missing_area miss;
+    int      tls_slots;                 /* TLS slots handed to DLLs (0 is the .exe's) */
+    uint64_t tls_next, tls_end;         /* next free byte / end of the mapped TLS area */
+    struct pe_load_info *out;           /* the .exe's TLS facts go here */
+};
+
+/* Copy [src, src+n) of USER memory the loader mapped (the caller has checked
+ * the range is inside a module), and the reverse. */
+static void pe_uread(void *dst, uint64_t src, size_t n) {
+    unsigned long f = uaccess_begin();
+    memcpy(dst, (const void *)src, n);
+    uaccess_end(f);
+}
+static void pe_uwrite(uint64_t dst, const void *src, size_t n) {
+    unsigned long f = uaccess_begin();
+    memcpy((void *)dst, src, n);
+    uaccess_end(f);
+}
+/* A NUL-terminated string at user `src`, which must end before `limit`.
+ * Returns its length, or -1 if it does not fit `cap` or runs past `limit`. */
+static int pe_ustr(char *dst, int cap, uint64_t src, uint64_t limit) {
+    int n = 0;
+    unsigned long f = uaccess_begin();
+    for (; src + (uint64_t)n < limit && n < cap; n++) {
+        char ch = *(const char *)(src + (uint64_t)n);
+        dst[n] = ch;
+        if (!ch) break;
+    }
+    uaccess_end(f);
+    if (n >= cap || src + (uint64_t)n >= limit) { dst[cap - 1] = '\0'; return -1; }
+    return n;
+}
+static bool pe_rva_ok(const struct pe_mod *m, uint64_t rva, uint64_t len) {
+    return rva < m->size && len <= m->size - rva;
+}
+static char pe_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+static bool pe_ieq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) if (pe_lower(*a) != pe_lower(*b)) return false;
+    return *a == *b;
+}
+
+/* The module table's string area (user memory): copy `s`, return its VA (0
+ * when the area is full). */
+static uint64_t pe_mt_string(struct pe_ctx *c, const char *s) {
+    size_t n = strlen(s) + 1;
+    if (c->str + n > WIN32_MODTAB_BASE + WIN32_MODTAB_BYTES) return 0;
+    uint64_t va = c->str;
+    pe_uwrite(va, s, n);
+    c->str += n;
+    return va;
+}
+
+/* Record the first load failure: its text goes to the module table, where the
+ * fail entry finds it. */
+static void pe_fail(struct pe_ctx *c, uint32_t status, const char *text) {
+    if (c->failed) return;
+    c->failed = true;
+    kprintf("[pe] load failure (0x%08x): %s\n", status, text);
+    uint64_t va = pe_mt_string(c, text);
+    pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_FAIL_TEXT, &va, 8);
+    pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_FAIL_STATUS, &status, 4);
+}
+
+/* ---- headers, placement, protection -------------------------------------- */
+
+struct pe_hdr {
+    const struct coff_header     *coff;
+    const struct pe_opt_header64 *opt;
+    const struct pe_data_dir     *dirs;
+    const struct pe_section      *secs;
+};
+
+/* Validate a PE32+ x64 image in a kernel buffer and point h at its headers. */
+static bool pe_parse(const void *image, size_t size, struct pe_hdr *h) {
+    if (!pe_is_image(image, size)) return false;
+    const struct dos_header *dos = (const struct dos_header *)image;
+    if ((uint64_t)dos->e_lfanew + 4 + sizeof(struct coff_header) > size) return false;
+    h->coff = (const struct coff_header *)((const uint8_t *)image + dos->e_lfanew + 4);
+    if (h->coff->machine != PE_MACHINE_AMD64) return false;
+    h->opt = (const struct pe_opt_header64 *)((const uint8_t *)h->coff + sizeof(*h->coff));
+    if ((const uint8_t *)h->opt + sizeof(*h->opt) > (const uint8_t *)image + size) return false;
+    if (h->opt->magic != PE_OPT_MAGIC_PE32P) return false;
+    h->dirs = (const struct pe_data_dir *)((const uint8_t *)h->opt + sizeof(*h->opt));
+    h->secs = (const struct pe_section *)((const uint8_t *)h->opt + h->coff->opt_header_size);
+    if ((const uint8_t *)(h->secs + h->coff->num_sections) > (const uint8_t *)image + size)
+        return false;
+    if ((const uint8_t *)(h->dirs + h->opt->num_data_dirs) > (const uint8_t *)image + size)
+        return false;
     return true;
 }
 
+static struct pe_data_dir pe_dir(const struct pe_hdr *h, int i) {
+    struct pe_data_dir z = {0, 0};
+    return (h->opt->num_data_dirs > (uint32_t)i) ? h->dirs[i] : z;
+}
+
+/* Copy headers + sections into the (mapped, RW) image span at `base` and apply
+ * the base relocations for `delta` = base - preferred base. */
+static void pe_place(const void *image, size_t size, const struct pe_hdr *h,
+                     uint64_t base, int64_t delta, uint64_t size_of_image) {
+    unsigned long uf = uaccess_begin();
+    uint32_t hdr = h->opt->size_of_headers;
+    if (hdr > size) hdr = (uint32_t)size;
+    if (hdr > size_of_image) hdr = (uint32_t)size_of_image;
+    memcpy((void *)base, image, hdr);
+    for (uint16_t i = 0; i < h->coff->num_sections; i++) {
+        const struct pe_section *s = &h->secs[i];
+        if ((uint64_t)s->virtual_addr >= size_of_image) continue;
+        uint64_t room = size_of_image - s->virtual_addr;
+        uint64_t va = base + s->virtual_addr;
+        uint32_t fsz = s->raw_data_size;
+        if (fsz && (uint64_t)s->raw_data_ptr + fsz <= size) {
+            if (fsz > room) fsz = (uint32_t)room;
+            memcpy((void *)va, (const uint8_t *)image + s->raw_data_ptr, fsz);
+        } else {
+            fsz = 0;
+        }
+        uint64_t vsz = s->virtual_size < room ? s->virtual_size : room;
+        if (vsz > fsz) memset((void *)(va + fsz), 0, vsz - fsz);
+    }
+    uaccess_end(uf);
+
+    struct pe_data_dir rd = pe_dir(h, PE_DIR_BASERELOC);
+    if (delta == 0 || !rd.rva || !rd.size || (uint64_t)rd.rva + rd.size > size_of_image)
+        return;
+    uf = uaccess_begin();
+    const uint8_t *rp  = (const uint8_t *)(base + rd.rva);
+    const uint8_t *end = rp + rd.size;
+    uint32_t nfix = 0, nother = 0;
+    while (rp + sizeof(struct pe_base_reloc) <= end) {
+        const struct pe_base_reloc *blk = (const struct pe_base_reloc *)rp;
+        if (blk->block_size < sizeof(*blk) || rp + blk->block_size > end) break;
+        uint32_t n = (blk->block_size - sizeof(*blk)) / 2;
+        const uint16_t *e = (const uint16_t *)(rp + sizeof(*blk));
+        for (uint32_t j = 0; j < n; j++) {
+            uint32_t type = e[j] >> 12;
+            uint64_t off = (uint64_t)blk->page_rva + (e[j] & 0xFFF);
+            if (type == PE_RELOC_DIR64 && off + 8 <= size_of_image) {
+                *(uint64_t *)(base + off) += (uint64_t)delta;
+                nfix++;
+            } else if (type != PE_RELOC_ABSOLUTE) {
+                nother++;
+            }
+        }
+        rp += blk->block_size;
+    }
+    uaccess_end(uf);
+    kprintf("[pe] relocations applied at %p: %u DIR64 fixups (delta=0x%lx)%s\n",
+            (void *)base, nfix, (unsigned long)delta,
+            nother ? " -- and some of a type this loader does not apply" : "");
+}
+
+/* W^X for a mapped module: headers read-only, each section per its flags
+ * (read from the module's own mapped headers). */
+static void pe_protect(const struct pe_mod *m) {
+    uint32_t lfanew;
+    pe_uread(&lfanew, m->base + 0x3C, 4);
+    if (!pe_rva_ok(m, lfanew, 4 + sizeof(struct coff_header))) return;
+    struct coff_header coff;
+    pe_uread(&coff, m->base + lfanew + 4, sizeof coff);
+    uint64_t secs = (uint64_t)lfanew + 4 + sizeof coff + coff.opt_header_size;
+    if (!pe_rva_ok(m, secs, (uint64_t)coff.num_sections * sizeof(struct pe_section))) return;
+    (void)vmm_protect(m->base, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_NX);
+    for (uint16_t i = 0; i < coff.num_sections; i++) {
+        struct pe_section s;
+        pe_uread(&s, m->base + secs + (uint64_t)i * sizeof s, sizeof s);
+        if (s.virtual_size == 0 || s.virtual_addr >= m->size) continue;
+        uint64_t lo = m->base + (s.virtual_addr & ~(PAGE_SIZE - 1));
+        uint64_t hi = m->base + round_up((uint64_t)s.virtual_addr + s.virtual_size, PAGE_SIZE);
+        if (hi > m->base + m->size) hi = m->base + m->size;
+        uint32_t f = VMM_PRESENT | VMM_USER;
+        if (s.characteristics & PE_SCN_MEM_WRITE)     f |= VMM_WRITE;
+        if (!(s.characteristics & PE_SCN_MEM_EXECUTE)) f |= VMM_NX;
+        (void)vmm_protect(lo, hi - lo, f);
+    }
+}
+
+/* ---- TLS (C18b, per module since W3) --------------------------------------
+ * The pointer array at WIN32_TLS_BASE has one slot per module: the .exe's is
+ * slot 0 (its _tls_index is 0, as before W3), each DLL with a TLS directory
+ * gets the next slot. The MAIN thread's blocks are laid out after the array;
+ * threads made by CreateThread copy the .exe's block only -- DLL slots on
+ * them are W5's. */
+static bool pe_tls_map(struct pe_ctx *c, uint64_t end) {
+    uint64_t need = round_up(end, PAGE_SIZE);
+    if (need > WIN32_MODTAB_BASE) return false;
+    if (need <= c->tls_end) return true;
+    if (!pe_map_user(c->tls_end, need)) return false;
+    unsigned long uf = uaccess_begin();
+    memset((void *)c->tls_end, 0, need - c->tls_end);
+    uaccess_end(uf);
+    c->tls_end = need;
+    return true;
+}
+
+static void pe_setup_tls(struct pe_ctx *c, struct pe_mod *m) {
+    if (!m->tls_rva || m->tls_size < sizeof(struct pe_tls_dir64) ||
+        !pe_rva_ok(m, m->tls_rva, sizeof(struct pe_tls_dir64)))
+        return;
+    struct pe_tls_dir64 t;
+    pe_uread(&t, m->base + m->tls_rva, sizeof t);
+    uint64_t raw_size = (t.raw_end > t.raw_start) ? (t.raw_end - t.raw_start) : 0;
+    uint64_t total = raw_size + (uint64_t)t.zero_fill;
+    uint64_t img_end = m->base + m->size;
+    if (t.raw_start < m->base || t.raw_start + raw_size > img_end || total > WIN32_TLS_MAX_BLK) {
+        kprintf("[pe] .tls of %s: skipped raw=%p size=0x%lx total=0x%lx (range)\n",
+                m->name, (void *)t.raw_start, (unsigned long)raw_size, (unsigned long)total);
+        return;
+    }
+    int slot = m->is_dll ? ++c->tls_slots : 0;
+    if (slot >= (int)(WIN32_TLS_BLK_OFF / 8)) {
+        kprintf("[pe] .tls of %s: no TLS slot left (%d)\n", m->name, slot);
+        return;
+    }
+    total = round_up(total, 16);
+    uint64_t blk = c->tls_next;
+    if (!pe_tls_map(c, blk + (total ? total : 16))) {
+        kprintf("[pe] .tls of %s: map failed\n", m->name);
+        return;
+    }
+    if (total) {
+        unsigned long uf = uaccess_begin();
+        memcpy((void *)blk, (const void *)t.raw_start, raw_size);
+        if (total > raw_size) memset((void *)(blk + raw_size), 0, total - raw_size);
+        uaccess_end(uf);
+        c->tls_next = blk + total;
+    }
+    uint64_t slot_va = WIN32_TLS_BASE + (uint64_t)slot * 8;
+    uint64_t blk_or_0 = total ? blk : 0;
+    pe_uwrite(slot_va, &blk_or_0, 8);
+    uint32_t idx = (uint32_t)slot;
+    if (t.index_addr >= m->base && t.index_addr + 4 <= img_end)
+        pe_uwrite(t.index_addr, &idx, 4);            /* _tls_index */
+    uint64_t arr = WIN32_TLS_BASE;
+    pe_uwrite(WIN32_TEB_BASE + WIN32_TEB_TLSPTR, &arr, 8);
+    if (!m->is_dll) {
+        c->out->tls_raw_va   = t.raw_start;
+        c->out->tls_raw_size = raw_size;
+        c->out->tls_total    = total;
+        c->out->tls_index    = 0;
+    }
+    /* The mingw .tls callbacks (__dyn_tls_init/__dyn_tls_dtor) are NOT invoked:
+     * they only service *dynamic* TLS initializers; every C1..C25 PE ships them
+     * and runs correctly without them (C18b). */
+    kprintf("[pe] .tls of %s: slot %d raw=%p size=0x%lx total=0x%lx blk=%p\n",
+            m->name, slot, (void *)t.raw_start, (unsigned long)raw_size,
+            (unsigned long)total, (void *)blk_or_0);
+}
+
+/* ---- import resolution ----------------------------------------------------- */
+
+/* An import from a DLL tobyOS implements itself: a user-mode stub (calls back
+ * into CPL3), the shim's procaddr thunk, or 0 when no shim has it. Shims are
+ * named, so an ordinal import ("#n") is always 0. */
+static uint64_t pe_builtin_import(const char *dll, const char *fname) {
+    if (fname[0] == '#') return 0;
+    uint64_t stub = win32_user_stub_va(dll, fname);
+    if (stub) return stub;
+    int idx = win32_shim_index(dll, fname);
+    if (idx < 0 || (uint64_t)idx >= WIN32_PA_CAP) return 0;
+    return WIN32_PROCADDR_BASE_VA + (uint64_t)idx * WIN32_PROCADDR_STRIDE;
+}
+
+static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed_by);
+
+struct pe_export_dir {
+    uint32_t characteristics, stamp;
+    uint16_t major, minor;
+    uint32_t name, base, nfuncs, nnames, funcs, names, ords;
+};
+
+/* `name` (or, when name is NULL, ordinal `ord`) in module mi's export table:
+ * the VA it resolves to, following forwarders, or 0. */
+static uint64_t pe_export_lookup(struct pe_ctx *c, int mi, const char *name,
+                                 uint32_t ord, int depth) {
+    const struct pe_mod *m = &c->mod[mi];
+    struct pe_export_dir ed;
+    if (depth > 8 || !m->export_rva || m->export_size < sizeof ed ||
+        !pe_rva_ok(m, m->export_rva, sizeof ed))
+        return 0;
+    pe_uread(&ed, m->base + m->export_rva, sizeof ed);
+    uint32_t idx;
+    if (name) {
+        if (!pe_rva_ok(m, ed.names, (uint64_t)ed.nnames * 4) ||
+            !pe_rva_ok(m, ed.ords, (uint64_t)ed.nnames * 2))
+            return 0;
+        uint32_t lo = 0, hi = ed.nnames;
+        bool found = false;
+        uint32_t mid = 0;
+        while (lo < hi) {                  /* the name table is sorted (spec) */
+            mid = lo + (hi - lo) / 2;
+            uint32_t nrva;
+            pe_uread(&nrva, m->base + ed.names + (uint64_t)mid * 4, 4);
+            char cand[256];
+            if (!pe_rva_ok(m, nrva, 1) ||
+                pe_ustr(cand, sizeof cand, m->base + nrva, m->base + m->size) < 0)
+                return 0;
+            int cmp = 0;
+            for (int i = 0; ; i++) {
+                unsigned char a = (unsigned char)name[i], b = (unsigned char)cand[i];
+                if (a != b) { cmp = (a < b) ? -1 : 1; break; }
+                if (!a) break;
+            }
+            if (cmp == 0) { found = true; break; }
+            if (cmp < 0) hi = mid; else lo = mid + 1;
+        }
+        if (!found) return 0;
+        uint16_t o;
+        pe_uread(&o, m->base + ed.ords + (uint64_t)mid * 2, 2);
+        idx = o;
+    } else {
+        if (ord < ed.base) return 0;
+        idx = ord - ed.base;
+    }
+    if (idx >= ed.nfuncs || !pe_rva_ok(m, ed.funcs, (uint64_t)ed.nfuncs * 4)) return 0;
+    uint32_t frva;
+    pe_uread(&frva, m->base + ed.funcs + (uint64_t)idx * 4, 4);
+    if (!frva || !pe_rva_ok(m, frva, 1)) return 0;
+    if (frva >= m->export_rva && frva < m->export_rva + m->export_size) {
+        /* A forwarder: "DLL.name" or "DLL.#ordinal". */
+        char fw[160];
+        if (pe_ustr(fw, sizeof fw, m->base + frva, m->base + m->size) < 0) return 0;
+        int dot = -1;
+        for (int i = 0; fw[i]; i++) if (fw[i] == '.') dot = i;
+        if (dot <= 0 || !fw[dot + 1]) return 0;
+        fw[dot] = '\0';
+        char fdll[80];
+        ksnprintf(fdll, sizeof fdll, "%s.dll", fw);
+        const char *ffn = fw + dot + 1;
+        kprintf("[pe]   %s forwards %s to %s!%s\n", m->name, name ? name : "(by ordinal)",
+                fdll, ffn);
+        if (win32_dll_is_builtin(fdll)) return pe_builtin_import(fdll, ffn);
+        uint32_t ford = 0;
+        if (ffn[0] == '#')
+            for (const char *q = ffn + 1; *q >= '0' && *q <= '9'; q++) ford = ford * 10 + (uint32_t)(*q - '0');
+        int fj = pe_find_or_load(c, fdll, m->name);
+        if (fj < 0) return 0;
+        return pe_export_lookup(c, fj, ffn[0] == '#' ? NULL : ffn, ford, depth + 1);
+    }
+    return m->base + frva;
+}
+
+static int pe_bind_module(struct pe_ctx *c, int mi);
+
+/* Is [lo, hi) free for a module: unmapped and clear of the fixed Win32 pages? */
+static bool pe_range_free(uint64_t lo, uint64_t hi) {
+    if (lo < 0x10000ULL || hi > 0x0000800000000000ULL || hi <= lo) return false;
+    if (lo < 0x32000000ULL && hi > 0x30000000ULL) return false;
+    for (uint64_t v = lo; v < hi; v += PAGE_SIZE)
+        if (vmm_translate(v) != 0) return false;
+    return true;
+}
+
+/* Read `dir`/`name`, matching the name case-insensitively when the exact name
+ * is not there. On success fills path and the image (borrowed or kmalloc'd). */
+static bool pe_try_dir(const char *dir, const char *name, char *path, int cap,
+                       void **img, size_t *sz, int *borrowed) {
+    ksnprintf(path, (size_t)cap, "%s%s%s", dir, (dir[0] && dir[strlen(dir) - 1] == '/') ? "" : "/", name);
+    if (vfs_read_all_ref(path, img, sz, borrowed) == VFS_OK) return true;
+    struct vfs_dir d;
+    if (vfs_opendir(dir, &d) != VFS_OK) return false;
+    struct vfs_dirent e;
+    bool found = false;
+    while (vfs_readdir(&d, &e) == VFS_OK) {
+        if (pe_ieq(e.name, name)) {
+            ksnprintf(path, (size_t)cap, "%s%s%s", dir,
+                      (dir[0] && dir[strlen(dir) - 1] == '/') ? "" : "/", e.name);
+            found = true;
+            break;
+        }
+    }
+    vfs_closedir(&d);
+    return found && vfs_read_all_ref(path, img, sz, borrowed) == VFS_OK;
+}
+
+/* The module for DLL `dll`: already loaded, or found, mapped and bound now.
+ * Returns its index, or -1 with the failure recorded. */
+static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed_by) {
+    if (c->failed) return -1;
+    /* the file name, lower case, ".dll" added when it has no extension */
+    const char *b = dll;
+    for (const char *q = dll; *q; q++) if (*q == '\\' || *q == '/') b = q + 1;
+    char name[64];
+    int n = 0;
+    bool dot = false;
+    for (; b[n] && n < (int)sizeof name - 5; n++) {
+        name[n] = pe_lower(b[n]);
+        if (b[n] == '.') dot = true;
+    }
+    name[n] = '\0';
+    if (!dot) memcpy(name + n, ".dll", 5);
+    for (int i = 0; i < c->n; i++)
+        if (strcmp(c->mod[i].name, name) == 0) return i;
+
+    char text[200];
+    if (c->n >= WIN32_MAX_MODULES) {
+        ksnprintf(text, sizeof text, "%s cannot be loaded: more than %d modules (needed by %s)",
+                  name, WIN32_MAX_MODULES, needed_by);
+        pe_fail(c, WIN32_STATUS_DLL_NOT_FOUND, text);
+        return -1;
+    }
+
+    const char *dirs[4] = { c->exe_dir, "/data/Windows/System32", "/data/Windows", c->cwd };
+    char path[ABI_PATH_MAX];
+    void *img = 0;
+    size_t sz = 0;
+    int borrowed = 0;
+    bool got = false;
+    for (int i = 0; i < 4 && !got; i++)
+        if (dirs[i] && dirs[i][0]) got = pe_try_dir(dirs[i], name, path, sizeof path, &img, &sz, &borrowed);
+    if (!got) {
+        ksnprintf(text, sizeof text, "%s was not found (needed by %s)", name, needed_by);
+        pe_fail(c, WIN32_STATUS_DLL_NOT_FOUND, text);
+        return -1;
+    }
+
+    struct pe_hdr h;
+    uint64_t pref = 0, soi = 0, base = 0;
+    bool ok = pe_parse(img, sz, &h);
+    if (ok) {
+        pref = h.opt->image_base;
+        soi  = round_up(h.opt->size_of_image, PAGE_SIZE);
+        ok = soi > 0 && soi < (1ULL << 32);
+    }
+    if (!ok) {
+        if (!borrowed) kfree(img);
+        ksnprintf(text, sizeof text, "%s is not a valid x64 image (needed by %s)", name, needed_by);
+        pe_fail(c, WIN32_STATUS_INVALID_IMAGE_FORMAT, text);
+        return -1;
+    }
+    struct pe_data_dir rd = pe_dir(&h, PE_DIR_BASERELOC);
+    bool has_reloc = rd.rva && rd.size;
+    base = pref;
+    if (!pe_range_free(base, base + soi)) {
+        base = 0;
+        if (has_reloc) {
+            for (uint64_t cand = c->next_base; cand + soi <= 0x00007F0000000000ULL; cand += 0x10000) {
+                if (pe_range_free(cand, cand + soi)) { base = cand; break; }
+            }
+        }
+        if (!base) {
+            if (!borrowed) kfree(img);
+            ksnprintf(text, sizeof text, "%s cannot be placed: its base %p is taken%s (needed by %s)",
+                      name, (void *)pref, has_reloc ? "" : " and it has no relocations", needed_by);
+            pe_fail(c, WIN32_STATUS_INVALID_IMAGE_FORMAT, text);
+            return -1;
+        }
+        c->next_base = round_up(base + soi, 0x10000);
+    }
+    if (!pe_map_user(base, base + soi)) {
+        if (!borrowed) kfree(img);
+        ksnprintf(text, sizeof text, "%s: out of memory mapping it (needed by %s)", name, needed_by);
+        pe_fail(c, WIN32_STATUS_DLL_NOT_FOUND, text);
+        return -1;
+    }
+    pe_place(img, sz, &h, base, (int64_t)(base - pref), soi);
+
+    int mi = c->n++;
+    struct pe_mod *m = &c->mod[mi];
+    memset(m, 0, sizeof *m);
+    memcpy(m->name, name, strlen(name) + 1);
+    m->base = base;
+    m->size = soi;
+    m->entry = h.opt->entry_point_rva ? base + h.opt->entry_point_rva : 0;
+    struct pe_data_dir d;
+    d = pe_dir(&h, PE_DIR_EXPORT); m->export_rva = d.rva; m->export_size = d.size;
+    d = pe_dir(&h, PE_DIR_IMPORT); m->import_rva = d.rva; m->import_size = d.size;
+    d = pe_dir(&h, PE_DIR_TLS);    m->tls_rva = d.rva;    m->tls_size = d.size;
+    m->is_dll = (h.coff->characteristics & PE_FILE_DLL) != 0;
+    m->state = PE_MOD_MAPPED;
+    m->name_va = pe_mt_string(c, name);
+    char wp[ABI_PATH_MAX];
+    if (win32_kpath_to_winpath(path, wp, sizeof wp) > 0) m->path_va = pe_mt_string(c, wp);
+    if (!borrowed) kfree(img);
+    kprintf("[pe] DLL %s from %s at %p (preferred %p%s), needed by %s\n",
+            name, path, (void *)base, (void *)pref,
+            base == pref ? "" : ", relocated", needed_by);
+
+    if (pe_bind_module(c, mi) < 0) return -1;
+    return mi;
+}
+
+/* Bind module mi's imports (loading the DLLs they name), then set up its TLS,
+ * tighten its pages, and queue its entry point for initialization -- after
+ * every DLL it imports, since those were bound (and queued) inside the loop. */
+static int pe_bind_module(struct pe_ctx *c, int mi) {
+    c->mod[mi].state = PE_MOD_BINDING;
+    if (c->mod[mi].import_rva && pe_rva_ok(&c->mod[mi], c->mod[mi].import_rva, sizeof(struct pe_import_desc))) {
+        for (uint64_t off = c->mod[mi].import_rva; ; off += sizeof(struct pe_import_desc)) {
+            struct pe_mod *m = &c->mod[mi];      /* re-read: c->mod is stable, m is a view */
+            if (!pe_rva_ok(m, off, sizeof(struct pe_import_desc))) break;
+            struct pe_import_desc desc;
+            pe_uread(&desc, m->base + off, sizeof desc);
+            if (!desc.name_rva) break;
+            char dll[80];
+            if (!pe_rva_ok(m, desc.name_rva, 1) ||
+                pe_ustr(dll, sizeof dll, m->base + desc.name_rva, m->base + m->size) < 0)
+                break;
+            bool builtin = win32_dll_is_builtin(dll);
+            int dj = -1;
+            if (!builtin) {
+                dj = pe_find_or_load(c, dll, m->name);
+                if (dj < 0) return -1;
+            }
+            uint64_t iat   = m->base + desc.first_thunk;
+            uint64_t names = m->base + (desc.original_first_thunk ? desc.original_first_thunk
+                                                                  : desc.first_thunk);
+            for (uint64_t k = 0; ; k++) {
+                if (!pe_rva_ok(m, (names - m->base) + k * 8, 8) ||
+                    !pe_rva_ok(m, (iat - m->base) + k * 8, 8))
+                    break;
+                uint64_t ent;
+                pe_uread(&ent, names + k * 8, 8);
+                if (!ent) break;
+                char fname[128];
+                bool by_ord = (ent & PE_ORDINAL_FLAG) != 0;
+                if (by_ord) {
+                    ksnprintf(fname, sizeof fname, "#%u", (unsigned)(ent & 0xFFFFu));
+                } else if (!pe_rva_ok(m, (uint32_t)ent + 2, 1) ||
+                           pe_ustr(fname, sizeof fname, m->base + (uint32_t)ent + 2,
+                                   m->base + m->size) < 0) {
+                    ksnprintf(fname, sizeof fname, "(bad name)");
+                }
+                uint64_t va = builtin
+                    ? pe_builtin_import(dll, fname)
+                    : pe_export_lookup(c, dj, by_ord ? NULL : fname,
+                                       by_ord ? (uint32_t)(ent & 0xFFFFu) : 0, 0);
+                if (c->failed) return -1;          /* a forwarder's DLL failed */
+                if (va) {
+                    kprintf("[pe]   bind %s!%s -> %s@%p\n", dll, fname,
+                            builtin ? "shim" : c->mod[dj].name, (void *)va);
+                } else {
+                    unsigned long uf = uaccess_begin();
+                    va = pe_missing_stub(&c->miss, dll, fname);
+                    uaccess_end(uf);
+                    kprintf("[pe] unresolved import %s!%s -> missing-stub@%p\n",
+                            dll, fname, (void *)va);
+                }
+                pe_uwrite(iat + k * 8, &va, 8);
+            }
+        }
+    }
+    struct pe_mod *m = &c->mod[mi];
+    pe_setup_tls(c, m);
+    pe_protect(m);
+    m->state = PE_MOD_DONE;
+    if (m->is_dll && m->entry && c->ninit < WIN32_MAX_MODULES)
+        c->init[c->ninit++] = mi;
+    return 0;
+}
+
+/* The module table's header, records and init list, from the loader's state. */
+static void pe_write_modtab(struct pe_ctx *c, uint64_t exe_entry) {
+    uint32_t nmod = (uint32_t)c->n, ninit = (uint32_t)c->ninit;
+    pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_EXE_ENTRY, &exe_entry, 8);
+    pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_INIT_COUNT, &ninit, 4);
+    pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_MOD_COUNT, &nmod, 4);
+    for (int i = 0; i < c->ninit; i++) {
+        const struct pe_mod *m = &c->mod[c->init[i]];
+        uint64_t e[3] = { m->entry, m->base, m->name_va };
+        pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_INIT_LIST + (uint64_t)i * WIN32_MT_INIT_STRIDE, e, sizeof e);
+    }
+    for (int i = 0; i < c->n; i++) {
+        const struct pe_mod *m = &c->mod[i];
+        uint8_t r[WIN32_MT_MOD_STRIDE];
+        memset(r, 0, sizeof r);
+        uint32_t flags = m->is_dll ? WIN32_MTM_FLAG_DLL : 0;
+        memcpy(r + WIN32_MTM_BASE, &m->base, 8);
+        memcpy(r + WIN32_MTM_SIZE, &m->size, 8);
+        memcpy(r + WIN32_MTM_ENTRY, &m->entry, 8);
+        memcpy(r + WIN32_MTM_NAME, &m->name_va, 8);
+        memcpy(r + WIN32_MTM_PATH, &m->path_va, 8);
+        memcpy(r + WIN32_MTM_EXPORT_RVA, &m->export_rva, 4);
+        memcpy(r + WIN32_MTM_EXPORT_SIZE, &m->export_size, 4);
+        memcpy(r + WIN32_MTM_FLAGS, &flags, 4);
+        pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_MODS + (uint64_t)i * WIN32_MT_MOD_STRIDE, r, sizeof r);
+    }
+}
+
 int pe_load_user(const void *image, size_t size, int argc, char **argv,
-                 struct pe_load_info *out) {
+                 const struct pe_load_env *env, struct pe_load_info *out) {
     if (!image || !out || !pe_is_image(image, size)) return -1;
     out->entry = 0;
     out->image_base = 0;
 
-    const struct dos_header  *dos  = (const struct dos_header *)image;
-    const uint8_t            *pehdr = (const uint8_t *)image + dos->e_lfanew;
-    const struct coff_header *coff =
-        (const struct coff_header *)(pehdr + 4);
-
-    if ((uint64_t)dos->e_lfanew + 4 + sizeof(struct coff_header) > size) {
-        kprintf("[pe] reject: COFF header runs off image\n");
+    struct pe_hdr h;
+    if (!pe_parse(image, size, &h)) {
+        kprintf("[pe] reject: not a PE32+ x64 image (or its headers run off it)\n");
         return -1;
     }
-    if (coff->machine != PE_MACHINE_AMD64) {
-        kprintf("[pe] reject: machine 0x%04x (need AMD64)\n", coff->machine);
-        return -1;
-    }
-
-    const struct pe_opt_header64 *opt =
-        (const struct pe_opt_header64 *)((const uint8_t *)coff + sizeof(*coff));
-    if ((const uint8_t *)opt + sizeof(*opt) > (const uint8_t *)image + size) {
-        kprintf("[pe] reject: optional header runs off image\n");
-        return -1;
-    }
-    if (opt->magic != PE_OPT_MAGIC_PE32P) {
-        kprintf("[pe] reject: not PE32+ (magic 0x%04x)\n", opt->magic);
-        return -1;
-    }
+    const struct coff_header     *coff = h.coff;
+    const struct pe_opt_header64 *opt  = h.opt;
+    const struct pe_data_dir     *dirs = h.dirs;
 
     uint64_t image_base    = opt->image_base;
     uint64_t size_of_image = round_up(opt->size_of_image, PAGE_SIZE);
@@ -704,11 +1285,6 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         return -1;
     }
 
-    const struct pe_data_dir *dirs = (const struct pe_data_dir *)
-        ((const uint8_t *)opt + sizeof(*opt));
-    const struct pe_section *secs = (const struct pe_section *)
-        ((const uint8_t *)opt + coff->opt_header_size);
-
     uint64_t load_base = image_base;
     int64_t  delta     = 0;                                   /* 0 == load at ImageBase */
 
@@ -716,12 +1292,10 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
      * If the image opted into dynamic basing (linked with --dynamicbase, which
      * sets IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE and keeps the .reloc table),
      * load it at a RANDOMIZED, 64KB-aligned slide instead of its preferred
-     * ImageBase and let step 3 rewrite every absolute address via the base-reloc
-     * fixups. This exercises the relocation engine (a prerequisite for loading
-     * real DLLs and third-party PEs whose preferred base is occupied). The slide
-     * stays in [16 MiB, ~80 MiB) above ImageBase: a mingw EXE bases at ~5 GiB, so
-     * the slid image stays far above the fixed shim/TEB/TLS/CRT pages (all
-     * < 0x32000000) and far below the user stack (0x800000000000). */
+     * ImageBase and let pe_place rewrite every absolute address via the base-reloc
+     * fixups. The slide stays in [16 MiB, ~80 MiB) above ImageBase: a mingw EXE
+     * bases at ~5 GiB, so the slid image stays far above the fixed shim/TEB/TLS/
+     * CRT pages (all < 0x32000000) and far below the user stack (0x800000000000). */
     bool has_reloc = (opt->num_data_dirs > PE_DIR_BASERELOC) &&
                      dirs[PE_DIR_BASERELOC].rva && dirs[PE_DIR_BASERELOC].size;
     if ((opt->dll_characteristics & PE_DLLCHAR_DYNAMIC_BASE) && has_reloc) {
@@ -742,7 +1316,8 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
                 (void *)image_base, (void *)load_base, (unsigned long)delta,
                 dirs[PE_DIR_BASERELOC].rva, dirs[PE_DIR_BASERELOC].size);
 
-    /* ---- 1. map the image span + the shim page (RW, user) ---- */
+    /* ---- 1. map the image span, the shim area, the TEB, the CRT data page
+     * and (W3) the module table (all RW, user) ---- */
     if (!pe_map_user(load_base, load_base + size_of_image)) {
         kprintf("[pe] failed mapping image pages\n");
         return -1;
@@ -759,6 +1334,10 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         kprintf("[pe] failed mapping CRT data page\n");
         return -1;
     }
+    if (!pe_map_user(WIN32_MODTAB_BASE, WIN32_MODTAB_BASE + WIN32_MODTAB_BYTES)) {
+        kprintf("[pe] failed mapping the module table\n");
+        return -1;
+    }
 
     /* ---- minimal TEB ---- the CRT startup reads gs:[0x30] (NtCurrentTeb).
      * Zero the page, then set the self-pointer + stack bounds. The proc's GS
@@ -770,6 +1349,7 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_SELF)       = WIN32_TEB_BASE;
         *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_STACKBASE)  = WIN32_USER_STACK_TOP;
         *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_STACKLIMIT) = WIN32_USER_STACK_TOP - 0x200000ULL;
+        memset((void *)WIN32_MODTAB_BASE, 0, WIN32_MODTAB_BYTES);
         uaccess_end(uf);
     }
 
@@ -824,155 +1404,85 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         uaccess_end(uf);
     }
 
-    /* ---- 2. copy headers + sections into the mapped pages ---- */
-    {
-        unsigned long uf = uaccess_begin();
-        uint32_t hdr = opt->size_of_headers;
-        if (hdr > size) hdr = (uint32_t)size;
-        memcpy((void *)load_base, image, hdr);
+    /* ---- 2. copy headers + sections into the mapped pages; 3. base
+     * relocations (only if we couldn't honour ImageBase) ---- */
+    pe_place(image, size, &h, load_base, delta, size_of_image);
 
-        for (uint16_t i = 0; i < coff->num_sections; i++) {
-            const struct pe_section *s = &secs[i];
-            uint64_t va = load_base + s->virtual_addr;
-            uint32_t fsz = s->raw_data_size;
-            if (fsz && (uint64_t)s->raw_data_ptr + fsz <= size) {
-                memcpy((void *)va, (const uint8_t *)image + s->raw_data_ptr, fsz);
-            } else {
-                fsz = 0;
-            }
-            if (s->virtual_size > fsz) {
-                memset((void *)(va + fsz), 0, s->virtual_size - fsz);
-            }
-        }
-        uaccess_end(uf);
-    }
+    /* ---- 4. the shim area, then the .exe's imports -- and (W3) the DLLs they
+     * name, each bound the same way -- then TLS and W^X per module ---- */
+    pe_setup_shim_area();
 
-    /* ---- 3. base relocations (only if we couldn't honour ImageBase) ---- */
-    if (delta != 0 && opt->num_data_dirs > PE_DIR_BASERELOC &&
-        dirs[PE_DIR_BASERELOC].rva && dirs[PE_DIR_BASERELOC].size) {
-        unsigned long uf = uaccess_begin();
-        const uint8_t *rp  = (const uint8_t *)(load_base + dirs[PE_DIR_BASERELOC].rva);
-        const uint8_t *end = rp + dirs[PE_DIR_BASERELOC].size;
-        uint32_t nfix = 0;
-        while (rp + sizeof(struct pe_base_reloc) <= end) {
-            const struct pe_base_reloc *blk = (const struct pe_base_reloc *)rp;
-            if (blk->block_size < sizeof(*blk)) break;
-            uint32_t n = (blk->block_size - sizeof(*blk)) / 2;
-            const uint16_t *e = (const uint16_t *)(rp + sizeof(*blk));
-            for (uint32_t j = 0; j < n; j++) {
-                if ((e[j] >> 12) == PE_RELOC_DIR64) {
-                    uint64_t *patch = (uint64_t *)(load_base + blk->page_rva + (e[j] & 0xFFF));
-                    *patch += (uint64_t)delta;
-                    nfix++;
-                }
-            }
-            rp += blk->block_size;
-        }
-        uaccess_end(uf);
-        kprintf("[pe] C24 relocations applied: %u DIR64 fixups (delta=0x%lx)\n",
-                nfix, (unsigned long)delta);
-    }
-
-    /* ---- 4. bind the IAT to the Win32 shim thunks ---- */
-    if (!pe_resolve_imports(load_base, dirs, opt->num_data_dirs)) {
-        kprintf("[pe] failed resolving imports\n");
+    struct pe_ctx *c = kmalloc(sizeof *c);
+    if (!c) {
+        kprintf("[pe] out of memory for the loader's state\n");
         return -1;
     }
-
-    /* ---- 4b. C18b: thread-local storage (.tls / IMAGE_TLS_DIRECTORY) ----
-     * Lay out the main thread's TLS block from the template, write _tls_index,
-     * and point gs:[0x58] (ThreadLocalStoragePointer) at the pointer array so a
-     * _Thread_local access resolves. Runs while the image is still RW (before
-     * the W^X tightening below) since it writes _tls_index into the image. */
+    memset(c, 0, sizeof *c);
+    c->out       = out;
+    c->cwd       = (env && env->cwd) ? env->cwd : "/";
+    c->next_base = 0x0000000200000000ULL;
+    c->str       = WIN32_MODTAB_BASE + WIN32_MT_STRINGS;
+    c->tls_next  = WIN32_TLS_BASE + WIN32_TLS_BLK_OFF;
+    c->tls_end   = WIN32_TLS_BASE;
     out->tls_raw_va = out->tls_raw_size = out->tls_total = out->tls_index = 0;
-    if (opt->num_data_dirs > PE_DIR_TLS && dirs[PE_DIR_TLS].rva &&
-        dirs[PE_DIR_TLS].size >= sizeof(struct pe_tls_dir64)) {
+    {
+        const char *ep = (env && env->exe_kpath) ? env->exe_kpath : "/";
+        int last = 0;
+        for (int i = 0; ep[i]; i++) if (ep[i] == '/') last = i;
+        int dn = last > 0 ? last : 1;
+        if (dn >= (int)sizeof c->exe_dir) dn = (int)sizeof c->exe_dir - 1;
+        memcpy(c->exe_dir, ep, (size_t)dn);
+        c->exe_dir[dn] = '\0';
+
+        struct pe_mod *x = &c->mod[0];
+        const char *bn = ep + last + (ep[last] == '/' ? 1 : 0);
+        int k = 0;
+        for (; bn[k] && k < (int)sizeof x->name - 1; k++) x->name[k] = pe_lower(bn[k]);
+        x->name[k] = '\0';
+        x->base  = load_base;
+        x->size  = size_of_image;
+        x->entry = load_base + opt->entry_point_rva;
+        struct pe_data_dir d;
+        d = pe_dir(&h, PE_DIR_EXPORT); x->export_rva = d.rva; x->export_size = d.size;
+        d = pe_dir(&h, PE_DIR_IMPORT); x->import_rva = d.rva; x->import_size = d.size;
+        d = pe_dir(&h, PE_DIR_TLS);    x->tls_rva = d.rva;    x->tls_size = d.size;
+        x->is_dll = false;
+        x->name_va = pe_mt_string(c, x->name);
+        char wp[ABI_PATH_MAX];
+        if (env && env->exe_kpath && win32_kpath_to_winpath(env->exe_kpath, wp, sizeof wp) > 0)
+            x->path_va = pe_mt_string(c, wp);
+        c->n = 1;
+    }
+    {
         unsigned long uf = uaccess_begin();
-        const struct pe_tls_dir64 *t =
-            (const struct pe_tls_dir64 *)(load_base + dirs[PE_DIR_TLS].rva);
-        uint64_t raw_start = t->raw_start, raw_end = t->raw_end;
-        uint64_t idx_addr  = t->index_addr, cbs = t->callbacks;
-        uint32_t zfill     = t->zero_fill;
+        pe_missing_init(&c->miss);
         uaccess_end(uf);
-
-        uint64_t raw_size = (raw_end > raw_start) ? (raw_end - raw_start) : 0;
-        uint64_t total    = raw_size + (uint64_t)zfill;
-        uint64_t img_end  = load_base + size_of_image;
-        if (raw_start >= load_base && raw_start + raw_size <= img_end &&
-            total > 0 && total <= WIN32_TLS_MAX_BLK) {
-            total = round_up(total, 16);
-            uint64_t blk  = WIN32_TLS_BASE + WIN32_TLS_BLK_OFF;
-            uint64_t need = round_up(WIN32_TLS_BLK_OFF + total, PAGE_SIZE);
-            if (pe_map_user(WIN32_TLS_BASE, WIN32_TLS_BASE + need)) {
-                unsigned long uf2 = uaccess_begin();
-                memset((void *)WIN32_TLS_BASE, 0, WIN32_TLS_BLK_OFF);
-                *(uint64_t *)WIN32_TLS_BASE = blk;            /* array[0] = block */
-                memcpy((void *)blk, (const void *)raw_start, raw_size);
-                if (total > raw_size)
-                    memset((void *)(blk + raw_size), 0, total - raw_size);
-                if (idx_addr >= load_base && idx_addr + 4 <= img_end)
-                    *(uint32_t *)idx_addr = 0;               /* _tls_index = 0 */
-                *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_TLSPTR) = WIN32_TLS_BASE;
-                uaccess_end(uf2);
-
-                int ncb = 0;
-                if (cbs >= load_base && cbs + 8 <= img_end) {
-                    unsigned long uf3 = uaccess_begin();
-                    const uint64_t *cb = (const uint64_t *)cbs;
-                    while (ncb < 64 && cb[ncb]) ncb++;
-                    uaccess_end(uf3);
-                }
-                out->tls_raw_va   = raw_start;
-                out->tls_raw_size = raw_size;
-                out->tls_total    = total;
-                out->tls_index    = 0;
-                kprintf("[pe] .tls: raw=%p size=0x%lx zfill=0x%x total=0x%lx "
-                        "idx@%p cbs=%d gs[0x58]=%p blk=%p\n",
-                        (void *)raw_start, (unsigned long)raw_size, zfill,
-                        (unsigned long)total, (void *)idx_addr, ncb,
-                        (void *)WIN32_TLS_BASE, (void *)blk);
-                /* The mingw .tls callbacks (__dyn_tls_init/__dyn_tls_dtor) are
-                 * NOT invoked: they only set _CRT_MT and service *dynamic* TLS;
-                 * every C1..C18a mingw PE ships them yet runs correctly with the
-                 * loader never calling them, so static _Thread_local works from
-                 * the template copy alone. Invoking CPL3 callbacks from the
-                 * kernel loader (process not yet running) is needless and risky. */
-            } else {
-                kprintf("[pe] .tls: map failed (need 0x%lx)\n", (unsigned long)need);
-            }
-        } else {
-            kprintf("[pe] .tls: skipped raw=%p size=0x%lx total=0x%lx (range)\n",
-                    (void *)raw_start, (unsigned long)raw_size,
-                    (unsigned long)total);
-        }
+        int li = win32_shim_index("kernel32.dll", "__toby_loadfail");
+        uint64_t lf = (li >= 0 && (uint64_t)li < WIN32_PA_CAP)
+            ? WIN32_PROCADDR_BASE_VA + (uint64_t)li * WIN32_PROCADDR_STRIDE : 0;
+        pe_uwrite(WIN32_MODTAB_BASE + WIN32_MT_LOADFAIL, &lf, 8);
     }
 
-    /* ---- 5. tighten W^X: per-section perms + R/NX headers + R-X shim ---- */
-    (void)vmm_protect(load_base, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_NX);
-    for (uint16_t i = 0; i < coff->num_sections; i++) {
-        const struct pe_section *s = &secs[i];
-        if (s->virtual_size == 0) continue;
-        uint64_t lo = load_base + (s->virtual_addr & ~(PAGE_SIZE - 1));
-        uint64_t hi = load_base + round_up((uint64_t)s->virtual_addr + s->virtual_size,
-                                           PAGE_SIZE);
-        uint32_t f = VMM_PRESENT | VMM_USER;
-        if (s->characteristics & PE_SCN_MEM_WRITE)     f |= VMM_WRITE;
-        if (!(s->characteristics & PE_SCN_MEM_EXECUTE)) f |= VMM_NX;
-        (void)vmm_protect(lo, hi - lo, f);
-    }
-    /* shim region (2 pages): executable, read-only (no write, no NX) at CPL3 */
+    (void)pe_bind_module(c, 0);
+    uint64_t exe_entry = load_base + opt->entry_point_rva;
+    pe_write_modtab(c, exe_entry);
+
+    /* ---- 5. W^X for the fixed pages ---- */
+    /* shim region: executable, read-only (no write, no NX) at CPL3 */
     (void)vmm_protect(WIN32_SHIM_BASE, WIN32_SHIM_BYTES, VMM_PRESENT | VMM_USER);
     /* TEB + CRT data pages: data, read-write, never executable */
     (void)vmm_protect(WIN32_TEB_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
     (void)vmm_protect(WIN32_CRT_DATA_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
-    /* C18b: main thread TLS region (array + block): read-write data, NX */
-    if (out->tls_total) {
-        uint64_t need = round_up(WIN32_TLS_BLK_OFF + out->tls_total, PAGE_SIZE);
-        (void)vmm_protect(WIN32_TLS_BASE, need, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
-    }
+    /* W3: the module table (W4's runtime loads update it) and the TLS area */
+    (void)vmm_protect(WIN32_MODTAB_BASE, WIN32_MODTAB_BYTES, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
+    if (c->tls_end > WIN32_TLS_BASE)
+        (void)vmm_protect(WIN32_TLS_BASE, c->tls_end - WIN32_TLS_BASE,
+                          VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
 
     out->image_base = load_base;
-    out->entry      = load_base + opt->entry_point_rva;
+    out->entry      = c->failed ? WIN32_FAIL_ENTRY_VA
+                    : c->ninit  ? WIN32_INIT_TRAMP_VA
+                                : exe_entry;
     out->teb        = WIN32_TEB_BASE;
     out->crt_data   = WIN32_CRT_DATA_BASE;
     /* C14: expose the resource directory (.rsrc) so DialogBoxParamA can walk it
@@ -984,9 +1494,11 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
     } else {
         out->rsrc_rva = out->rsrc_size = 0;
     }
-    kprintf("[pe] loaded: base=%p entry=%p (gate@%p teb@%p crt@%p)\n",
+    kprintf("[pe] loaded: base=%p entry=%p (gate@%p teb@%p crt@%p) modules=%d init=%d%s\n",
             (void *)load_base, (void *)out->entry,
             (void *)WIN32_SHIM_BASE, (void *)WIN32_TEB_BASE,
-            (void *)WIN32_CRT_DATA_BASE);
+            (void *)WIN32_CRT_DATA_BASE, c->n, c->ninit,
+            c->failed ? " LOAD FAILED" : "");
+    kfree(c);
     return 0;
 }

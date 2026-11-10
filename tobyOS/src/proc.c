@@ -1302,7 +1302,8 @@ static int spawn_body(const char *path, const char *name,
 
   if (is_pe) {
     /* ---- Windows PE/COFF image (Track C) ---- */
-    int prc = pe_load_user(image, image_size, argc, argv, &pe_info);
+    struct pe_load_env pe_env = { .exe_kpath = path, .cwd = p->cwd };   /* W3 */
+    int prc = pe_load_user(image, image_size, argc, argv, &pe_env, &pe_info);
     if (!img_borrowed) kfree(image);
     ok = (prc == 0);
     if (ok) {

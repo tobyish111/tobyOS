@@ -18718,6 +18718,33 @@ static long w32_toby_missing(uint64_t *a) {
     return 0;       /* unreached */
 }
 
+/* W3: the loader's failure path (pe_loader.c). A process whose DLLs could not
+ * be loaded starts at the fail entry, which lands here with a[0] = the user VA
+ * of the loader's text and a[1] = the NTSTATUS (STATUS_DLL_NOT_FOUND,
+ * STATUS_INVALID_IMAGE_FORMAT); a DLL whose DllMain refused DLL_PROCESS_ATTACH
+ * lands here from the init trampoline with a[0] = the DLL's name and a[1] =
+ * STATUS_DLL_INIT_FAILED. Windows shows these in a message box and ends the
+ * process with the status before its entry point runs; tobyOS writes them to
+ * the program's stderr and the kernel log, and does the same. */
+static long w32_toby_loadfail(uint64_t *a) {
+    char text[200];
+    uint32_t status = (uint32_t)a[1];
+    if (!a[0] || strncpy_from_user(text, (const char *)(uintptr_t)a[0], sizeof(text)) < 0)
+        memcpy(text, "a DLL", sizeof("a DLL"));
+    struct proc *p = current_proc();
+    const char *prog = p ? p->name : "?";
+    char msg[300];
+    int n = (status == WIN32_STATUS_DLL_INIT_FAILED)
+        ? ksnprintf(msg, sizeof(msg), "%s: %s failed to initialize (its DllMain returned FALSE)\n",
+                    prog, text)
+        : ksnprintf(msg, sizeof(msg), "%s: %s\n", prog, text);
+    if (n > (int)sizeof(msg) - 1) n = (int)sizeof(msg) - 1;
+    kprintf("[pe] load failure, status 0x%08x, pid %d: %s", status, p ? p->pid : -1, msg);
+    if (n > 0) (void)win32_fd_write(2, msg, (size_t)n);
+    proc_exit_group((int)status);
+    return 0;       /* unreached */
+}
+
 /* The Win32 process heap: a per-proc bump allocator over anonymous user
  * memory (sys_mmap). Never reclaims (free() is a no-op), so every block is
  * fresh + zeroed -- which also makes calloc == malloc. */
@@ -18751,6 +18778,7 @@ static void win32_user_memcpy(uint64_t dst, uint64_t src, uint64_t n) {
         src += c; dst += c; n -= c;
     }
 }
+
 /* Size-tracked allocation over the bump arena: store the byte count in a 16-byte
  * header (keeps the returned pointer 16-aligned) so realloc / HeapSize / _msize
  * can recover it. free() stays a no-op (the arena never reclaims). C18a: SQLite
@@ -25366,6 +25394,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetSystemDirectoryW",    w32_GetSystemDirectoryW },
     { "kernel32.dll", "GetWindowsDirectoryA",   w32_GetWindowsDirectoryA },
     { "kernel32.dll", "GetWindowsDirectoryW",   w32_GetWindowsDirectoryW },
+    /* W3: the loader's failure path's target (pe_loader.c); never a real export. */
+    { "kernel32.dll", "__toby_loadfail",        w32_toby_loadfail },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 
@@ -25444,6 +25474,31 @@ static int win32_dll_first_index(const char *dll) {
 static const char *win32_shim_dll(int idx) {
     if (idx < 0 || idx >= WIN32_SHIM_COUNT) return 0;
     return g_win32_shims[idx].dll;
+}
+
+/* W3: 1 if tobyOS implements DLL `dll` itself, so the loader binds its imports
+ * to shims and never looks for a file: a shim names it, or it is an API-set
+ * name (api-ms-win-*, ext-ms-win-*), which Windows resolves with no file of
+ * that name either. Case-insensitive. */
+int win32_dll_is_builtin(const char *dll) {
+    if (!dll) return 0;
+    if (win32_dll_first_index(dll) >= 0) return 1;
+    static const char *const sets[] = { "api-ms-win-", "ext-ms-win-" };
+    for (unsigned s = 0; s < sizeof(sets) / sizeof(sets[0]); s++) {
+        int i = 0;
+        for (; sets[s][i]; i++) {
+            char c = dll[i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            if (c != sets[s][i]) break;
+        }
+        if (!sets[s][i]) return 1;
+    }
+    return 0;
+}
+
+/* W3: W2's reverse mapping, for the loader's module records. */
+int win32_kpath_to_winpath(const char *kpath, char *out, int cap) {
+    return win32_k_to_winpath(kpath, out, cap);
 }
 
 long win32_dispatch(uint64_t func_index, uint64_t args_ptr) {

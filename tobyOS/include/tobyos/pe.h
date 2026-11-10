@@ -42,13 +42,67 @@ struct pe_load_info {
  * branch ELF vs PE. */
 bool pe_is_image(const void *image, size_t size);
 
+/* W3: where the .exe came from and the process's working directory -- the
+ * DLL search order's first and last places. */
+struct pe_load_env {
+    const char *exe_kpath;     /* the .exe's tobyOS path, e.g. "/bin/win-dll28.exe" */
+    const char *cwd;           /* the new process's working directory */
+};
+
 /* Map a PE32+ image into the *currently active* user address space. The
  * caller (spawn) must already have installed the child's CR3 + vmm editor
  * root so vmm_map edits + user writes land in the child. Applies base
- * relocations, installs the Win32 IAT thunks + marshalling gate, and
- * reports the entry point. Returns 0 on success, <0 on failure. */
+ * relocations, installs the Win32 IAT thunks + marshalling gate, loads (W3)
+ * the DLLs its imports name, and reports the entry point -- the init
+ * trampoline when there are DLLs to initialize, the fail entry when one could
+ * not be loaded. Returns 0 on success, <0 when the .exe itself is unusable. */
 int pe_load_user(const void *image, size_t size, int argc, char **argv,
-                 struct pe_load_info *out);
+                 const struct pe_load_env *env, struct pe_load_info *out);
+
+/* W3: the module table -- the loader's record of the modules it mapped, in
+ * user memory as Windows keeps its loader data (the PEB's). Fixed VA, 2 pages:
+ * a header, the init list (one 24-byte entry per DLL to call at
+ * DLL_PROCESS_ATTACH, in order), the module records (64 bytes each, the .exe
+ * first) and the strings they point at. The init trampoline and the fail entry
+ * hard-code the VA and the header offsets. */
+#define WIN32_MODTAB_BASE      0x0000000031008000ULL
+#define WIN32_MODTAB_BYTES     (2u * 4096u)
+#define WIN32_MAX_MODULES      16
+#define WIN32_MT_EXE_ENTRY     0x000   /* u64: the .exe's entry point          */
+#define WIN32_MT_LOADFAIL      0x008   /* u64: __toby_loadfail's thunk         */
+#define WIN32_MT_INIT_COUNT    0x010   /* u32: entries in the init list        */
+#define WIN32_MT_FAIL_TEXT     0x018   /* u64: VA of the load failure's text   */
+#define WIN32_MT_FAIL_STATUS   0x020   /* u32: its NTSTATUS                    */
+#define WIN32_MT_MOD_COUNT     0x024   /* u32: module records                  */
+#define WIN32_MT_INIT_LIST     0x040   /* {u64 entry, u64 base, u64 name VA}   */
+#define WIN32_MT_INIT_STRIDE   24
+#define WIN32_MT_MODS          0x200   /* module records                       */
+#define WIN32_MT_MOD_STRIDE    64
+#define WIN32_MT_STRINGS       0x600   /* names and Windows paths              */
+#define WIN32_MTM_BASE         0x00    /* u64 */
+#define WIN32_MTM_SIZE         0x08    /* u64 */
+#define WIN32_MTM_ENTRY        0x10    /* u64: 0 if none */
+#define WIN32_MTM_NAME         0x18    /* u64: VA of the lower-case file name */
+#define WIN32_MTM_PATH         0x20    /* u64: VA of its Windows path */
+#define WIN32_MTM_EXPORT_RVA   0x28    /* u32 */
+#define WIN32_MTM_EXPORT_SIZE  0x2C    /* u32 */
+#define WIN32_MTM_FLAGS        0x30    /* u32 */
+#define WIN32_MTM_FLAG_DLL     1u
+
+/* W3: CPL3 routines in the shim area's page 0 (the space W1 freed). */
+#define WIN32_INIT_TRAMP_VA    0x0000000030000200ULL   /* DllMains, then the .exe */
+#define WIN32_FAIL_ENTRY_VA    0x0000000030000280ULL   /* a load failure's entry  */
+
+#define WIN32_STATUS_DLL_NOT_FOUND        0xC0000135u
+#define WIN32_STATUS_DLL_INIT_FAILED      0xC0000142u
+#define WIN32_STATUS_INVALID_IMAGE_FORMAT 0xC000007Bu
+
+/* W3 (src/syscall.c): 1 if tobyOS implements DLL `dll` itself -- a shim names
+ * it, or it is an API-set name (api-ms-win-*, ext-ms-win-*) -- so the loader
+ * binds its imports to shims and never looks for a file. */
+int win32_dll_is_builtin(const char *dll);
+/* W3 (src/syscall.c): a tobyOS path in its Windows form (C: = /data, Z: = /). */
+int win32_kpath_to_winpath(const char *kpath, char *out, int cap);
 
 /* CRT data page layout (Track C). The ucrt startup reaches argc/argv/environ
  * through __p___argc / __p___argv / __p__environ, and _commode/_fmode through

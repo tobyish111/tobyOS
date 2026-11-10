@@ -1386,7 +1386,8 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
                       uint64_t saved_cr3, uint64_t old_editor,
                       char **exec_argv, char **exec_envp) {
     struct pe_load_info pe_info = {0};
-    int prc = pe_load_user(image, image_size, kargc, kargv_buf, &pe_info);
+    struct pe_load_env pe_env = { .exe_kpath = kpath, .cwd = p->cwd };  /* W3 */
+    int prc = pe_load_user(image, image_size, kargc, kargv_buf, &pe_env, &pe_info);
     if (!image_borrowed) kfree(image);   /* slice 112: initrd borrow */
 
     bool ok = (prc == 0);
