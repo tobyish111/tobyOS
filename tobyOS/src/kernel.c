@@ -7742,9 +7742,14 @@ void _start(void) {
     }
 #endif
 
-#if defined(WINPE26A_BOOT) || defined(WINPE26B_BOOT) || defined(WINPE26C_BOOT)
-    /* Track C, W1 (docs/roadmap-2026-11.md) -- three stock console .exes, each
-     * default-linked (DYNAMIC_BASE, so loaded slid):
+#if defined(WINPE26A_BOOT) || defined(WINPE26B_BOOT) || defined(WINPE26C_BOOT) || \
+    defined(WINPE27A_BOOT) || defined(WINPE27B_BOOT)
+    /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
+     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W2:
+     *   27A /bin/win-path27.exe: drives, path forms, the current directory,
+     *       GetModuleFileName/GetFullPathName (20 checks), exit 27.
+     *   27B /bin/win-lerr27.exe: the last-error value is per thread, exit 27.
+     * W1:
      *   26A /bin/win-modh26.exe: GetModuleHandleA(NULL) == &__ImageBase, exit 26.
      *   26B /bin/win-miss26.exe: calls kernel32!GetNumaHighestNodeNumber, which
      *       no shim implements; the loader's missing-import stub must end it
@@ -7764,6 +7769,14 @@ void _start(void) {
 #ifdef WINPE26C_BOOT
             { "WINPE26C", "/bin/win-exit26.exe", "win-exit26.exe", 26,
               "a thread's ExitProcess ends the whole process" },
+#endif
+#ifdef WINPE27A_BOOT
+            { "WINPE27A", "/bin/win-path27.exe", "win-path27.exe", 27,
+              "drives, path forms and the current directory" },
+#endif
+#ifdef WINPE27B_BOOT
+            { "WINPE27B", "/bin/win-lerr27.exe", "win-lerr27.exe", 27,
+              "the last-error value is per thread" },
 #endif
         };
         win32_gui_set_log(true);

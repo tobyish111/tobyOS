@@ -2490,6 +2490,14 @@ programs/win-miss26/win-miss26.exe: programs/win-miss26/main.c
 programs/win-exit26/win-exit26.exe: programs/win-exit26/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
 
+# Track C/W2: win-path27 -- drives (C: = /data, Z: = /), every path form, the
+# current directory, GetModuleFileName, GetFullPathName (exit 27);
+# win-lerr27 -- the last-error value is per thread (exit 27).
+programs/win-path27/win-path27.exe: programs/win-path27/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
+programs/win-lerr27/win-lerr27.exe: programs/win-lerr27/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3008,6 +3016,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-modh26/win-modh26.exe \
                programs/win-miss26/win-miss26.exe \
                programs/win-exit26/win-exit26.exe \
+               programs/win-path27/win-path27.exe \
+               programs/win-lerr27/win-lerr27.exe \
                programs/win-xprod/win-xprod.exe \
                programs/win-xcons/win-xcons.exe \
                programs/win-xfilter/win-xfilter.exe \
@@ -3176,6 +3186,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-modh26/win-modh26.exe             $(INITRD_STAGE)/bin/win-modh26.exe
 	cp programs/win-miss26/win-miss26.exe             $(INITRD_STAGE)/bin/win-miss26.exe
 	cp programs/win-exit26/win-exit26.exe             $(INITRD_STAGE)/bin/win-exit26.exe
+	cp programs/win-path27/win-path27.exe             $(INITRD_STAGE)/bin/win-path27.exe
+	cp programs/win-lerr27/win-lerr27.exe             $(INITRD_STAGE)/bin/win-lerr27.exe
 	cp programs/win-xprod/win-xprod.exe               $(INITRD_STAGE)/bin/win-xprod.exe
 	cp programs/win-xcons/win-xcons.exe               $(INITRD_STAGE)/bin/win-xcons.exe
 	cp programs/win-xfilter/win-xfilter.exe           $(INITRD_STAGE)/bin/win-xfilter.exe
@@ -4165,6 +4177,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
 	    bin/win-wide23.exe bin/win-reloc24.exe                        \
 	    bin/win-modh26.exe bin/win-miss26.exe bin/win-exit26.exe      \
+	    bin/win-path27.exe bin/win-lerr27.exe                         \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
