@@ -18211,9 +18211,12 @@ static long w32_WriteFile(uint64_t *args) {
 }
 
 /* kernel32!ExitProcess(UINT code) -> (noreturn). */
+/* ExitProcess ends EVERY thread of the process, whichever thread calls it.
+ * W1: proc_exit ends only the caller when that is a secondary (CreateThread)
+ * thread, so the process ran on; the group exit is what Windows means. */
 static long w32_ExitProcess(uint64_t *args) {
     kprintf("[win32] ExitProcess(%u)\n", (unsigned)args[0]);
-    proc_exit((int)(uint32_t)args[0]);
+    proc_exit_group((int)(uint32_t)args[0]);
     return 0;       /* unreached */
 }
 
@@ -18666,8 +18669,10 @@ static long w32_zero(uint64_t *a) { (void)a; return 0; }
 static long w32_one (uint64_t *a) { (void)a; return 1; }
 
 /* CRT process-termination entry points -> tobyOS proc_exit. */
-static long w32_exit (uint64_t *a) { proc_exit((int)(uint32_t)a[0]); return 0; }
-static long w32_abort(uint64_t *a) { (void)a; proc_exit(3); return 0; }
+/* The CRT's exit, _exit and abort end the whole process too (W1, as
+ * ExitProcess above). */
+static long w32_exit (uint64_t *a) { proc_exit_group((int)(uint32_t)a[0]); return 0; }
+static long w32_abort(uint64_t *a) { (void)a; proc_exit_group(3); return 0; }
 
 /* The Win32 process heap: a per-proc bump allocator over anonymous user
  * memory (sys_mmap). Never reclaims (free() is a no-op), so every block is
