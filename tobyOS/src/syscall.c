@@ -18779,6 +18779,36 @@ static void win32_user_memcpy(uint64_t dst, uint64_t src, uint64_t n) {
     }
 }
 
+/* W3: ucrt's onexit tables -- the atexit list a DLL's CRT keeps for itself
+ * (DllMainCRTStartup initializes one at DLL_PROCESS_ATTACH, registers the
+ * DLL's atexit functions in it, and runs it at DLL_PROCESS_DETACH). An
+ * _onexit_table_t is { _PVFV *_first, *_last, *_end }: the functions are
+ * [_first, _last), the room [_first, _end). Running the table calls back into
+ * the program, so _execute_onexit_table is a CPL3 stub in the shim area
+ * (pe_loader.c), not a shim. Before W3 none existed, and every mingw DLL's
+ * startup ended at the missing-import stub for _initialize_onexit_table. */
+static long w32_initialize_onexit_table(uint64_t *a) {
+    uint64_t z[3] = { 0, 0, 0 };
+    if (!a[0] || copy_to_user((void *)(uintptr_t)a[0], z, sizeof(z)) != 0) return -1;
+    return 0;
+}
+static long w32_register_onexit_function(uint64_t *a) {
+    uint64_t t[3];
+    if (!a[0] || copy_from_user(t, (const void *)(uintptr_t)a[0], sizeof(t)) != 0) return -1;
+    if (t[1] < t[0] || t[2] < t[1]) return -1;
+    if (t[1] == t[2]) {                       /* full: double it (32 at first) */
+        uint64_t used = t[1] - t[0], cap = t[2] - t[0];
+        uint64_t ncap = cap ? cap * 2 : 32 * 8;
+        uint64_t arr = win32_heap_alloc(ncap);
+        if (!arr) return -1;
+        if (used) win32_user_memcpy(arr, t[0], used);    /* the arena never frees the old */
+        t[0] = arr; t[1] = arr + used; t[2] = arr + ncap;
+    }
+    if (copy_to_user((void *)(uintptr_t)t[1], &a[1], 8) != 0) return -1;
+    t[1] += 8;
+    if (copy_to_user((void *)(uintptr_t)a[0], t, sizeof(t)) != 0) return -1;
+    return 0;
+}
 /* Size-tracked allocation over the bump arena: store the byte count in a 16-byte
  * header (keeps the returned pointer 16-aligned) so realloc / HeapSize / _msize
  * can recover it. free() stays a no-op (the arena never reclaims). C18a: SQLite
@@ -25396,6 +25426,9 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetWindowsDirectoryW",   w32_GetWindowsDirectoryW },
     /* W3: the loader's failure path's target (pe_loader.c); never a real export. */
     { "kernel32.dll", "__toby_loadfail",        w32_toby_loadfail },
+    /* W3: a DLL CRT's own atexit table (_execute_onexit_table is a CPL3 stub). */
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_onexit_table",  w32_initialize_onexit_table },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_register_onexit_function", w32_register_onexit_function },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

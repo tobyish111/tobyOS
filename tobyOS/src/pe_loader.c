@@ -445,6 +445,9 @@ static uint64_t win32_user_stub_va(const char *dll, const char *func) {
         return WIN32_SETJMP_STUB_VA;
     if (strcmp(func, "longjmp") == 0)
         return WIN32_LONGJMP_STUB_VA;
+    /* W3: running a DLL CRT's onexit table calls the program's functions. */
+    if (strcmp(func, "_execute_onexit_table") == 0)
+        return WIN32_ONEXIT_EXEC_VA;
     return 0;
 }
 
@@ -539,6 +542,18 @@ static const uint8_t g_win32_fail_entry[] = {
     0x00, 0x00, 0x48, 0x8b, 0x48, 0x18, 0x8b, 0x50, 0x20, 0xff, 0x50, 0x08,
     0x0f, 0x0b,
 };
+/* _execute_onexit_table(table) (W3, same source file): call the functions in
+ * [_first, _last) from the last to the first, skipping NULLs, then clear the
+ * table's three pointers; returns 0. rbx/rsi/rdi are the x64 ABI's
+ * callee-saved registers, so the walk survives each call. */
+static const uint8_t g_win32_onexit_exec[] = {
+    0x53, 0x56, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0xcf, 0x48, 0x8b,
+    0x1f, 0x48, 0x8b, 0x77, 0x08, 0x48, 0x39, 0xde, 0x76, 0x10, 0x48, 0x83,
+    0xee, 0x08, 0x48, 0x8b, 0x06, 0x48, 0x85, 0xc0, 0x74, 0xef, 0xff, 0xd0,
+    0xeb, 0xeb, 0x31, 0xc0, 0x48, 0x89, 0x07, 0x48, 0x89, 0x47, 0x08, 0x48,
+    0x89, 0x47, 0x10, 0x48, 0x83, 0xc4, 0x20, 0x5f, 0x5e, 0x5b, 0xc3,
+};
+#define WIN32_ONEXIT_EXEC_OFF ((uint64_t)(WIN32_ONEXIT_EXEC_VA - WIN32_SHIM_BASE))
 #define WIN32_INIT_TRAMP_OFF ((uint64_t)(WIN32_INIT_TRAMP_VA - WIN32_SHIM_BASE))
 #define WIN32_FAIL_ENTRY_OFF ((uint64_t)(WIN32_FAIL_ENTRY_VA - WIN32_SHIM_BASE))
 _Static_assert(WIN32_MODTAB_BASE == 0x31008000ULL, "the trampolines hard-code the module table's VA");
@@ -612,10 +627,13 @@ static void pe_setup_shim_area(void) {
     _Static_assert(WIN32_INIT_TRAMP_OFF >= WIN32_THUNK_BASE &&
                    WIN32_INIT_TRAMP_OFF + sizeof(g_win32_init_tramp) <= WIN32_FAIL_ENTRY_OFF,
                    "init trampoline overruns the fail entry");
-    _Static_assert(WIN32_FAIL_ENTRY_OFF + sizeof(g_win32_fail_entry) <= WIN32_SETJMP_OFF,
-                   "fail entry overruns the setjmp stub");
+    _Static_assert(WIN32_FAIL_ENTRY_OFF + sizeof(g_win32_fail_entry) <= WIN32_ONEXIT_EXEC_OFF,
+                   "fail entry overruns the onexit stub");
+    _Static_assert(WIN32_ONEXIT_EXEC_OFF + sizeof(g_win32_onexit_exec) <= WIN32_SETJMP_OFF,
+                   "onexit stub overruns the setjmp stub");
     memcpy((void *)WIN32_INIT_TRAMP_VA, g_win32_init_tramp, sizeof(g_win32_init_tramp));
     memcpy((void *)WIN32_FAIL_ENTRY_VA, g_win32_fail_entry, sizeof(g_win32_fail_entry));
+    memcpy((void *)WIN32_ONEXIT_EXEC_VA, g_win32_onexit_exec, sizeof(g_win32_onexit_exec));
 
     /* C9: a thunk for EVERY shim, so GetProcAddress can return a callable
      * pointer for any shim resolved by name (slot i at WIN32_PROCADDR_BASE_VA

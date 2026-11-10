@@ -92,6 +92,7 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 /* W3: CPL3 routines in the shim area's page 0 (the space W1 freed). */
 #define WIN32_INIT_TRAMP_VA    0x0000000030000200ULL   /* DllMains, then the .exe */
 #define WIN32_FAIL_ENTRY_VA    0x0000000030000280ULL   /* a load failure's entry  */
+#define WIN32_ONEXIT_EXEC_VA   0x00000000300002C0ULL   /* _execute_onexit_table   */
 
 #define WIN32_STATUS_DLL_NOT_FOUND        0xC0000135u
 #define WIN32_STATUS_DLL_INIT_FAILED      0xC0000142u
