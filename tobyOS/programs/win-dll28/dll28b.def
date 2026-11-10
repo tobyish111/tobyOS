@@ -1,0 +1,3 @@
+EXPORTS
+    b_twice
+    fwd_add = dll28c.c_add

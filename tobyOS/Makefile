@@ -2498,6 +2498,36 @@ programs/win-path27/win-path27.exe: programs/win-path27/main.c
 programs/win-lerr27/win-lerr27.exe: programs/win-lerr27/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
 
+# Track C/W3: DLLs from disk. dll28c and dll28b are linked at the SAME
+# preferred base, so the loader must relocate one of them; dll28b imports
+# dll28c and forwards fwd_add to it (dll28b.def); dll28c exports c_mul by
+# ordinal only (dll28c.def). win-dll28.exe imports from both (exit 28);
+# win-dllf28.exe imports from dll28f, whose DllMain fails (0xC0000142);
+# win-dllm28.exe imports from dll28m.dll, which is built only to link
+# against and is NOT put in the initrd (0xC0000135). Each DLL rule also
+# writes the import library its users link with.
+W28 := programs/win-dll28
+$(W28)/dll28c.dll: $(W28)/dll28c.c $(W28)/dll28c.def
+	$(CC) --target=x86_64-w64-mingw32 -O1 -shared -o $@ $(W28)/dll28c.c $(W28)/dll28c.def \
+	      -Wl,--out-implib,$(W28)/libdll28c.a -Wl,--image-base,0x380000000
+$(W28)/libdll28c.a: $(W28)/dll28c.dll
+$(W28)/dll28b.dll: $(W28)/dll28b.c $(W28)/dll28b.def $(W28)/libdll28c.a
+	$(CC) --target=x86_64-w64-mingw32 -O1 -shared -o $@ $(W28)/dll28b.c $(W28)/dll28b.def \
+	      -L$(W28) -ldll28c -Wl,--out-implib,$(W28)/libdll28b.a -Wl,--image-base,0x380000000
+$(W28)/libdll28b.a: $(W28)/dll28b.dll
+$(W28)/win-dll28.exe: $(W28)/main.c $(W28)/libdll28b.a $(W28)/libdll28c.a
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $(W28)/main.c -L$(W28) -ldll28b -ldll28c
+$(W28)/dll28f.dll: $(W28)/dll28f.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -shared -o $@ $< -Wl,--out-implib,$(W28)/libdll28f.a
+$(W28)/libdll28f.a: $(W28)/dll28f.dll
+$(W28)/win-dllf28.exe: $(W28)/mainf.c $(W28)/libdll28f.a
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $(W28)/mainf.c -L$(W28) -ldll28f
+$(W28)/dll28m.dll: $(W28)/dll28m.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -shared -o $@ $< -Wl,--out-implib,$(W28)/libdll28m.a
+$(W28)/libdll28m.a: $(W28)/dll28m.dll
+$(W28)/win-dllm28.exe: $(W28)/mainm.c $(W28)/libdll28m.a
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $(W28)/mainm.c -L$(W28) -ldll28m
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3018,6 +3048,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-exit26/win-exit26.exe \
                programs/win-path27/win-path27.exe \
                programs/win-lerr27/win-lerr27.exe \
+               programs/win-dll28/win-dll28.exe \
+               programs/win-dll28/dll28b.dll \
+               programs/win-dll28/dll28c.dll \
+               programs/win-dll28/win-dllf28.exe \
+               programs/win-dll28/dll28f.dll \
+               programs/win-dll28/win-dllm28.exe \
                programs/win-xprod/win-xprod.exe \
                programs/win-xcons/win-xcons.exe \
                programs/win-xfilter/win-xfilter.exe \
@@ -3188,6 +3224,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-exit26/win-exit26.exe             $(INITRD_STAGE)/bin/win-exit26.exe
 	cp programs/win-path27/win-path27.exe             $(INITRD_STAGE)/bin/win-path27.exe
 	cp programs/win-lerr27/win-lerr27.exe             $(INITRD_STAGE)/bin/win-lerr27.exe
+	cp programs/win-dll28/win-dll28.exe               $(INITRD_STAGE)/bin/win-dll28.exe
+	cp programs/win-dll28/dll28b.dll                  $(INITRD_STAGE)/bin/dll28b.dll
+	cp programs/win-dll28/dll28c.dll                  $(INITRD_STAGE)/bin/dll28c.dll
+	cp programs/win-dll28/win-dllf28.exe              $(INITRD_STAGE)/bin/win-dllf28.exe
+	cp programs/win-dll28/dll28f.dll                  $(INITRD_STAGE)/bin/dll28f.dll
+	cp programs/win-dll28/win-dllm28.exe              $(INITRD_STAGE)/bin/win-dllm28.exe
 	cp programs/win-xprod/win-xprod.exe               $(INITRD_STAGE)/bin/win-xprod.exe
 	cp programs/win-xcons/win-xcons.exe               $(INITRD_STAGE)/bin/win-xcons.exe
 	cp programs/win-xfilter/win-xfilter.exe           $(INITRD_STAGE)/bin/win-xfilter.exe
@@ -4178,6 +4220,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-wide23.exe bin/win-reloc24.exe                        \
 	    bin/win-modh26.exe bin/win-miss26.exe bin/win-exit26.exe      \
 	    bin/win-path27.exe bin/win-lerr27.exe                         \
+	    bin/win-dll28.exe bin/dll28b.dll bin/dll28c.dll               \
+	    bin/win-dllf28.exe bin/dll28f.dll bin/win-dllm28.exe          \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \

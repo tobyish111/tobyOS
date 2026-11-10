@@ -19,6 +19,7 @@
 *.elf
 *.bin
 *.exe
+*.dll
 tobyos.bin
 
 # Track B (Linux compat): opt-in third-party Linux binaries fetched at test

@@ -7743,9 +7743,15 @@ void _start(void) {
 #endif
 
 #if defined(WINPE26A_BOOT) || defined(WINPE26B_BOOT) || defined(WINPE26C_BOOT) || \
-    defined(WINPE27A_BOOT) || defined(WINPE27B_BOOT)
+    defined(WINPE27A_BOOT) || defined(WINPE27B_BOOT) || defined(WINPE28A_BOOT) || \
+    defined(WINPE28B_BOOT) || defined(WINPE28C_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
-     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W2:
+     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W3:
+     *   28A /bin/win-dll28.exe: imports from /bin/dll28b.dll and dll28c.dll --
+     *       DllMain order, a forwarder, an ordinal import, a relocated DLL; 28.
+     *   28B /bin/win-dllf28.exe: dll28f's DllMain fails -> 0xC0000142.
+     *   28C /bin/win-dllm28.exe: dll28m.dll is not on disk -> 0xC0000135.
+     * W2:
      *   27A /bin/win-path27.exe: drives, path forms, the current directory,
      *       GetModuleFileName/GetFullPathName (20 checks), exit 27.
      *   27B /bin/win-lerr27.exe: the last-error value is per thread, exit 27.
@@ -7777,6 +7783,18 @@ void _start(void) {
 #ifdef WINPE27B_BOOT
             { "WINPE27B", "/bin/win-lerr27.exe", "win-lerr27.exe", 27,
               "the last-error value is per thread" },
+#endif
+#ifdef WINPE28A_BOOT
+            { "WINPE28A", "/bin/win-dll28.exe", "win-dll28.exe", 28,
+              "imports from two DLLs on disk: order, forwarder, ordinal, relocation" },
+#endif
+#ifdef WINPE28B_BOOT
+            { "WINPE28B", "/bin/win-dllf28.exe", "win-dllf28.exe", (int)0xC0000142u,
+              "a DLL whose DllMain fails stops the process before main" },
+#endif
+#ifdef WINPE28C_BOOT
+            { "WINPE28C", "/bin/win-dllm28.exe", "win-dllm28.exe", (int)0xC0000135u,
+              "a DLL that is not on disk stops the process before main" },
 #endif
         };
         win32_gui_set_log(true);
