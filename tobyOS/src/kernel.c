@@ -7719,6 +7719,53 @@ void _start(void) {
     }
 #endif
 
+#if defined(WINPE26A_BOOT) || defined(WINPE26B_BOOT) || defined(WINPE26C_BOOT)
+    /* Track C, W1 (docs/roadmap-2026-11.md) -- three stock console .exes, each
+     * default-linked (DYNAMIC_BASE, so loaded slid):
+     *   26A /bin/win-modh26.exe: GetModuleHandleA(NULL) == &__ImageBase, exit 26.
+     *   26B /bin/win-miss26.exe: calls kernel32!GetNumaHighestNodeNumber, which
+     *       no shim implements; the loader's missing-import stub must end it
+     *       with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) and name the import.
+     *   26C /bin/win-exit26.exe: a secondary thread's ExitProcess(26) must end
+     *       the whole process (a kernel that ends only the thread gives 1). */
+    {
+        static const struct { const char *tag, *path, *name; int want; const char *what; } w1[] = {
+#ifdef WINPE26A_BOOT
+            { "WINPE26A", "/bin/win-modh26.exe", "win-modh26.exe", 26,
+              "GetModuleHandleA(NULL) is the slid base" },
+#endif
+#ifdef WINPE26B_BOOT
+            { "WINPE26B", "/bin/win-miss26.exe", "win-miss26.exe", (int)0xC0000139u,
+              "a missing import ends the process with 0xC0000139" },
+#endif
+#ifdef WINPE26C_BOOT
+            { "WINPE26C", "/bin/win-exit26.exe", "win-exit26.exe", 26,
+              "a thread's ExitProcess ends the whole process" },
+#endif
+        };
+        win32_gui_set_log(true);
+        for (unsigned i = 0; i < sizeof(w1) / sizeof(w1[0]); i++) {
+            kprintf("[boot] %s: spawning %s\n", w1[i].tag, w1[i].path);
+            char *argv[] = { (char *)w1[i].name, 0 };
+            char *envp[] = { (char *)"PATH=/bin", 0 };
+            struct proc_spec spec = {
+                .path = w1[i].path, .name = w1[i].name,
+                .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+            };
+            int pid = proc_spawn(&spec);
+            if (pid < 0) {
+                kprintf("[%s] VERDICT: FAIL reason=spawn\n", w1[i].tag);
+                continue;
+            }
+            int rc = proc_wait(pid);
+            kprintf("[%s] VERDICT: %s exit=%d (0x%x; expect 0x%x: %s)\n", w1[i].tag,
+                    rc == w1[i].want ? "PASS" : "FAIL", rc, (unsigned)rc,
+                    (unsigned)w1[i].want, w1[i].what);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery

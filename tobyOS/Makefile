@@ -2478,6 +2478,18 @@ programs/win-reloc24/win-reloc24.exe: programs/win-reloc24/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $< \
 	      -Wl,--dynamicbase -Wl,--disable-high-entropy-va
 
+# Track C/W1 (docs/roadmap-2026-11.md): three STOCK console .exes, default
+# link (DYNAMIC_BASE, so each loads slid). win-modh26: GetModuleHandleA(NULL)
+# is the real base (exit 26). win-miss26: a call to an import no shim
+# implements ends the process with 0xC0000139 and names it. win-exit26:
+# ExitProcess from a secondary thread ends the whole process (exit 26).
+programs/win-modh26/win-modh26.exe: programs/win-modh26/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
+programs/win-miss26/win-miss26.exe: programs/win-miss26/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
+programs/win-exit26/win-exit26.exe: programs/win-exit26/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -2993,6 +3005,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-scan22/win-scan22.exe \
                programs/win-wide23/win-wide23.exe \
                programs/win-reloc24/win-reloc24.exe \
+               programs/win-modh26/win-modh26.exe \
+               programs/win-miss26/win-miss26.exe \
+               programs/win-exit26/win-exit26.exe \
                programs/win-xprod/win-xprod.exe \
                programs/win-xcons/win-xcons.exe \
                programs/win-xfilter/win-xfilter.exe \
@@ -3158,6 +3173,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-scan22/win-scan22.exe             $(INITRD_STAGE)/bin/win-scan22.exe
 	cp programs/win-wide23/win-wide23.exe             $(INITRD_STAGE)/bin/win-wide23.exe
 	cp programs/win-reloc24/win-reloc24.exe           $(INITRD_STAGE)/bin/win-reloc24.exe
+	cp programs/win-modh26/win-modh26.exe             $(INITRD_STAGE)/bin/win-modh26.exe
+	cp programs/win-miss26/win-miss26.exe             $(INITRD_STAGE)/bin/win-miss26.exe
+	cp programs/win-exit26/win-exit26.exe             $(INITRD_STAGE)/bin/win-exit26.exe
 	cp programs/win-xprod/win-xprod.exe               $(INITRD_STAGE)/bin/win-xprod.exe
 	cp programs/win-xcons/win-xcons.exe               $(INITRD_STAGE)/bin/win-xcons.exe
 	cp programs/win-xfilter/win-xfilter.exe           $(INITRD_STAGE)/bin/win-xfilter.exe
@@ -4146,6 +4164,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-font18c.exe bin/win-lua.exe bin/win-com19c.exe        \
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
 	    bin/win-wide23.exe bin/win-reloc24.exe                        \
+	    bin/win-modh26.exe bin/win-miss26.exe bin/win-exit26.exe      \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
