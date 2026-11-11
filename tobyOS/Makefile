@@ -2595,6 +2595,25 @@ $(W32X)/win-cxx32.exe: $(W32X)/main.cpp
 $(addprefix $(W32X)/,$(W32X_DLLS)): $(W32X)/win-cxx32.exe
 	cp $(W32X_BIN)$(notdir $@) $@
 
+# Track C/W7b: exceptions. win-exc33.exe (C++ throw/catch, 11 checks, exit
+# 33) and win-unc33.exe (a throw nobody catches: std::terminate, exit 34) are
+# g++-built like win-cxx32 and run on the same DLLs; win-seh33.exe (exit 35)
+# drives the exception machinery itself through hand-written frames
+# (seh33s.S) carrying handlers of its own and a __C_specific_handler scope
+# table; win-top33.exe (exit 36) runs itself as a child five times to see
+# what follows the top-level filter's answers. All four exit as they do on
+# Windows 11.
+W33 := programs/win-exc33
+W33_GCC = $(W32X_BIN)gcc
+$(W33)/win-exc33.exe: $(W33)/main.cpp
+	TMP='C:\t' TEMP='C:\t' $(W32X_GXX) -O1 -o $@ $<
+$(W33)/win-unc33.exe: $(W33)/uncaught.cpp
+	TMP='C:\t' TEMP='C:\t' $(W32X_GXX) -O1 -o $@ $<
+$(W33)/win-seh33.exe: $(W33)/seh33.c $(W33)/seh33s.S
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W33)/seh33.c $(W33)/seh33s.S
+$(W33)/win-top33.exe: $(W33)/top33.c $(W33)/seh33s.S
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W33)/top33.c $(W33)/seh33s.S
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3136,6 +3155,10 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-cxx32/libstdc++-6.dll \
                programs/win-cxx32/libgcc_s_seh-1.dll \
                programs/win-cxx32/libwinpthread-1.dll \
+               programs/win-exc33/win-exc33.exe \
+               programs/win-exc33/win-unc33.exe \
+               programs/win-exc33/win-seh33.exe \
+               programs/win-exc33/win-top33.exe \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3333,6 +3356,10 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-cxx32/libstdc++-6.dll            $(INITRD_STAGE)/bin/libstdc++-6.dll
 	cp programs/win-cxx32/libgcc_s_seh-1.dll         $(INITRD_STAGE)/bin/libgcc_s_seh-1.dll
 	cp programs/win-cxx32/libwinpthread-1.dll        $(INITRD_STAGE)/bin/libwinpthread-1.dll
+	cp programs/win-exc33/win-exc33.exe              $(INITRD_STAGE)/bin/win-exc33.exe
+	cp programs/win-exc33/win-unc33.exe              $(INITRD_STAGE)/bin/win-unc33.exe
+	cp programs/win-exc33/win-seh33.exe              $(INITRD_STAGE)/bin/win-seh33.exe
+	cp programs/win-exc33/win-top33.exe              $(INITRD_STAGE)/bin/win-top33.exe
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4337,6 +4364,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-proc31.exe bin/child31.exe bin/notpe31.exe            \
 	    bin/win-cxx32.exe bin/libstdc++-6.dll bin/libgcc_s_seh-1.dll  \
 	    bin/libwinpthread-1.dll                                       \
+	    bin/win-exc33.exe bin/win-unc33.exe bin/win-seh33.exe         \
+	    bin/win-top33.exe                                             \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \

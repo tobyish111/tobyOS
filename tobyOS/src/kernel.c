@@ -7746,9 +7746,27 @@ void _start(void) {
     defined(WINPE27A_BOOT) || defined(WINPE27B_BOOT) || defined(WINPE28A_BOOT) || \
     defined(WINPE28B_BOOT) || defined(WINPE28C_BOOT) || defined(WINPE29A_BOOT) || \
     defined(WINPE30A_BOOT) || defined(WINPE30B_BOOT) || defined(WINPE31A_BOOT) || \
-    defined(WINPE32A_BOOT)
+    defined(WINPE32A_BOOT) || defined(WINPE33A_BOOT) || defined(WINPE33B_BOOT) || \
+    defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
-     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W7:
+     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W7b:
+     *   33A /bin/win-exc33.exe: C++ exceptions on the same DLLs -- caught in
+     *       the throwing function, three frames up with the destructors
+     *       between, thrown inside libstdc++-6.dll, by base class, rethrown,
+     *       nested, catch (...), a thousand, on another thread, an
+     *       exception_ptr between threads (11 checks), 33.
+     *   33B /bin/win-unc33.exe: a throw nobody catches -- the CRT's filter
+     *       continues it, so std::terminate (its handler exits 34).
+     *   33C /bin/win-seh33.exe: the exception machinery itself, through
+     *       hand-written frames with handlers of their own and a
+     *       __C_specific_handler scope table -- both phases and their flags,
+     *       the target's registers, a collided unwind, a noncontinuable
+     *       exception continued, filters and __finally (12 checks), 35.
+     *   33D /bin/win-top33.exe: an exception no frame takes -- itself as a
+     *       child five times: the top-level filter's three answers, on the
+     *       main thread and another; the whole stack unwound, the process
+     *       ended with the code and no DLL detach (as Windows 11), 36.
+     * W7:
      *   32A /bin/win-cxx32.exe: a C++ program built by g++ the ordinary way, on
      *       the toolchain's own libstdc++-6.dll, libgcc_s_seh-1.dll and
      *       libwinpthread-1.dll -- iostreams, containers, std::thread, mutexes,
@@ -7845,6 +7863,22 @@ void _start(void) {
 #ifdef WINPE32A_BOOT
             { "WINPE32A", "/bin/win-cxx32.exe", "win-cxx32.exe", 32,
               "C++ on the toolchain's libstdc++/libgcc_s/libwinpthread DLLs (12 checks + exit())" },
+#endif
+#ifdef WINPE33A_BOOT
+            { "WINPE33A", "/bin/win-exc33.exe", "win-exc33.exe", 33,
+              "C++ exceptions: throw, catch, unwind through frames, DLLs and threads (11 checks)" },
+#endif
+#ifdef WINPE33B_BOOT
+            { "WINPE33B", "/bin/win-unc33.exe", "win-unc33.exe", 34,
+              "an uncaught C++ exception: the CRT's filter, then std::terminate" },
+#endif
+#ifdef WINPE33C_BOOT
+            { "WINPE33C", "/bin/win-seh33.exe", "win-seh33.exe", 35,
+              "the x64 exception machinery: dispatch, unwind, collided unwind, scope tables (12 checks)" },
+#endif
+#ifdef WINPE33D_BOOT
+            { "WINPE33D", "/bin/win-top33.exe", "win-top33.exe", 36,
+              "an exception no frame takes: the top-level filter's answers, the unwind, the exit code" },
 #endif
         };
         win32_gui_set_log(true);
