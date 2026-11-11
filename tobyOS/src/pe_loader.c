@@ -790,6 +790,7 @@ struct pe_ctx {
     bool     rt;                        /* W4: a run-time call (see pe_uread) */
     bool     no_load;                   /* W4: GetProcAddress: map nothing */
     bool     miss_open;                 /* W4: the missing-import pages are writable */
+    bool     rt_absent;                 /* W7b: /lib/win32/tobyrt.dll is not there */
     struct pe_missing_area miss;
     uint32_t tls_used;                  /* bit n: TLS slot n is taken (0 is the .exe's) */
     uint64_t tls_next, tls_end;         /* next free byte / end of the mapped TLS area */
@@ -1235,10 +1236,39 @@ static uint64_t pe_builtin_import(const char *dll, const char *fname) {
     if (idx < 0 || (uint64_t)idx >= WIN32_PA_CAP) return 0;
     return WIN32_PROCADDR_BASE_VA + (uint64_t)idx * WIN32_PROCADDR_STRIDE;
 }
+/* W7b: the exception machinery runs in user mode, in tobyOS's own DLL
+ * (programs/tobyrt: the dispatcher, the x64 unwinder, RtlUnwindEx,
+ * __C_specific_handler, the top-level filter -- it calls the program's
+ * handlers and walks its stack). An import of one of these names from any
+ * built-in DLL (kernel32, ntdll, the CRT's) binds to that DLL's export of
+ * the same name, the DLL loaded with the first such import and pinned. When
+ * the file is not there they bind as before (shims, or missing-import stubs). */
+#define PE_RT_KPATH "/lib/win32/tobyrt.dll"
+#define PE_RT_NAME  "tobyrt.dll"
+static const char *const g_pe_rt_names[] = {
+    "RaiseException", "RtlRaiseException", "RtlCaptureContext", "RtlRestoreContext",
+    "RtlLookupFunctionEntry", "RtlVirtualUnwind", "RtlUnwindEx", "RtlUnwind",
+    "__C_specific_handler", "SetUnhandledExceptionFilter", "UnhandledExceptionFilter",
+    "SetErrorMode", "GetErrorMode",
+};
+static bool pe_rt_name(const char *func) {
+    for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)
+        if (strcmp(func, g_pe_rt_names[i]) == 0) return true;
+    return false;
+}
+
 /* W4 (pe.h): the same, for GetProcAddress on a built-in module -- so it
- * returns LoadLibraryA's CPL3 stub, not a shim that would skip DllMain. */
+ * returns LoadLibraryA's CPL3 stub, not a shim that would skip DllMain.
+ * W7b: a runtime name is the runtime's export, when the process has it. */
 uint64_t win32_builtin_proc_va(const char *dll, const char *func) {
-    return (dll && func) ? pe_builtin_import(dll, func) : 0;
+    if (!dll || !func) return 0;
+    if (pe_rt_name(func)) {
+        uint64_t base = pe_rt_find(PE_RT_NAME, 0);
+        uint32_t err = 0;
+        uint64_t va = base ? pe_rt_proc(base, func, 0, &err) : 0;
+        if (va) return va;
+    }
+    return pe_builtin_import(dll, func);
 }
 
 static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed_by);
@@ -1479,6 +1509,26 @@ static int pe_find_or_load(struct pe_ctx *c, const char *dll, const char *needed
     return pe_map_file(c, name, path, img, sz, borrowed, needed_by);
 }
 
+/* W7b: the runtime's module -- mapped and bound now if it is not yet, and
+ * pinned (a process never unloads its exception machinery) -- or -1 when the
+ * file is not there (or nothing may be mapped: GetProcAddress). */
+static int pe_runtime(struct pe_ctx *c, const char *needed_by) {
+    int li = pe_loaded(c, PE_RT_NAME);
+    if (li >= 0) return li;
+    if (c->rt_absent || c->no_load || c->failed) return -1;
+    void *img = 0;
+    size_t sz = 0;
+    int borrowed = 0;
+    if (vfs_read_all_ref(PE_RT_KPATH, &img, &sz, &borrowed) != VFS_OK) {
+        kprintf("[pe] %s is not there: the exception functions bind as before W7b\n", PE_RT_KPATH);
+        c->rt_absent = true;
+        return -1;
+    }
+    int mi = pe_map_file(c, PE_RT_NAME, PE_RT_KPATH, img, sz, borrowed, needed_by);
+    if (mi >= 0) c->mod[mi].flags |= WIN32_MTM_FLAG_PINNED;
+    return mi;
+}
+
 /* An import a module's DLL does not export: bind it to a missing-import stub
  * (W1). At run time (W4) the stubs' pages are read-only and executable, so
  * they are opened for writing for the rest of the call (pe_rt_end closes
@@ -1541,14 +1591,22 @@ static int pe_bind_module(struct pe_ctx *c, int mi) {
                                    m->base + m->size) < 0) {
                     ksnprintf(fname, sizeof fname, "(bad name)");
                 }
-                uint64_t va = builtin
-                    ? pe_builtin_import(dll, fname)
-                    : pe_export_lookup(c, dj, by_ord ? NULL : fname,
-                                       by_ord ? (uint32_t)(ent & 0xFFFFu) : 0, 0);
+                uint64_t va = 0;
+                const char *to = builtin ? "shim" : c->mod[dj].name;
+                if (builtin && !by_ord && pe_rt_name(fname)) {
+                    int rj = pe_runtime(c, c->mod[mi].name);
+                    if (c->failed) return -1;
+                    if (rj >= 0 && (va = pe_export_lookup(c, rj, fname, 0, 0)) != 0)
+                        to = PE_RT_NAME;
+                }
+                if (!va)
+                    va = builtin
+                        ? pe_builtin_import(dll, fname)
+                        : pe_export_lookup(c, dj, by_ord ? NULL : fname,
+                                           by_ord ? (uint32_t)(ent & 0xFFFFu) : 0, 0);
                 if (c->failed) return -1;          /* a forwarder's DLL failed */
                 if (va) {
-                    kprintf("[pe]   bind %s!%s -> %s@%p\n", dll, fname,
-                            builtin ? "shim" : c->mod[dj].name, (void *)va);
+                    kprintf("[pe]   bind %s!%s -> %s@%p\n", dll, fname, to, (void *)va);
                 } else {
                     va = pe_missing_bind(c, dll, fname);
                     kprintf("[pe] unresolved import %s!%s -> missing-stub@%p\n",

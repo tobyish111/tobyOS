@@ -1,0 +1,18 @@
+; tobyrt.dll -- the tobyOS Win32 runtime (W7b). The loader (src/pe_loader.c,
+; g_pe_rt_names) binds a program's import of each of these names from a
+; built-in DLL (kernel32, ntdll, the CRT's) to this DLL's export.
+LIBRARY tobyrt.dll
+EXPORTS
+    RaiseException = rt_RaiseException
+    RtlRaiseException = rt_RtlRaiseException
+    RtlCaptureContext = rt_capture_context
+    RtlRestoreContext = rt_restore_context
+    RtlLookupFunctionEntry = rt_RtlLookupFunctionEntry
+    RtlVirtualUnwind = rt_RtlVirtualUnwind
+    RtlUnwindEx = rt_RtlUnwindEx
+    RtlUnwind = rt_RtlUnwind
+    __C_specific_handler = rt_C_specific_handler
+    SetUnhandledExceptionFilter = rt_SetUnhandledExceptionFilter
+    UnhandledExceptionFilter = rt_UnhandledExceptionFilter
+    SetErrorMode = rt_SetErrorMode
+    GetErrorMode = rt_GetErrorMode

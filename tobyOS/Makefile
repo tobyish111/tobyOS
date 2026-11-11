@@ -2614,6 +2614,25 @@ $(W33)/win-seh33.exe: $(W33)/seh33.c $(W33)/seh33s.S
 $(W33)/win-top33.exe: $(W33)/top33.c $(W33)/seh33s.S
 	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W33)/top33.c $(W33)/seh33s.S
 
+# W7b: tobyrt.dll, the Win32 runtime's user-mode half -- RaiseException, the
+# x64 unwinder (RtlLookupFunctionEntry, RtlVirtualUnwind, RtlUnwindEx),
+# RtlCaptureContext/RtlRestoreContext, __C_specific_handler and the top-level
+# exception filter. The loader binds those names, imported from any built-in
+# DLL, to it (src/pe_loader.c: g_pe_rt_names). Freestanding: it imports four
+# kernel32 functions and nothing else; unwind tables for every function (a
+# walk goes through its own frames: -fasynchronous-unwind-tables, which
+# -ffreestanding would otherwise drop); no sibling calls (a frame that
+# captured its own context must stay); no entry point; no fixups (all its
+# addressing is RIP-relative), so it has a base of its own, just above the
+# loader's fixed Win32 pages (pe.h: 0x30000000..0x32000000).
+TRT := programs/tobyrt
+$(TRT)/tobyrt.dll: $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def
+	$(CC) --target=x86_64-w64-mingw32 -O2 -Wall -Wextra -shared -nostdlib -ffreestanding \
+	      -fasynchronous-unwind-tables -fno-builtin -fno-optimize-sibling-calls \
+	      -fno-stack-protector -mno-stack-arg-probe \
+	      -o $@ $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def -lkernel32 \
+	      -Wl,-e,0 -Wl,--image-base,0x32000000
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3159,6 +3178,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-exc33/win-unc33.exe \
                programs/win-exc33/win-seh33.exe \
                programs/win-exc33/win-top33.exe \
+               programs/tobyrt/tobyrt.dll \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3360,6 +3380,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-exc33/win-unc33.exe              $(INITRD_STAGE)/bin/win-unc33.exe
 	cp programs/win-exc33/win-seh33.exe              $(INITRD_STAGE)/bin/win-seh33.exe
 	cp programs/win-exc33/win-top33.exe              $(INITRD_STAGE)/bin/win-top33.exe
+	mkdir -p $(INITRD_STAGE)/lib/win32
+	cp programs/tobyrt/tobyrt.dll                    $(INITRD_STAGE)/lib/win32/tobyrt.dll
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4460,7 +4482,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/bluescreen                                                    \
 	    bin/tsh bin/sh bin/shparity bin/oilspec bin/ttyparity             \
 	    bin/tjoinchurn bin/waittest bin/stdiotest bin/sigregs             \
-	    lib/ld-toby.so lib/libtoby.so                                     \
+	    lib/ld-toby.so lib/libtoby.so lib/win32/tobyrt.dll                \
 	    $$EXTRA_FILES                                                     \
 	  && tar --format=ustar --mode=4755 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
