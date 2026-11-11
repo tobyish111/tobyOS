@@ -18804,6 +18804,24 @@ static long w32_register_onexit_function(uint64_t *a) {
     if (copy_to_user((void *)(uintptr_t)a[0], t, sizeof(t)) != 0) return -1;
     return 0;
 }
+/* W7: ucrt's _crt_atexit(fn) -> 0 -- the .exe's atexit list (its C++ static
+ * destructors among them, registered by the mingw startup's atexit). The list
+ * is an _onexit_table_t in the process's heap, its address in the module
+ * table (WIN32_MT_ATEXIT); the C runtime's exit -- a CPL3 stub, pe_loader.c --
+ * runs it, the last first, before ExitProcess. Until W7 this was a no-op, and
+ * no .exe's atexit function ever ran. */
+static long w32_crt_atexit(uint64_t *a) {
+    uint64_t t = 0;
+    if (copy_from_user(&t, (const void *)(uintptr_t)(WIN32_MODTAB_BASE + WIN32_MT_ATEXIT), 8) != 0) return -1;
+    if (!t) {
+        t = win32_heap_alloc(24);             /* fresh memory: {0, 0, 0} */
+        if (!t) return -1;
+        if (copy_to_user((void *)(uintptr_t)(WIN32_MODTAB_BASE + WIN32_MT_ATEXIT), &t, 8) != 0) return -1;
+    }
+    uint64_t r[2] = { t, a[0] };
+    return w32_register_onexit_function(r);
+}
+
 /* Size-tracked allocation over the bump arena: store the byte count in a 16-byte
  * header (keeps the returned pointer 16-aligned) so realloc / HeapSize / _msize
  * can recover it. free() stays a no-op (the arena never reclaims). C18a: SQLite
@@ -18940,6 +18958,20 @@ static long w32_strstr(uint64_t *a) {
 
 /* VirtualQuery(addr, buf, len): fill a minimal MEMORY_BASIC_INFORMATION
  * (committed, private, read-write). Enough for the CRT's startup probes. */
+/* W7: a present page's protection, as a PAGE_* value. */
+static uint32_t win32_page_prot(uint64_t pte) {
+    bool w = (pte & PTE_WRITABLE) != 0, x = !(pte & (1ULL << 63));
+    return x ? (w ? 0x40u : 0x20u) : (w ? 0x04u : 0x02u);
+}
+/* kernel32!VirtualQuery(lpAddress, lpBuffer, dwLength) -> bytes written.
+ * W7: the truth about the page -- its protection from its page-table entry,
+ * the region as the run of pages after it with the same protection (at most
+ * 16 MiB), MEM_IMAGE with the module's base as the allocation base for a
+ * loaded image's pages. Until W7 it answered "1 MiB of PAGE_READWRITE" for
+ * everything, and the mingw C runtime's pseudo-relocation pass, which asks
+ * before it opens a read-only section, never opened one. A page not mapped
+ * yet (demand-paged memory not touched) is reported as before: committed,
+ * read-write. */
 static long w32_VirtualQuery(uint64_t *a) {
     struct {
         uint64_t BaseAddress, AllocationBase;
@@ -18948,15 +18980,80 @@ static long w32_VirtualQuery(uint64_t *a) {
         uint32_t State, Protect, Type, _pad1;
     } mbi;
     memset(&mbi, 0, sizeof(mbi));
-    mbi.BaseAddress    = a[0] & ~0xFFFull;
-    mbi.AllocationBase = a[0] & ~0xFFFull;
-    mbi.AllocationProtect = 0x04;     /* PAGE_READWRITE */
-    mbi.RegionSize     = 0x100000;    /* 1 MiB */
-    mbi.State          = 0x1000;      /* MEM_COMMIT  */
-    mbi.Protect        = 0x04;        /* PAGE_READWRITE */
-    mbi.Type           = 0x20000;     /* MEM_PRIVATE */
+    if (a[2] < sizeof mbi) { win32_set_last_error(24 /* ERROR_BAD_LENGTH */); return 0; }
+    struct proc *p = current_proc();
+    uint64_t page = a[0] & ~0xFFFull;
+    uint64_t *pte = p ? get_pte(p->cr3, page) : 0;
+    bool present = pte && (*pte & PTE_PRESENT);
+    uint32_t prot = present ? win32_page_prot(*pte) : 0x04u;
+    uint64_t end = page + PAGE_SIZE;
+    for (uint64_t n = 1; n < 4096; n++, end += PAGE_SIZE) {
+        uint64_t *q = get_pte(p->cr3, end);
+        bool qp = q && (*q & PTE_PRESENT);
+        if (qp != present || (qp && win32_page_prot(*q) != prot)) break;
+    }
+    mbi.BaseAddress = page;
+    mbi.AllocationBase = page;
+    mbi.AllocationProtect = prot;
+    mbi.RegionSize = end - page;
+    mbi.State = 0x1000;                           /* MEM_COMMIT */
+    mbi.Protect = prot;
+    mbi.Type = 0x20000;                           /* MEM_PRIVATE */
+    /* a loaded image's page: its module (the module table's records) */
+    for (uint32_t i = 0; i < WIN32_MAX_MODULES; i++) {
+        uint64_t r[2] = { 0, 0 };
+        if (copy_from_user(r, (const void *)(uintptr_t)(WIN32_MODTAB_BASE + WIN32_MT_MODS +
+                                                      (uint64_t)i * WIN32_MT_MOD_STRIDE), sizeof r) != 0)
+            break;
+        if (r[0] && page >= r[0] && page < r[0] + r[1]) {
+            mbi.AllocationBase = r[0];
+            mbi.AllocationProtect = 0x80;         /* PAGE_EXECUTE_WRITECOPY, as Windows says of an image */
+            mbi.Type = 0x1000000;                 /* MEM_IMAGE */
+            if (end > r[0] + r[1]) mbi.RegionSize = r[0] + r[1] - page;
+            break;
+        }
+    }
     if (copy_to_user((void *)(uintptr_t)a[1], &mbi, sizeof(mbi)) != 0) return 0;
     return (long)sizeof(mbi);
+}
+
+/* W7: kernel32!VirtualProtect(lpAddress, dwSize, flNewProtect,
+ * lpflOldProtect) -> BOOL. The pages of [lpAddress, +dwSize) get the new
+ * protection -- an image's (which have no VMA) as well as VirtualAlloc'd
+ * memory, through mprotect -- and *lpflOldProtect the first page's old one.
+ * The mingw C runtime's pseudo-relocation pass opens an image's read-only
+ * pages with it to patch its references to a DLL's data, then closes them;
+ * until W7 this was a no-op returning TRUE, and since W3 made an image's
+ * read-only sections read-only those patches went nowhere (every C++ program
+ * using libstdc++-6.dll's data -- std::cout -- then ran on garbage). A
+ * protection it does not know, or no lpflOldProtect: FALSE,
+ * ERROR_INVALID_PARAMETER. */
+static long w32_VirtualProtect(uint64_t *a) {
+    uint64_t addr = a[0], len = a[1], pold = a[3];
+    uint32_t prot;
+    switch ((uint32_t)a[2] & 0xFFu) {           /* PAGE_GUARD, NOCACHE...: no meaning here */
+    case 0x01: prot = 0; break;                 /* PAGE_NOACCESS */
+    case 0x02: prot = 1; break;                 /* PAGE_READONLY */
+    case 0x04: case 0x08: prot = 3; break;      /* PAGE_READWRITE, PAGE_WRITECOPY */
+    case 0x10: case 0x20: prot = 5; break;      /* PAGE_EXECUTE, PAGE_EXECUTE_READ */
+    case 0x40: case 0x80: prot = 7; break;      /* PAGE_EXECUTE_READWRITE, _WRITECOPY */
+    default: win32_set_last_error(87 /* ERROR_INVALID_PARAMETER */); return 0;
+    }
+    if (!len || !pold) { win32_set_last_error(87); return 0; }
+    struct proc *p = current_proc();
+    uint64_t *pte = p ? get_pte(p->cr3, addr & ~0xFFFull) : 0;
+    uint32_t old = 0x04;                        /* committed, not touched yet: read-write */
+    if (pte && (*pte & PTE_PRESENT)) {
+        bool w = (*pte & PTE_WRITABLE) != 0, x = !(*pte & (1ULL << 63));
+        old = x ? (w ? 0x40u : 0x20u) : (w ? 0x04u : 0x02u);
+    }
+    uint64_t start = addr & ~0xFFFull, end = (addr + len + 0xFFFull) & ~0xFFFull;
+    if (sys_mprotect(start, end - start, prot) < 0) {
+        win32_set_last_error(487 /* ERROR_INVALID_ADDRESS */);
+        return 0;
+    }
+    if (copy_to_user((void *)(uintptr_t)pold, &old, 4) != 0) { win32_set_last_error(998); return 0; }
+    return 1;
 }
 
 /* ---- C4: the extra ucrt surface a C++ program pulls in ---- */
@@ -18964,6 +19061,108 @@ static long w32_VirtualQuery(uint64_t *a) {
 /* _errno() / localeconv() / strerror(): return USER pointers into the CRT
  * data page (errno slot, minimal "C" lconv, a fixed message). */
 static long w32_errno(uint64_t *a)     { (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_ERRNO); }
+
+/* ---- W7: what libstdc++-6.dll and libwinpthread-1.dll ask of the ucrt ---- */
+/* _get_errno(int *) / _set_errno(int) -> 0 (errno lives in the CRT page). */
+static long w32_get_errno(uint64_t *a) {
+    int32_t v = 0;
+    (void)copy_from_user(&v, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_ERRNO), 4);
+    if (!a[0] || copy_to_user((void *)(uintptr_t)a[0], &v, 4) != 0) return 22;   /* EINVAL */
+    return 0;
+}
+static long w32_set_errno(uint64_t *a) {
+    int32_t v = (int32_t)a[0];
+    (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_ERRNO), &v, 4);
+    return 0;
+}
+/* rand_s(unsigned *) -> 0: from the kernel's entropy pool. */
+static long w32_rand_s(uint64_t *a) {
+    uint32_t v;
+    rng_fill(&v, sizeof v);
+    if (!a[0] || copy_to_user((void *)(uintptr_t)a[0], &v, 4) != 0) return 22;   /* EINVAL */
+    return 0;
+}
+/* _aligned_malloc(size, alignment) / _aligned_free: over the bump heap (which
+ * never reclaims, so _aligned_free has nothing to do). An alignment that is
+ * not a power of two: NULL, errno EINVAL. */
+static long w32_aligned_malloc(uint64_t *a) {
+    uint64_t n = a[0], al = a[1];
+    if (!al || (al & (al - 1))) {
+        int32_t e = 22;
+        (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_ERRNO), &e, 4);
+        return 0;
+    }
+    if (al < 16) al = 16;
+    uint64_t p = win32_heap_alloc(n + al);
+    return p ? (long)((p + al - 1) & ~(al - 1)) : 0;
+}
+/* ___mb_cur_max_func() -> MB_CUR_MAX: 1, the C locale's. */
+static long w32_mb_cur_max(uint64_t *a) { (void)a; return 1; }
+/* The C locale's wide-character classes, as the ucrt's ctype masks:
+ * _UPPER 1, _LOWER 2, _DIGIT 4, _SPACE 8, _PUNCT 0x10, _CONTROL 0x20,
+ * _BLANK 0x40 (the space only), _HEX 0x80, _ALPHA 0x100 (with UPPER/LOWER). */
+static uint16_t win32_wclass(uint32_t c) {
+    if (c > 0x7F) return 0;
+    uint16_t m = 0;
+    if (c >= 'A' && c <= 'Z') m |= 0x101;
+    if (c >= 'a' && c <= 'z') m |= 0x102;
+    if (c >= '0' && c <= '9') m |= 0x84;
+    if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) m |= 0x80;
+    if (c == ' ') m |= 0x48;
+    if (c >= 9 && c <= 13) m |= 0x28;
+    if (c < 32 || c == 127) m |= 0x20;
+    if (c > 32 && c < 127 && !(m & 0x107)) m |= 0x10;
+    return m;
+}
+/* wctype(name) -> the class's mask, 0 for no such class. */
+static long w32_wctype(uint64_t *a) {
+    static const struct { const char *n; uint16_t m; } k[] = {
+        { "alnum", 0x107 }, { "alpha", 0x103 }, { "blank", 0x40 }, { "cntrl", 0x20 },
+        { "digit", 0x04 }, { "graph", 0x117 }, { "lower", 0x02 }, { "print", 0x157 },
+        { "punct", 0x10 }, { "space", 0x08 }, { "upper", 0x01 }, { "xdigit", 0x80 },
+    };
+    char n[16];
+    if (!a[0] || strncpy_from_user(n, (const char *)(uintptr_t)a[0], sizeof n) < 0) return 0;
+    for (unsigned i = 0; i < sizeof k / sizeof k[0]; i++) if (!strcmp(n, k[i].n)) return k[i].m;
+    return 0;
+}
+/* iswctype(c, mask) -> nonzero if c is of the class. */
+static long w32_iswctype(uint64_t *a) { return (win32_wclass((uint16_t)a[0]) & (uint16_t)a[1]) != 0; }
+static long w32_towupper(uint64_t *a) { uint32_t c = (uint16_t)a[0]; return (c >= 'a' && c <= 'z') ? (long)(c - 32) : (long)c; }
+static long w32_towlower(uint64_t *a) { uint32_t c = (uint16_t)a[0]; return (c >= 'A' && c <= 'Z') ? (long)(c + 32) : (long)c; }
+/* strxfrm(dst, src, n) / wcsxfrm: the C locale's collation is the bytes
+ * themselves: the copy (when it fits in n), and the length. wcscoll = wcscmp. */
+static long w32_strxfrm(uint64_t *a) {
+    char buf[1024];
+    long len = strncpy_from_user(buf, (const char *)(uintptr_t)a[1], sizeof buf);
+    if (len < 0) return 0x7FFFFFFF;
+    if (a[0] && (uint64_t)len < a[2]) (void)copy_to_user((void *)(uintptr_t)a[0], buf, (size_t)len + 1);
+    return len;
+}
+static long w32_wcsxfrm(uint64_t *a) {
+    uint64_t len = 0;
+    for (;; len++) {
+        uint16_t c = 0;
+        if (copy_from_user(&c, (const void *)(uintptr_t)(a[1] + len * 2), 2) != 0) return 0x7FFFFFFF;
+        if (!c) break;
+    }
+    if (a[0] && len < a[2])
+        for (uint64_t i = 0; i <= len; i++) {
+            uint16_t c = 0;
+            (void)copy_from_user(&c, (const void *)(uintptr_t)(a[1] + i * 2), 2);
+            (void)copy_to_user((void *)(uintptr_t)(a[0] + i * 2), &c, 2);
+        }
+    return (long)len;
+}
+static long w32_wcscoll(uint64_t *a) {
+    for (uint64_t i = 0;; i++) {
+        uint16_t x = 0, y = 0;
+        (void)copy_from_user(&x, (const void *)(uintptr_t)(a[0] + i * 2), 2);
+        (void)copy_from_user(&y, (const void *)(uintptr_t)(a[1] + i * 2), 2);
+        if (x != y) return x < y ? -1 : 1;
+        if (!x) return 0;
+    }
+}
 static long w32_localeconv(uint64_t *a){ (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_LCONV); }
 static long w32_strerror(uint64_t *a)  { (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_STRERR); }
 
@@ -19496,12 +19695,228 @@ static long w32_CreatePipe(uint64_t *a) {
     return 1;
 }
 
+/* ================= W7: events, semaphores and the waits =================
+ * What libwinpthread-1.dll builds pthreads on: CreateEvent (manual or auto
+ * reset), SetEvent, ResetEvent, CreateSemaphore, ReleaseSemaphore, and
+ * WaitForSingleObject / WaitForMultipleObjects on them, on threads and on
+ * processes, with a timeout. An object is a slot of this table (one for the
+ * kernel; each slot names the thread group that owns it); a handle's low 32
+ * bits are 0x50000000 + the slot. A waiter puts itself on its objects'
+ * waiter lists and blocks; SetEvent and ReleaseSemaphore wake the list. A
+ * waiter that finds a list full, or waits on a thread, re-checks every 20 ms.
+ * Names (the lpName of a named object) are not kept: every Create makes a
+ * new object. */
+#define WIN32_SYNC_TAG    0x7700000000000000ULL
+#define WIN32_SYNC_LOW    0x50000000u
+#define WIN32_SYNC_MAX    256
+#define WIN32_SYNC_WAITERS 16
+enum { W32S_FREE = 0, W32S_EVENT, W32S_SEM };
+struct win32_sync {
+    int       owner;
+    uint16_t  gen;
+    uint8_t   kind;
+    bool      manual;     /* an event that stays set until ResetEvent */
+    bool      set;
+    int32_t   count, max; /* a semaphore */
+    uint32_t  refs;       /* handles (DuplicateHandle adds one) */
+    struct proc *waiters[WIN32_SYNC_WAITERS];
+};
+static struct win32_sync g_win32_sync[WIN32_SYNC_MAX];
+
+static struct win32_sync *win32_sync_of(uint64_t h) {
+    if ((h & 0xFF00000000000000ULL) != WIN32_SYNC_TAG) return 0;
+    uint32_t low = (uint32_t)h;
+    if (low < WIN32_SYNC_LOW || low >= WIN32_SYNC_LOW + WIN32_SYNC_MAX) return 0;
+    struct win32_sync *o = &g_win32_sync[low - WIN32_SYNC_LOW];
+    if (o->kind == W32S_FREE || o->owner != win32_ph_tg() || o->gen != (uint16_t)(h >> 32)) return 0;
+    return o;
+}
+static uint64_t win32_sync_new(uint8_t kind) {
+    int tg = win32_ph_tg();
+    for (int i = 0; i < WIN32_SYNC_MAX; i++) {          /* objects whose owner is gone */
+        struct win32_sync *o = &g_win32_sync[i];
+        if (o->kind == W32S_FREE) continue;
+        struct proc *op = proc_lookup(o->owner);
+        if (!op || op->state == PROC_TERMINATED) o->kind = W32S_FREE;
+    }
+    for (int i = 0; i < WIN32_SYNC_MAX; i++) {
+        struct win32_sync *o = &g_win32_sync[i];
+        if (o->kind != W32S_FREE) continue;
+        uint16_t gen = (uint16_t)(o->gen + 1);
+        memset(o, 0, sizeof *o);
+        o->gen = gen;
+        o->owner = tg;
+        o->kind = kind;
+        o->refs = 1;
+        return WIN32_SYNC_TAG | ((uint64_t)gen << 32) | (uint64_t)(WIN32_SYNC_LOW + (uint32_t)i);
+    }
+    return 0;
+}
+static void win32_sync_wake(struct win32_sync *o) {
+    for (int i = 0; i < WIN32_SYNC_WAITERS; i++) {
+        struct proc *w = o->waiters[i];
+        o->waiters[i] = 0;
+        if (w && w->state == PROC_BLOCKED) {
+            w->sleep_deadline_ns = 0;
+            w->state = PROC_READY;
+            sched_enqueue(w);
+        }
+    }
+}
+
+/* Is h signaled? `take`: and take it (an auto-reset event is reset, a
+ * semaphore's count goes down by one, an ended thread is reaped). 1 yes,
+ * 0 no, -1 not a handle one can wait on. */
+static int win32_obj_ready(uint64_t h, bool take) {
+    struct win32_sync *o = win32_sync_of(h);
+    if (o) {
+        if (o->kind == W32S_EVENT) {
+            if (!o->set) return 0;
+            if (take && !o->manual) o->set = false;
+            return 1;
+        }
+        if (o->count <= 0) return 0;
+        if (take) o->count--;
+        return 1;
+    }
+    struct win32_ph *e = win32_ph_of(h);
+    if (e) {
+        win32_ph_poll(e);
+        return e->ended ? 1 : 0;
+    }
+    if ((h & 0xFF00000000000000ULL) == WIN32_THREAD_TAG) {
+        int tid = (int)(h & 0xFFFFFFFFULL);
+        struct proc *t = proc_lookup(tid);
+        if (t && t->state != PROC_TERMINATED) return 0;
+        if (t && take) (void)thread_join(tid, 0);
+        return 1;
+    }
+    if ((int64_t)h == -1 || (int64_t)h == -2) return 0;  /* this process / thread: never */
+    return -1;
+}
+
+/* The wait itself: any one of n handles (or, all, every one at once),
+ * `ms` milliseconds (0xFFFFFFFF: no end). WAIT_OBJECT_0 + i, WAIT_TIMEOUT, or
+ * WAIT_FAILED with ERROR_INVALID_HANDLE. */
+static uint32_t win32_wait(const uint64_t *hs, uint32_t n, bool all, uint32_t ms) {
+    uint64_t deadline = (ms == 0xFFFFFFFFu) ? 0 : perf_now_ns() + (uint64_t)ms * 1000000ull;
+    struct proc *self = current_proc();
+    for (;;) {
+        if (all) {
+            bool every = true;
+            for (uint32_t i = 0; i < n; i++) {
+                int r = win32_obj_ready(hs[i], false);
+                if (r < 0) { win32_set_last_error(WIN32_ERR_INVALID_HANDLE); return WIN32_WAIT_FAILED; }
+                if (!r) every = false;
+            }
+            if (every) {
+                for (uint32_t i = 0; i < n; i++) (void)win32_obj_ready(hs[i], true);
+                return 0;
+            }
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                int r = win32_obj_ready(hs[i], true);
+                if (r < 0) { win32_set_last_error(WIN32_ERR_INVALID_HANDLE); return WIN32_WAIT_FAILED; }
+                if (r) return i;
+            }
+        }
+        uint64_t now = perf_now_ns();
+        if (deadline && now >= deadline) return WIN32_WAIT_TIMEOUT;
+        uint64_t wake = now + 20000000ull;                  /* the re-check */
+        if (deadline && deadline < wake) wake = deadline;
+        for (uint32_t i = 0; i < n; i++) {                  /* on the waiter lists */
+            struct win32_sync *o = win32_sync_of(hs[i]);
+            if (!o) continue;
+            for (int k = 0; k < WIN32_SYNC_WAITERS; k++)
+                if (!o->waiters[k] || o->waiters[k] == self) { o->waiters[k] = self; break; }
+        }
+        struct win32_ph *e = (n == 1) ? win32_ph_of(hs[0]) : 0;
+        self->wait_pid = e ? e->pid : -1;
+        self->sleep_deadline_ns = wake;
+        self->state = PROC_BLOCKED;
+        sched_yield();
+        self->sleep_deadline_ns = 0;
+        self->wait_pid = -1;
+        for (uint32_t i = 0; i < n; i++) {                  /* off them again */
+            struct win32_sync *o = win32_sync_of(hs[i]);
+            if (!o) continue;
+            for (int k = 0; k < WIN32_SYNC_WAITERS; k++) if (o->waiters[k] == self) o->waiters[k] = 0;
+        }
+    }
+}
+
+/* kernel32!CreateEventA/W(lpEventAttributes, bManualReset, bInitialState,
+ * lpName) -> HANDLE, NULL when the table is full. */
+static long w32_CreateEvent(uint64_t *a) {
+    uint64_t h = win32_sync_new(W32S_EVENT);
+    if (!h) { win32_set_last_error(8 /* ERROR_NOT_ENOUGH_MEMORY */); return 0; }
+    struct win32_sync *o = win32_sync_of(h);
+    o->manual = a[1] != 0;
+    o->set = a[2] != 0;
+    return (long)h;
+}
+static long w32_SetEvent(uint64_t *a) {
+    struct win32_sync *o = win32_sync_of(a[0]);
+    if (!o || o->kind != W32S_EVENT) { win32_set_last_error(WIN32_ERR_INVALID_HANDLE); return 0; }
+    o->set = true;
+    win32_sync_wake(o);
+    return 1;
+}
+static long w32_ResetEvent(uint64_t *a) {
+    struct win32_sync *o = win32_sync_of(a[0]);
+    if (!o || o->kind != W32S_EVENT) { win32_set_last_error(WIN32_ERR_INVALID_HANDLE); return 0; }
+    o->set = false;
+    return 1;
+}
+/* kernel32!CreateSemaphoreA/W(lpSemaphoreAttributes, lInitialCount,
+ * lMaximumCount, lpName) -> HANDLE; a count outside 0..max (or max < 1):
+ * NULL, ERROR_INVALID_PARAMETER. */
+static long w32_CreateSemaphore(uint64_t *a) {
+    int32_t init = (int32_t)a[1], max = (int32_t)a[2];
+    if (max < 1 || init < 0 || init > max) { win32_set_last_error(87); return 0; }
+    uint64_t h = win32_sync_new(W32S_SEM);
+    if (!h) { win32_set_last_error(8); return 0; }
+    struct win32_sync *o = win32_sync_of(h);
+    o->count = init;
+    o->max = max;
+    return (long)h;
+}
+/* kernel32!ReleaseSemaphore(h, lReleaseCount, lpPreviousCount) -> BOOL;
+ * past the maximum: FALSE, ERROR_TOO_MANY_POSTS, the count unchanged. */
+static long w32_ReleaseSemaphore(uint64_t *a) {
+    struct win32_sync *o = win32_sync_of(a[0]);
+    int32_t n = (int32_t)a[1];
+    if (!o || o->kind != W32S_SEM) { win32_set_last_error(WIN32_ERR_INVALID_HANDLE); return 0; }
+    if (n < 1) { win32_set_last_error(87); return 0; }
+    int32_t prev = o->count;
+    if ((int64_t)prev + n > o->max) { win32_set_last_error(298 /* ERROR_TOO_MANY_POSTS */); return 0; }
+    o->count = prev + n;
+    if (a[2]) (void)copy_to_user((void *)(uintptr_t)a[2], &prev, 4);
+    win32_sync_wake(o);
+    return 1;
+}
+/* kernel32!WaitForMultipleObjects(nCount, lpHandles, bWaitAll, ms) -> DWORD. */
+static long w32_WaitForMultipleObjects(uint64_t *a) {
+    uint32_t n = (uint32_t)a[0];
+    uint64_t hs[64];
+    if (n < 1 || n > 64 || !a[1] || copy_from_user(hs, (const void *)(uintptr_t)a[1], (size_t)n * 8) != 0) {
+        win32_set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+        return (long)WIN32_WAIT_FAILED;
+    }
+    return (long)win32_wait(hs, n, a[2] != 0, (uint32_t)a[3]);
+}
+
 /* kernel32!CloseHandle(h) -> BOOL. Leaves std handles (0/1/2), the ucrt
  * FILE* tokens, and thread handles (reaped by the join) alone; closes real
  * file fds. W6: a process handle (or its thread's) once, then it is no
  * handle: FALSE, ERROR_INVALID_HANDLE. */
 static long w32_CloseHandle(uint64_t *a) {
     uint64_t h = a[0];
+    struct win32_sync *so = win32_sync_of(h);          /* W7: an event or a semaphore */
+    if (so) {
+        if (--so->refs == 0) { win32_sync_wake(so); so->kind = W32S_FREE; }
+        return 1;
+    }
     if (win32_is_ph(h)) {
         if (win32_ph_close(h)) return 1;
         win32_set_last_error(WIN32_ERR_INVALID_HANDLE);
@@ -19534,6 +19949,7 @@ static long w32_CloseHandle(uint64_t *a) {
 #define WIN32_TEB_TLS_OFF        0x80    /* TLS slot array within our 1-page TEB */
 #define WIN32_TEB_TLSPTR_OFF     0x58    /* C18b: x64 ThreadLocalStoragePointer  */
 #define WIN32_TLS_ARR_BYTES      0x80    /* C18b: per-thread TLS pointer array    */
+#define WIN32_TEB_SUSPEND_OFF    0x2F0   /* W7: the suspend count (CREATE_SUSPENDED) */
 #define WIN32_TLS_MAX            64
 static uint8_t g_win32_tls_used[WIN32_TLS_MAX];
 
@@ -19751,6 +20167,14 @@ static long w32_CreateThread(uint64_t *a) {
             (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_STACKBASE_OFF),  &sb,   8);
             (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_STACKLIMIT_OFF), &sl,   8);
             t->gs_base = teb;
+            /* W7: CREATE_SUSPENDED -- the thread waits at its start (before its
+             * DLL_THREAD_ATTACH) until ResumeThread; its suspend count is in its
+             * TEB, written before the thread can make its first system call
+             * (this one holds the BKL) */
+            if ((uint32_t)a[4] & 0x4u) {
+                uint32_t one = 1;
+                (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_SUSPEND_OFF), &one, 4);
+            }
             /* C18b, W5: the thread's OWN static-TLS pointer array (gs:[0x58]) and
              * a block for every module with static TLS -- the .exe's and each
              * DLL's -- holding its template's initial values. */
@@ -19769,11 +20193,114 @@ static long w32_CreateThread(uint64_t *a) {
     return (long)(WIN32_THREAD_TAG | (uint64_t)(uint32_t)tid);
 }
 
+/* ---- W7: the rest of what libwinpthread-1.dll asks of kernel32 ---- */
+/* The thread a thread handle names (one of the caller's process), or NULL;
+ * -2 is GetCurrentThread()'s pseudo handle. */
+static struct proc *win32_thread_of_handle(uint64_t h) {
+    struct proc *me = current_proc();
+    if ((int64_t)h == -2) return me;
+    if ((h & 0xFF00000000000000ULL) != WIN32_THREAD_TAG || !me) return 0;
+    struct proc *t = proc_lookup((int)(h & 0xFFFFFFFFULL));
+    int tg = me->is_thread ? me->tgid : me->pid;
+    if (!t || (t->is_thread ? t->tgid : t->pid) != tg) return 0;
+    return t;
+}
+/* A thread made with CREATE_SUSPENDED waits here, at its start, until its
+ * suspend count (in its TEB) is 0 -- ResumeThread wakes it. */
+static void win32_suspended_wait(void) {
+    struct proc *me = current_proc();
+    for (;;) {
+        uint32_t n = 0;
+        if (!me || !me->gs_base ||
+            copy_from_user(&n, (const void *)(uintptr_t)(me->gs_base + WIN32_TEB_SUSPEND_OFF), 4) != 0 || !n)
+            return;
+        me->sleep_deadline_ns = perf_now_ns() + 20000000ull;
+        me->state = PROC_BLOCKED;
+        sched_yield();
+        me->sleep_deadline_ns = 0;
+    }
+}
+/* kernel32!ResumeThread(h) -> the previous suspend count, (DWORD)-1 for no
+ * such thread. */
+static long w32_ResumeThread(uint64_t *a) {
+    struct proc *t = win32_thread_of_handle(a[0]);
+    if (!t) { win32_set_last_error(WIN32_ERR_INVALID_HANDLE); return (long)0xFFFFFFFFu; }
+    uint32_t n = 0;
+    if (!t->gs_base || copy_from_user(&n, (const void *)(uintptr_t)(t->gs_base + WIN32_TEB_SUSPEND_OFF), 4) != 0)
+        return 0;
+    if (n) {
+        uint32_t m = n - 1;
+        (void)copy_to_user((void *)(uintptr_t)(t->gs_base + WIN32_TEB_SUSPEND_OFF), &m, 4);
+        if (!m && t->state == PROC_BLOCKED) {
+            t->sleep_deadline_ns = 0;
+            t->state = PROC_READY;
+            sched_enqueue(t);
+        }
+    }
+    return (long)n;
+}
+/* kernel32!GetCurrentThread() -> the pseudo handle -2. */
+static long w32_GetCurrentThread(uint64_t *a) { (void)a; return (long)(int64_t)-2; }
+/* kernel32!DuplicateHandle(hSourceProcess, hSource, hTargetProcess,
+ * lpTargetHandle, access, inherit, options) -> BOOL, within this process:
+ * GetCurrentThread()'s pseudo handle becomes the thread's own handle, an
+ * event or a semaphore gains a handle, a descriptor is dup()ed, any other
+ * handle is itself. DUPLICATE_CLOSE_SOURCE (1) closes the source. */
+static long w32_CloseHandle(uint64_t *a);
+static long w32_DuplicateHandle(uint64_t *a) {
+    uint64_t sp = a[0], h = a[1], tp = a[2], out = a[3];
+    uint32_t opts = (uint32_t)a[6];
+    if ((int64_t)sp != -1 || (int64_t)tp != -1) {
+        win32_set_last_error(50 /* ERROR_NOT_SUPPORTED: another process's handles */);
+        return 0;
+    }
+    uint64_t nh = h;
+    struct win32_sync *o = win32_sync_of(h);
+    if ((int64_t)h == -2) {
+        struct proc *me = current_proc();
+        nh = WIN32_THREAD_TAG | (uint64_t)(uint32_t)(me ? me->pid : 0);
+    } else if (o) {
+        o->refs++;
+    } else if (!win32_is_ph(h) && (h & 0xFF00000000000000ULL) == 0 && (int64_t)h >= 3 && fd_lookup((int)h)) {
+        long d = sys_dup((int)h);
+        if (d < 0) { win32_set_last_error(4 /* ERROR_TOO_MANY_OPEN_FILES */); return 0; }
+        nh = (uint64_t)d;
+    }
+    if (out && copy_to_user((void *)(uintptr_t)out, &nh, 8) != 0) { win32_set_last_error(998); return 0; }
+    if (opts & 1u) { uint64_t c[1] = { h }; (void)w32_CloseHandle(c); }
+    return 1;
+}
+/* kernel32!SetThreadPriority -> TRUE, GetThreadPriority -> THREAD_PRIORITY_NORMAL
+ * (0): one priority here. */
+static long w32_SetThreadPriority(uint64_t *a) { return win32_thread_of_handle(a[0]) ? 1 : 0; }
+static long w32_GetThreadPriority(uint64_t *a) { (void)a; return 0; }
+/* kernel32!GetProcessAffinityMask(h, &process, &system) -> TRUE: the one
+ * processor GetSystemInfo reports. */
+static long w32_GetProcessAffinityMask(uint64_t *a) {
+    uint64_t m = 1;
+    if (a[1]) (void)copy_to_user((void *)(uintptr_t)a[1], &m, 8);
+    if (a[2]) (void)copy_to_user((void *)(uintptr_t)a[2], &m, 8);
+    return 1;
+}
+/* kernel32!IsProcessorFeaturePresent(feature) -> BOOL: x86-64's baseline
+ * (cmpxchg8b, MMX, SSE, RDTSC, PAE, SSE2, NX); not PF_FASTFAIL_AVAILABLE, so
+ * the ucrt's abort ends the process the old way. */
+static long w32_IsProcessorFeaturePresent(uint64_t *a) {
+    switch ((uint32_t)a[0]) {
+    case 2: case 3: case 6: case 8: case 9: case 10: case 12: return 1;
+    default: return 0;
+    }
+}
+
 /* WaitForSingleObject(handle, ms) -> WAIT_OBJECT_0(0) / WAIT_FAILED. For a
  * thread handle this is a join (timeout ignored == INFINITE). */
 static long w32_WaitForSingleObject(uint64_t *a) {
     uint64_t h = a[0];
     if (win32_is_ph(h)) return (long)win32_ph_wait(h, (uint32_t)a[1]);   /* W6 */
+    /* W7: an event, a semaphore, a thread with a timeout */
+    if (win32_sync_of(h) ||
+        ((h & 0xFF00000000000000ULL) == WIN32_THREAD_TAG && (uint32_t)a[1] != 0xFFFFFFFFu))
+        return (long)win32_wait(&h, 1, false, (uint32_t)a[1]);
     if ((h & 0xFF00000000000000ULL) == WIN32_THREAD_TAG) {
         int tid = (int)(h & 0xFFFFFFFFULL);
         return (thread_join(tid, 0) == 0) ? 0 : (long)0xFFFFFFFF;
@@ -19812,6 +20339,22 @@ static long w32_EnterCriticalSection(uint64_t *a) {
          * owner can run + release) and retry. */
         sched_yield();
     }
+}
+
+/* W7: kernel32!TryEnterCriticalSection(cs) -> TRUE when taken (free, or
+ * already the caller's), FALSE at once when another thread holds it. */
+static long w32_TryEnterCriticalSection(uint64_t *a) {
+    uint64_t cs = a[0];
+    struct proc *p = current_proc();
+    uint64_t me = p ? (uint64_t)p->pid : 0, owner = 0;
+    if (copy_from_user(&owner, (const void *)(uintptr_t)(cs + WIN32_CS_OWNER), 8) != 0) return 0;
+    if (owner != 0 && owner != me) return 0;
+    uint32_t rec = 0;
+    (void)copy_from_user(&rec, (const void *)(uintptr_t)(cs + WIN32_CS_RECURSION), 4);
+    rec++;
+    (void)copy_to_user((void *)(uintptr_t)(cs + WIN32_CS_OWNER), &me, 8);
+    (void)copy_to_user((void *)(uintptr_t)(cs + WIN32_CS_RECURSION), &rec, 4);
+    return 1;
 }
 
 static long w32_LeaveCriticalSection(uint64_t *a) {
@@ -23303,6 +23846,7 @@ static long w32_toby_ldr(uint64_t *a) {
         return (long)entry;
     }
     case 7: {                                     /* THREAD(reason, code, buf) */
+        if (a[1] == 2) win32_suspended_wait();    /* W7: CREATE_SUSPENDED */
         win32_ldr_lock();
         if (a[1] == 3 && win32_other_threads() == 0) {
             /* the last thread: its end is the process's (ExitThread) */
@@ -25935,7 +26479,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "TlsFree",                   w32_TlsFree },
     { "kernel32.dll", "TlsGetValue",               w32_TlsGetValue },
     { "kernel32.dll", "TlsSetValue",               w32_TlsSetValue },
-    { "kernel32.dll", "VirtualProtect",            w32_one },
+    { "kernel32.dll", "VirtualProtect",            w32_VirtualProtect },
     { "kernel32.dll", "VirtualQuery",              w32_VirtualQuery },
     /* ucrt: environment */
     { "api-ms-win-crt-environment-l1-1-0.dll", "__p__environ",       w32_p_environ },
@@ -25989,7 +26533,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_get_initial_narrow_environment", w32_p_environ },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_set_app_type",          w32_zero },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_set_invalid_parameter_handler", w32_zero },
-    { "api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit",            w32_zero },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit",            w32_crt_atexit },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_cexit",                 w32_zero },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_initterm",              w32_initterm },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_initterm_e",            w32_initterm },
@@ -26049,6 +26593,39 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetExitCodeProcess",  w32_GetExitCodeProcess },
     { "kernel32.dll", "GetProcessId",        w32_GetProcessId },
     { "kernel32.dll", "SetHandleInformation", w32_SetHandleInformation },
+    /* W7: what the toolchain's libstdc++/libgcc_s/libwinpthread DLLs need */
+    { "kernel32.dll", "CreateEventA",        w32_CreateEvent },
+    { "kernel32.dll", "CreateEventW",        w32_CreateEvent },
+    { "kernel32.dll", "SetEvent",            w32_SetEvent },
+    { "kernel32.dll", "ResetEvent",          w32_ResetEvent },
+    { "kernel32.dll", "CreateSemaphoreA",    w32_CreateSemaphore },
+    { "kernel32.dll", "CreateSemaphoreW",    w32_CreateSemaphore },
+    { "kernel32.dll", "ReleaseSemaphore",    w32_ReleaseSemaphore },
+    { "kernel32.dll", "WaitForMultipleObjects", w32_WaitForMultipleObjects },
+    { "kernel32.dll", "ResumeThread",        w32_ResumeThread },
+    { "kernel32.dll", "GetCurrentThread",    w32_GetCurrentThread },
+    { "kernel32.dll", "DuplicateHandle",     w32_DuplicateHandle },
+    { "kernel32.dll", "SetThreadPriority",   w32_SetThreadPriority },
+    { "kernel32.dll", "GetThreadPriority",   w32_GetThreadPriority },
+    { "kernel32.dll", "GetProcessAffinityMask", w32_GetProcessAffinityMask },
+    { "kernel32.dll", "IsProcessorFeaturePresent", w32_IsProcessorFeaturePresent },
+    { "kernel32.dll", "TryEnterCriticalSection", w32_TryEnterCriticalSection },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_beginthreadex", w32_CreateThread },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_get_errno",     w32_get_errno },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_set_errno",     w32_set_errno },
+    { "api-ms-win-crt-utility-l1-1-0.dll", "rand_s",         w32_rand_s },
+    { "api-ms-win-crt-heap-l1-1-0.dll",    "_aligned_malloc", w32_aligned_malloc },
+    { "api-ms-win-crt-heap-l1-1-0.dll",    "_aligned_free",  w32_zero },
+    { "api-ms-win-crt-locale-l1-1-0.dll",  "___mb_cur_max_func", w32_mb_cur_max },
+    { "api-ms-win-crt-string-l1-1-0.dll",  "wctype",         w32_wctype },
+    { "api-ms-win-crt-string-l1-1-0.dll",  "iswctype",       w32_iswctype },
+    { "api-ms-win-crt-string-l1-1-0.dll",  "towupper",       w32_towupper },
+    { "api-ms-win-crt-string-l1-1-0.dll",  "towlower",       w32_towlower },
+    { "api-ms-win-crt-string-l1-1-0.dll",  "strxfrm",        w32_strxfrm },
+    { "api-ms-win-crt-string-l1-1-0.dll",  "wcsxfrm",        w32_wcsxfrm },
+    { "api-ms-win-crt-string-l1-1-0.dll",  "wcscoll",        w32_wcscoll },
+    { "api-ms-win-crt-stdio-l1-1-0.dll",   "putc",           w32_fputc },
+    { "api-ms-win-crt-stdio-l1-1-0.dll",   "putwc",          w32_fputwc },
 
     /* ---- C7: the GUI bridge ---- */
     /* kernel32 + crt extras the GUI-subsystem CRT startup pulls in */

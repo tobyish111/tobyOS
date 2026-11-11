@@ -81,6 +81,7 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_MT_FAIL_STATUS   0x020   /* u32: its NTSTATUS                    */
 #define WIN32_MT_MOD_COUNT     0x024   /* u32: record slots in use (high water) */
 #define WIN32_MT_LDR           0x028   /* u64: W4: __toby_ldr's thunk          */
+#define WIN32_MT_ATEXIT        0x030   /* u64: W7: the .exe's atexit table (_crt_atexit), 0 none */
 #define WIN32_MT_INIT_LIST     0x040   /* {u64 entry, u64 base, u64 name VA}   */
 #define WIN32_MT_INIT_STRIDE   24
 #define WIN32_MT_MISS_STUB     0x1C0   /* u64: W4: next free missing-import stub */
@@ -139,6 +140,7 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_LDR_FREEEXIT_VA  (WIN32_LDR_STUBS_VA + 0x38)   /* FreeLibraryAndExitThread */
 #define WIN32_LDR_THREAD_VA    (WIN32_LDR_STUBS_VA + 0x40)   /* CreateThread's threads start here */
 #define WIN32_LDR_START_VA     (WIN32_LDR_STUBS_VA + 0x48)   /* a process with DLLs or TLS callbacks starts here */
+#define WIN32_LDR_CRTEXIT_VA   (WIN32_LDR_STUBS_VA + 0x50)   /* W7: the CRT's exit: atexit, then ExitProcess */
 /* The list the kernel hands a stub: u64 count, then {u64 fn, u64 base, u64
  * ctl} -- ctl's low byte the reason, and: */
 #define WIN32_LDR_BUF_MAX      (2 * WIN32_MAX_MODULES)       /* a module's TLS callbacks + its DllMain */
