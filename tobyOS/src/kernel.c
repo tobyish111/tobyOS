@@ -7745,9 +7745,17 @@ void _start(void) {
 #if defined(WINPE26A_BOOT) || defined(WINPE26B_BOOT) || defined(WINPE26C_BOOT) || \
     defined(WINPE27A_BOOT) || defined(WINPE27B_BOOT) || defined(WINPE28A_BOOT) || \
     defined(WINPE28B_BOOT) || defined(WINPE28C_BOOT) || defined(WINPE29A_BOOT) || \
-    defined(WINPE30A_BOOT) || defined(WINPE30B_BOOT)
+    defined(WINPE30A_BOOT) || defined(WINPE30B_BOOT) || defined(WINPE31A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
-     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W5:
+     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W6:
+     *   31A /bin/win-proc31.exe: CreateProcessA/W -- the search, argv by the
+     *       documented rules and the exact command line, exit codes,
+     *       WaitForSingleObject/GetExitCodeProcess/TerminateProcess, pipes as
+     *       the child's standard handles, lpCurrentDirectory; children that
+     *       are a PE (child31.exe), native (Z:\bin\grep) and Linux
+     *       (Z:\bin\linux-hello); the name rules Windows 11 keeps -- 18
+     *       checks, exit 31.
+     * W5:
      *   30A /bin/win-life30.exe: DLL lifetime -- TLS callbacks, a DLL's own
      *       TLS slot and a block per thread (threads already running too),
      *       DLL_THREAD_ATTACH/DETACH (ExitThread, DisableThreadLibraryCalls),
@@ -7822,6 +7830,10 @@ void _start(void) {
 #ifdef WINPE30B_BOOT
             { "WINPE30B", "/bin/win-life30b.exe", "win-life30b.exe", 31,
               "the main thread's ExitThread; the last thread's exit is the process's" },
+#endif
+#ifdef WINPE31A_BOOT
+            { "WINPE31A", "/bin/win-proc31.exe", "win-proc31.exe", 31,
+              "CreateProcess: PE, native and Linux children, pipes, exit codes (18 checks)" },
 #endif
         };
         win32_gui_set_log(true);

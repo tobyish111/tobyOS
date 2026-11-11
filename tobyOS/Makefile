@@ -2571,6 +2571,16 @@ $(W30)/win-life30.exe: $(W30)/main.c $(W30)/life30.h $(W30)/liblife30a.a $(W30)/
 $(W30)/win-life30b.exe: $(W30)/mainb.c $(W30)/life30.h $(W30)/liblife30a.a
 	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -o $@ $(W30)/mainb.c -L$(W30) -llife30a
 
+# Track C/W6: CreateProcess. win-proc31.exe starts child31.exe (beside it in
+# /bin) through pipes, and Z:\bin\grep and Z:\bin\linux-hello; notpe31.exe is a
+# text file (a "program" that is not one). Exit 31 (it
+# does on Windows 11 too, the tobyOS-only checks skipped).
+W31 := programs/win-proc31
+$(W31)/child31.exe: $(W31)/child31.c
+	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -o $@ $<
+$(W31)/win-proc31.exe: $(W31)/main.c
+	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -o $@ $<
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3105,6 +3115,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-plug29/notpe.txt \
                programs/win-life30/win-life30.exe \
                programs/win-life30/win-life30b.exe \
+               programs/win-proc31/win-proc31.exe \
+               programs/win-proc31/child31.exe \
+               programs/win-proc31/notpe.txt \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3295,6 +3308,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-plug29/notpe.txt                 $(INITRD_STAGE)/bin/plug29/notpe.dll
 	cp programs/win-life30/win-life30.exe            $(INITRD_STAGE)/bin/win-life30.exe
 	cp programs/win-life30/win-life30b.exe           $(INITRD_STAGE)/bin/win-life30b.exe
+	cp programs/win-proc31/win-proc31.exe            $(INITRD_STAGE)/bin/win-proc31.exe
+	cp programs/win-proc31/child31.exe               $(INITRD_STAGE)/bin/child31.exe
+	cp programs/win-proc31/notpe.txt                $(INITRD_STAGE)/bin/notpe31.exe
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4296,6 +4312,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/plug29/plug29c.dll bin/plug29/plug29f.dll bin/plug29/notpe.dll \
 	    bin/win-life30.exe bin/life30a.dll bin/life30c.dll bin/life30n.dll \
 	    bin/life30d.dll bin/life30s.dll bin/win-life30b.exe           \
+	    bin/win-proc31.exe bin/child31.exe bin/notpe31.exe            \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
