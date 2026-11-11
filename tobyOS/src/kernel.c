@@ -7744,9 +7744,19 @@ void _start(void) {
 
 #if defined(WINPE26A_BOOT) || defined(WINPE26B_BOOT) || defined(WINPE26C_BOOT) || \
     defined(WINPE27A_BOOT) || defined(WINPE27B_BOOT) || defined(WINPE28A_BOOT) || \
-    defined(WINPE28B_BOOT) || defined(WINPE28C_BOOT) || defined(WINPE29A_BOOT)
+    defined(WINPE28B_BOOT) || defined(WINPE28C_BOOT) || defined(WINPE29A_BOOT) || \
+    defined(WINPE30A_BOOT) || defined(WINPE30B_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
-     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W4:
+     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W5:
+     *   30A /bin/win-life30.exe: DLL lifetime -- TLS callbacks, a DLL's own
+     *       TLS slot and a block per thread (threads already running too),
+     *       DLL_THREAD_ATTACH/DETACH (ExitThread, DisableThreadLibraryCalls),
+     *       two threads loading at once (the loader lock), and ExitProcess's
+     *       DLL_PROCESS_DETACH in reverse order (14 checks + the exit's), 30.
+     *   30B /bin/win-life30b.exe: the main thread's ExitThread (the process
+     *       goes on), FreeLibraryAndExitThread on the last thread (its exit
+     *       is the process's DLL_PROCESS_DETACH), 31.
+     * W4:
      *   29A /bin/win-plug29.exe: LoadLibrary/GetProcAddress/GetModuleHandle/
      *       GetModuleFileName/FreeLibrary on DLLs from disk -- search order and
      *       its flags, DllMain arguments and order, reference counts, unload,
@@ -7804,6 +7814,14 @@ void _start(void) {
 #ifdef WINPE29A_BOOT
             { "WINPE29A", "/bin/win-plug29.exe", "win-plug29.exe", 29,
               "DLLs at run time: LoadLibrary, GetProcAddress, FreeLibrary (25 checks)" },
+#endif
+#ifdef WINPE30A_BOOT
+            { "WINPE30A", "/bin/win-life30.exe", "win-life30.exe", 30,
+              "DLL lifetime: TLS callbacks, thread attach/detach, the loader lock, ExitProcess" },
+#endif
+#ifdef WINPE30B_BOOT
+            { "WINPE30B", "/bin/win-life30b.exe", "win-life30b.exe", 31,
+              "the main thread's ExitThread; the last thread's exit is the process's" },
 #endif
         };
         win32_gui_set_log(true);

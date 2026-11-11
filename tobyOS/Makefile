@@ -2545,6 +2545,32 @@ $(W29)/plug29f.dll: $(W29)/plug29f.c $(W29)/libplug29c.a
 $(W29)/win-plug29.exe: $(W29)/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
 
+# Track C/W5: DLL lifetime. win-life30.exe imports life30a.dll (the event log;
+# its import library is liblife30a.a) and life30c.dll, and loads life30n.dll
+# (no C runtime: no TLS directory), life30d.dll (thread-locals) and
+# life30s.dll while it runs -- all beside it in /bin. Exit 30 (it does on
+# Windows 11 too). win-life30b.exe (the main thread's ExitThread,
+# FreeLibraryAndExitThread) uses the same DLLs; exit 31. -fno-emulated-tls,
+# as for C18b: _Thread_local in the PE's own TLS (the TLS directory and
+# _tls_index), not libgcc's __emutls_get_address.
+W30 := programs/win-life30
+$(W30)/life30a.dll: $(W30)/life30a.c $(W30)/life30.h
+	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -shared -o $@ $(W30)/life30a.c -Wl,--out-implib,$(W30)/liblife30a.a
+$(W30)/liblife30a.a: $(W30)/life30a.dll
+$(W30)/life30c.dll: $(W30)/life30c.c $(W30)/life30.h $(W30)/liblife30a.a
+	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -shared -o $@ $(W30)/life30c.c -Wl,--out-implib,$(W30)/liblife30c.a -L$(W30) -llife30a
+$(W30)/liblife30c.a: $(W30)/life30c.dll
+$(W30)/life30n.dll: $(W30)/life30n.c $(W30)/life30.h $(W30)/liblife30a.a
+	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -shared -nostdlib -Wl,--entry=n_entry -o $@ $(W30)/life30n.c -L$(W30) -llife30a -lkernel32
+$(W30)/life30d.dll: $(W30)/life30d.c $(W30)/life30.h $(W30)/liblife30a.a
+	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -shared -o $@ $(W30)/life30d.c -L$(W30) -llife30a
+$(W30)/life30s.dll: $(W30)/life30s.c $(W30)/life30.h $(W30)/liblife30a.a
+	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -shared -o $@ $(W30)/life30s.c -L$(W30) -llife30a
+$(W30)/win-life30.exe: $(W30)/main.c $(W30)/life30.h $(W30)/liblife30a.a $(W30)/liblife30c.a
+	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -o $@ $(W30)/main.c -L$(W30) -llife30a -llife30c
+$(W30)/win-life30b.exe: $(W30)/mainb.c $(W30)/life30.h $(W30)/liblife30a.a
+	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -o $@ $(W30)/mainb.c -L$(W30) -llife30a
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3077,6 +3103,13 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-plug29/plug29c.dll \
                programs/win-plug29/plug29f.dll \
                programs/win-plug29/notpe.txt \
+               programs/win-life30/win-life30.exe \
+               programs/win-life30/win-life30b.exe \
+               programs/win-life30/life30a.dll \
+               programs/win-life30/life30c.dll \
+               programs/win-life30/life30n.dll \
+               programs/win-life30/life30d.dll \
+               programs/win-life30/life30s.dll \
                programs/win-xprod/win-xprod.exe \
                programs/win-xcons/win-xcons.exe \
                programs/win-xfilter/win-xfilter.exe \
@@ -3260,6 +3293,13 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-plug29/plug29c.dll               $(INITRD_STAGE)/bin/plug29/plug29c.dll
 	cp programs/win-plug29/plug29f.dll               $(INITRD_STAGE)/bin/plug29/plug29f.dll
 	cp programs/win-plug29/notpe.txt                 $(INITRD_STAGE)/bin/plug29/notpe.dll
+	cp programs/win-life30/win-life30.exe            $(INITRD_STAGE)/bin/win-life30.exe
+	cp programs/win-life30/win-life30b.exe           $(INITRD_STAGE)/bin/win-life30b.exe
+	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
+	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
+	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
+	cp programs/win-life30/life30d.dll               $(INITRD_STAGE)/bin/life30d.dll
+	cp programs/win-life30/life30s.dll               $(INITRD_STAGE)/bin/life30s.dll
 	cp programs/win-xprod/win-xprod.exe               $(INITRD_STAGE)/bin/win-xprod.exe
 	cp programs/win-xcons/win-xcons.exe               $(INITRD_STAGE)/bin/win-xcons.exe
 	cp programs/win-xfilter/win-xfilter.exe           $(INITRD_STAGE)/bin/win-xfilter.exe
@@ -4254,6 +4294,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-dllf28.exe bin/dll28f.dll bin/win-dllm28.exe          \
 	    bin/win-plug29.exe bin/plug29a.dll bin/plug29/plug29b.dll      \
 	    bin/plug29/plug29c.dll bin/plug29/plug29f.dll bin/plug29/notpe.dll \
+	    bin/win-life30.exe bin/life30a.dll bin/life30c.dll bin/life30n.dll \
+	    bin/life30d.dll bin/life30s.dll bin/win-life30b.exe           \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
