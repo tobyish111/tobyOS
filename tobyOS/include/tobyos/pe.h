@@ -223,6 +223,10 @@ int pe_rt_tls_templates(struct pe_tls_tmpl *out, int cap);
 int win32_dll_is_builtin(const char *dll);
 /* W3 (src/syscall.c): a tobyOS path in its Windows form (C: = /data, Z: = /). */
 int win32_kpath_to_winpath(const char *kpath, char *out, int cap);
+/* W6 (src/syscall.c): the exact command line the calling thread's
+ * CreateProcess call is starting a program with, or NULL -- for the PE
+ * loader, which runs inside that call (proc_spawn) on the same thread. */
+const char *win32_spawn_cmdline(void);
 
 /* CRT data page layout (Track C). The ucrt startup reaches argc/argv/environ
  * through __p___argc / __p___argv / __p__environ, and _commode/_fmode through

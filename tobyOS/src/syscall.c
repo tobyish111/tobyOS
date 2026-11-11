@@ -19299,6 +19299,16 @@ static long w32_ReadFile(uint64_t *a) {
         if (pread) { uint32_t z = 0; (void)copy_to_user((void *)(uintptr_t)pread, &z, 4); }
         return 0;
     }
+    /* W6: the end of a pipe -- every writer gone -- is a failure on Windows,
+     * ERROR_BROKEN_PIPE (a file's end is TRUE with 0 bytes, as here) */
+    if (got == 0 && n > 0) {
+        struct file *f = fd_lookup(fd);
+        if (f && f->kind == FILE_KIND_PIPE_R) {
+            if (pread) { uint32_t z = 0; (void)copy_to_user((void *)(uintptr_t)pread, &z, 4); }
+            win32_set_last_error(109 /* ERROR_BROKEN_PIPE */);
+            return 0;
+        }
+    }
     if (pread) {
         uint32_t g = (uint32_t)got;
         if (copy_to_user((void *)(uintptr_t)pread, &g, 4) != 0) return 0;
@@ -19306,11 +19316,197 @@ static long w32_ReadFile(uint64_t *a) {
     return 1;
 }
 
+/* ================= W6: process handles =================
+ * CreateProcess hands back two: the process's (WIN32_PROCESS_TAG) and its
+ * first thread's (WIN32_PTHREAD_TAG); both name one slot of this table, which
+ * keeps the child's exit code once the child is reaped -- so
+ * GetExitCodeProcess answers after the child is gone, as a Windows process
+ * object does until its last handle is closed. A handle's low 32 bits are
+ * 0x40000000 + the slot, never a descriptor number: a process handle passed
+ * to ReadFile is a bad descriptor, not somebody's file. The table is one for
+ * the kernel; each slot names the thread group that holds it, and a slot
+ * whose holder is gone, or whose handles are both closed and whose child has
+ * ended, is freed (the child reaped) by the next CreateProcess. */
+#define WIN32_PROCESS_TAG    0x7500000000000000ULL
+#define WIN32_PTHREAD_TAG    0x7600000000000000ULL
+#define WIN32_PH_LOW         0x40000000u
+#define WIN32_PH_MAX         64
+#define WIN32_STILL_ACTIVE   259u
+#define WIN32_WAIT_TIMEOUT   0x102u
+#define WIN32_WAIT_FAILED    0xFFFFFFFFu
+#define WIN32_ERR_INVALID_HANDLE 6u
+struct win32_ph {
+    int      owner;      /* the holding thread group; 0 = a free slot */
+    int      pid;        /* the child */
+    uint16_t gen;        /* bumped each time the slot is reused */
+    uint8_t  open;       /* bit 0: the process handle is open, bit 1: the thread's */
+    bool     ended;      /* reaped: `code` is final */
+    bool     killed;     /* TerminateProcess: `code` is its uExitCode */
+    uint32_t code;
+};
+static struct win32_ph g_win32_ph[WIN32_PH_MAX];
+
+static int win32_ph_tg(void) {
+    struct proc *p = current_proc();
+    return p ? (p->is_thread ? p->tgid : p->pid) : 0;
+}
+static uint64_t win32_ph_handle(int i, uint64_t tag) {
+    return tag | ((uint64_t)g_win32_ph[i].gen << 32) | (uint64_t)(WIN32_PH_LOW + (uint32_t)i);
+}
+/* The slot handle h names -- one of the caller's, still open -- or NULL. */
+static struct win32_ph *win32_ph_of(uint64_t h) {
+    uint64_t tag = h & 0xFF00000000000000ULL;
+    if (tag != WIN32_PROCESS_TAG && tag != WIN32_PTHREAD_TAG) return 0;
+    uint32_t low = (uint32_t)h;
+    if (low < WIN32_PH_LOW || low >= WIN32_PH_LOW + WIN32_PH_MAX) return 0;
+    struct win32_ph *e = &g_win32_ph[low - WIN32_PH_LOW];
+    uint8_t bit = (tag == WIN32_PROCESS_TAG) ? 1 : 2;
+    if (!e->owner || e->owner != win32_ph_tg() || e->gen != (uint16_t)(h >> 32) || !(e->open & bit))
+        return 0;
+    return e;
+}
+static bool win32_is_ph(uint64_t h) {
+    uint64_t tag = h & 0xFF00000000000000ULL;
+    return tag == WIN32_PROCESS_TAG || tag == WIN32_PTHREAD_TAG;
+}
+/* Reap the child once it has ended, keeping its exit code. */
+static void win32_ph_poll(struct win32_ph *e) {
+    if (e->ended) return;
+    struct proc *c = proc_lookup(e->pid);
+    if (c && c->state != PROC_TERMINATED) return;
+    int code = c ? proc_wait(e->pid) : -1;    /* gone: reaped elsewhere */
+    if (!e->killed) e->code = (uint32_t)code;
+    e->ended = true;
+}
+static void win32_ph_sweep(void) {
+    int tg = win32_ph_tg();
+    for (int i = 0; i < WIN32_PH_MAX; i++) {
+        struct win32_ph *e = &g_win32_ph[i];
+        if (!e->owner) continue;
+        struct proc *o = proc_lookup(e->owner);
+        if (!o || o->state == PROC_TERMINATED) { e->owner = 0; continue; }  /* the child was reparented */
+        if (e->open || e->owner != tg) continue;
+        win32_ph_poll(e);
+        if (e->ended) e->owner = 0;
+    }
+}
+static int win32_ph_alloc(void) {
+    win32_ph_sweep();
+    for (int i = 0; i < WIN32_PH_MAX; i++) {
+        struct win32_ph *e = &g_win32_ph[i];
+        if (e->owner) continue;
+        e->gen++;
+        e->owner = win32_ph_tg();
+        e->pid = 0;
+        e->open = 3;
+        e->ended = e->killed = false;
+        e->code = 0;
+        return i;
+    }
+    return -1;
+}
+static bool win32_ph_close(uint64_t h) {
+    struct win32_ph *e = win32_ph_of(h);
+    if (!e) return false;
+    e->open &= (uint8_t)~(((h & 0xFF00000000000000ULL) == WIN32_PROCESS_TAG) ? 1 : 2);
+    if (!e->open) {
+        win32_ph_poll(e);
+        if (e->ended) e->owner = 0;
+    }
+    return true;
+}
+/* WaitForSingleObject on a process (or its first thread): WAIT_OBJECT_0 once
+ * the child has ended, WAIT_TIMEOUT after `ms` (INFINITE: never). The wait is
+ * a real block -- woken by the child's exit (wait_pid) or the deadline -- with
+ * a 100 ms re-check under it. */
+static uint32_t win32_ph_wait(uint64_t h, uint32_t ms) {
+    uint64_t deadline = (ms == 0xFFFFFFFFu) ? 0 : perf_now_ns() + (uint64_t)ms * 1000000ull;
+    struct proc *self = current_proc();
+    for (;;) {
+        struct win32_ph *e = win32_ph_of(h);       /* (it may be closed meanwhile) */
+        if (!e) { win32_set_last_error(WIN32_ERR_INVALID_HANDLE); return WIN32_WAIT_FAILED; }
+        win32_ph_poll(e);
+        if (e->ended) return 0;                    /* WAIT_OBJECT_0 */
+        uint64_t now = perf_now_ns();
+        if (deadline && now >= deadline) return WIN32_WAIT_TIMEOUT;
+        uint64_t wake = now + 100000000ull;
+        if (deadline && deadline < wake) wake = deadline;
+        self->wait_pid = e->pid;
+        self->sleep_deadline_ns = wake;
+        self->state = PROC_BLOCKED;
+        sched_yield();
+        self->sleep_deadline_ns = 0;
+        self->wait_pid = -1;
+    }
+}
+
+/* kernel32!GetExitCodeProcess(hProcess, lpExitCode) -> BOOL: STILL_ACTIVE
+ * (259) while the process runs, then its exit code. */
+static long w32_GetExitCodeProcess(uint64_t *a) {
+    uint32_t code;
+    if ((int64_t)a[0] == -1) {
+        code = WIN32_STILL_ACTIVE;                 /* this process */
+    } else {
+        struct win32_ph *e = win32_ph_of(a[0]);
+        if (!e) { win32_set_last_error(WIN32_ERR_INVALID_HANDLE); return 0; }
+        win32_ph_poll(e);
+        code = e->ended ? e->code : WIN32_STILL_ACTIVE;
+    }
+    if (!a[1] || copy_to_user((void *)(uintptr_t)a[1], &code, 4) != 0) {
+        win32_set_last_error(998 /* ERROR_NOACCESS */);
+        return 0;
+    }
+    return 1;
+}
+/* kernel32!GetProcessId(hProcess) -> DWORD, 0 for no such handle. */
+static long w32_GetProcessId(uint64_t *a) {
+    if ((int64_t)a[0] == -1) return (long)(uint32_t)win32_ph_tg();
+    struct win32_ph *e = win32_ph_of(a[0]);
+    if (!e) { win32_set_last_error(WIN32_ERR_INVALID_HANDLE); return 0; }
+    return (long)(uint32_t)e->pid;
+}
+/* kernel32!SetHandleInformation(h, mask, flags) -> BOOL. HANDLE_FLAG_INHERIT
+ * needs nothing more here: a child gets only the handles its STARTUPINFO
+ * names (or the parent's standard ones). TRUE for an open handle. */
+static long w32_SetHandleInformation(uint64_t *a) {
+    if (win32_ph_of(a[0]) || fd_lookup((int)a[0])) return 1;
+    win32_set_last_error(WIN32_ERR_INVALID_HANDLE);
+    return 0;
+}
+/* kernel32!CreatePipe(&hRead, &hWrite, lpPipeAttributes, nSize) -> BOOL: an
+ * anonymous pipe, each end a descriptor of the caller's (nSize is advice). */
+static long w32_CreatePipe(uint64_t *a) {
+    uint64_t ur = a[0], uw = a[1];
+    if (!ur || !uw) { win32_set_last_error(87 /* ERROR_INVALID_PARAMETER */); return 0; }
+    struct file *r = 0, *w = 0;
+    if (pipe_create(&r, &w) != 0) { win32_set_last_error(8 /* ERROR_NOT_ENOUGH_MEMORY */); return 0; }
+    struct proc *p = current_proc();
+    struct file **t = proc_fds(p);
+    int fr = fd_alloc_into(p, r);
+    if (fr < 0) { file_close(r); file_close(w); win32_set_last_error(4 /* ERROR_TOO_MANY_OPEN_FILES */); return 0; }
+    int fw = fd_alloc_into(p, w);
+    if (fw < 0) { t[fr] = 0; file_close(r); file_close(w); win32_set_last_error(4); return 0; }
+    uint64_t hr = (uint64_t)fr, hw = (uint64_t)fw;
+    if (copy_to_user((void *)(uintptr_t)ur, &hr, 8) != 0 || copy_to_user((void *)(uintptr_t)uw, &hw, 8) != 0) {
+        (void)sys_close(fr);
+        (void)sys_close(fw);
+        win32_set_last_error(998 /* ERROR_NOACCESS */);
+        return 0;
+    }
+    return 1;
+}
+
 /* kernel32!CloseHandle(h) -> BOOL. Leaves std handles (0/1/2), the ucrt
  * FILE* tokens, and thread handles (reaped by the join) alone; closes real
- * file fds. */
+ * file fds. W6: a process handle (or its thread's) once, then it is no
+ * handle: FALSE, ERROR_INVALID_HANDLE. */
 static long w32_CloseHandle(uint64_t *a) {
     uint64_t h = a[0];
+    if (win32_is_ph(h)) {
+        if (win32_ph_close(h)) return 1;
+        win32_set_last_error(WIN32_ERR_INVALID_HANDLE);
+        return 0;
+    }
     if ((h & 0xFF00000000000000ULL) == WIN32_THREAD_TAG) return 1; /* thread handle */
     if ((h & 0xFFFFFF00ULL) == WIN32_IOB_TAG) return 1;           /* stdio FILE token */
     int fd = (int)h;
@@ -19577,6 +19773,7 @@ static long w32_CreateThread(uint64_t *a) {
  * thread handle this is a join (timeout ignored == INFINITE). */
 static long w32_WaitForSingleObject(uint64_t *a) {
     uint64_t h = a[0];
+    if (win32_is_ph(h)) return (long)win32_ph_wait(h, (uint32_t)a[1]);   /* W6 */
     if ((h & 0xFF00000000000000ULL) == WIN32_THREAD_TAG) {
         int tid = (int)(h & 0xFFFFFFFFULL);
         return (thread_join(tid, 0) == 0) ? 0 : (long)0xFFFFFFFF;
@@ -23181,15 +23378,27 @@ static long w32_DisableThreadLibraryCalls(uint64_t *a) {
 
 /* kernel32!TerminateProcess(hProcess, uExitCode) -> BOOL. W5: the calling
  * process (GetCurrentProcess()'s pseudo handle, -1) ends at once, every
- * thread, and -- as Microsoft documents -- no DLL is told. Another process's
- * handle is W6's (CreateProcess): FALSE, ERROR_INVALID_HANDLE. */
+ * thread, and -- as Microsoft documents -- no DLL is told. W6: a child's
+ * process handle -- the child is killed (SIGKILL), and its exit code, for
+ * GetExitCodeProcess, is uExitCode; one that has already ended: FALSE,
+ * ERROR_ACCESS_DENIED. */
 static long w32_TerminateProcess(uint64_t *a) {
     if ((int64_t)a[0] == -1) {
         kprintf("[win32] TerminateProcess(self, %u)\n", (unsigned)a[1]);
         proc_exit_group((int)(uint32_t)a[1]);
     }
-    win32_set_last_error(6 /* ERROR_INVALID_HANDLE */);
-    return 0;
+    struct win32_ph *e = win32_ph_of(a[0]);
+    if (!e || (a[0] & 0xFF00000000000000ULL) != WIN32_PROCESS_TAG) {
+        win32_set_last_error(WIN32_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    win32_ph_poll(e);
+    if (e->ended) { win32_set_last_error(5 /* ERROR_ACCESS_DENIED */); return 0; }
+    e->killed = true;
+    e->code = (uint32_t)a[1];
+    kprintf("[win32] TerminateProcess(pid %d, %u)\n", e->pid, (unsigned)a[1]);
+    signal_send_to_pid(e->pid, SIGKILL);
+    return 1;
 }
 
 static int win32_k_to_wstr(uint64_t uwide, const char *s, int cap);   /* defined with the wide shims */
@@ -23834,12 +24043,420 @@ static long w32_GetCommandLineA(uint64_t *a) {
 static long w32_GetCommandLineW(uint64_t *a) {
     (void)a;
     uint64_t dst = WIN32_CRT_DATA_BASE + WIN32_CRT_CMDLINEW;
-    char s[200]; s[0] = 0;
+    /* W6: the whole command line (its area: WIN32_CRT_CMDLINE..NMHDR), into
+     * the wide area's 0x300 bytes (was: 199 characters) */
+    char s[WIN32_CRT_NMHDR - WIN32_CRT_CMDLINE]; s[0] = 0;
     (void)strncpy_from_user(s, (const char *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_CMDLINE), sizeof(s));
-    uint16_t w[200]; int i = 0; for (; s[i] && i < 199; i++) w[i] = (uint16_t)(uint8_t)s[i]; w[i] = 0;
+    uint16_t w[0x300 / 2]; int i = 0;
+    for (; s[i] && i < (int)(sizeof w / 2) - 1; i++) w[i] = (uint16_t)(uint8_t)s[i];
+    w[i] = 0;
     (void)copy_to_user((void *)(uintptr_t)dst, w, (size_t)(i + 1) * 2);
     return (long)dst;
 }
+/* ================= W6: CreateProcess =================
+ * (docs/roadmap-2026-11.md.) From Microsoft's CreateProcess page and its
+ * "Parsing C command-line arguments", measured on Windows 11 where they
+ * differ (programs/win-proc31). The child is any program proc_spawn starts --
+ * a PE, a native one, a Linux ELF -- with the argv the C runtime would parse
+ * from the command line, fds 0-2 from STARTUPINFO's standard handles (or the
+ * parent's own), lpCurrentDirectory, and lpEnvironment as its environment (a
+ * PE reads the Win32 environment table instead, which is one for every
+ * Win32 process: not per process yet). A PE child's GetCommandLine is the
+ * exact string (win32_spawn_cmdline). */
+
+/* The command line a CreateProcess call is starting a program with, for the
+ * PE loader (pe_load_user runs inside proc_spawn, on the caller's thread):
+ * one entry per thread in that call, for its length only. */
+static struct { struct proc *p; const char *cmd; } g_win32_spawn_cmd[8];
+const char *win32_spawn_cmdline(void) {
+    struct proc *me = current_proc();
+    for (int i = 0; me && i < (int)(sizeof g_win32_spawn_cmd / sizeof g_win32_spawn_cmd[0]); i++)
+        if (g_win32_spawn_cmd[i].p == me) return g_win32_spawn_cmd[i].cmd;
+    return 0;
+}
+
+/* A command line -> argv, by the Microsoft C runtime's rules: whitespace
+ * (space, tab) between arguments; argv[0], the program, ends at whitespace
+ * outside double quotes, its quotes dropped, a backslash only a backslash;
+ * the rest: a quoted span keeps its whitespace, "" inside quotes is a
+ * literal quote, 2n backslashes then a quote are n backslashes and a quote
+ * that opens or closes a span, 2n+1 backslashes then a quote are n
+ * backslashes and a literal quote, other backslashes are themselves. The
+ * strings go to pool. Returns argc, or -1 when it does not fit. */
+#define WIN32_CP_ARGV_MAX 64
+#define WIN32_CP_PATH     520     /* a name or directory being tried (MAX_PATH is 260) */
+static int win32_cmd_parse(const char *p, char *pool, int cap, char **argv) {
+    int argc = 0, k = 0;
+#define CP_PUT(c) do { if (k >= cap - 1) return -1; pool[k++] = (c); } while (0)
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) return 0;
+    argv[argc++] = pool + k;
+    for (bool q = false; *p && (q || (*p != ' ' && *p != '\t')); p++) {
+        if (*p == '"') q = !q;
+        else CP_PUT(*p);
+    }
+    CP_PUT('\0');
+    for (;;) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        if (argc >= WIN32_CP_ARGV_MAX) return -1;
+        argv[argc++] = pool + k;
+        bool q = false;
+        for (;;) {
+            int nbs = 0;
+            while (*p == '\\') { p++; nbs++; }
+            if (*p == '"') {
+                for (int i = 0; i < nbs / 2; i++) CP_PUT('\\');
+                if (nbs & 1) { CP_PUT('"'); p++; continue; }
+                if (q && p[1] == '"') { CP_PUT('"'); p += 2; continue; }
+                q = !q;
+                p++;
+                continue;
+            }
+            for (int i = 0; i < nbs; i++) CP_PUT('\\');
+            if (!*p || (!q && (*p == ' ' || *p == '\t'))) break;
+            CP_PUT(*p);
+            p++;
+        }
+        CP_PUT('\0');
+    }
+#undef CP_PUT
+    argv[argc] = 0;
+    return argc;
+}
+
+/* Is kpath a file? */
+static bool win32_cp_file(const char *kpath) {
+    struct vfs_stat vs;
+    return vfs_stat(kpath, &vs) == VFS_OK && vs.type != VFS_TYPE_DIR;
+}
+
+static bool win32_cp_runnable(const char *kpath);
+/* A file the search takes: any file for Windows' own names (one that is not a
+ * program is then ERROR_EXE_MACHINE_TYPE_MISMATCH, as on Windows); for the
+ * tobyOS bare-name pass, only a program -- so "c:\program files\x" still
+ * goes on to "c:\program files\x.exe" past a data file "c:\program". */
+static bool win32_cp_hit(const char *kpath, int pass) {
+    return win32_cp_file(kpath) && (pass == 0 || win32_cp_runnable(kpath));
+}
+
+/* `name` (a Windows file name or path, from a command line) -> the program's
+ * tobyOS path, by CreateProcess's rules: ".exe" added unless the last
+ * component has an extension -- a path with no extension gets it too, as
+ * Windows 11 does (Microsoft's page says it does not) -- and a trailing
+ * period means "no extension, and none added"; a name with no directory is
+ * looked for in the .exe's directory, the current one, System32, System,
+ * Windows and PATH. tobyOS: when the name had no extension and nothing was
+ * found with ".exe", the name itself is looked for the same way -- so a
+ * native program ("grep") is found as a PE would be -- a program only. */
+static bool win32_cp_find(const char *name, char *kpath, int cap) {
+    char base[WIN32_CP_PATH];
+    int n = (int)strlen(name);
+    if (n <= 0 || n >= (int)sizeof base - 5) return false;
+    memcpy(base, name, (size_t)n + 1);
+    bool has_dir = false, has_ext = false;
+    for (int i = 0; i < n; i++) {
+        if (base[i] == '\\' || base[i] == '/' || base[i] == ':') { has_dir = true; has_ext = false; }
+        else if (base[i] == '.') has_ext = true;
+    }
+    bool trailing_dot = base[n - 1] == '.';
+    if (trailing_dot) { base[n - 1] = '\0'; has_ext = true; }
+    for (int pass = 0; pass < 2; pass++) {
+        char nm[WIN32_CP_PATH];
+        if (pass == 0) {
+            if (has_ext) ksnprintf(nm, sizeof nm, "%s", base);
+            else ksnprintf(nm, sizeof nm, "%s.exe", base);
+        } else {
+            if (has_ext) break;                        /* nothing else to try */
+            ksnprintf(nm, sizeof nm, "%s", base);
+        }
+        if (has_dir) {
+            if (win32_winpath_to_k(nm, kpath, cap) >= 0 && win32_cp_hit(kpath, pass)) return true;
+            continue;
+        }
+        /* the search order */
+        struct proc *p = current_proc();
+        struct proc *lead = (p && p->is_thread) ? proc_lookup(p->tgid) : p;
+        char dirs[6][WIN32_CP_PATH];
+        int nd = 0;
+        if (lead && lead->exe_path[0]) {
+            int last = 0;
+            for (int i = 0; lead->exe_path[i]; i++) if (lead->exe_path[i] == '/') last = i;
+            int dn = last > 0 ? last : 1;
+            if (dn >= WIN32_CP_PATH) dn = WIN32_CP_PATH - 1;
+            memcpy(dirs[nd], lead->exe_path, (size_t)dn);
+            dirs[nd++][dn] = '\0';
+        }
+        ksnprintf(dirs[nd++], WIN32_CP_PATH, "%s", (p && p->cwd[0]) ? p->cwd : "/");
+        ksnprintf(dirs[nd++], WIN32_CP_PATH, "/data/Windows/System32");
+        ksnprintf(dirs[nd++], WIN32_CP_PATH, "/data/Windows/System");
+        ksnprintf(dirs[nd++], WIN32_CP_PATH, "/data/Windows");
+        for (int d = 0; d < nd; d++) {
+            ksnprintf(kpath, (size_t)cap, "%s%s%s", dirs[d],
+                      dirs[d][strlen(dirs[d]) - 1] == '/' ? "" : "/", nm);
+            if (win32_cp_hit(kpath, pass)) return true;
+        }
+        /* PATH (the Win32 environment's, ';'-separated Windows paths) */
+        env_seed();
+        int ei = env_find("PATH");
+        if (ei >= 0) {
+            const char *v = g_win32_env[ei].val;
+            while (*v) {
+                char seg[WIN32_CP_PATH], wp[WIN32_CP_PATH];
+                int sl = 0;
+                while (*v && *v != ';') { if (sl < (int)sizeof seg - 1) seg[sl++] = *v; v++; }
+                if (*v == ';') v++;
+                seg[sl] = '\0';
+                if (!sl) continue;
+                ksnprintf(wp, sizeof wp, "%s%s%s", seg, (seg[sl - 1] == '\\') ? "" : "\\", nm);
+                if (win32_winpath_to_k(wp, kpath, cap) >= 0 && win32_cp_hit(kpath, pass)) return true;
+            }
+        }
+    }
+    kpath[0] = '\0';
+    return false;
+}
+
+/* Does the file at kpath start like a program: a PE's MZ, an ELF, a #!? */
+static bool win32_cp_runnable(const char *kpath) {
+    struct vfs_file f;
+    if (vfs_open(kpath, &f) != VFS_OK) return false;
+    unsigned char h[4] = { 0, 0, 0, 0 };
+    long got = vfs_read(&f, h, sizeof h);
+    vfs_close(&f);
+    if (got < 2) return false;
+    if (h[0] == 'M' && h[1] == 'Z') return true;
+    if (got >= 4 && h[0] == 0x7F && h[1] == 'E' && h[2] == 'L' && h[3] == 'F') return true;
+    return h[0] == '#' && h[1] == '!';
+}
+
+/* A child's descriptor for standard handle `h` (STARTUPINFO's), cloned: a
+ * handle is a descriptor here (GetStdHandle's 0-2 among them); one that names
+ * nothing leaves the child's slot empty. */
+static struct file *win32_cp_fd(uint64_t h) {
+    struct file **t = proc_fds(current_proc());
+    if ((int64_t)h < 0 || h >= PROC_NFDS || !t || !t[h]) return PROC_FD_CLOSED;
+    struct file *cl = file_clone(t[h]);
+    return cl ? cl : PROC_FD_CLOSED;
+}
+
+#define WIN32_STARTF_USESTDHANDLES 0x100u
+#define WIN32_CREATE_SUSPENDED     0x4u
+#define WIN32_CREATE_UNICODE_ENV   0x400u
+#define WIN32_CP_CMD_MAX           4096
+#define WIN32_CP_ENV_MAX           64
+
+/* The common half of CreateProcessA/W: app and cmd are kernel strings (app
+ * may be NULL; cmd may be NULL when app is not), cwd a Windows path or NULL;
+ * a[] the call's arguments, for the environment, STARTUPINFO and
+ * PROCESS_INFORMATION. */
+static long win32_create_process(const char *app, const char *cmd, const char *cwd,
+                                 bool wide, uint64_t *a) {
+    uint32_t flags = (uint32_t)a[5];
+    uint64_t uenv = a[6], usi = a[8], upi = a[9];
+    if (!usi || !upi || (!app && !cmd)) { win32_set_last_error(87 /* ERROR_INVALID_PARAMETER */); return 0; }
+    if (flags & WIN32_CREATE_SUSPENDED) {
+        kprintf("[win32] CreateProcess: CREATE_SUSPENDED is not implemented\n");
+        win32_set_last_error(50 /* ERROR_NOT_SUPPORTED */);
+        return 0;
+    }
+    if (!cap_check(current_proc(), CAP_EXEC, "CreateProcess")) { win32_set_last_error(5); return 0; }
+    if (!cmd) cmd = app;                       /* "uses lpApplicationName as the command line" */
+
+    long ret = 0;
+    char *pool = kmalloc(WIN32_CP_CMD_MAX), *envpool = 0, *cmd2 = 0;
+    char **argv = kmalloc(sizeof(char *) * (WIN32_CP_ARGV_MAX + 1));
+    char **envp = 0;
+    char *kpath = kmalloc(ABI_PATH_MAX), *kcwd = kmalloc(ABI_PATH_MAX);
+    int envc = 0, slot = -1, ph = -1;
+    struct file *f[3] = { 0, 0, 0 };
+    if (!pool || !argv || !kpath || !kcwd) { win32_set_last_error(8); goto out; }
+    kcwd[0] = '\0';
+
+    /* the program */
+    if (app) {
+        if (win32_winpath_to_k(app, kpath, ABI_PATH_MAX) < 0 || !win32_cp_file(kpath)) {
+            win32_set_last_error(WIN32_ERR_FILE_NOT_FOUND);
+            goto out;
+        }
+    } else {
+        /* the first token; unquoted, every way of reading its spaces, the
+         * shortest first ("c:\program files\x" is c:\program, then
+         * c:\program files\x) */
+        bool found = false;
+        const char *c = cmd;
+        while (*c == ' ' || *c == '\t') c++;
+        char tok[WIN32_CP_PATH];
+        if (*c == '"') {
+            int k = 0;
+            for (c++; *c && *c != '"' && k < (int)sizeof tok - 1; c++) tok[k++] = *c;
+            tok[k] = '\0';
+            found = k && win32_cp_find(tok, kpath, ABI_PATH_MAX);
+        } else {
+            int k = 0;
+            bool spaced = false;
+            for (;;) {
+                while (c[k] && c[k] != ' ' && c[k] != '\t') k++;
+                if (k >= (int)sizeof tok) break;
+                memcpy(tok, c, (size_t)k);
+                tok[k] = '\0';
+                if (win32_cp_find(tok, kpath, ABI_PATH_MAX)) { found = true; break; }
+                if (!c[k]) break;
+                while (c[k] == ' ' || c[k] == '\t') k++;
+                if (!c[k]) break;
+                spaced = true;
+            }
+            /* Windows 11: the program read across a space is quoted in the
+             * child's command line ("c:\a b\x" args), so the child parses
+             * the same argv[0] (measured; the caller's buffer is unchanged) */
+            if (found && spaced) {
+                cmd2 = kmalloc(WIN32_CP_CMD_MAX);
+                if (!cmd2) { win32_set_last_error(8); goto out; }
+                ksnprintf(cmd2, WIN32_CP_CMD_MAX, "\"%s\"%s", tok, c + k);
+                cmd = cmd2;
+            }
+        }
+        if (!found) {
+            kprintf("[win32] CreateProcess(%s): not found\n", cmd);
+            win32_set_last_error(WIN32_ERR_FILE_NOT_FOUND);
+            goto out;
+        }
+    }
+    if (!win32_cp_runnable(kpath)) {
+        /* Windows 11: a file that is not a program at all */
+        win32_set_last_error(216 /* ERROR_EXE_MACHINE_TYPE_MISMATCH */);
+        goto out;
+    }
+
+    /* its argv, from the command line it gets */
+    int argc = win32_cmd_parse(cmd, pool, WIN32_CP_CMD_MAX, argv);
+    if (argc < 0) { win32_set_last_error(206 /* ERROR_FILENAME_EXCED_RANGE */); goto out; }
+
+    /* its directory */
+    if (cwd) {
+        struct vfs_stat vs;
+        if (win32_winpath_to_k(cwd, kcwd, ABI_PATH_MAX) < 0 ||
+            vfs_stat(kcwd, &vs) != VFS_OK || vs.type != VFS_TYPE_DIR) {
+            win32_set_last_error(267 /* ERROR_DIRECTORY */);
+            goto out;
+        }
+    }
+
+    /* its environment: "NAME=value\0...\0\0", ANSI or (CREATE_UNICODE_
+     * ENVIRONMENT) UTF-16; none: the parent's */
+    if (uenv) {
+        bool wenv = (flags & WIN32_CREATE_UNICODE_ENV) != 0;
+        envpool = kmalloc(WIN32_CP_CMD_MAX);
+        envp = kmalloc(sizeof(char *) * (WIN32_CP_ENV_MAX + 1));
+        if (!envpool || !envp) { win32_set_last_error(8); goto out; }
+        int k = 0;
+        uint64_t at = uenv;
+        while (envc < WIN32_CP_ENV_MAX) {
+            int start = k;
+            for (;;) {
+                uint16_t ch = 0;
+                if (wenv) { if (copy_from_user(&ch, (const void *)(uintptr_t)at, 2) != 0) ch = 0; at += 2; }
+                else { uint8_t b = 0; if (copy_from_user(&b, (const void *)(uintptr_t)at, 1) != 0) b = 0; ch = b; at += 1; }
+                if (!ch) break;
+                if (k < WIN32_CP_CMD_MAX - 1) envpool[k++] = (ch < 0x80) ? (char)ch : '?';
+            }
+            if (k == start) break;             /* the empty string: the block's end */
+            envpool[k++] = '\0';
+            envp[envc++] = envpool + start;
+            if (k >= WIN32_CP_CMD_MAX - 1) break;
+        }
+        envp[envc] = 0;
+    }
+
+    /* its standard handles */
+    uint8_t sib[104];
+    if (copy_from_user(sib, (const void *)(uintptr_t)usi, sizeof sib) != 0) { win32_set_last_error(998); goto out; }
+    uint32_t siflags;
+    memcpy(&siflags, sib + 60, 4);
+    for (int i = 0; i < 3; i++) {
+        if (siflags & WIN32_STARTF_USESTDHANDLES) {
+            uint64_t h;
+            memcpy(&h, sib + 80 + 8 * i, 8);
+            f[i] = win32_cp_fd(h);
+        } else {
+            f[i] = win32_cp_fd((uint64_t)i);   /* the parent's own */
+        }
+    }
+
+    ph = win32_ph_alloc();
+    if (ph < 0) { win32_set_last_error(8); goto out; }
+    for (int i = 0; i < (int)(sizeof g_win32_spawn_cmd / sizeof g_win32_spawn_cmd[0]); i++)
+        if (!g_win32_spawn_cmd[i].p) { slot = i; g_win32_spawn_cmd[i].p = current_proc(); g_win32_spawn_cmd[i].cmd = cmd; break; }
+    struct proc_spec spec = {
+        .path = kpath, .name = 0,
+        .fd0 = f[0], .fd1 = f[1], .fd2 = f[2],
+        .argc = argc, .argv = argv,
+        .envc = envc, .envp = envp,
+        .cwd = kcwd[0] ? kcwd : 0,
+    };
+    int pid = proc_spawn(&spec);
+    if (slot >= 0) { g_win32_spawn_cmd[slot].p = 0; g_win32_spawn_cmd[slot].cmd = 0; }
+    if (pid < 0) {
+        kprintf("[win32] CreateProcess(%s): spawn failed (%d)\n", kpath, pid);
+        g_win32_ph[ph].owner = 0;
+        win32_set_last_error(193 /* ERROR_BAD_EXE_FORMAT */);
+        goto out;
+    }
+    g_win32_ph[ph].pid = pid;
+    uint8_t pib[24];
+    uint64_t hp = win32_ph_handle(ph, WIN32_PROCESS_TAG), ht = win32_ph_handle(ph, WIN32_PTHREAD_TAG);
+    uint32_t id = (uint32_t)pid;
+    memcpy(pib, &hp, 8);
+    memcpy(pib + 8, &ht, 8);
+    memcpy(pib + 16, &id, 4);
+    memcpy(pib + 20, &id, 4);                  /* its first thread is the pid */
+    if (copy_to_user((void *)(uintptr_t)upi, pib, sizeof pib) != 0) {
+        win32_set_last_error(998);             /* the child runs on; its slot is reaped later */
+        g_win32_ph[ph].open = 0;
+        goto out;
+    }
+    kprintf("[win32] CreateProcess%s(%s) -> pid %d (%s)\n", wide ? "W" : "A", cmd, pid, kpath);
+    ret = 1;
+out:
+    for (int i = 0; i < 3; i++) spawn_fd_put(f[i]);
+    kfree(pool); kfree(argv); kfree(kpath); kfree(kcwd); kfree(envpool); kfree(envp); kfree(cmd2);
+    return ret;
+}
+
+/* kernel32!CreateProcessA(lpApplicationName, lpCommandLine, lpProcessAttributes,
+ * lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+ * lpCurrentDirectory, lpStartupInfo, lpProcessInformation) -> BOOL. */
+static long w32_CreateProcessA(uint64_t *a) {
+    char *app = 0, *cmd = 0, *cwd = 0;
+    long r = 0;
+    if (a[0]) { app = kmalloc(ABI_PATH_MAX); if (!app || strncpy_from_user(app, (const char *)(uintptr_t)a[0], ABI_PATH_MAX) < 0) goto bad; }
+    if (a[1]) { cmd = kmalloc(WIN32_CP_CMD_MAX); if (!cmd || strncpy_from_user(cmd, (const char *)(uintptr_t)a[1], WIN32_CP_CMD_MAX) < 0) goto bad; }
+    if (a[7]) { cwd = kmalloc(ABI_PATH_MAX); if (!cwd || strncpy_from_user(cwd, (const char *)(uintptr_t)a[7], ABI_PATH_MAX) < 0) goto bad; }
+    r = win32_create_process(app, cmd, cwd, false, a);
+    kfree(app); kfree(cmd); kfree(cwd);
+    return r;
+bad:
+    kfree(app); kfree(cmd); kfree(cwd);
+    win32_set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+    return 0;
+}
+/* kernel32!CreateProcessW: the same, its strings UTF-16 (STARTUPINFOW has
+ * STARTUPINFOA's layout). */
+static long w32_CreateProcessW(uint64_t *a) {
+    char *app = 0, *cmd = 0, *cwd = 0;
+    long r = 0;
+    if (a[0]) { app = kmalloc(ABI_PATH_MAX); if (!app) goto bad; win32_wstr_to_k(a[0], app, ABI_PATH_MAX); }
+    if (a[1]) { cmd = kmalloc(WIN32_CP_CMD_MAX); if (!cmd) goto bad; win32_wstr_to_k(a[1], cmd, WIN32_CP_CMD_MAX); }
+    if (a[7]) { cwd = kmalloc(ABI_PATH_MAX); if (!cwd) goto bad; win32_wstr_to_k(a[7], cwd, ABI_PATH_MAX); }
+    r = win32_create_process(app, cmd, cwd, true, a);
+    kfree(app); kfree(cmd); kfree(cwd);
+    return r;
+bad:
+    kfree(app); kfree(cmd); kfree(cwd);
+    win32_set_last_error(8);
+    return 0;
+}
+
 /* kernel32!GetEnvironmentVariableA(name, buf, size) -> chars copied (excl NUL),
  * or 0 if not found. */
 static long w32_GetEnvironmentVariableA(uint64_t *a) {
@@ -25425,6 +26042,13 @@ static const struct win32_shim g_win32_shims[] = {
     /* ---- C6: multithreading (kernel32) ---- */
     { "kernel32.dll", "CreateThread",        w32_CreateThread },
     { "kernel32.dll", "WaitForSingleObject", w32_WaitForSingleObject },
+    /* W6: CreateProcess, pipes, process handles */
+    { "kernel32.dll", "CreateProcessA",      w32_CreateProcessA },
+    { "kernel32.dll", "CreateProcessW",      w32_CreateProcessW },
+    { "kernel32.dll", "CreatePipe",          w32_CreatePipe },
+    { "kernel32.dll", "GetExitCodeProcess",  w32_GetExitCodeProcess },
+    { "kernel32.dll", "GetProcessId",        w32_GetProcessId },
+    { "kernel32.dll", "SetHandleInformation", w32_SetHandleInformation },
 
     /* ---- C7: the GUI bridge ---- */
     /* kernel32 + crt extras the GUI-subsystem CRT startup pulls in */

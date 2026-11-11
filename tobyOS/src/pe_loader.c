@@ -2281,6 +2281,45 @@ int pe_rt_tls_templates(struct pe_tls_tmpl *out, int cap) {
     return n;
 }
 
+/* W6: one argument of a command line, written at p (in a uaccess window, up
+ * to lim): as it is when nothing in it needs quoting, else in double quotes
+ * with a quote as \" and the backslashes before a quote, or before the
+ * closing one, doubled -- the inverse of the C runtime's parse. The program
+ * name (argv[0]) is only quoted: its rules have no escapes. */
+static uint64_t pe_cmd_quote(uint64_t p, uint64_t lim, const char *s, bool prog) {
+#define PUTC(c) do { if (p < lim) *(char *)(p++) = (c); } while (0)
+    bool plain = s[0] != '\0';
+    for (const char *q = s; *q; q++)
+        if (*q == ' ' || *q == '\t' || (*q == '"' && !prog)) plain = false;
+    if (plain) {
+        for (; *s; s++) PUTC(*s);
+        return p;
+    }
+    PUTC('"');
+    if (prog) {
+        for (; *s; s++) if (*s != '"') PUTC(*s);
+        PUTC('"');
+        return p;
+    }
+    for (;;) {
+        int nbs = 0;
+        while (*s == '\\') { s++; nbs++; }
+        if (!*s) { for (int i = 0; i < 2 * nbs; i++) PUTC('\\'); break; }
+        if (*s == '"') {
+            for (int i = 0; i < 2 * nbs + 1; i++) PUTC('\\');
+            PUTC('"');
+            s++;
+            continue;
+        }
+        for (int i = 0; i < nbs; i++) PUTC('\\');
+        PUTC(*s);
+        s++;
+    }
+    PUTC('"');
+#undef PUTC
+    return p;
+}
+
 int pe_load_user(const void *image, size_t size, int argc, char **argv,
                  const struct pe_load_env *env, struct pe_load_info *out) {
     if (!image || !out || !pe_is_image(image, size)) return -1;
@@ -2406,13 +2445,26 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         *(uint64_t *)(base + WIN32_CRT_ENVIRON)     = base + WIN32_CRT_ENVIRON_ARR;
         *(uint64_t *)(base + WIN32_CRT_ENVIRON_ARR) = 0;   /* environ[0] = NULL */
 
-        /* C7: _acmdln (the raw command line) -> the program name. The GUI CRT
-         * startup reads it via __p__acmdln to build WinMain's lpCmdLine. */
+        /* C7, W6: _acmdln and GetCommandLine -- the command line. The GUI CRT
+         * startup reads it via __p__acmdln to build WinMain's lpCmdLine. W6:
+         * the exact string, when a CreateProcess call is starting this
+         * program (win32_spawn_cmdline: its thread is the current one here);
+         * otherwise every argument, quoted by the rules the CRT parses them
+         * back with (Microsoft's "Parsing C command-line arguments"), as the
+         * POSIX side's launchers of Windows programs build it. Until W6 it was
+         * argv[0] alone. Its area of the page ends at WIN32_CRT_NMHDR. */
         {
-            const char *s0 = (n > 0 && argv) ? argv[0] : "";
-            uint64_t cl = base + WIN32_CRT_CMDLINE;
+            uint64_t cl = base + WIN32_CRT_CMDLINE, lim = base + WIN32_CRT_NMHDR - 1;
             uint64_t clp = cl;
-            while (*s0 && clp < base + PAGE_SIZE - 1) *(char *)(clp++) = *s0++;
+            const char *raw = win32_spawn_cmdline();
+            if (raw) {
+                while (*raw && clp < lim) *(char *)(clp++) = *raw++;
+            } else {
+                for (int i = 0; argv && i < argc && argv[i]; i++) {
+                    if (i && clp < lim) *(char *)(clp++) = ' ';
+                    clp = pe_cmd_quote(clp, lim, argv[i], i == 0);
+                }
+            }
             *(char *)clp = '\0';
             *(uint64_t *)(base + WIN32_CRT_ACMDLN) = cl;   /* char* to the cmdline */
         }
