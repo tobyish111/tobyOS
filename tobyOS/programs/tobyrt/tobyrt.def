@@ -16,3 +16,11 @@ EXPORTS
     UnhandledExceptionFilter = rt_UnhandledExceptionFilter
     SetErrorMode = rt_SetErrorMode
     GetErrorMode = rt_GetErrorMode
+    AddVectoredExceptionHandler = rt_AddVectoredExceptionHandler
+    RemoveVectoredExceptionHandler = rt_RemoveVectoredExceptionHandler
+    AddVectoredContinueHandler = rt_AddVectoredContinueHandler
+    RemoveVectoredContinueHandler = rt_RemoveVectoredContinueHandler
+    RtlAddVectoredExceptionHandler = rt_AddVectoredExceptionHandler
+    RtlRemoveVectoredExceptionHandler = rt_RemoveVectoredExceptionHandler
+    RtlAddVectoredContinueHandler = rt_AddVectoredContinueHandler
+    RtlRemoveVectoredContinueHandler = rt_RemoveVectoredContinueHandler

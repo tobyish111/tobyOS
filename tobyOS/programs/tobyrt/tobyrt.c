@@ -69,6 +69,90 @@ LONG rt_UnhandledExceptionFilter(EXCEPTION_POINTERS *ep);
 static LPTOP_LEVEL_EXCEPTION_FILTER volatile g_top_filter;
 static volatile UINT g_error_mode;          /* SetErrorMode's */
 
+/* ---- vectored handlers (W7c) -------------------------------------------- *
+ * Two lists -- exception handlers, called before any frame's handler while
+ * dispatching, and continue handlers, called when an exception is about to be
+ * continued -- of entries from a fixed pool (a handle is its entry). A spin
+ * lock guards the lists only: the handlers are called from a copy taken under
+ * it, so one may add or remove handlers, or raise, while being called. The
+ * rules (measured on Windows 11, programs/win-exc34): First != 0 puts an entry
+ * at the head; a handler's EXCEPTION_CONTINUE_EXECUTION ends its list, any
+ * other answer goes on. */
+#define RT_VEH_MAX 64
+struct rt_veh {
+    struct rt_veh *next;
+    PVECTORED_EXCEPTION_HANDLER fn;         /* NULL: a free entry */
+};
+static struct rt_veh g_veh_pool[RT_VEH_MAX];
+static struct rt_veh *g_veh_head[2];        /* 0 exception handlers, 1 continue handlers */
+static volatile LONG g_veh_lock;
+
+static void rt_veh_lock(void) {
+    while (__atomic_exchange_n(&g_veh_lock, 1, __ATOMIC_ACQUIRE)) __builtin_ia32_pause();
+}
+static void rt_veh_unlock(void) { __atomic_store_n(&g_veh_lock, 0, __ATOMIC_RELEASE); }
+
+static PVOID rt_veh_add(int list, ULONG first, PVECTORED_EXCEPTION_HANDLER fn) {
+    if (!fn) return 0;
+    rt_veh_lock();
+    struct rt_veh *e = 0;
+    for (int i = 0; i < RT_VEH_MAX && !e; i++)
+        if (!g_veh_pool[i].fn) e = &g_veh_pool[i];
+    if (e) {
+        e->fn = fn;
+        e->next = 0;
+        if (first || !g_veh_head[list]) {
+            e->next = g_veh_head[list];
+            g_veh_head[list] = e;
+        } else {
+            struct rt_veh *t = g_veh_head[list];
+            while (t->next) t = t->next;
+            t->next = e;
+        }
+    }
+    rt_veh_unlock();
+    return e;
+}
+
+static ULONG rt_veh_remove(int list, PVOID h) {
+    ULONG done = 0;
+    rt_veh_lock();
+    for (struct rt_veh **pp = &g_veh_head[list]; *pp; pp = &(*pp)->next) {
+        if (*pp == h) {
+            struct rt_veh *e = *pp;
+            *pp = e->next;
+            e->next = 0;
+            e->fn = 0;
+            done = 1;
+            break;
+        }
+    }
+    rt_veh_unlock();
+    return done;
+}
+
+/* Call a list's handlers in order; EXCEPTION_CONTINUE_EXECUTION from one ends
+ * it and is the answer, else EXCEPTION_CONTINUE_SEARCH. */
+static LONG rt_veh_call(int list, EXCEPTION_POINTERS *ep) {
+    PVECTORED_EXCEPTION_HANDLER fns[RT_VEH_MAX];
+    int n = 0;
+    rt_veh_lock();
+    for (struct rt_veh *e = g_veh_head[list]; e && n < RT_VEH_MAX; e = e->next) fns[n++] = e->fn;
+    rt_veh_unlock();
+    for (int i = 0; i < n; i++)
+        if (fns[i](ep) == EXCEPTION_CONTINUE_EXECUTION) return EXCEPTION_CONTINUE_EXECUTION;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+PVOID rt_AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER fn) {
+    return rt_veh_add(0, first, fn);
+}
+ULONG rt_RemoveVectoredExceptionHandler(PVOID h) { return rt_veh_remove(0, h); }
+PVOID rt_AddVectoredContinueHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER fn) {
+    return rt_veh_add(1, first, fn);
+}
+ULONG rt_RemoveVectoredContinueHandler(PVOID h) { return rt_veh_remove(1, h); }
+
 /* ---- where a pc is ------------------------------------------------------ */
 
 static int rt_is_system_pc(ULONG64 pc) { return pc >= RT_SHIM_LO && pc < RT_SHIM_HI; }
@@ -370,8 +454,16 @@ static __attribute__((noreturn)) void rt_raise_status(DWORD code) {
     rt_terminate(code);
 }
 
-/* 1 when a handler took the exception (continue at orig), 0 when none did. */
+/* 1 when a handler took the exception (continue at orig), 0 when none did.
+ * The vectored handlers first; a vectored handler's CONTINUE_EXECUTION
+ * continues even a noncontinuable exception (as Windows 11 does). Whatever
+ * continues it, the continue handlers run before. */
 __attribute__((noinline)) static int rt_dispatch(EXCEPTION_RECORD *rec, CONTEXT *orig) {
+    EXCEPTION_POINTERS ep = { rec, orig };
+    if (rt_veh_call(0, &ep) == EXCEPTION_CONTINUE_EXECUTION) {
+        (void)rt_veh_call(1, &ep);
+        return 1;
+    }
     CONTEXT ctx = *orig;
     ULONG64 lo = orig->Rsp, hi = rt_stack_base(), nested = 0;
     for (int depth = 0; depth < 100000; depth++) {
@@ -413,6 +505,7 @@ __attribute__((noinline)) static int rt_dispatch(EXCEPTION_RECORD *rec, CONTEXT 
         switch ((int)d) {
         case ExceptionContinueExecution:
             if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) rt_raise_status(RT_STATUS_NONCONTINUABLE);
+            (void)rt_veh_call(1, &ep);
             return 1;
         case ExceptionContinueSearch:
             break;
@@ -475,6 +568,7 @@ __attribute__((noinline, noreturn)) static void rt_unhandled(EXCEPTION_RECORD *r
         LONG r = rt_UnhandledExceptionFilter(&ep);
         if (r == EXCEPTION_CONTINUE_EXECUTION) {
             if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) rt_raise_status(RT_STATUS_NONCONTINUABLE);
+            (void)rt_veh_call(1, &ep);
             rt_restore_context(ctx, 0);
         }
     } else {

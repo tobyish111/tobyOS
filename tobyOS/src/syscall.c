@@ -19764,6 +19764,44 @@ static void win32_sync_wake(struct win32_sync *o) {
     }
 }
 
+/* W7c: the exit codes of threads a wait reaped (thread_join frees the proc
+ * slot, and its exit_code with it), for GetExitCodeThread afterwards. A ring
+ * of the latest; a tid's newest entry is the one found. Windows keeps a
+ * thread object -- and its code -- until the last handle closes; tobyOS's
+ * thread handles carry no count, so a code can fall out of the ring after
+ * WIN32_TCODES later reaps in the process (and a reused tid is a live
+ * thread's first). */
+#define WIN32_TCODES 64
+static struct { int tg, tid; uint32_t code; bool used; } g_win32_tcodes[WIN32_TCODES];
+static unsigned g_win32_tcode_next;
+static int win32_tg_of(const struct proc *p) { return p->is_thread ? p->tgid : p->pid; }
+static void win32_tcode_put(int tid, int code) {
+    struct proc *me = current_proc();
+    if (!me) return;
+    unsigned i = g_win32_tcode_next++ % WIN32_TCODES;
+    g_win32_tcodes[i].tg = win32_tg_of(me);
+    g_win32_tcodes[i].tid = tid;
+    g_win32_tcodes[i].code = (uint32_t)code;
+    g_win32_tcodes[i].used = true;
+}
+static bool win32_tcode_get(int tg, int tid, uint32_t *code) {
+    for (unsigned k = 1; k <= WIN32_TCODES; k++) {
+        unsigned i = (g_win32_tcode_next - k) % WIN32_TCODES;
+        if (g_win32_tcodes[i].used && g_win32_tcodes[i].tg == tg && g_win32_tcodes[i].tid == tid) {
+            *code = g_win32_tcodes[i].code;
+            return true;
+        }
+    }
+    return false;
+}
+/* Reap ended thread tid (a wait took it), keeping its code. */
+static int win32_thread_reap(int tid) {
+    int code = 0;
+    int r = thread_join(tid, &code);
+    if (r == 0) win32_tcode_put(tid, code);
+    return r;
+}
+
 /* Is h signaled? `take`: and take it (an auto-reset event is reset, a
  * semaphore's count goes down by one, an ended thread is reaped). 1 yes,
  * 0 no, -1 not a handle one can wait on. */
@@ -19788,7 +19826,7 @@ static int win32_obj_ready(uint64_t h, bool take) {
         int tid = (int)(h & 0xFFFFFFFFULL);
         struct proc *t = proc_lookup(tid);
         if (t && t->state != PROC_TERMINATED) return 0;
-        if (t && take) (void)thread_join(tid, 0);
+        if (t && take) (void)win32_thread_reap(tid);
         return 1;
     }
     if ((int64_t)h == -1 || (int64_t)h == -2) return 0;  /* this process / thread: never */
@@ -20303,9 +20341,40 @@ static long w32_WaitForSingleObject(uint64_t *a) {
         return (long)win32_wait(&h, 1, false, (uint32_t)a[1]);
     if ((h & 0xFF00000000000000ULL) == WIN32_THREAD_TAG) {
         int tid = (int)(h & 0xFFFFFFFFULL);
-        return (thread_join(tid, 0) == 0) ? 0 : (long)0xFFFFFFFF;
+        return (win32_thread_reap(tid) == 0) ? 0 : (long)0xFFFFFFFF;
     }
     return 0;
+}
+
+/* kernel32!GetExitCodeThread(hThread, lpExitCode) -> BOOL. W7c: STILL_ACTIVE
+ * (259) while the thread runs (the current thread's pseudo handle too); once
+ * it has ended, its code -- the thread function's return value or
+ * ExitThread's argument -- from its proc while it waits to be reaped, from
+ * win32_tcode_get after a wait reaped it. Not a thread of this process:
+ * FALSE, ERROR_INVALID_HANDLE. */
+static long w32_GetExitCodeThread(uint64_t *a) {
+    uint64_t h = a[0];
+    struct proc *me = current_proc();
+    uint32_t code = 259;
+    if ((int64_t)h != -2) {
+        if ((h & 0xFF00000000000000ULL) != WIN32_THREAD_TAG || !me) {
+            win32_set_last_error(WIN32_ERR_INVALID_HANDLE);
+            return 0;
+        }
+        int tid = (int)(h & 0xFFFFFFFFULL), tg = win32_tg_of(me);
+        struct proc *t = proc_lookup(tid);
+        if (t && win32_tg_of(t) == tg) {
+            if (t->state == PROC_TERMINATED) code = (uint32_t)t->exit_code;
+        } else if (!win32_tcode_get(tg, tid, &code)) {
+            win32_set_last_error(WIN32_ERR_INVALID_HANDLE);
+            return 0;
+        }
+    }
+    if (!a[1] || copy_to_user((void *)(uintptr_t)a[1], &code, 4) != 0) {
+        win32_set_last_error(998 /* ERROR_NOACCESS */);
+        return 0;
+    }
+    return 1;
 }
 
 #define WIN32_CS_RECURSION 0x0C   /* CRITICAL_SECTION.RecursionCount (LONG) */
@@ -26603,6 +26672,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "ReleaseSemaphore",    w32_ReleaseSemaphore },
     { "kernel32.dll", "WaitForMultipleObjects", w32_WaitForMultipleObjects },
     { "kernel32.dll", "ResumeThread",        w32_ResumeThread },
+    { "kernel32.dll", "GetExitCodeThread",   w32_GetExitCodeThread },
     { "kernel32.dll", "GetCurrentThread",    w32_GetCurrentThread },
     { "kernel32.dll", "DuplicateHandle",     w32_DuplicateHandle },
     { "kernel32.dll", "SetThreadPriority",   w32_SetThreadPriority },

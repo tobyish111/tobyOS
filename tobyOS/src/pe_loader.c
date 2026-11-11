@@ -1250,6 +1250,11 @@ static const char *const g_pe_rt_names[] = {
     "RtlLookupFunctionEntry", "RtlVirtualUnwind", "RtlUnwindEx", "RtlUnwind",
     "__C_specific_handler", "SetUnhandledExceptionFilter", "UnhandledExceptionFilter",
     "SetErrorMode", "GetErrorMode",
+    /* W7c */
+    "AddVectoredExceptionHandler", "RemoveVectoredExceptionHandler",
+    "AddVectoredContinueHandler", "RemoveVectoredContinueHandler",
+    "RtlAddVectoredExceptionHandler", "RtlRemoveVectoredExceptionHandler",
+    "RtlAddVectoredContinueHandler", "RtlRemoveVectoredContinueHandler",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)
