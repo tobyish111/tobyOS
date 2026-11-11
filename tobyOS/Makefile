@@ -2633,6 +2633,13 @@ $(TRT)/tobyrt.dll: $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def
 	      -o $@ $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def -lkernel32 \
 	      -Wl,-e,0 -Wl,--image-base,0x32000000
 
+# Track C/W7c: win-veh34.exe (exit 34, as on Windows 11) -- vectored exception
+# and continue handlers, GetExitCodeThread, and raises on one thread while
+# another loads and frees /bin/dll28c.dll; its frames are win-seh33's.
+W34 := programs/win-exc34
+$(W34)/win-veh34.exe: $(W34)/veh34.c $(W33)/seh33s.S
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W34)/veh34.c $(W33)/seh33s.S
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3179,6 +3186,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-exc33/win-seh33.exe \
                programs/win-exc33/win-top33.exe \
                programs/tobyrt/tobyrt.dll \
+               programs/win-exc34/win-veh34.exe \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3382,6 +3390,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-exc33/win-top33.exe              $(INITRD_STAGE)/bin/win-top33.exe
 	mkdir -p $(INITRD_STAGE)/lib/win32
 	cp programs/tobyrt/tobyrt.dll                    $(INITRD_STAGE)/lib/win32/tobyrt.dll
+	cp programs/win-exc34/win-veh34.exe              $(INITRD_STAGE)/bin/win-veh34.exe
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4387,7 +4396,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-cxx32.exe bin/libstdc++-6.dll bin/libgcc_s_seh-1.dll  \
 	    bin/libwinpthread-1.dll                                       \
 	    bin/win-exc33.exe bin/win-unc33.exe bin/win-seh33.exe         \
-	    bin/win-top33.exe                                             \
+	    bin/win-top33.exe bin/win-veh34.exe                           \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \

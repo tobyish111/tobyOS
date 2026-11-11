@@ -7747,9 +7747,14 @@ void _start(void) {
     defined(WINPE28B_BOOT) || defined(WINPE28C_BOOT) || defined(WINPE29A_BOOT) || \
     defined(WINPE30A_BOOT) || defined(WINPE30B_BOOT) || defined(WINPE31A_BOOT) || \
     defined(WINPE32A_BOOT) || defined(WINPE33A_BOOT) || defined(WINPE33B_BOOT) || \
-    defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT)
+    defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT) || defined(WINPE34A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
-     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W7b:
+     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W7c:
+     *   34A /bin/win-veh34.exe: vectored exception and continue handlers --
+     *       order, First, what ends each list, a noncontinuable exception,
+     *       Remove -- GetExitCodeThread, and raises on one thread while
+     *       another loads and frees a DLL (15 checks), 34.
+     * W7b:
      *   33A /bin/win-exc33.exe: C++ exceptions on the same DLLs -- caught in
      *       the throwing function, three frames up with the destructors
      *       between, thrown inside libstdc++-6.dll, by base class, rethrown,
@@ -7879,6 +7884,10 @@ void _start(void) {
 #ifdef WINPE33D_BOOT
             { "WINPE33D", "/bin/win-top33.exe", "win-top33.exe", 36,
               "an exception no frame takes: the top-level filter's answers, the unwind, the exit code" },
+#endif
+#ifdef WINPE34A_BOOT
+            { "WINPE34A", "/bin/win-veh34.exe", "win-veh34.exe", 34,
+              "vectored exception and continue handlers, GetExitCodeThread (15 checks)" },
 #endif
         };
         win32_gui_set_log(true);
