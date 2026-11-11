@@ -25,6 +25,7 @@
 #define CR4_SMAP          (1UL << 21)
 #define CR0_MP            (1UL << 1)    /* monitor coprocessor               */
 #define CR0_EM            (1UL << 2)    /* FPU emulation (must be 0 for SSE) */
+#define CR0_NE            (1UL << 5)    /* x87 errors as #MF, not FERR#/IRQ 13 */
 #define MSR_IA32_EFER     0xC0000080UL
 #define EFER_NXE          (1UL << 11)
 
@@ -66,7 +67,10 @@ void hardening_init(void) {
      * state is saved/restored across switches by proc_context_switch. */
     {
         uint64_t cr0 = read_cr0();
-        cr0 = (cr0 & ~CR0_EM) | CR0_MP;
+        /* W7d: CR0.NE too -- an unmasked x87 exception is then #MF at the
+         * next x87 instruction, as Windows and Linux both run (the bootloader
+         * left the legacy FERR#/IRQ 13 route, which a 64-bit OS never uses). */
+        cr0 = (cr0 & ~CR0_EM) | CR0_MP | CR0_NE;
         __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
         cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
         kprintf("[hardening] SSE enabled (CR0.EM=0, CR4.OSFXSR|OSXMMEXCPT)\n");
@@ -127,7 +131,7 @@ void hardening_init_ap(void) {
      * just-reset AP comes up with caches disabled and the trampoline leaves
      * them off -- running user code uncached works but is cripplingly slow. */
     uint64_t cr0 = read_cr0();
-    cr0 = (cr0 & ~CR0_EM) | CR0_MP;
+    cr0 = (cr0 & ~CR0_EM) | CR0_MP | CR0_NE;   /* NE: x87 errors as #MF (W7d) */
     cr0 &= ~((1UL << 30) | (1UL << 29));   /* clear CD (30) and NW (29) */
     __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
 

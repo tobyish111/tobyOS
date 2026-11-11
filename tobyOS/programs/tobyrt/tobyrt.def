@@ -24,3 +24,4 @@ EXPORTS
     RtlRemoveVectoredExceptionHandler = rt_RemoveVectoredExceptionHandler
     RtlAddVectoredContinueHandler = rt_AddVectoredContinueHandler
     RtlRemoveVectoredContinueHandler = rt_RemoveVectoredContinueHandler
+    KiUserExceptionDispatcher = rt_KiUserExceptionDispatcher

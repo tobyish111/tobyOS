@@ -47,7 +47,11 @@ rt_capture_context:
 	movw	%gs, 0x40(%rcx)
 	movw	%ss, 0x42(%rcx)
 	stmxcsr	0x34(%rcx)
-	fnstcw	0x100(%rcx)
+	testb	$15, %cl			/* W7d: an aligned CONTEXT takes the whole x87/SSE state */
+	jnz	1f
+	fxsave	0x100(%rcx)
+	jmp	2f
+1:	fnstcw	0x100(%rcx)
 	stmxcsr	0x118(%rcx)
 	movups	%xmm0, 0x1A0(%rcx)
 	movups	%xmm1, 0x1B0(%rcx)
@@ -65,15 +69,16 @@ rt_capture_context:
 	movups	%xmm13, 0x270(%rcx)
 	movups	%xmm14, 0x280(%rcx)
 	movups	%xmm15, 0x290(%rcx)
-	movl	$0x10000F, 0x30(%rcx)		/* CONTEXT_AMD64 | CONTROL | INTEGER | SEGMENTS | FLOATING_POINT */
+2:	movl	$0x10000F, 0x30(%rcx)		/* CONTEXT_AMD64 | CONTROL | INTEGER | SEGMENTS | FLOATING_POINT */
 	movq	0x78(%rcx), %rax
 	addq	$8, %rsp
 	ret
 	.seh_endproc
 
 /* void RtlRestoreContext(CONTEXT *ctx, EXCEPTION_RECORD *rec): continue at
- * ctx -- every integer and XMM register, MXCSR, the arithmetic flags, Rsp and
- * Rip at once through an IRETQ (same privilege, so nothing else changes).
+ * ctx -- every integer register, the arithmetic flags, and (with
+ * CONTEXT_FLOATING_POINT) the x87/SSE state, then Rsp and Rip at once through
+ * an IRETQ (same privilege, so nothing else changes).
  * rec is not used: STATUS_LONGJUMP and STATUS_UNWIND_CONSOLIDATE records are
  * not handled. */
 	.p2align 4
@@ -82,28 +87,27 @@ rt_capture_context:
 	.seh_proc	rt_restore_context
 rt_restore_context:
 	.seh_endprologue
-	movl	0x34(%rcx), %eax
-	andl	$0xFFFF, %eax
-	pushq	%rax
-	ldmxcsr	(%rsp)
-	popq	%rax
-	movups	0x1A0(%rcx), %xmm0
-	movups	0x1B0(%rcx), %xmm1
-	movups	0x1C0(%rcx), %xmm2
-	movups	0x1D0(%rcx), %xmm3
-	movups	0x1E0(%rcx), %xmm4
-	movups	0x1F0(%rcx), %xmm5
-	movups	0x200(%rcx), %xmm6
-	movups	0x210(%rcx), %xmm7
-	movups	0x220(%rcx), %xmm8
-	movups	0x230(%rcx), %xmm9
-	movups	0x240(%rcx), %xmm10
-	movups	0x250(%rcx), %xmm11
-	movups	0x260(%rcx), %xmm12
-	movups	0x270(%rcx), %xmm13
-	movups	0x280(%rcx), %xmm14
-	movups	0x290(%rcx), %xmm15
-	movq	0x90(%rcx), %rbx
+	/* W7d: with CONTEXT_FLOATING_POINT, the whole x87/SSE state -- the x87
+	 * control and status words and registers, MXCSR (the context's MxCsr
+	 * field, masked to its valid bits), XMM0-15 -- through FXRSTOR from an
+	 * aligned copy (the context need not be aligned) */
+	testl	$8, 0x30(%rcx)
+	jz	2f
+	subq	$0x218, %rsp
+	leaq	0xF(%rsp), %rax
+	andq	$-16, %rax
+	xorl	%edx, %edx
+1:	movups	0x100(%rcx,%rdx), %xmm0
+	movaps	%xmm0, (%rax,%rdx)
+	addq	$16, %rdx
+	cmpq	$512, %rdx
+	jb	1b
+	movl	0x34(%rcx), %edx
+	andl	$0xFFFF, %edx
+	movl	%edx, 0x18(%rax)
+	fxrstor	(%rax)
+	addq	$0x218, %rsp
+2:	movq	0x90(%rcx), %rbx
 	movq	0xA0(%rcx), %rbp
 	movq	0xA8(%rcx), %rsi
 	movq	0xB0(%rcx), %rdi
@@ -170,6 +174,49 @@ rt_call_unwind_handler:
 	addq	$0x38, %rsp
 	ret
 	.seh_handler	rt_unwind_collided, @unwind
+	.seh_endproc
+
+/* void KiUserExceptionDispatcher(void) -- W7d: where the kernel sends a
+ * thread that faulted (src/win32_seh.c), with Rsp = S:
+ *   S + 0x000  home space
+ *   S + 0x020  CONTEXT of the fault
+ *   S + 0x4F0  EXCEPTION_RECORD
+ *   S + 0x590  machine frame: Rip, CS, RFLAGS, Rsp, SS of the fault
+ * Never entered by a call: the "prolog" below is a description only (no
+ * instruction of it is executed) -- the machine frame, the frame's size, and
+ * where the fault's nonvolatile registers are (in the CONTEXT) -- so a walk
+ * that reaches this frame unwinds it into the faulting function, with the
+ * fault's registers, as through ntdll's on Windows. */
+	.p2align 4
+	.globl	rt_KiUserExceptionDispatcher
+	.def	rt_KiUserExceptionDispatcher;	.scl	2;	.type	32;	.endef
+	.seh_proc	rt_KiUserExceptionDispatcher
+rt_KiUserExceptionDispatcher:
+	.seh_pushframe
+	.seh_stackalloc	0x590
+	.seh_savereg	%rbx, 0xB0		/* 0x20 + CONTEXT.Rbx (0x90) */
+	.seh_savereg	%rbp, 0xC0
+	.seh_savereg	%rsi, 0xC8
+	.seh_savereg	%rdi, 0xD0
+	.seh_savereg	%r12, 0xF8
+	.seh_savereg	%r13, 0x100
+	.seh_savereg	%r14, 0x108
+	.seh_savereg	%r15, 0x110
+	.seh_savexmm	%xmm6, 0x220		/* 0x20 + CONTEXT.Xmm6 (0x200) */
+	.seh_savexmm	%xmm7, 0x230
+	.seh_savexmm	%xmm8, 0x240
+	.seh_savexmm	%xmm9, 0x250
+	.seh_savexmm	%xmm10, 0x260
+	.seh_savexmm	%xmm11, 0x270
+	.seh_savexmm	%xmm12, 0x280
+	.seh_savexmm	%xmm13, 0x290
+	.seh_savexmm	%xmm14, 0x2A0
+	.seh_savexmm	%xmm15, 0x2B0
+	.seh_endprologue
+	leaq	0x4F0(%rsp), %rcx
+	leaq	0x20(%rsp), %rdx
+	call	rt_dispatch_fault
+	int3
 	.seh_endproc
 
 /* memcpy and memset (not exported): what the C half's CONTEXT copies call. */

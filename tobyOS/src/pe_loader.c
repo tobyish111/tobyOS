@@ -615,6 +615,8 @@ static const uint8_t g_win32_ldr_stubs[] = {
 _Static_assert(WIN32_MT_LDR == 0x28, "the loader stubs hard-code __toby_ldr's slot");
 _Static_assert(WIN32_MT_ATEXIT == 0x30 && WIN32_ONEXIT_EXEC_VA == 0x300002C0ULL,
                "the CRT's exit stub hard-codes the atexit slot and _execute_onexit_table");
+_Static_assert(WIN32_MT_ATEXIT + 8 <= WIN32_MT_KIUSER && WIN32_MT_KIUSER + 8 <= WIN32_MT_INIT_LIST,
+               "the fault entry's slot sits between the atexit slot and the init list");
 _Static_assert(8 + WIN32_LDR_BUF_MAX * 24 <= 0x310, "the loader stubs' buffer is 0x310 bytes");
 _Static_assert(WIN32_LDR_CTL_TLS == 0x100 && WIN32_LDR_CTL_RES == 0x200 && WIN32_LDR_CTL_CHECK == 0x400,
                "the loader stubs hard-code the list's ctl bits");
@@ -1659,6 +1661,13 @@ static void pe_commit(struct pe_ctx *c) {
         }
         (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_MODS + (uint64_t)i * WIN32_MT_MOD_STRIDE, r, sizeof r);
     }
+    /* W7d: where the kernel sends a faulting thread (src/win32_seh.c) -- the
+     * runtime's entry while the runtime is mapped, else 0 (the fault takes
+     * the old path). Written with the committed records, so it never names
+     * a runtime a failed LoadLibrary has unmapped again. */
+    int rj = pe_loaded(c, PE_RT_NAME);
+    uint64_t ki = rj >= 0 ? pe_export_lookup(c, rj, "KiUserExceptionDispatcher", 0, 0) : 0;
+    (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_KIUSER, &ki, 8);
 }
 
 /* At process start: the header, the init list and the records. */

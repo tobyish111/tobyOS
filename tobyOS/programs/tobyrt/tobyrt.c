@@ -600,6 +600,16 @@ __attribute__((noinline)) void rt_RtlRaiseException(EXCEPTION_RECORD *rec) {
     rt_unhandled(rec, &ctx);
 }
 
+/* W7d: a CPU fault, from rt_KiUserExceptionDispatcher (tobyrt_s.S): the
+ * kernel (src/win32_seh.c) put the record and the fault's context on the
+ * stack. Dispatched as a raise is; a handler that continues it continues at
+ * the context -- the faulting instruction again, unless the handler moved
+ * Rip -- and nobody taking it ends the process with its code. */
+__attribute__((noreturn)) void rt_dispatch_fault(EXCEPTION_RECORD *rec, CONTEXT *ctx) {
+    if (rt_dispatch(rec, ctx)) rt_restore_context(ctx, 0);
+    rt_unhandled(rec, ctx);
+}
+
 /* RtlRaiseException comes back to its caller only through a restored context
  * (every path in it ends in a noreturn call), so the compiler takes it for
  * noreturn and puts an int3 after a direct call to it -- which a handler's

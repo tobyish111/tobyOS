@@ -82,6 +82,7 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_MT_MOD_COUNT     0x024   /* u32: record slots in use (high water) */
 #define WIN32_MT_LDR           0x028   /* u64: W4: __toby_ldr's thunk          */
 #define WIN32_MT_ATEXIT        0x030   /* u64: W7: the .exe's atexit table (_crt_atexit), 0 none */
+#define WIN32_MT_KIUSER        0x038   /* u64: W7d: tobyrt.dll's KiUserExceptionDispatcher, 0 none */
 #define WIN32_MT_INIT_LIST     0x040   /* {u64 entry, u64 base, u64 name VA}   */
 #define WIN32_MT_INIT_STRIDE   24
 #define WIN32_MT_MISS_STUB     0x1C0   /* u64: W4: next free missing-import stub */
@@ -218,6 +219,14 @@ struct pe_tls_tmpl {
     uint64_t total;         /* the block's size (the template + zero fill) */
 };
 int pe_rt_tls_templates(struct pe_tls_tmpl *out, int cap);
+
+/* W7d (src/win32_seh.c): a ring-3 CPU fault of a Win32 process, as an SEH
+ * exception -- the record and context on its stack, the trap frame redirected
+ * to tobyrt.dll's KiUserExceptionDispatcher. false when it cannot be (not a
+ * Win32 process, no runtime, no room on the stack, a vector SEH has no code
+ * for): the caller goes on as before. */
+struct regs;
+bool win32_fault_deliver(struct regs *r);
 
 /* W3 (src/syscall.c): 1 if tobyOS implements DLL `dll` itself -- a shim names
  * it, or it is an API-set name (api-ms-win-*, ext-ms-win-*) -- so the loader

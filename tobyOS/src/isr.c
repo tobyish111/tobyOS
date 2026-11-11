@@ -18,6 +18,7 @@
 #include <tobyos/percpu.h>   /* MAX_CPUS */
 #include <tobyos/signal.h>
 #include <tobyos/uaccess.h>  /* get_user_u64 -- SMAP-safe user stack read */
+#include <tobyos/pe.h>       /* W7d: win32_fault_deliver */
 
 /* During pid-0 bring-up, demand-map HHDM mirror gaps (UEFI memmap
  * holes, GOP framebuffer tagged RESERVED, freshly PMM'd pages). */
@@ -327,6 +328,16 @@ static void default_exception(struct regs *r) {
             if (r->rflags & 0x200) sti();
             if (ptrace_trap_stop(tp, SIGTRAP, r)) return;
         }
+    }
+
+    /* W7d: a fault of a Win32 program is an SEH exception, dispatched in its
+     * own user mode by tobyrt.dll (src/win32_seh.c) -- before the POSIX
+     * signal path, which a Win32 program has no use for. Every other
+     * personality goes on exactly as before; so does a Win32 process the
+     * runtime cannot take this fault for. */
+    if (from_user) {
+        struct proc *wp = current_proc();
+        if (wp && wp->personality == 2 /* ABI_PERS_WIN32 */ && win32_fault_deliver(r)) return;
     }
 
     if (from_user) {
