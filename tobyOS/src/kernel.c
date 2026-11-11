@@ -7745,9 +7745,16 @@ void _start(void) {
 #if defined(WINPE26A_BOOT) || defined(WINPE26B_BOOT) || defined(WINPE26C_BOOT) || \
     defined(WINPE27A_BOOT) || defined(WINPE27B_BOOT) || defined(WINPE28A_BOOT) || \
     defined(WINPE28B_BOOT) || defined(WINPE28C_BOOT) || defined(WINPE29A_BOOT) || \
-    defined(WINPE30A_BOOT) || defined(WINPE30B_BOOT) || defined(WINPE31A_BOOT)
+    defined(WINPE30A_BOOT) || defined(WINPE30B_BOOT) || defined(WINPE31A_BOOT) || \
+    defined(WINPE32A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
-     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W6:
+     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W7:
+     *   32A /bin/win-cxx32.exe: a C++ program built by g++ the ordinary way, on
+     *       the toolchain's own libstdc++-6.dll, libgcc_s_seh-1.dll and
+     *       libwinpthread-1.dll -- iostreams, containers, std::thread, mutexes,
+     *       condition variables, thread_local, and its static destructor at
+     *       exit() (which makes the exit code 32).
+     * W6:
      *   31A /bin/win-proc31.exe: CreateProcessA/W -- the search, argv by the
      *       documented rules and the exact command line, exit codes,
      *       WaitForSingleObject/GetExitCodeProcess/TerminateProcess, pipes as
@@ -7834,6 +7841,10 @@ void _start(void) {
 #ifdef WINPE31A_BOOT
             { "WINPE31A", "/bin/win-proc31.exe", "win-proc31.exe", 31,
               "CreateProcess: PE, native and Linux children, pipes, exit codes (18 checks)" },
+#endif
+#ifdef WINPE32A_BOOT
+            { "WINPE32A", "/bin/win-cxx32.exe", "win-cxx32.exe", 32,
+              "C++ on the toolchain's libstdc++/libgcc_s/libwinpthread DLLs (12 checks + exit())" },
 #endif
         };
         win32_gui_set_log(true);

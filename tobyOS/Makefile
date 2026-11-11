@@ -2581,6 +2581,20 @@ $(W31)/child31.exe: $(W31)/child31.c
 $(W31)/win-proc31.exe: $(W31)/main.c
 	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -o $@ $<
 
+# Track C/W7: DLLs someone else built. win-cxx32.exe is a C++ program built
+# by the toolchain's g++ the ordinary way -- dynamically linked -- and runs on
+# the toolchain's own libstdc++-6.dll, libgcc_s_seh-1.dll and
+# libwinpthread-1.dll, copied from g++'s directory to beside it in /bin.
+# Exit 32 (it does on Windows 11 too).
+W32X := programs/win-cxx32
+W32X_GXX ?= g++
+W32X_BIN = $(dir $(shell command -v $(W32X_GXX)))
+W32X_DLLS := libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll
+$(W32X)/win-cxx32.exe: $(W32X)/main.cpp
+	TMP='C:\t' TEMP='C:\t' $(W32X_GXX) -O1 -o $@ $<
+$(addprefix $(W32X)/,$(W32X_DLLS)): $(W32X)/win-cxx32.exe
+	cp $(W32X_BIN)$(notdir $@) $@
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3118,6 +3132,10 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-proc31/win-proc31.exe \
                programs/win-proc31/child31.exe \
                programs/win-proc31/notpe.txt \
+               programs/win-cxx32/win-cxx32.exe \
+               programs/win-cxx32/libstdc++-6.dll \
+               programs/win-cxx32/libgcc_s_seh-1.dll \
+               programs/win-cxx32/libwinpthread-1.dll \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3311,6 +3329,10 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-proc31/win-proc31.exe            $(INITRD_STAGE)/bin/win-proc31.exe
 	cp programs/win-proc31/child31.exe               $(INITRD_STAGE)/bin/child31.exe
 	cp programs/win-proc31/notpe.txt                $(INITRD_STAGE)/bin/notpe31.exe
+	cp programs/win-cxx32/win-cxx32.exe              $(INITRD_STAGE)/bin/win-cxx32.exe
+	cp programs/win-cxx32/libstdc++-6.dll            $(INITRD_STAGE)/bin/libstdc++-6.dll
+	cp programs/win-cxx32/libgcc_s_seh-1.dll         $(INITRD_STAGE)/bin/libgcc_s_seh-1.dll
+	cp programs/win-cxx32/libwinpthread-1.dll        $(INITRD_STAGE)/bin/libwinpthread-1.dll
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4313,6 +4335,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-life30.exe bin/life30a.dll bin/life30c.dll bin/life30n.dll \
 	    bin/life30d.dll bin/life30s.dll bin/win-life30b.exe           \
 	    bin/win-proc31.exe bin/child31.exe bin/notpe31.exe            \
+	    bin/win-cxx32.exe bin/libstdc++-6.dll bin/libgcc_s_seh-1.dll  \
+	    bin/libwinpthread-1.dll                                       \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
