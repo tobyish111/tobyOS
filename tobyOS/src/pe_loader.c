@@ -1257,6 +1257,8 @@ static const char *const g_pe_rt_names[] = {
     "AddVectoredContinueHandler", "RemoveVectoredContinueHandler",
     "RtlAddVectoredExceptionHandler", "RtlRemoveVectoredExceptionHandler",
     "RtlAddVectoredContinueHandler", "RtlRemoveVectoredContinueHandler",
+    /* W7d-2 */
+    "GetCurrentThreadStackLimits",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)
@@ -2487,12 +2489,23 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
      * Zero the page, then set the self-pointer + stack bounds. The proc's GS
      * base is set to WIN32_TEB_BASE by the spawn path, and the SWAPGS scheme
      * makes gs:[...] resolve here while the PE runs in CPL3. */
+    /* W7d-2: the main thread's stack is a reservation of the .exe's
+     * SizeOfStackReserve -- at least 512 KiB (spawn maps 256 KiB of it at
+     * once, and the guard and some room must lie below that), at most the
+     * 8 MiB the stack growth path reaches -- its lowest 16 KiB the guard
+     * (page_fault.c grows it no further than the guard's top: the spawn path
+     * sets p->win_stack_floor from out->stack_reserve). */
+    uint64_t sres = (opt->stack_reserve + 0xFFFFull) & ~0xFFFFull;
+    if (sres < 0x80000ull) sres = 0x80000ull;
+    if (sres > 0x800000ull) sres = 0x800000ull;
+    out->stack_reserve = sres;
     {
         unsigned long uf = uaccess_begin();
         memset((void *)WIN32_TEB_BASE, 0, PAGE_SIZE);
         *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_SELF)       = WIN32_TEB_BASE;
         *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_STACKBASE)  = WIN32_USER_STACK_TOP;
-        *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_STACKLIMIT) = WIN32_USER_STACK_TOP - 0x200000ULL;
+        *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_STACKLIMIT) = WIN32_USER_STACK_TOP - sres + WIN32_STACK_GUARD_BYTES;
+        *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_STACK_BOTTOM) = WIN32_USER_STACK_TOP - sres;
         memset((void *)WIN32_MODTAB_BASE, 0, WIN32_MODTAB_BYTES);
         uaccess_end(uf);
     }

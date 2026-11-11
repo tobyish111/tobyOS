@@ -839,6 +839,16 @@ LPTOP_LEVEL_EXCEPTION_FILTER rt_SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTIO
                                                              (void *)f, __ATOMIC_SEQ_CST);
 }
 
+/* GetCurrentThreadStackLimits (W7d-2): the thread's stack reservation,
+ * [lowest address, StackBase) -- the lowest kept in the TEB's slot 0x2F8
+ * (include/tobyos/pe.h, WIN32_TEB_STACK_BOTTOM), StackBase at 0x08. */
+void rt_GetCurrentThreadStackLimits(PULONG_PTR low, PULONG_PTR high) {
+    ULONG64 bottom = __readgsqword(0x2F8);
+    ULONG64 top = __readgsqword(8);
+    if (low) *low = (ULONG_PTR)bottom;
+    if (high) *high = (ULONG_PTR)top;
+}
+
 /* SetErrorMode / GetErrorMode: the process's error mode. Of its flags only
  * SEM_NOGPFAULTERRORBOX means anything here (rt_report); the rest are kept
  * and given back. */

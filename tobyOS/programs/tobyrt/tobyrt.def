@@ -25,3 +25,4 @@ EXPORTS
     RtlAddVectoredContinueHandler = rt_AddVectoredContinueHandler
     RtlRemoveVectoredContinueHandler = rt_RemoveVectoredContinueHandler
     KiUserExceptionDispatcher = rt_KiUserExceptionDispatcher
+    GetCurrentThreadStackLimits = rt_GetCurrentThreadStackLimits

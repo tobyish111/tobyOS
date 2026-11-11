@@ -489,7 +489,12 @@ static bool page_fault_resolve(uint64_t fault_addr, uint64_t error_code,
      * pointer as "stack". */
     if ((error_code & PF_ERR_USER) && p->user_stack_base &&
         page_va <  p->user_stack_base &&
-        page_va >= USER_STACK_FLOOR_VA) {
+        page_va >= USER_STACK_FLOOR_VA &&
+        /* W7d-2: a Win32 main thread's stack stops at its guard's top (its
+         * reservation, the .exe's SizeOfStackReserve): a fault below is a
+         * stack overflow for src/win32_seh.c. Every other process as before. */
+        !(p->personality == 2 /* ABI_PERS_WIN32 */ && p->win_stack_floor &&
+          page_va < p->win_stack_floor)) {
 
         /* Map EVERY page from the fault up to the current base -- like
          * Linux's expand_stack, which extends the VMA to COVER the fault,

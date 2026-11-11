@@ -1323,6 +1323,8 @@ static int spawn_body(const char *path, const char *name,
         p->win_tls_raw_size = pe_info.tls_raw_size;
         p->win_tls_total    = pe_info.tls_total;
         p->win_tls_index    = pe_info.tls_index;
+        /* W7d-2: the main thread's stack grows down to its guard, no further */
+        p->win_stack_floor  = USER_STACK_TOP_VA - pe_info.stack_reserve + WIN32_STACK_GUARD_BYTES;
         kprintf("[proc] pid %d '%s' -> Win32 PE personality (entry=%p teb=%p)\n",
                 p->pid, p->name, (void *)pe_info.entry, (void *)pe_info.teb);
         ok = build_user_stack(p, USER_STACK_PAGES);

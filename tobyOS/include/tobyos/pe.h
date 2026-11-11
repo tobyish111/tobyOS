@@ -35,7 +35,18 @@ struct pe_load_info {
     uint64_t tls_raw_size; /* template raw byte count (End - Start)                */
     uint64_t tls_total;    /* per-thread block size (raw + zero-fill, 16-aligned)  */
     uint64_t tls_index;    /* the module's assigned _tls_index (0 = sole module)   */
+    uint64_t stack_reserve; /* W7d-2: the main thread's stack reservation (bytes) */
 };
+
+/* W7d-2: a Win32 thread's stack is a reservation whose lowest
+ * WIN32_STACK_GUARD_BYTES are a guard: running into it is
+ * STATUS_STACK_OVERFLOW, once (src/win32_seh.c). Two slots of the TEB, which
+ * tobyOS keeps to its first KiB (Windows' TEB.DeallocationStack, 0x1478, is
+ * past it): the reservation's lowest address, and whether its guard is
+ * spent. */
+#define WIN32_STACK_GUARD_BYTES   (16u * 1024u)
+#define WIN32_TEB_STACK_BOTTOM    0x2F8   /* u64 */
+#define WIN32_TEB_STACK_SPENT     0x300   /* u32 */
 
 /* True if [image,size) looks like a PE/COFF image: 'MZ' DOS magic and a
  * 'PE\0\0' signature at e_lfanew. Cheap sniff used by the exec path to

@@ -19974,8 +19974,8 @@ static long w32_CloseHandle(uint64_t *a) {
  * EnterCriticalSection/LeaveCriticalSection are REAL mutual exclusion: the
  * lock state lives in the user CRITICAL_SECTION struct (OwningThread at +0x10,
  * RecursionCount at +0x0C), and the BKL makes the read-modify-write atomic
- * across threads. */
-#define WIN32_THREAD_STACK (256u * 1024u)
+ * across threads. (W7d-2: a thread's stack is its own reservation now, see
+ * w32_CreateThread -- no longer 256 KiB of the bump heap.) */
 
 /* ================= C16e: per-thread TEBs + TLS =================
  * Each CreateThread thread gets its OWN TEB (so gs:[0x30] / NtCurrentTeb is
@@ -20170,6 +20170,7 @@ static __attribute__((noreturn)) void win32_park_forever(void) {
     }
 }
 
+static uint64_t win32_exe_base(void);
 static long w32_CreateThread(uint64_t *a) {
     uint64_t start = a[2];   /* lpStartAddress */
     uint64_t param = a[3];   /* lpParameter    */
@@ -20181,9 +20182,33 @@ static long w32_CreateThread(uint64_t *a) {
     uint64_t fp[2] = { start, param };
     if (copy_to_user((void *)(uintptr_t)block, fp, 16) != 0) return 0;
 
-    uint64_t stack = win32_heap_alloc(WIN32_THREAD_STACK);
-    if (!stack) return 0;
-    uint64_t stack_top = (stack + WIN32_THREAD_STACK) & ~0xFULL;   /* 16-aligned */
+    /* W7d-2: the thread's stack is a reservation of its own -- dwStackSize
+     * with STACK_SIZE_PARAM_IS_A_RESERVATION (0x10000), else the .exe's
+     * SizeOfStackReserve (dwStackSize being the commit then, which a
+     * demand-paged mapping makes moot, unless it is the larger) -- 64 KiB at
+     * least, 256 MiB at most, its lowest WIN32_STACK_GUARD_BYTES a guard with
+     * no access: running into it is STATUS_STACK_OVERFLOW (src/win32_seh.c).
+     * (A slice of the bump heap until W7d-2: 256 KiB, no guard -- an overflow
+     * ran into the heap.) */
+    uint64_t reserve = 0;
+    {
+        uint64_t eb = win32_exe_base();
+        uint32_t lfanew = 0;
+        if (copy_from_user(&lfanew, (const void *)(uintptr_t)(eb + 0x3C), 4) == 0 && lfanew < 0x1000)
+            (void)copy_from_user(&reserve, (const void *)(uintptr_t)(eb + lfanew + 0x18 + 0x48), 8);
+        uint64_t want = (uint64_t)(uint32_t)a[1];
+        if (((uint32_t)a[4] & 0x10000u) && want) reserve = want;
+        else if (want > reserve) reserve = want;
+        if (!reserve) reserve = 0x100000;
+        reserve = (reserve + 0xFFFFull) & ~0xFFFFull;
+        if (reserve < 0x10000) reserve = 0x10000;
+        if (reserve > 0x10000000ull) reserve = 0x10000000ull;
+    }
+    long smap = sys_mmap(0, reserve, 0x03 /*RW*/, 0x05 /*ANON|PRIVATE*/, -1, 0);
+    if (smap < 0) return 0;
+    uint64_t stack = (uint64_t)smap;
+    (void)sys_mprotect(stack, WIN32_STACK_GUARD_BYTES, 0 /* PROT_NONE: the guard */);
+    uint64_t stack_top = stack + reserve;
 
     struct proc *leader = current_proc();
     int tid = thread_create(WIN32_THREAD_WRAPPER_VA, block, stack_top, 0);
@@ -20200,10 +20225,11 @@ static long w32_CreateThread(uint64_t *a) {
          * reachable via the thread's gs_base once do_switch loads it. */
         uint64_t teb = win32_heap_alloc(0x400);
         if (teb) {
-            uint64_t self = teb, sb = stack_top, sl = stack;
+            uint64_t self = teb, sb = stack_top, sl = stack + WIN32_STACK_GUARD_BYTES, bottom = stack;
             (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_SELF_OFF),       &self, 8);
             (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_STACKBASE_OFF),  &sb,   8);
             (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_STACKLIMIT_OFF), &sl,   8);
+            (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_STACK_BOTTOM),   &bottom, 8);
             t->gs_base = teb;
             /* W7: CREATE_SUSPENDED -- the thread waits at its start (before its
              * DLL_THREAD_ATTACH) until ResumeThread; its suspend count is in its

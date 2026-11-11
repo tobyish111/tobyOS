@@ -730,6 +730,10 @@ struct proc {
     uint64_t        win_tls_raw_size;
     uint64_t        win_tls_total;
     uint64_t        win_tls_index;
+    /* W7d-2: the lowest address a Win32 main thread's stack grows to -- the
+     * top of its guard. page_fault.c grows it no further, so running into the
+     * guard is src/win32_seh.c's STATUS_STACK_OVERFLOW. 0: no floor. */
+    uint64_t        win_stack_floor;
     struct proc    *join_waiters;
 
     /* ---- Priority scheduling (gap #3: priority classes + timeslicing) ----

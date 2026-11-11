@@ -40,6 +40,7 @@
 #include <tobyos/uaccess.h>
 #include <tobyos/cpu.h>
 #include <tobyos/pe.h>
+#include <tobyos/vmm.h>      /* W7d-2: sys_mprotect (a thread's stack guard) */
 #include <tobyos/abi/abi.h>
 
 #define W32X_ACCESS_VIOLATION       0xC0000005u
@@ -50,6 +51,7 @@
 #define W32X_BREAKPOINT             0x80000003u
 #define W32X_SINGLE_STEP            0x80000004u
 #define W32X_DATATYPE_MISALIGNMENT  0x80000002u
+#define W32X_STACK_OVERFLOW         0xC00000FDu
 #define W32X_FLT_DENORMAL_OPERAND   0xC000008Du
 #define W32X_FLT_DIVIDE_BY_ZERO     0xC000008Eu
 #define W32X_FLT_INEXACT_RESULT     0xC000008Fu
@@ -327,6 +329,24 @@ bool win32_fault_deliver(struct regs *r) {
         rec.nparams = 2;
         rec.info[0] = (r->error_code & 0x10) ? 8 : (r->error_code & 0x02) ? 1 : 0;
         rec.info[1] = cr2;
+        /* W7d-2: into the thread's stack guard, the first time: a stack
+         * overflow. The guard opens for the dispatch to run in (Windows
+         * leaves about as much); a second overflow finds none, and the
+         * process ends with the access violation. */
+        uint64_t bottom = 0;
+        uint32_t spent = 1;
+        if (p->gs_base &&
+            copy_from_user_nofault(&bottom, (const void *)(uintptr_t)(p->gs_base + WIN32_TEB_STACK_BOTTOM), 8) == 0 &&
+            copy_from_user_nofault(&spent, (const void *)(uintptr_t)(p->gs_base + WIN32_TEB_STACK_SPENT), 4) == 0 &&
+            bottom && !spent && cr2 >= bottom && cr2 < bottom + WIN32_STACK_GUARD_BYTES) {
+            spent = 1;
+            (void)copy_to_user((void *)(uintptr_t)(p->gs_base + WIN32_TEB_STACK_SPENT), &spent, 4);
+            if (bottom >= USER_STACK_FLOOR_VA)
+                p->win_stack_floor = bottom;            /* the main thread: grow into it */
+            else
+                (void)sys_mprotect(bottom, WIN32_STACK_GUARD_BYTES, 3);   /* a thread's: open it */
+            rec.code = W32X_STACK_OVERFLOW;
+        }
         break;
     }
     case 16: {                                          /* #MF: x87 */
@@ -376,9 +396,12 @@ bool win32_fault_deliver(struct regs *r) {
     if (copy_to_user((void *)(uintptr_t)(s + FRAME_CTX), cbuf, CTX_SIZE) != 0 ||
         copy_to_user((void *)(uintptr_t)(s + FRAME_REC), &rec, REC_SIZE) != 0 ||
         copy_to_user((void *)(uintptr_t)(s + FRAME_MACH), mach, sizeof mach) != 0) {
-        kprintf("[win32] fault 0x%x at %p: no room on the stack (rsp %p) for the dispatch\n",
-                rec.code, (void *)rip, (void *)r->rsp);
-        return false;
+        /* No stack to dispatch on (a second overflow, a wild Rsp): Windows
+         * ends the process with the exception's code -- so does this (W7d-2;
+         * until then the signal path's SIGSEGV, 139). */
+        kprintf("[win32] fault 0x%x at %p: no room on the stack (rsp %p) for the dispatch -- "
+                "the process ends with the code\n", rec.code, (void *)rip, (void *)r->rsp);
+        proc_exit_group((int)rec.code);
     }
     r->rip = kiuser;
     r->rsp = s;

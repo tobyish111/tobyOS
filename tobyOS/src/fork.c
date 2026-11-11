@@ -1438,6 +1438,7 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
     p->brk_max  = USER_HEAP_BASE + USER_HEAP_MAX_BYTES;
     p->win_heap_cur = 0;
     p->win_heap_end = 0;
+    p->win_stack_floor = 0;              /* W7d-2: an exec'd PE sets its own */
     p->clear_child_tid = 0;
 
     /* FD_CLOEXEC acts on ANY successful exec, a .exe included. */
@@ -1454,6 +1455,8 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
     p->win_tls_raw_size = pe_info.tls_raw_size;
     p->win_tls_total    = pe_info.tls_total;
     p->win_tls_index    = pe_info.tls_index;
+    /* W7d-2: the main thread's stack grows down to its guard, no further */
+    p->win_stack_floor  = USER_STACK_TOP_VA - pe_info.stack_reserve + WIN32_STACK_GUARD_BYTES;
 
     /* Update name from the new path. */
     const char *base = kpath;
