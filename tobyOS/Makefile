@@ -2648,6 +2648,10 @@ $(W34)/win-veh34.exe: $(W34)/veh34.c $(W33)/seh33s.S
 W35 := programs/win-exc35
 $(W35)/win-flt35.exe: $(W35)/flt35.c $(W35)/flt35s.S
 	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W35)/flt35.c $(W35)/flt35s.S
+# W7d's second part: win-so35.exe (exit 36) -- stack overflow on the main
+# thread and on a thread with a 64 KiB reservation.
+$(W35)/win-so35.exe: $(W35)/so35.c $(W35)/so35s.S
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W35)/so35.c $(W35)/so35s.S
 
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
@@ -3197,6 +3201,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/tobyrt/tobyrt.dll \
                programs/win-exc34/win-veh34.exe \
                programs/win-exc35/win-flt35.exe \
+               programs/win-exc35/win-so35.exe \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3402,6 +3407,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/tobyrt/tobyrt.dll                    $(INITRD_STAGE)/lib/win32/tobyrt.dll
 	cp programs/win-exc34/win-veh34.exe              $(INITRD_STAGE)/bin/win-veh34.exe
 	cp programs/win-exc35/win-flt35.exe              $(INITRD_STAGE)/bin/win-flt35.exe
+	cp programs/win-exc35/win-so35.exe               $(INITRD_STAGE)/bin/win-so35.exe
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4408,6 +4414,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/libwinpthread-1.dll                                       \
 	    bin/win-exc33.exe bin/win-unc33.exe bin/win-seh33.exe         \
 	    bin/win-top33.exe bin/win-veh34.exe bin/win-flt35.exe         \
+	    bin/win-so35.exe                                              \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \

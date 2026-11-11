@@ -7748,7 +7748,7 @@ void _start(void) {
     defined(WINPE30A_BOOT) || defined(WINPE30B_BOOT) || defined(WINPE31A_BOOT) || \
     defined(WINPE32A_BOOT) || defined(WINPE33A_BOOT) || defined(WINPE33B_BOOT) || \
     defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT) || defined(WINPE34A_BOOT) || \
-    defined(WINPE35A_BOOT)
+    defined(WINPE35A_BOOT) || defined(WINPE35B_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
      * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W7d:
      *   35A /bin/win-flt35.exe: CPU faults as SEH exceptions -- an access
@@ -7758,6 +7758,10 @@ void _start(void) {
      *       SIMD exception), an x87 one; every register through a handler
      *       and back; a fault caught two frames up; faults nobody handles
      *       (15 checks), 35.
+     *   35B /bin/win-so35.exe: stack overflow -- the reservation's size on
+     *       the main thread and a 64 KiB thread, an overflow caught on each
+     *       and going on, a deep recursion that fits, the unhandled and the
+     *       second overflow in children (6 checks), 36.
      * W7c:
      *   34A /bin/win-veh34.exe: vectored exception and continue handlers --
      *       order, First, what ends each list, a noncontinuable exception,
@@ -7901,6 +7905,10 @@ void _start(void) {
 #ifdef WINPE35A_BOOT
             { "WINPE35A", "/bin/win-flt35.exe", "win-flt35.exe", 35,
               "CPU faults as SEH exceptions (15 checks)" },
+#endif
+#ifdef WINPE35B_BOOT
+            { "WINPE35B", "/bin/win-so35.exe", "win-so35.exe", 36,
+              "stack overflow: the reservations, caught, unhandled, a second one (6 checks)" },
 #endif
         };
         win32_gui_set_log(true);
