@@ -224,20 +224,20 @@ static const uint8_t g_win32_gate[] = {
 
 /* Shim-page layout (fixed offsets the loader + the kernel shims agree on):
  *   0x00  gate (123 bytes, C11: 10-arg)
- *   0x80  thread wrapper (C6: CreateThread's CPL3 entry trampoline)
+ *   0x80  (free: C6's thread wrapper, until W5)
  *   0xC0  DispatchMessage trampoline (C7)
  *   0x100 dialog modal-loop trampoline (C14: DialogBoxParamA, 106 bytes)
  *   0x1F0 dialog-service gate-thunk (C14: __toby_dlgsvc, 10 bytes)
- *   0x200 init trampoline, 0x280 fail entry, 0x2C0 _execute_onexit_table (W3)
- *   0x300 LoadLibraryA/W/ExA/ExW + FreeLibrary (W4, 335 bytes)
+ *   0x200 (free: W3's init trampoline, until W5)
+ *   0x280 fail entry, 0x2C0 _execute_onexit_table (W3)
+ *   0x300 the loader's stubs (W4, W5: 712 bytes): LoadLibrary, FreeLibrary,
+ *         ExitThread, ExitProcess, thread and process start
  *   0xE00 setjmp / 0xE80 longjmp leaf stubs (C19b)
  *   0x1000.. procaddr table (one thunk per shim); 0x4000.. missing-import stubs
- * See WIN32_THREAD_WRAPPER_VA / WIN32_DLG_TRAMP_VA in pe.h for the user VAs. */
-#define WIN32_WRAPPER_OFF   0x80
+ * See WIN32_LDR_STUBS_VA / WIN32_DLG_TRAMP_VA in pe.h for the user VAs. */
 #define WIN32_DLGTRAMP_OFF  0x100     /* C14: DialogBoxParamA trampoline */
 #define WIN32_DLGSVC_THUNK_OFF 0x1F0  /* C14: __toby_dlgsvc gate-thunk (fixed VA) */
 #define WIN32_THUNK_BASE    0x200
-#define WIN32_WRAPPER_IMM_OFF 0x14    /* the thread-exit imm32 in the wrapper */
 
 /* C9: per-import thunks grow up from WIN32_THUNK_BASE; the GetProcAddress thunk
  * table (one slot per shim) sits at this fixed offset above them. Both must stay
@@ -262,24 +262,6 @@ static void pe_emit_gate_thunk(uint64_t page_off, uint32_t idx) {
     t[5] = 0xE9; memcpy(&t[6], &rel, 4);    /* jmp rel32 (gate) */
     memcpy((void *)(WIN32_SHIM_BASE + page_off), t, WIN32_THUNK_SIZE);
 }
-
-/* Position-independent thread wrapper (C6). A Win32 thread function is
- * entered here (via tobyOS thread_create, rdi = &{func, param}); it sets up
- * the Microsoft-x64 first arg (param -> rcx), calls the thread function,
- * then exits the thread with its DWORD return via a raw ABI_SYS_THREAD_EXIT
- * (patched into the imm32 at load). Verified by assembling the equivalent
- * .intel_syntax + extracting .text.
- *
- *   mov rax,[rdi] ; mov rcx,[rdi+8]     ; func, param(->rcx)
- *   sub rsp,0x20 ; call rax ; add rsp,0x20
- *   mov edi,eax ; mov eax,<THREAD_EXIT> ; syscall ; ud2
- */
-static const uint8_t g_win32_thread_wrapper[] = {
-    0x48, 0x8b, 0x07, 0x48, 0x8b, 0x4f, 0x08, 0x48, 0x83, 0xec, 0x20, 0xff,
-    0xd0, 0x48, 0x83, 0xc4, 0x20, 0x89, 0xc7, 0xb8, 0x00, 0x00, 0x00, 0x00,
-    0x0f, 0x05, 0x0f, 0x0b
-};
-#define WIN32_WRAPPER_SIZE (sizeof(g_win32_thread_wrapper))
 
 /* DispatchMessage trampoline (C7), at WIN32_DISPATCH_OFF. DispatchMessageA's
  * IAT slot points here. It reads the MSG (rcx), loads the registered WndProc
@@ -457,6 +439,14 @@ static uint64_t win32_user_stub_va(const char *dll, const char *func) {
     if (strcmp(func, "LoadLibraryExA") == 0) return WIN32_LDR_LOADEXA_VA;
     if (strcmp(func, "LoadLibraryExW") == 0) return WIN32_LDR_LOADEXW_VA;
     if (strcmp(func, "FreeLibrary") == 0)    return WIN32_LDR_FREE_VA;
+    /* W5: ending a thread or the process calls the DLLs' DllMains and TLS
+     * callbacks (DLL_THREAD_DETACH, DLL_PROCESS_DETACH) -- the CRT's exit
+     * and _exit too, which end in ExitProcess on Windows. */
+    if (strcmp(func, "ExitThread") == 0)     return WIN32_LDR_EXITTHR_VA;
+    if (strcmp(func, "FreeLibraryAndExitThread") == 0) return WIN32_LDR_FREEEXIT_VA;
+    if (strcmp(func, "ExitProcess") == 0 || strcmp(func, "exit") == 0 ||
+        strcmp(func, "_exit") == 0)
+        return WIN32_LDR_EXITPROC_VA;
     return 0;
 }
 
@@ -523,29 +513,11 @@ static uint64_t pe_missing_stub(struct pe_missing_area *m, const char *dll,
 /* W1: how many procaddr slots fit before the missing-import stubs. */
 #define WIN32_PA_CAP ((WIN32_MISSING_STUB_VA - WIN32_PROCADDR_BASE_VA) / WIN32_PROCADDR_STRIDE)
 
-/* W3: the CPL3 routines the loader starts a process through (assembled offline
- * from logs/w32/w3-tramp.S with clang --target=x86_64-elf, bytes taken with
- * objcopy). Both read the module table at its fixed VA (WIN32_MODTAB_BASE,
- * 0x31008000), so neither needs patching.
- *   init trampoline (WIN32_INIT_TRAMP_VA): for each entry of the init list,
- *   call entry(hinstDLL = base, DLL_PROCESS_ATTACH, lpvReserved = 1 -- a
- *   static load), in dependency order; a FALSE return calls __toby_loadfail
- *   with the DLL's name and STATUS_DLL_INIT_FAILED; then jump to the .exe's
- *   entry with RSP as at process start (RSP%16 == 8). Each DllMain is called
- *   with RSP%16 == 8 and 32 bytes of shadow space, as the x64 ABI wants.
- *   fail entry (WIN32_FAIL_ENTRY_VA): call __toby_loadfail with the loader's
- *   failure text and status from the module table. */
-static const uint8_t g_win32_init_tramp[] = {
-    0x48, 0x83, 0xec, 0x28, 0x48, 0xbb, 0x40, 0x80, 0x00, 0x31, 0x00, 0x00,
-    0x00, 0x00, 0x48, 0xb8, 0x00, 0x80, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00,
-    0x8b, 0x70, 0x10, 0x85, 0xf6, 0x74, 0x1d, 0x48, 0x8b, 0x4b, 0x08, 0xba,
-    0x01, 0x00, 0x00, 0x00, 0x41, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xff, 0x13,
-    0x85, 0xc0, 0x74, 0x18, 0x48, 0x83, 0xc3, 0x18, 0xff, 0xce, 0xeb, 0xdf,
-    0x48, 0x83, 0xc4, 0x28, 0x48, 0xb8, 0x00, 0x80, 0x00, 0x31, 0x00, 0x00,
-    0x00, 0x00, 0xff, 0x20, 0x48, 0x8b, 0x4b, 0x10, 0xba, 0x42, 0x01, 0x00,
-    0xc0, 0x48, 0xb8, 0x00, 0x80, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0xff,
-    0x50, 0x08, 0x0f, 0x0b,
-};
+/* W3: the fail entry (WIN32_FAIL_ENTRY_VA, from logs/w32/w3-tramp.S --
+ * assembled offline with clang --target=x86_64-elf, bytes taken with
+ * objcopy): the first instruction of a process whose loading failed; it calls
+ * __toby_loadfail with the loader's failure text and status from the module
+ * table (WIN32_MODTAB_BASE, 0x31008000, read at its fixed VA). */
 static const uint8_t g_win32_fail_entry[] = {
     0x48, 0x83, 0xec, 0x28, 0x48, 0xb8, 0x00, 0x80, 0x00, 0x31, 0x00, 0x00,
     0x00, 0x00, 0x48, 0x8b, 0x48, 0x18, 0x8b, 0x50, 0x20, 0xff, 0x50, 0x08,
@@ -562,50 +534,86 @@ static const uint8_t g_win32_onexit_exec[] = {
     0xeb, 0xeb, 0x31, 0xc0, 0x48, 0x89, 0x07, 0x48, 0x89, 0x47, 0x08, 0x48,
     0x89, 0x47, 0x10, 0x48, 0x83, 0xc4, 0x20, 0x5f, 0x5e, 0x5b, 0xc3,
 };
-/* W4: LoadLibraryA/W/ExA/ExW and FreeLibrary (logs/w32/w4-ldr.S; the entry
- * points' offsets are pe.h's WIN32_LDR_*_VA). Each calls the kernel through
+/* W4, W5: the loader's CPL3 half (logs/w32/w5-ldr.S, which describes it):
+ * LoadLibraryA/W/ExA/ExW, FreeLibrary, ExitThread, ExitProcess,
+ * FreeLibraryAndExitThread, where CreateThread starts a thread, and where a
+ * process with DLLs or TLS callbacks starts -- each a slot of the jump table
+ * at its start (pe.h's WIN32_LDR_*_VA) -- and the routine that makes the
+ * calls a list from the kernel names. Each reaches the kernel through
  * __toby_ldr's thunk, read from the module table, so nothing is patched. */
 static const uint8_t g_win32_ldr_stubs[] = {
-    0x45, 0x31, 0xc0, 0x45, 0x31, 0xc9, 0xeb, 0x1e, 0x45, 0x31, 0xc0, 0x41,
-    0xb9, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x13, 0x0f, 0x1f, 0x44, 0x00, 0x00,
-    0x45, 0x31, 0xc9, 0xeb, 0x09, 0x0f, 0x1f, 0x00, 0x41, 0xb9, 0x01, 0x00,
-    0x00, 0x00, 0x53, 0x56, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00, 0x48,
+    0xeb, 0x4e, 0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0xeb, 0x4e, 0x66, 0x0f,
+    0x1f, 0x44, 0x00, 0x00, 0xeb, 0x51, 0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00,
+    0xeb, 0x4e, 0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0xe9, 0xa1, 0x00, 0x00,
+    0x00, 0x0f, 0x1f, 0x00, 0xe9, 0x3e, 0x01, 0x00, 0x00, 0x0f, 0x1f, 0x00,
+    0xe9, 0x72, 0x01, 0x00, 0x00, 0x0f, 0x1f, 0x00, 0xe9, 0xd7, 0x00, 0x00,
+    0x00, 0x0f, 0x1f, 0x00, 0xe9, 0xde, 0x00, 0x00, 0x00, 0x0f, 0x1f, 0x00,
+    0xe9, 0x93, 0x01, 0x00, 0x00, 0x0f, 0x1f, 0x00, 0x45, 0x31, 0xc0, 0x45,
+    0x31, 0xc9, 0xeb, 0x16, 0x45, 0x31, 0xc0, 0x41, 0xb9, 0x01, 0x00, 0x00,
+    0x00, 0xeb, 0x0b, 0x45, 0x31, 0xc9, 0xeb, 0x06, 0x41, 0xb9, 0x01, 0x00,
+    0x00, 0x00, 0x53, 0x56, 0x48, 0x81, 0xec, 0x38, 0x03, 0x00, 0x00, 0x48,
     0x89, 0xca, 0x45, 0x89, 0xc0, 0x49, 0xc1, 0xe1, 0x20, 0x4d, 0x09, 0xc8,
-    0x4c, 0x8d, 0x4c, 0x24, 0x20, 0xb9, 0x01, 0x00, 0x00, 0x00, 0x48, 0xb8,
-    0x28, 0x80, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0xff, 0x10, 0x48, 0x85,
-    0xc0, 0x0f, 0x84, 0x91, 0x00, 0x00, 0x00, 0x48, 0x89, 0xc3, 0x48, 0x8d,
-    0x4c, 0x24, 0x20, 0xba, 0x01, 0x00, 0x00, 0x00, 0xe8, 0x89, 0x00, 0x00,
-    0x00, 0x4c, 0x63, 0xc0, 0x48, 0x89, 0xda, 0x4c, 0x8d, 0x4c, 0x24, 0x20,
-    0xb9, 0x02, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x28, 0x80, 0x00, 0x31, 0x00,
-    0x00, 0x00, 0x00, 0xff, 0x10, 0x48, 0x85, 0xc0, 0x75, 0x5e, 0xbe, 0x5a,
-    0x04, 0x00, 0x00, 0xeb, 0x30, 0x0f, 0x1f, 0x00, 0x53, 0x56, 0x48, 0x81,
-    0xec, 0x28, 0x01, 0x00, 0x00, 0x48, 0x89, 0xca, 0x45, 0x31, 0xc0, 0x4c,
-    0x8d, 0x4c, 0x24, 0x20, 0xb9, 0x03, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x28,
-    0x80, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0xff, 0x10, 0x48, 0x83, 0xf8,
-    0x02, 0x75, 0x29, 0x31, 0xf6, 0x48, 0x8d, 0x4c, 0x24, 0x20, 0x31, 0xd2,
-    0xe8, 0x25, 0x00, 0x00, 0x00, 0x89, 0xf2, 0x45, 0x31, 0xc0, 0x4c, 0x8d,
-    0x4c, 0x24, 0x20, 0xb9, 0x04, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x28, 0x80,
-    0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0xff, 0x10, 0x48, 0x81, 0xc4, 0x28,
-    0x01, 0x00, 0x00, 0x5e, 0x5b, 0xc3, 0x53, 0x56, 0x57, 0x41, 0x54, 0x48,
-    0x83, 0xec, 0x28, 0x48, 0x89, 0xce, 0x89, 0xd7, 0x48, 0x8b, 0x1e, 0x45,
-    0x31, 0xe4, 0x49, 0x39, 0xdc, 0x73, 0x2c, 0x4c, 0x89, 0xe0, 0x48, 0xc1,
-    0xe0, 0x04, 0x4c, 0x8b, 0x54, 0x06, 0x08, 0x48, 0x8b, 0x4c, 0x06, 0x10,
-    0x4d, 0x85, 0xd2, 0x74, 0x11, 0x89, 0xfa, 0x45, 0x31, 0xc0, 0x41, 0xff,
-    0xd2, 0x83, 0xff, 0x01, 0x75, 0x04, 0x85, 0xc0, 0x74, 0x0c, 0x49, 0xff,
-    0xc4, 0xeb, 0xcf, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xeb, 0x03, 0x44, 0x89,
-    0xe0, 0x48, 0x83, 0xc4, 0x28, 0x41, 0x5c, 0x5f, 0x5e, 0x5b, 0xc3,
+    0x4c, 0x8d, 0x4c, 0x24, 0x20, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, 0x90,
+    0x01, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x72, 0x48, 0x89, 0xc3, 0x48,
+    0x8d, 0x4c, 0x24, 0x20, 0xe8, 0x8a, 0x01, 0x00, 0x00, 0x4c, 0x63, 0xc0,
+    0x48, 0x89, 0xda, 0x4c, 0x8d, 0x4c, 0x24, 0x20, 0xb9, 0x02, 0x00, 0x00,
+    0x00, 0xe8, 0x69, 0x01, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x75, 0x4b, 0xbe,
+    0x5a, 0x04, 0x00, 0x00, 0xeb, 0x26, 0x53, 0x56, 0x48, 0x81, 0xec, 0x38,
+    0x03, 0x00, 0x00, 0x48, 0x89, 0xca, 0x45, 0x31, 0xc0, 0x4c, 0x8d, 0x4c,
+    0x24, 0x20, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x3f, 0x01, 0x00, 0x00,
+    0x48, 0x83, 0xf8, 0x02, 0x75, 0x20, 0x31, 0xf6, 0x48, 0x8d, 0x4c, 0x24,
+    0x20, 0xe8, 0x39, 0x01, 0x00, 0x00, 0x89, 0xf2, 0x45, 0x31, 0xc0, 0x4c,
+    0x8d, 0x4c, 0x24, 0x20, 0xb9, 0x04, 0x00, 0x00, 0x00, 0xe8, 0x19, 0x01,
+    0x00, 0x00, 0x48, 0x81, 0xc4, 0x38, 0x03, 0x00, 0x00, 0x5e, 0x5b, 0xc3,
+    0x48, 0x83, 0xec, 0x28, 0x89, 0xd6, 0xe8, 0xa7, 0xff, 0xff, 0xff, 0x89,
+    0xf1, 0xeb, 0x48, 0x48, 0x89, 0xfb, 0x48, 0x81, 0xec, 0x30, 0x03, 0x00,
+    0x00, 0xb9, 0x07, 0x00, 0x00, 0x00, 0xba, 0x02, 0x00, 0x00, 0x00, 0x45,
+    0x31, 0xc0, 0x4c, 0x8d, 0x4c, 0x24, 0x20, 0xe8, 0xdf, 0x00, 0x00, 0x00,
+    0x48, 0x8d, 0x4c, 0x24, 0x20, 0xe8, 0xe1, 0x00, 0x00, 0x00, 0xb9, 0x08,
+    0x00, 0x00, 0x00, 0xe8, 0xcb, 0x00, 0x00, 0x00, 0x48, 0x81, 0xc4, 0x30,
+    0x03, 0x00, 0x00, 0x48, 0x8b, 0x4b, 0x08, 0x48, 0x83, 0xec, 0x20, 0xff,
+    0x13, 0x89, 0xc1, 0x48, 0x83, 0xe4, 0xf0, 0x48, 0x81, 0xec, 0x30, 0x03,
+    0x00, 0x00, 0x89, 0xce, 0xb9, 0x07, 0x00, 0x00, 0x00, 0xba, 0x03, 0x00,
+    0x00, 0x00, 0x41, 0x89, 0xf0, 0x4c, 0x8d, 0x4c, 0x24, 0x20, 0xe8, 0x94,
+    0x00, 0x00, 0x00, 0x48, 0x8d, 0x4c, 0x24, 0x20, 0xe8, 0x96, 0x00, 0x00,
+    0x00, 0xb9, 0x0a, 0x00, 0x00, 0x00, 0x89, 0xf2, 0xe8, 0x7e, 0x00, 0x00,
+    0x00, 0x0f, 0x0b, 0x48, 0x83, 0xe4, 0xf0, 0x48, 0x81, 0xec, 0x30, 0x03,
+    0x00, 0x00, 0x89, 0xce, 0xb9, 0x09, 0x00, 0x00, 0x00, 0x89, 0xf2, 0x45,
+    0x31, 0xc0, 0x4c, 0x8d, 0x4c, 0x24, 0x20, 0xe8, 0x5b, 0x00, 0x00, 0x00,
+    0x48, 0x8d, 0x4c, 0x24, 0x20, 0xe8, 0x5d, 0x00, 0x00, 0x00, 0xb9, 0x0a,
+    0x00, 0x00, 0x00, 0x89, 0xf2, 0xe8, 0x45, 0x00, 0x00, 0x00, 0x0f, 0x0b,
+    0x48, 0x81, 0xec, 0x38, 0x03, 0x00, 0x00, 0xb9, 0x05, 0x00, 0x00, 0x00,
+    0x31, 0xd2, 0x45, 0x31, 0xc0, 0x4c, 0x8d, 0x4c, 0x24, 0x20, 0xe8, 0x28,
+    0x00, 0x00, 0x00, 0x48, 0x8d, 0x4c, 0x24, 0x20, 0xe8, 0x2a, 0x00, 0x00,
+    0x00, 0x48, 0x63, 0xd0, 0xb9, 0x06, 0x00, 0x00, 0x00, 0x45, 0x31, 0xc0,
+    0x4c, 0x8d, 0x4c, 0x24, 0x20, 0xe8, 0x09, 0x00, 0x00, 0x00, 0x48, 0x81,
+    0xc4, 0x38, 0x03, 0x00, 0x00, 0xff, 0xe0, 0x48, 0xb8, 0x28, 0x80, 0x00,
+    0x31, 0x00, 0x00, 0x00, 0x00, 0xff, 0x20, 0x53, 0x56, 0x57, 0x41, 0x54,
+    0x41, 0x55, 0x41, 0x56, 0x48, 0x83, 0xec, 0x28, 0x48, 0x89, 0xce, 0x48,
+    0x8b, 0x1e, 0x45, 0x31, 0xe4, 0x49, 0x39, 0xdc, 0x73, 0x66, 0x4b, 0x8d,
+    0x04, 0x64, 0x48, 0x8d, 0x7c, 0xc6, 0x08, 0x4c, 0x8b, 0x2f, 0x4d, 0x85,
+    0xed, 0x74, 0x2c, 0x4c, 0x8b, 0x77, 0x10, 0x41, 0x0f, 0xba, 0xe6, 0x08,
+    0x72, 0x26, 0x48, 0x8b, 0x4f, 0x08, 0x41, 0x0f, 0xb6, 0xd6, 0x45, 0x89,
+    0xf0, 0x41, 0xc1, 0xe8, 0x09, 0x41, 0x83, 0xe0, 0x01, 0x41, 0xff, 0xd5,
+    0x41, 0x0f, 0xba, 0xe6, 0x0a, 0x73, 0x04, 0x85, 0xc0, 0x74, 0x30, 0x49,
+    0xff, 0xc4, 0xeb, 0xb9, 0x49, 0x8b, 0x45, 0x00, 0x48, 0x85, 0xc0, 0x74,
+    0xf2, 0x48, 0x8b, 0x4f, 0x08, 0x41, 0x0f, 0xb6, 0xd6, 0x45, 0x89, 0xf0,
+    0x41, 0xc1, 0xe8, 0x09, 0x41, 0x83, 0xe0, 0x01, 0xff, 0xd0, 0x49, 0x83,
+    0xc5, 0x08, 0xeb, 0xdc, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xeb, 0x03, 0x44,
+    0x89, 0xe0, 0x48, 0x83, 0xc4, 0x28, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c,
+    0x5f, 0x5e, 0x5b, 0xc3,
 };
 #define WIN32_LDR_STUBS_OFF ((uint64_t)(WIN32_LDR_STUBS_VA - WIN32_SHIM_BASE))
-_Static_assert(WIN32_MT_LDR == 0x28, "the LoadLibrary stubs hard-code __toby_ldr's slot");
-_Static_assert(WIN32_LDR_BUF_MAX == 16, "the LoadLibrary stubs' buffer holds 16 pairs");
+_Static_assert(WIN32_MT_LDR == 0x28, "the loader stubs hard-code __toby_ldr's slot");
+_Static_assert(8 + WIN32_LDR_BUF_MAX * 24 <= 0x310, "the loader stubs' buffer is 0x310 bytes");
+_Static_assert(WIN32_LDR_CTL_TLS == 0x100 && WIN32_LDR_CTL_RES == 0x200 && WIN32_LDR_CTL_CHECK == 0x400,
+               "the loader stubs hard-code the list's ctl bits");
 #define WIN32_ONEXIT_EXEC_OFF ((uint64_t)(WIN32_ONEXIT_EXEC_VA - WIN32_SHIM_BASE))
-#define WIN32_INIT_TRAMP_OFF ((uint64_t)(WIN32_INIT_TRAMP_VA - WIN32_SHIM_BASE))
 #define WIN32_FAIL_ENTRY_OFF ((uint64_t)(WIN32_FAIL_ENTRY_VA - WIN32_SHIM_BASE))
-_Static_assert(WIN32_MODTAB_BASE == 0x31008000ULL, "the trampolines hard-code the module table's VA");
-_Static_assert(WIN32_MT_INIT_LIST == 0x40 && WIN32_MT_INIT_COUNT == 0x10 &&
-               WIN32_MT_LOADFAIL == 0x08 && WIN32_MT_FAIL_TEXT == 0x18 &&
-               WIN32_MT_FAIL_STATUS == 0x20 && WIN32_MT_INIT_STRIDE == 24,
-               "the trampolines hard-code the module table's layout");
+_Static_assert(WIN32_MODTAB_BASE == 0x31008000ULL, "the fail entry hard-codes the module table's VA");
+_Static_assert(WIN32_MT_LOADFAIL == 0x08 && WIN32_MT_FAIL_TEXT == 0x18 &&
+               WIN32_MT_FAIL_STATUS == 0x20,
+               "the fail entry hard-codes the module table's layout");
 
 /* Lay down the marshalling gates, the user-mode trampolines and the procaddr
  * table (one thunk per shim) in the (already mapped, RW) shim area. None of it
@@ -624,13 +632,6 @@ static void pe_setup_shim_area(void) {
     memcpy(fgate, g_win32_fgate, WIN32_FGATE_SIZE);
     memcpy(&fgate[WIN32_FGATE_IMM_OFF], &nr, 4);
 
-    /* Thread wrapper (C6) at its fixed offset, with the thread-exit syscall
-     * number patched in. */
-    uint8_t wrap[WIN32_WRAPPER_SIZE];
-    memcpy(wrap, g_win32_thread_wrapper, WIN32_WRAPPER_SIZE);
-    uint32_t tx = ABI_SYS_THREAD_EXIT;
-    memcpy(&wrap[WIN32_WRAPPER_IMM_OFF], &tx, 4);
-
     /* DispatchMessage trampoline (C7), with the &wndproc CRT-data slot
      * patched into its abs64 load. */
     uint8_t disp[WIN32_DISPATCH_SIZE];
@@ -640,7 +641,6 @@ static void pe_setup_shim_area(void) {
 
     unsigned long uf = uaccess_begin();
     memcpy((void *)WIN32_SHIM_BASE, gate, WIN32_GATE_SIZE);
-    memcpy((void *)(WIN32_SHIM_BASE + WIN32_WRAPPER_OFF), wrap, WIN32_WRAPPER_SIZE);
     memcpy((void *)(WIN32_SHIM_BASE + WIN32_DISPATCH_OFF), disp, WIN32_DISPATCH_SIZE);
     /* C14: the dialog modal-loop trampoline + its dedicated gate-thunk for the
      * __toby_dlgsvc shim (so the trampoline can reach the kernel at a fixed VA
@@ -668,17 +668,14 @@ static void pe_setup_shim_area(void) {
     _Static_assert(WIN32_FGATE_OFF + WIN32_FGATE_SIZE <= WIN32_DLGSVC_THUNK_OFF,
                    "float gate overruns the dlgsvc thunk slot");
     memcpy((void *)(WIN32_SHIM_BASE + WIN32_FGATE_OFF), fgate, WIN32_FGATE_SIZE);
-    /* W3: the init trampoline and the fail entry, in the area W1 freed. */
-    _Static_assert(WIN32_INIT_TRAMP_OFF >= WIN32_THUNK_BASE &&
-                   WIN32_INIT_TRAMP_OFF + sizeof(g_win32_init_tramp) <= WIN32_FAIL_ENTRY_OFF,
-                   "init trampoline overruns the fail entry");
+    /* W3: the fail entry, in the area W1 freed; W4/W5: the loader's stubs. */
+    _Static_assert(WIN32_FAIL_ENTRY_OFF >= WIN32_THUNK_BASE, "fail entry overlaps the dlgsvc thunk");
     _Static_assert(WIN32_FAIL_ENTRY_OFF + sizeof(g_win32_fail_entry) <= WIN32_ONEXIT_EXEC_OFF,
                    "fail entry overruns the onexit stub");
     _Static_assert(WIN32_ONEXIT_EXEC_OFF + sizeof(g_win32_onexit_exec) <= WIN32_LDR_STUBS_OFF,
-                   "onexit stub overruns the LoadLibrary stubs");
+                   "onexit stub overruns the loader stubs");
     _Static_assert(WIN32_LDR_STUBS_OFF + sizeof(g_win32_ldr_stubs) <= WIN32_SETJMP_OFF,
-                   "the LoadLibrary stubs overrun the setjmp stub");
-    memcpy((void *)WIN32_INIT_TRAMP_VA, g_win32_init_tramp, sizeof(g_win32_init_tramp));
+                   "the loader stubs overrun the setjmp stub");
     memcpy((void *)WIN32_FAIL_ENTRY_VA, g_win32_fail_entry, sizeof(g_win32_fail_entry));
     memcpy((void *)WIN32_ONEXIT_EXEC_VA, g_win32_onexit_exec, sizeof(g_win32_onexit_exec));
     memcpy((void *)WIN32_LDR_STUBS_VA, g_win32_ldr_stubs, sizeof(g_win32_ldr_stubs));
@@ -712,8 +709,9 @@ static void pe_setup_shim_area(void) {
  * the system directory (C:\Windows\System32), the Windows directory, the
  * current directory (PATH: not yet). A file name is matched exactly, then
  * case-insensitively, as Windows' file system would. Each DLL's entry point
- * is called at DLL_PROCESS_ATTACH by the init trampoline, in dependency order
- * (a DLL after every DLL it imports), before the .exe's own entry. A DLL that
+ * is called at DLL_PROCESS_ATTACH (W5: by the process-start stub, after the
+ * DLL's TLS callbacks), in dependency order (a DLL after every DLL it
+ * imports), before the .exe's own TLS callbacks and entry. A DLL that
  * is not found, is not a PE32+ x64 image, or cannot be placed starts the
  * process at the fail entry: it says so on stderr and ends with the status
  * Windows uses (STATUS_DLL_NOT_FOUND, STATUS_INVALID_IMAGE_FORMAT). An import
@@ -730,10 +728,22 @@ static void pe_setup_shim_area(void) {
  * LoadLibrary and one per module whose imports name it -- and FreeLibrary
  * unloads it when that reaches 0, with every module it imports that reaches 0
  * too, each after its DLL_PROCESS_DETACH; the modules loaded with the process
- * stay loaded (Windows' static dependencies stay too). Not yet: a loader lock
- * (two threads loading at once can lose a record -- W5, with thread attach),
- * TLS for a run-time DLL on threads other than the main one (W5), mapping as
- * data (LOAD_LIBRARY_AS_DATAFILE and its kin fail with ERROR_NOT_SUPPORTED). */
+ * stay loaded (Windows' static dependencies stay too). Not yet: mapping as
+ * data (LOAD_LIBRARY_AS_DATAFILE and its kin fail with ERROR_NOT_SUPPORTED).
+ *
+ * W5: a module's whole lifetime. Every call that changes the module table, or
+ * runs DllMains, holds the loader lock (src/syscall.c keeps it, in the table's
+ * header), so two threads loading at once no longer lose a record. Each
+ * module's TLS callbacks are called with every reason its DllMain is, before
+ * it: at DLL_PROCESS_ATTACH and DETACH, and -- on the thread itself, for
+ * every loaded DLL that did not turn them off with DisableThreadLibraryCalls
+ * -- at DLL_THREAD_ATTACH and DETACH; the .exe's TLS callbacks come after all
+ * the DLLs'. ExitProcess (and the CRT's exit) ends the other threads, then
+ * sends DLL_PROCESS_DETACH in the reverse of the order the DLLs were
+ * initialized in (each record keeps its number). Every thread has its own
+ * static-TLS block for every module with TLS: made with the thread
+ * (src/syscall.c), or -- for a DLL loaded while it runs -- by LoadLibrary. The
+ * orders are what Windows 11 does (programs/win-life30 runs there too). */
 
 enum { PE_MOD_MAPPED, PE_MOD_BINDING, PE_MOD_DONE };
 
@@ -748,6 +758,7 @@ struct pe_mod {
     uint32_t flags;            /* WIN32_MTM_FLAG_* other than DLL (W4) */
     uint32_t refs;             /* W4: references (meaningless when pinned) */
     uint32_t tls_slot;         /* W4: its TLS slot, 0 if none */
+    uint32_t init_seq;         /* W5: when it was initialized (1 first), 0 before */
     int      state;
     bool     is_dll;
     bool     fresh;            /* W4: mapped by this call -- unmapped if it fails */
@@ -772,6 +783,7 @@ struct pe_ctx {
     struct pe_missing_area miss;
     uint32_t tls_used;                  /* bit n: TLS slot n is taken (0 is the .exe's) */
     uint64_t tls_next, tls_end;         /* next free byte / end of the mapped TLS area */
+    uint32_t init_seq;                  /* W5: the last initialization number given */
     struct pe_load_info *out;           /* the .exe's TLS facts go here (process start) */
 };
 
@@ -779,10 +791,14 @@ struct pe_ctx {
 _Static_assert(WIN32_TLS_SLOTS <= 32, "tls_used is a 32-bit map");
 _Static_assert(WIN32_MT_INIT_LIST + WIN32_MAX_MODULES * WIN32_MT_INIT_STRIDE <= WIN32_MT_MISS_STUB,
                "the init list overruns the loader state");
-_Static_assert(WIN32_MT_TLS_USED + 4 <= WIN32_MT_MODS, "the loader state overruns the records");
+_Static_assert(WIN32_MT_TLS_USED + 4 <= WIN32_MT_LOCK_DEPTH && WIN32_MT_LOCK_DEPTH + 4 <= WIN32_MT_LOCK_OWNER &&
+               WIN32_MT_LOCK_OWNER + 8 <= WIN32_MT_INIT_SEQ && WIN32_MT_INIT_SEQ + 4 <= WIN32_MT_MAIN_GONE &&
+               WIN32_MT_MAIN_GONE + 4 <= WIN32_MT_EXITING && WIN32_MT_EXITING + 8 <= WIN32_MT_MODS,
+               "the loader state overruns the records");
 _Static_assert(WIN32_MT_MODS + WIN32_MAX_MODULES * WIN32_MT_MOD_STRIDE <= WIN32_MT_STRINGS,
                "the records overrun the strings");
-_Static_assert(WIN32_MTM_TLS_SLOT + 4 <= WIN32_MT_MOD_STRIDE, "a record overruns its stride");
+_Static_assert(WIN32_MTM_TLS_SLOT + 4 <= WIN32_MTM_INIT_SEQ && WIN32_MTM_INIT_SEQ + 4 <= WIN32_MT_MOD_STRIDE,
+               "a record overruns its stride");
 _Static_assert(WIN32_MT_STRINGS + WIN32_MAX_MODULES * WIN32_MT_STR_STRIDE <= WIN32_MT_FAIL_AREA,
                "the strings overrun the failure text");
 _Static_assert(WIN32_MT_FAIL_AREA < WIN32_MODTAB_BYTES, "the failure text is outside the table");
@@ -1076,8 +1092,28 @@ static void pe_protect(const struct pe_ctx *c, const struct pe_mod *m) {
  * The pointer array at WIN32_TLS_BASE has one slot per module: the .exe's is
  * slot 0 (its _tls_index is 0, as before W3), each DLL with a TLS directory
  * gets a free slot (W4: FreeLibrary gives it back). The MAIN thread's blocks
- * are laid out after the array; threads made by CreateThread copy the .exe's
- * block only -- DLL slots on them are W5's. */
+ * are laid out after the array; every other thread has its own array and
+ * blocks (W5: src/syscall.c makes them from pe_rt_tls_templates). */
+
+/* Module m's TLS directory, when it has one that fits in the image. */
+static bool pe_tls_dir(const struct pe_ctx *c, const struct pe_mod *m, struct pe_tls_dir64 *t) {
+    if (!m->base || !m->tls_rva || m->tls_size < sizeof *t || !pe_rva_ok(m, m->tls_rva, sizeof *t))
+        return false;
+    return pe_uread(c, t, m->base + m->tls_rva, sizeof *t);
+}
+
+/* W5: the VA of module m's TLS callback array (NULL-terminated, in the image),
+ * or 0 when it has none: no TLS directory, no array, or an empty one. The
+ * stub walks the array itself, reading each entry when it calls it, as
+ * Windows does. */
+static uint64_t pe_tls_callbacks(const struct pe_ctx *c, const struct pe_mod *m) {
+    struct pe_tls_dir64 t;
+    if (!pe_tls_dir(c, m, &t) || !t.callbacks) return 0;
+    if (t.callbacks < m->base || t.callbacks + 8 > m->base + m->size || (t.callbacks & 7)) return 0;
+    uint64_t first = 0;
+    if (!pe_uread(c, &first, t.callbacks, 8) || !first) return 0;
+    return t.callbacks;
+}
 static bool pe_tls_map(struct pe_ctx *c, uint64_t end) {
     uint64_t need = round_up(end, PAGE_SIZE);
     if (need > WIN32_MODTAB_BASE) return false;
@@ -1383,9 +1419,10 @@ static int pe_map_file(struct pe_ctx *c, const char *name, const char *path,
     m->is_dll = (h.coff->characteristics & PE_FILE_DLL) != 0;
     m->state = PE_MOD_MAPPED;
     m->fresh = c->rt;
-    /* Loaded with the process: pinned, and its entry is called by the init
-     * trampoline before the .exe's. At run time: neither, yet. */
-    m->flags = c->rt ? 0 : (WIN32_MTM_FLAG_PINNED | (m->entry ? WIN32_MTM_FLAG_INITED : 0));
+    /* Loaded with the process: pinned, and initialized by the process-start
+     * stub before the .exe's entry (pe_rt_started marks it). At run time:
+     * neither, yet. */
+    m->flags = c->rt ? 0 : WIN32_MTM_FLAG_PINNED;
     if (mi >= c->n) c->n = mi + 1;
     char wp[ABI_PATH_MAX];
     pe_slot_strings(c, mi, win32_kpath_to_winpath(path, wp, sizeof wp) > 0 ? wp : 0);
@@ -1515,7 +1552,7 @@ static int pe_bind_module(struct pe_ctx *c, int mi) {
     pe_setup_tls(c, mi);
     pe_protect(c, m);
     m->state = PE_MOD_DONE;
-    if (m->is_dll && m->entry && c->ninit < WIN32_MAX_MODULES)
+    if (m->is_dll && c->ninit < WIN32_MAX_MODULES)     /* W5: entry or not */
         c->init[c->ninit++] = mi;
     return 0;
 }
@@ -1528,6 +1565,7 @@ static void pe_commit(struct pe_ctx *c) {
     uint64_t st[4] = { c->miss.next_stub, c->miss.next_name, c->tls_next, c->tls_end };
     (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_MISS_STUB, st, sizeof st);
     (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_TLS_USED, &c->tls_used, 4);
+    (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_INIT_SEQ, &c->init_seq, 4);
     for (int i = 0; i < WIN32_MAX_MODULES; i++) {
         const struct pe_mod *m = &c->mod[i];
         uint8_t r[WIN32_MT_MOD_STRIDE];
@@ -1544,6 +1582,7 @@ static void pe_commit(struct pe_ctx *c) {
             memcpy(r + WIN32_MTM_FLAGS, &flags, 4);
             memcpy(r + WIN32_MTM_REFS, &m->refs, 4);
             memcpy(r + WIN32_MTM_TLS_SLOT, &m->tls_slot, 4);
+            memcpy(r + WIN32_MTM_INIT_SEQ, &m->init_seq, 4);
         }
         (void)pe_uwrite(c, WIN32_MODTAB_BASE + WIN32_MT_MODS + (uint64_t)i * WIN32_MT_MOD_STRIDE, r, sizeof r);
     }
@@ -1636,6 +1675,7 @@ static struct pe_ctx *pe_rt_begin(uint32_t *err) {
     if (!pe_uread(c, &nmod, WIN32_MODTAB_BASE + WIN32_MT_MOD_COUNT, 4) ||
         !pe_uread(c, st, WIN32_MODTAB_BASE + WIN32_MT_MISS_STUB, sizeof st) ||
         !pe_uread(c, &used, WIN32_MODTAB_BASE + WIN32_MT_TLS_USED, 4) ||
+        !pe_uread(c, &c->init_seq, WIN32_MODTAB_BASE + WIN32_MT_INIT_SEQ, 4) ||
         nmod == 0 || nmod > WIN32_MAX_MODULES)
         goto bad;
     c->n = (int)nmod;
@@ -1677,6 +1717,7 @@ static struct pe_ctx *pe_rt_begin(uint32_t *err) {
         memcpy(&flags, r + WIN32_MTM_FLAGS, 4);
         memcpy(&m->refs, r + WIN32_MTM_REFS, 4);
         memcpy(&m->tls_slot, r + WIN32_MTM_TLS_SLOT, 4);
+        memcpy(&m->init_seq, r + WIN32_MTM_INIT_SEQ, 4);
         if (!pe_rt_range_ok(m->base, m->size) || (i == 0 && (flags & WIN32_MTM_FLAG_DLL)) ||
             m->tls_slot >= (uint32_t)WIN32_TLS_SLOTS)
             goto bad;
@@ -1764,24 +1805,58 @@ static void pe_rt_release(struct pe_ctx *c, int mi, int *list, int *nl) {
     }
 }
 
-/* ubuf <- {count, {entry, base}...} for `list`: the entry when the module's
- * DLL_PROCESS_ATTACH was called (so it gets its DETACH), else 0 (unmapped
- * without a call). */
+/* A list for a stub (pe.h): b[0] the count, then {fn, base, ctl} triples. */
+#define PE_LIST_WORDS (1 + 3 * WIN32_LDR_BUF_MAX)
+#define PE_DLL_PROCESS_DETACH 0u
+#define PE_DLL_PROCESS_ATTACH 1u
+#define PE_DLL_THREAD_ATTACH  2u
+#define PE_DLL_THREAD_DETACH  3u
+
+static void pe_list_add(uint64_t *b, uint64_t fn, uint64_t base, uint32_t ctl) {
+    uint64_t n = b[0];
+    if (n >= WIN32_LDR_BUF_MAX) return;
+    b[1 + 3 * n] = fn;
+    b[2 + 3 * n] = base;
+    b[3 + 3 * n] = ctl;
+    b[0] = n + 1;
+}
+
+/* W5: module m's calls for one notification: its TLS callbacks, then (a DLL,
+ * `dllmain`) its entry point; ctl = the reason and flags, WIN32_LDR_CTL_CHECK
+ * for the entry point only (a TLS callback returns nothing). A module with
+ * nothing to call is listed with fn 0 when `always`, so the kernel half of a
+ * stub still finds it by its base afterwards. */
+static void pe_note(const struct pe_ctx *c, const struct pe_mod *m, uint64_t *b,
+                    uint32_t ctl, bool dllmain, bool always) {
+    uint64_t before = b[0];
+    uint64_t cb = pe_tls_callbacks(c, m);
+    if (cb) pe_list_add(b, cb, m->base, (ctl & ~WIN32_LDR_CTL_CHECK) | WIN32_LDR_CTL_TLS);
+    if (dllmain && m->is_dll && m->entry) pe_list_add(b, m->entry, m->base, ctl);
+    if (b[0] == before && always) pe_list_add(b, 0, m->base, 0);
+}
+
+static bool pe_list_put(uint64_t ubuf, const uint64_t *b) {
+    return copy_to_user((void *)(uintptr_t)ubuf, b, 8 + (size_t)b[0] * 24) == 0;
+}
+
+/* ubuf <- `list`'s DLL_PROCESS_DETACH calls (lpReserved NULL: FreeLibrary, or
+ * a failed LoadLibrary): a module that was initialized gets them, one that
+ * was not is listed with nothing to call (unmapped without a call). */
 static bool pe_rt_put_list(struct pe_ctx *c, uint64_t ubuf, const int *list, int nl) {
-    uint64_t b[1 + 2 * WIN32_LDR_BUF_MAX];
-    b[0] = (uint64_t)nl;
+    uint64_t b[PE_LIST_WORDS];
+    b[0] = 0;
     for (int k = 0; k < nl; k++) {
         const struct pe_mod *m = &c->mod[list[k]];
-        b[1 + 2 * k] = (m->flags & WIN32_MTM_FLAG_INITED) ? m->entry : 0;
-        b[2 + 2 * k] = m->base;
+        if (m->flags & WIN32_MTM_FLAG_INITED) pe_note(c, m, b, PE_DLL_PROCESS_DETACH, true, true);
+        else pe_list_add(b, 0, m->base, 0);
     }
-    return copy_to_user((void *)(uintptr_t)ubuf, b, 8 + (size_t)nl * 16) == 0;
+    return pe_list_put(ubuf, b);
 }
-/* The {entry, base} pairs at ubuf (count clamped to the buffer). */
+/* The list at ubuf (count clamped to the buffer). */
 static int pe_rt_get_list(uint64_t ubuf, uint64_t *b) {
     if (copy_from_user(b, (const void *)(uintptr_t)ubuf, 8) != 0) return 0;
     int n = b[0] > WIN32_LDR_BUF_MAX ? 0 : (int)b[0];
-    if (n && copy_from_user(b + 1, (const void *)(uintptr_t)(ubuf + 8), (size_t)n * 16) != 0) return 0;
+    if (n && copy_from_user(b + 1, (const void *)(uintptr_t)(ubuf + 8), (size_t)n * 24) != 0) return 0;
     return n;
 }
 
@@ -1895,14 +1970,13 @@ uint64_t pe_rt_load(const struct pe_rt_req *rq, uint64_t ubuf, uint32_t *err) {
     }
     pe_ref(c, mi);                                /* this LoadLibrary's reference */
 
-    /* the entry points to call: the DLLs this call mapped, dependencies first */
-    uint64_t b[1 + 2 * WIN32_LDR_BUF_MAX];
-    b[0] = (uint64_t)c->ninit;
-    for (int k = 0; k < c->ninit; k++) {
-        b[1 + 2 * k] = c->mod[c->init[k]].entry;
-        b[2 + 2 * k] = c->mod[c->init[k]].base;
-    }
-    if (copy_to_user((void *)(uintptr_t)ubuf, b, 8 + (size_t)c->ninit * 16) != 0) {
+    /* the calls to make: the DLLs this call mapped, dependencies first, each
+     * its TLS callbacks then its DllMain (lpReserved NULL: a dynamic load) */
+    uint64_t b[PE_LIST_WORDS];
+    b[0] = 0;
+    for (int k = 0; k < c->ninit; k++)
+        pe_note(c, &c->mod[c->init[k]], b, PE_DLL_PROCESS_ATTACH | WIN32_LDR_CTL_CHECK, true, true);
+    if (!pe_list_put(ubuf, b)) {
         pe_rt_rollback(c);
         *err = W32E_INVALID_PARAMETER;
         pe_rt_end(c);
@@ -1924,14 +1998,17 @@ uint64_t pe_rt_attached(uint64_t hmod, int64_t failed, uint64_t ubuf) {
         (void)copy_to_user((void *)(uintptr_t)ubuf, &zero, 8);
         return failed < 0 ? hmod : 0;
     }
-    uint64_t b[1 + 2 * WIN32_LDR_BUF_MAX];
+    uint64_t b[PE_LIST_WORDS];
     int n = pe_rt_get_list(ubuf, b);
-    /* the DllMains that were called -- the one that refused too: Windows calls
-     * it again with DLL_PROCESS_DETACH */
+    /* the modules whose calls were made -- the one that refused too: Windows
+     * calls it again with DLL_PROCESS_DETACH -- numbered in that order (W5) */
     int upto = (failed < 0 || failed >= n) ? n : (int)failed + 1;
     for (int k = 0; k < upto; k++) {
-        int j = pe_by_base(c, b[2 + 2 * k]);
-        if (j >= 0) c->mod[j].flags |= WIN32_MTM_FLAG_INITED;
+        int j = pe_by_base(c, b[2 + 3 * k]);
+        if (j >= 0 && !(c->mod[j].flags & WIN32_MTM_FLAG_INITED)) {
+            c->mod[j].flags |= WIN32_MTM_FLAG_INITED;
+            c->mod[j].init_seq = ++c->init_seq;
+        }
     }
     if (failed < 0) {
         pe_commit(c);
@@ -1977,10 +2054,10 @@ void pe_rt_unmap(uint64_t ubuf) {
     uint32_t err;
     struct pe_ctx *c = pe_rt_begin(&err);
     if (!c) return;
-    uint64_t b[1 + 2 * WIN32_LDR_BUF_MAX];
+    uint64_t b[PE_LIST_WORDS];
     int n = pe_rt_get_list(ubuf, b);
     for (int k = 0; k < n; k++) {
-        int j = pe_by_base(c, b[2 + 2 * k]);
+        int j = pe_by_base(c, b[2 + 3 * k]);
         if (j < 0 || !(c->mod[j].flags & WIN32_MTM_FLAG_UNLOAD)) continue;
         struct pe_mod *m = &c->mod[j];
         pe_tls_release(c, m);
@@ -2025,6 +2102,181 @@ int pe_rt_module_path(uint64_t base, char *out, int cap) {
     int mi = pe_by_base(c, base), n = -1;
     if (mi >= 0 && c->mod[mi].path_va)
         n = pe_ustr(c, out, cap, c->mod[mi].path_va, c->mod[mi].path_va + WIN32_MT_PATH_MAX);
+    pe_rt_end(c);
+    return n;
+}
+
+/* ===== W5: the DLL notifications =========================================
+ * Each builds a list for a stub (pe.h); the caller (src/syscall.c) holds the
+ * loader lock from the list's making to the stub's last call. */
+
+/* The loaded DLLs that were initialized and are not being unloaded, by their
+ * initialization numbers: ascending, or (`down`) descending. */
+static int pe_inited(const struct pe_ctx *c, int *out, bool down) {
+    int n = 0;
+    for (int i = 1; i < c->n; i++) {
+        const struct pe_mod *m = &c->mod[i];
+        if (!m->base || !m->is_dll || !(m->flags & WIN32_MTM_FLAG_INITED) ||
+            (m->flags & WIN32_MTM_FLAG_UNLOAD))
+            continue;
+        int k = n++;
+        while (k > 0 && (down ? c->mod[out[k - 1]].init_seq < m->init_seq
+                              : c->mod[out[k - 1]].init_seq > m->init_seq)) {
+            out[k] = out[k - 1];
+            k--;
+        }
+        out[k] = i;
+    }
+    return n;
+}
+
+/* The DLLs the module table's init list names, in its order (the order they
+ * were bound: a DLL after the DLLs it imports). */
+static int pe_init_list(const struct pe_ctx *c, int *out) {
+    uint32_t ninit = 0;
+    if (!pe_uread(c, &ninit, WIN32_MODTAB_BASE + WIN32_MT_INIT_COUNT, 4) || ninit > WIN32_MAX_MODULES)
+        return 0;
+    int n = 0;
+    for (uint32_t i = 0; i < ninit; i++) {
+        uint64_t e[3];
+        if (!pe_uread(c, e, WIN32_MODTAB_BASE + WIN32_MT_INIT_LIST + (uint64_t)i * WIN32_MT_INIT_STRIDE,
+                      sizeof e))
+            break;
+        int j = pe_by_base(c, e[1]);
+        if (j > 0 && c->mod[j].is_dll) out[n++] = j;
+    }
+    return n;
+}
+
+static void pe_list_clear(uint64_t ubuf) {
+    uint64_t zero = 0;
+    (void)copy_to_user((void *)(uintptr_t)ubuf, &zero, 8);
+}
+
+int pe_rt_start(uint64_t ubuf) {
+    pe_list_clear(ubuf);
+    uint32_t err;
+    struct pe_ctx *c = pe_rt_begin(&err);
+    if (!c) return -1;
+    int order[WIN32_MAX_MODULES];
+    int n = pe_init_list(c, order);
+    uint64_t b[PE_LIST_WORDS];
+    b[0] = 0;
+    for (int k = 0; k < n; k++) {
+        const struct pe_mod *m = &c->mod[order[k]];
+        if (m->flags & WIN32_MTM_FLAG_INITED) continue;
+        pe_note(c, m, b, PE_DLL_PROCESS_ATTACH | WIN32_LDR_CTL_RES | WIN32_LDR_CTL_CHECK, true, true);
+    }
+    pe_note(c, &c->mod[0], b, PE_DLL_PROCESS_ATTACH | WIN32_LDR_CTL_RES, false, false);
+    bool ok = pe_list_put(ubuf, b);
+    pe_rt_end(c);
+    return ok ? (int)b[0] : -1;
+}
+
+uint64_t pe_rt_started(int64_t failed, uint64_t ubuf, char *who, int cap) {
+    uint32_t err;
+    struct pe_ctx *c = pe_rt_begin(&err);
+    if (cap > 0) who[0] = '\0';
+    if (!c) return 0;
+    uint64_t b[PE_LIST_WORDS];
+    int n = pe_rt_get_list(ubuf, b);
+    if (failed >= 0) {
+        int j = failed < n ? pe_by_base(c, b[2 + 3 * failed]) : -1;
+        if (j >= 0 && cap > 0) ksnprintf(who, (size_t)cap, "%s", c->mod[j].name);
+        pe_rt_end(c);
+        return 0;
+    }
+    /* every DLL of the init list is initialized: number them in its order */
+    int order[WIN32_MAX_MODULES];
+    int k = pe_init_list(c, order);
+    for (int i = 0; i < k; i++) {
+        struct pe_mod *m = &c->mod[order[i]];
+        if (m->flags & WIN32_MTM_FLAG_INITED) continue;
+        m->flags |= WIN32_MTM_FLAG_INITED;
+        m->init_seq = ++c->init_seq;
+    }
+    uint64_t entry = 0;
+    (void)pe_uread(c, &entry, WIN32_MODTAB_BASE + WIN32_MT_EXE_ENTRY, 8);
+    pe_commit(c);
+    pe_rt_end(c);
+    return entry;
+}
+
+int pe_rt_thread_list(uint32_t reason, uint64_t ubuf) {
+    pe_list_clear(ubuf);
+    uint32_t err;
+    struct pe_ctx *c = pe_rt_begin(&err);
+    if (!c) return -1;
+    int order[WIN32_MAX_MODULES];
+    int n = pe_inited(c, order, reason == PE_DLL_THREAD_DETACH);
+    uint64_t b[PE_LIST_WORDS];
+    b[0] = 0;
+    for (int k = 0; k < n; k++) {
+        const struct pe_mod *m = &c->mod[order[k]];
+        pe_note(c, m, b, reason, !(m->flags & WIN32_MTM_FLAG_NOTHREAD), false);
+    }
+    pe_note(c, &c->mod[0], b, reason, false, false);
+    bool ok = pe_list_put(ubuf, b);
+    pe_rt_end(c);
+    return ok ? (int)b[0] : -1;
+}
+
+int pe_rt_exit_list(uint64_t ubuf) {
+    pe_list_clear(ubuf);
+    uint32_t err;
+    struct pe_ctx *c = pe_rt_begin(&err);
+    if (!c) return -1;
+    int order[WIN32_MAX_MODULES];
+    int n = pe_inited(c, order, true);
+    uint64_t b[PE_LIST_WORDS];
+    b[0] = 0;
+    for (int k = 0; k < n; k++)
+        pe_note(c, &c->mod[order[k]], b, PE_DLL_PROCESS_DETACH | WIN32_LDR_CTL_RES, true, false);
+    pe_note(c, &c->mod[0], b, PE_DLL_PROCESS_DETACH | WIN32_LDR_CTL_RES, false, false);
+    bool ok = pe_list_put(ubuf, b);
+    pe_rt_end(c);
+    return ok ? (int)b[0] : -1;
+}
+
+int pe_rt_disable_thread_calls(uint64_t hmod) {
+    uint32_t err;
+    struct pe_ctx *c = pe_rt_begin(&err);
+    if (!c) return 0;
+    int mi = pe_by_base(c, hmod);
+    if (mi < 0) {
+        pe_rt_end(c);
+        return 0;
+    }
+    struct pe_tls_dir64 t;
+    struct pe_mod *m = &c->mod[mi];
+    if (m->is_dll && !(m->flags & WIN32_MTM_FLAG_NOTHREAD) && !pe_tls_dir(c, m, &t)) {
+        m->flags |= WIN32_MTM_FLAG_NOTHREAD;
+        pe_commit(c);
+    }
+    pe_rt_end(c);
+    return 1;
+}
+
+int pe_rt_tls_templates(struct pe_tls_tmpl *out, int cap) {
+    uint32_t err;
+    struct pe_ctx *c = pe_rt_begin(&err);
+    if (!c) return 0;
+    int n = 0;
+    for (int i = 0; i < c->n && n < cap; i++) {
+        const struct pe_mod *m = &c->mod[i];
+        if (!m->base || (m->flags & WIN32_MTM_FLAG_UNLOAD) || (i != 0 && !m->tls_slot)) continue;
+        struct pe_tls_dir64 t;
+        if (!pe_tls_dir(c, m, &t)) continue;
+        uint64_t raw = (t.raw_end > t.raw_start) ? (t.raw_end - t.raw_start) : 0;
+        uint64_t total = raw + (uint64_t)t.zero_fill;
+        if (t.raw_start < m->base || t.raw_start + raw > m->base + m->size || total > WIN32_TLS_MAX_BLK)
+            continue;                         /* as pe_setup_tls skipped it */
+        out[n].slot = (uint32_t)(i == 0 ? 0 : m->tls_slot);
+        out[n].raw = t.raw_start;
+        out[n].raw_size = raw;
+        out[n].total = round_up(total, 16);
+        n++;
+    }
     pe_rt_end(c);
     return n;
 }
@@ -2262,8 +2514,10 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
                           VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
 
     out->image_base = load_base;
+    /* W5: a process with DLLs from disk, or with TLS callbacks of its own
+     * (every mingw .exe has the CRT's), starts at the stub that calls them */
     out->entry      = c->failed ? WIN32_FAIL_ENTRY_VA
-                    : c->ninit  ? WIN32_INIT_TRAMP_VA
+                    : (c->ninit || pe_tls_callbacks(c, &c->mod[0])) ? WIN32_LDR_START_VA
                                 : exe_entry;
     out->teb        = WIN32_TEB_BASE;
     out->crt_data   = WIN32_CRT_DATA_BASE;

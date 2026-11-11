@@ -18210,15 +18210,10 @@ static long w32_WriteFile(uint64_t *args) {
     return 1;       /* TRUE */
 }
 
-/* kernel32!ExitProcess(UINT code) -> (noreturn). */
-/* ExitProcess ends EVERY thread of the process, whichever thread calls it.
- * W1: proc_exit ends only the caller when that is a secondary (CreateThread)
- * thread, so the process ran on; the group exit is what Windows means. */
-static long w32_ExitProcess(uint64_t *args) {
-    kprintf("[win32] ExitProcess(%u)\n", (unsigned)args[0]);
-    proc_exit_group((int)(uint32_t)args[0]);
-    return 0;       /* unreached */
-}
+/* kernel32!ExitProcess, and the CRT's exit and _exit: W5 -- a CPL3 stub in
+ * the shim area (pe_loader.c), since the DLLs get DLL_PROCESS_DETACH first;
+ * its kernel half is w32_toby_ldr's EXIT and END. It ends EVERY thread of the
+ * process, whichever thread calls it (W1: the group exit). */
 
 /* ============================================================
  * C2: the C-runtime printf path (api-ms-win-crt-stdio-l1-1-0.dll).
@@ -18688,10 +18683,9 @@ static long w32_putwchar(uint64_t *a) {
 static long w32_zero(uint64_t *a) { (void)a; return 0; }
 static long w32_one (uint64_t *a) { (void)a; return 1; }
 
-/* CRT process-termination entry points -> tobyOS proc_exit. */
-/* The CRT's exit, _exit and abort end the whole process too (W1, as
- * ExitProcess above). */
-static long w32_exit (uint64_t *a) { proc_exit_group((int)(uint32_t)a[0]); return 0; }
+/* The CRT's abort ends the whole process at once (W1); no DLL is told -- the
+ * ucrt's abort ends the process with __fastfail. (exit and _exit: the
+ * loader's ExitProcess stub, W5.) */
 static long w32_abort(uint64_t *a) { (void)a; proc_exit_group(3); return 0; }
 
 /* W1 (docs/roadmap-2026-11.md): every import no shim implements is bound by
@@ -18726,11 +18720,7 @@ static long w32_toby_missing(uint64_t *a) {
  * STATUS_DLL_INIT_FAILED. Windows shows these in a message box and ends the
  * process with the status before its entry point runs; tobyOS writes them to
  * the program's stderr and the kernel log, and does the same. */
-static long w32_toby_loadfail(uint64_t *a) {
-    char text[200];
-    uint32_t status = (uint32_t)a[1];
-    if (!a[0] || strncpy_from_user(text, (const char *)(uintptr_t)a[0], sizeof(text)) < 0)
-        memcpy(text, "a DLL", sizeof("a DLL"));
+static __attribute__((noreturn)) void win32_load_failure(const char *text, uint32_t status) {
     struct proc *p = current_proc();
     const char *prog = p ? p->name : "?";
     char msg[300];
@@ -18742,7 +18732,12 @@ static long w32_toby_loadfail(uint64_t *a) {
     kprintf("[pe] load failure, status 0x%08x, pid %d: %s", status, p ? p->pid : -1, msg);
     if (n > 0) (void)win32_fd_write(2, msg, (size_t)n);
     proc_exit_group((int)status);
-    return 0;       /* unreached */
+}
+static long w32_toby_loadfail(uint64_t *a) {
+    char text[200];
+    if (!a[0] || strncpy_from_user(text, (const char *)(uintptr_t)a[0], sizeof(text)) < 0)
+        memcpy(text, "a DLL", sizeof("a DLL"));
+    win32_load_failure(text, (uint32_t)a[1]);
 }
 
 /* The Win32 process heap: a per-proc bump allocator over anonymous user
@@ -19379,6 +19374,152 @@ static long w32_TlsGetValue(uint64_t *a) {
     return (long)v;
 }
 
+/* ================= W5: the loader lock, threads, per-thread TLS ==========
+ * (docs/roadmap-2026-11.md.) The loader lock lives in the module table's
+ * header (pe.h: WIN32_MT_LOCK_*), beside what it guards. Its holder is named
+ * by its TEB, which no other live thread of the process has. It is held from
+ * the start of a call that changes the table, or that lists DllMain and
+ * TLS-callback calls, to the end of the stub's last call; the holder may take
+ * it again (a DllMain may load or free a DLL). The kernel half of every such
+ * call is a syscall under the BKL, so taking it is one atomic read-modify-
+ * write; a thread that finds another live thread holding it yields until it
+ * is free, and a holder that is gone (ended while it held it) holds nothing.
+ * Being user memory it is the program's to corrupt -- which can stall the
+ * program's own loader calls, never the kernel. */
+static int win32_tg(const struct proc *p) { return p->is_thread ? p->tgid : p->pid; }
+static bool win32_live(const struct proc *q) { return q && q->state != PROC_TERMINATED && !q->dying; }
+
+/* The live thread of the caller's process whose TEB is `teb`, or NULL. */
+static struct proc *win32_thread_of_teb(uint64_t teb) {
+    struct proc *me = current_proc();
+    if (!me || !teb) return 0;
+    int tg = win32_tg(me);
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = proc_at_slot(i);
+        if (win32_live(q) && win32_tg(q) == tg && q->gs_base == teb) return q;
+    }
+    return 0;
+}
+
+static bool win32_mt_get(uint64_t off, void *v, size_t n) {
+    return copy_from_user(v, (const void *)(uintptr_t)(WIN32_MODTAB_BASE + off), n) == 0;
+}
+static void win32_mt_put(uint64_t off, const void *v, size_t n) {
+    (void)copy_to_user((void *)(uintptr_t)(WIN32_MODTAB_BASE + off), v, n);
+}
+
+static void win32_ldr_lock(void) {
+    struct proc *me = current_proc();
+    if (!me || !me->gs_base) return;
+    for (;;) {
+        uint64_t owner = 0;
+        uint32_t depth = 0;
+        if (!win32_mt_get(WIN32_MT_LOCK_OWNER, &owner, 8) || !win32_mt_get(WIN32_MT_LOCK_DEPTH, &depth, 4))
+            return;                               /* no table: nothing to guard */
+        if (owner == me->gs_base) {
+            depth++;
+            win32_mt_put(WIN32_MT_LOCK_DEPTH, &depth, 4);
+            return;
+        }
+        if (!owner || !win32_thread_of_teb(owner)) {
+            owner = me->gs_base;
+            depth = 1;
+            win32_mt_put(WIN32_MT_LOCK_OWNER, &owner, 8);
+            win32_mt_put(WIN32_MT_LOCK_DEPTH, &depth, 4);
+            return;
+        }
+        sched_yield();                            /* drops the BKL: the holder runs on */
+    }
+}
+/* Once (`all`: entirely -- the thread is ending). Not the holder: nothing. */
+static void win32_ldr_unlock_as(bool all) {
+    struct proc *me = current_proc();
+    uint64_t owner = 0;
+    uint32_t depth = 0;
+    if (!me || !win32_mt_get(WIN32_MT_LOCK_OWNER, &owner, 8) || owner != me->gs_base || !owner) return;
+    (void)win32_mt_get(WIN32_MT_LOCK_DEPTH, &depth, 4);
+    depth = (all || depth <= 1) ? 0 : depth - 1;
+    if (!depth) owner = 0;
+    win32_mt_put(WIN32_MT_LOCK_DEPTH, &depth, 4);
+    win32_mt_put(WIN32_MT_LOCK_OWNER, &owner, 8);
+}
+static void win32_ldr_unlock(void) { win32_ldr_unlock_as(false); }
+
+/* The other live threads of the caller's process -- the main thread not
+ * among them once it has called ExitThread (it waits, parked, for the end). */
+static int win32_other_threads(void) {
+    struct proc *me = current_proc();
+    if (!me) return 0;
+    uint32_t main_gone = 0;
+    (void)win32_mt_get(WIN32_MT_MAIN_GONE, &main_gone, 4);
+    int tg = win32_tg(me), n = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = proc_at_slot(i);
+        if (!win32_live(q) || q == me || win32_tg(q) != tg) continue;
+        if (!q->is_thread && main_gone) continue;
+        n++;
+    }
+    return n;
+}
+
+/* One thread's TLS pointer array (`arr`, WIN32_TLS_ARR_BYTES, in user memory)
+ * against the modules' templates: a block for each module with static TLS
+ * that has none in it yet -- the template's bytes, then zeros (the heap is
+ * fresh memory) -- and no block for a slot no module has now. */
+#define WIN32_TLS_ARR_SLOTS (WIN32_TLS_ARR_BYTES / 8)
+static void win32_tls_fill(uint64_t arr, const struct pe_tls_tmpl *t, int n) {
+    uint64_t cur[WIN32_TLS_ARR_SLOTS];
+    bool used[WIN32_TLS_ARR_SLOTS] = { false }, dirty = false;
+    if (copy_from_user(cur, (const void *)(uintptr_t)arr, sizeof cur) != 0) return;
+    for (int k = 0; k < n; k++) {
+        uint32_t sl = t[k].slot;
+        if (sl >= WIN32_TLS_ARR_SLOTS) continue;
+        used[sl] = true;
+        if (cur[sl] || !t[k].total) continue;
+        uint64_t blk = win32_heap_alloc(t[k].total);
+        if (!blk) continue;
+        win32_user_memcpy(blk, t[k].raw, t[k].raw_size);
+        cur[sl] = blk;
+        dirty = true;
+    }
+    for (uint32_t sl = 0; sl < WIN32_TLS_ARR_SLOTS; sl++)
+        if (!used[sl] && cur[sl]) { cur[sl] = 0; dirty = true; }
+    if (dirty) (void)copy_to_user((void *)(uintptr_t)arr, cur, sizeof cur);
+}
+
+/* After a LoadLibrary or an unload: every thread but the main one (whose
+ * array is the loader's own) gets its block of a DLL that came, and loses
+ * the one of a DLL that went -- Windows gives a DLL loaded at run time its
+ * static TLS on every thread, the ones already running too. */
+static void win32_tls_sync_threads(void) {
+    struct proc *me = current_proc();
+    if (!me) return;
+    int tg = win32_tg(me);
+    struct proc *lead = proc_lookup(tg);
+    struct pe_tls_tmpl t[WIN32_MAX_MODULES];
+    int n = -1;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = proc_at_slot(i);
+        if (!win32_live(q) || win32_tg(q) != tg || !q->is_thread || !q->gs_base) continue;
+        if (q->personality != ABI_PERS_WIN32 || (lead && q->gs_base == lead->gs_base)) continue;
+        uint64_t arr = 0;
+        if (copy_from_user(&arr, (const void *)(uintptr_t)(q->gs_base + WIN32_TEB_TLSPTR_OFF), 8) != 0 || !arr)
+            continue;
+        if (n < 0) n = pe_rt_tls_templates(t, WIN32_MAX_MODULES);
+        win32_tls_fill(arr, t, n);
+    }
+}
+
+/* The main thread's ExitThread while others run: it waits here, gone as far
+ * as the process is concerned, until the last thread ends the process. */
+static __attribute__((noreturn)) void win32_park_forever(void) {
+    struct proc *me = current_proc();
+    for (;;) {
+        me->state = PROC_BLOCKED;
+        sched_yield();
+    }
+}
+
 static long w32_CreateThread(uint64_t *a) {
     uint64_t start = a[2];   /* lpStartAddress */
     uint64_t param = a[3];   /* lpParameter    */
@@ -19395,8 +19536,6 @@ static long w32_CreateThread(uint64_t *a) {
     uint64_t stack_top = (stack + WIN32_THREAD_STACK) & ~0xFULL;   /* 16-aligned */
 
     struct proc *leader = current_proc();
-    /* C18b: the .tls template lives on the thread-group leader (the main proc). */
-    struct proc *lead = (leader && leader->is_thread) ? proc_lookup(leader->tgid) : leader;
     int tid = thread_create(WIN32_THREAD_WRAPPER_VA, block, stack_top, 0);
     if (tid < 0) return 0;
 
@@ -19416,18 +19555,14 @@ static long w32_CreateThread(uint64_t *a) {
             (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_STACKBASE_OFF),  &sb,   8);
             (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_STACKLIMIT_OFF), &sl,   8);
             t->gs_base = teb;
-            /* C18b: give this thread its OWN static-TLS block + pointer array and
-             * point its TEB's gs:[0x58] at the array, so every _Thread_local is
-             * per-thread (the template's initial values, isolated per thread). */
-            if (lead && lead->win_tls_total) {
-                uint64_t arr = win32_heap_alloc(WIN32_TLS_ARR_BYTES);
-                uint64_t blk = win32_heap_alloc(lead->win_tls_total);
-                if (arr && blk) {
-                    /* heap is fresh ANON (zeroed): only copy the template raw. */
-                    win32_user_memcpy(blk, lead->win_tls_raw_va, lead->win_tls_raw_size);
-                    (void)copy_to_user((void *)(uintptr_t)(arr + lead->win_tls_index * 8), &blk, 8);
-                    (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_TLSPTR_OFF), &arr, 8);
-                }
+            /* C18b, W5: the thread's OWN static-TLS pointer array (gs:[0x58]) and
+             * a block for every module with static TLS -- the .exe's and each
+             * DLL's -- holding its template's initial values. */
+            uint64_t arr = win32_heap_alloc(WIN32_TLS_ARR_BYTES);
+            if (arr) {
+                struct pe_tls_tmpl tt[WIN32_MAX_MODULES];
+                win32_tls_fill(arr, tt, pe_rt_tls_templates(tt, WIN32_MAX_MODULES));
+                (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_TLSPTR_OFF), &arr, 8);
             }
         } else {
             t->gs_base = leader ? leader->gs_base : 0;   /* fallback: share */
@@ -22873,9 +23008,27 @@ static long win32_module_handle(uint64_t uname, bool wide) {
 static long w32_GetModuleHandleA(uint64_t *a) { return win32_module_handle(a[0], false); }
 static long w32_GetModuleHandleW(uint64_t *a) { return win32_module_handle(a[0], true); }
 
-/* W4: kernel32!__toby_ldr(op, a, b, buf) -- the kernel half of the CPL3
- * LoadLibrary and FreeLibrary stubs (logs/w32/w4-ldr.S, where the ops are
- * described; buf is on the stub's stack). Not a Windows API. */
+/* W4, W5: kernel32!__toby_ldr(op, a, b, buf) -- the kernel half of the
+ * loader's CPL3 stubs (logs/w32/w5-ldr.S; buf, on the stub's stack, is the
+ * list of calls the stub makes next). Not a Windows API. The ops:
+ *   1 LOAD(name, flags | wide << 32, buf): LoadLibrary -> the module, its
+ *     DLL_PROCESS_ATTACH calls in buf; or 0 with the last error set
+ *   2 ATTACHED(hmod, index of the call that failed or -1, buf) -> hmod; or
+ *     0 with buf = the DLL_PROCESS_DETACH calls, then UNMAP
+ *   3 FREE(hmod, 0, buf): FreeLibrary -> 0 bad handle, 1 done, 2 buf = the
+ *     DLL_PROCESS_DETACH calls, then UNMAP
+ *   4 UNMAP(error, 0, buf): unmap what buf names; 1, or 0 with `error` set
+ *   5 START(0, 0, buf): process start -> buf = the DLL_PROCESS_ATTACH calls
+ *   6 STARTED(failed, 0, buf) -> the .exe's entry point (a DllMain that
+ *     failed ends the process: STATUS_DLL_INIT_FAILED)
+ *   7 THREAD(reason, code, buf): buf = DLL_THREAD_ATTACH (2) or DETACH (3)
+ *     calls -- or, for the process's last thread, its DLL_PROCESS_DETACH
+ *   8 UNLOCK: after the thread-attach calls
+ *   9 EXIT(code, 0, buf): ExitProcess -> the other threads ended, buf =
+ *     the DLL_PROCESS_DETACH calls
+ *  10 END(code): the thread or the process ends (never returns)
+ * 1, 3, 5, 7 and 9 take the loader lock; the call that ends the stub's
+ * sequence (2 or 4, 4, 6, 8 or 10) gives it back. */
 static long win32_ldr_load(uint64_t uname, uint32_t flags, bool wide, uint64_t buf) {
     uint64_t zero = 0;
     if (copy_to_user((void *)(uintptr_t)buf, &zero, 8) != 0) return 0;
@@ -22912,24 +23065,130 @@ static long win32_ldr_load(uint64_t uname, uint32_t flags, bool wide, uint64_t b
 static long w32_toby_ldr(uint64_t *a) {
     uint64_t hmod = a[1], buf = a[3];
     bool builtin = (hmod & WIN32_HMODULE_MASK) == WIN32_HMODULE_TAG;
+    struct proc *me = current_proc();
+    if (!me) return 0;
     switch (a[0]) {
-    case 1:                                       /* LOAD(name, flags | wide << 32, buf) */
-        return win32_ldr_load(a[1], (uint32_t)a[2], (a[2] >> 32) != 0, buf);
-    case 2:                                       /* ATTACHED(hmod, failed, buf) */
-        if (builtin) return (long)hmod;
-        return (long)pe_rt_attached(hmod, (int64_t)a[2], buf);
+    case 1: {                                     /* LOAD(name, flags | wide << 32, buf) */
+        win32_ldr_lock();
+        long r = win32_ldr_load(a[1], (uint32_t)a[2], (a[2] >> 32) != 0, buf);
+        if (!r) win32_ldr_unlock();
+        else if (((uint64_t)r & WIN32_HMODULE_MASK) != WIN32_HMODULE_TAG) win32_tls_sync_threads();
+        return r;
+    }
+    case 2: {                                     /* ATTACHED(hmod, failed, buf) */
+        long r = builtin ? (long)hmod : (long)pe_rt_attached(hmod, (int64_t)a[2], buf);
+        if (r) win32_ldr_unlock();
+        return r;
+    }
     case 3: {                                     /* FREE(hmod, 0, buf) */
         if (builtin) return 1;                    /* nothing to unload */
+        win32_ldr_lock();
         uint32_t err = 0;
         int r = pe_rt_free(hmod, buf, &err);
+        if (r != 2) win32_ldr_unlock();
         if (!r) win32_set_last_error(err ? err : 126);
         return r;
     }
     case 4:                                       /* UNMAP(error, 0, buf) */
         pe_rt_unmap(buf);
+        win32_tls_sync_threads();
+        win32_ldr_unlock();
         if (a[1]) { win32_set_last_error((uint32_t)a[1]); return 0; }
         return 1;
+    case 5:                                       /* START(0, 0, buf) */
+        win32_ldr_lock();
+        return pe_rt_start(buf);
+    case 6: {                                     /* STARTED(failed, 0, buf) */
+        char who[WIN32_MT_NAME_MAX];
+        uint64_t entry = pe_rt_started((int64_t)a[1], buf, who, sizeof who);
+        if (!entry) win32_load_failure(who[0] ? who : "a DLL", WIN32_STATUS_DLL_INIT_FAILED);
+        win32_ldr_unlock();
+        return (long)entry;
     }
+    case 7: {                                     /* THREAD(reason, code, buf) */
+        win32_ldr_lock();
+        if (a[1] == 3 && win32_other_threads() == 0) {
+            /* the last thread: its end is the process's (ExitThread) */
+            uint64_t teb = me->gs_base;
+            win32_mt_put(WIN32_MT_EXITING, &teb, 8);
+            return pe_rt_exit_list(buf);
+        }
+        return pe_rt_thread_list(a[1] == 3 ? 3u : 2u, buf);
+    }
+    case 8:                                       /* UNLOCK */
+        win32_ldr_unlock();
+        return 0;
+    case 9: {                                     /* EXIT(code, 0, buf) */
+        uint64_t ex = 0;
+        (void)win32_mt_get(WIN32_MT_EXITING, &ex, 8);
+        if (ex && ex == me->gs_base) {            /* an exit inside the exit's own calls */
+            kprintf("[win32] ExitProcess(%u) during the exit\n", (unsigned)a[1]);
+            proc_exit_group((int)(uint32_t)a[1]);
+        }
+        /* Windows ends the other threads first: none gets DLL_THREAD_DETACH,
+         * and none runs while the DLLs are told. From the main thread that is
+         * exec's de_thread; from another one the threads run on until the
+         * group exit at the end (exec's documented divergence, the same). One
+         * exit already under way on another thread finishes first. */
+        if (!me->is_thread && !(ex && win32_thread_of_teb(ex))) {
+            bool had = bkl_held();
+            if (had) bkl_exit();
+            proc_reap_group_threads(me, (int)(uint32_t)a[1]);
+            if (had) bkl_enter();
+        }
+        win32_ldr_lock();
+        uint64_t teb = me->gs_base;
+        win32_mt_put(WIN32_MT_EXITING, &teb, 8);
+        return pe_rt_exit_list(buf);
+    }
+    case 10: {                                    /* END(code) */
+        int code = (int)(uint32_t)a[1];
+        uint64_t ex = 0;
+        (void)win32_mt_get(WIN32_MT_EXITING, &ex, 8);
+        if (ex && ex == me->gs_base) {
+            kprintf("[win32] ExitProcess(%u)\n", (unsigned)code);
+            proc_exit_group(code);
+        }
+        win32_ldr_unlock_as(true);
+        if (!me->is_thread && win32_other_threads() > 0) {
+            uint32_t one = 1;
+            win32_mt_put(WIN32_MT_MAIN_GONE, &one, 4);
+            kprintf("[win32] the main thread ExitThread(%u)s: the process runs on\n", (unsigned)code);
+            win32_park_forever();
+        }
+        if (!me->is_thread) proc_exit_group(code);
+        thread_exit(code);
+    }
+    }
+    return 0;
+}
+
+/* kernel32!DisableThreadLibraryCalls(hLibModule) -> BOOL. W5: the module's
+ * DllMain gets no DLL_THREAD_ATTACH/DETACH from then on -- when it has no TLS
+ * directory; with one (every DLL the mingw CRT starts) Windows 11 returns
+ * TRUE and the calls go on (measured: programs/win-life30; Microsoft's page
+ * says the call fails there). A module that is not loaded: FALSE,
+ * ERROR_MOD_NOT_FOUND. A DLL tobyOS implements has no DllMain to stop. */
+static long w32_DisableThreadLibraryCalls(uint64_t *a) {
+    uint64_t h = a[0];
+    if ((h & WIN32_HMODULE_MASK) == WIN32_HMODULE_TAG) return 1;
+    win32_ldr_lock();
+    int r = pe_rt_disable_thread_calls(h);
+    win32_ldr_unlock();
+    if (!r) win32_set_last_error(126 /* ERROR_MOD_NOT_FOUND */);
+    return r;
+}
+
+/* kernel32!TerminateProcess(hProcess, uExitCode) -> BOOL. W5: the calling
+ * process (GetCurrentProcess()'s pseudo handle, -1) ends at once, every
+ * thread, and -- as Microsoft documents -- no DLL is told. Another process's
+ * handle is W6's (CreateProcess): FALSE, ERROR_INVALID_HANDLE. */
+static long w32_TerminateProcess(uint64_t *a) {
+    if ((int64_t)a[0] == -1) {
+        kprintf("[win32] TerminateProcess(self, %u)\n", (unsigned)a[1]);
+        proc_exit_group((int)(uint32_t)a[1]);
+    }
+    win32_set_last_error(6 /* ERROR_INVALID_HANDLE */);
     return 0;
 }
 
@@ -25030,7 +25289,6 @@ struct win32_shim {
 static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetStdHandle", w32_GetStdHandle },
     { "kernel32.dll", "WriteFile",    w32_WriteFile },
-    { "kernel32.dll", "ExitProcess",  w32_ExitProcess },
     /* C2: the C-runtime printf path. The DLL name is one of the ucrt API
      * sets ("api-ms-win-crt-stdio-l1-1-0.dll"); match is case-insensitive. */
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__acrt_iob_func",          w32_acrt_iob_func },
@@ -25118,8 +25376,6 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_cexit",                 w32_zero },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_initterm",              w32_initterm },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_initterm_e",            w32_initterm },
-    { "api-ms-win-crt-runtime-l1-1-0.dll", "exit",                   w32_exit },
-    { "api-ms-win-crt-runtime-l1-1-0.dll", "_exit",                  w32_exit },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "abort",                  w32_abort },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "signal",                 w32_zero },
     /* ucrt: stdio (extras beyond the C2 set) */
@@ -25535,6 +25791,10 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "__toby_loadfail",        w32_toby_loadfail },
     /* W4: LoadLibrary/FreeLibrary's kernel half (their CPL3 stubs call it). */
     { "kernel32.dll", "__toby_ldr",           w32_toby_ldr },
+    /* W5: DLL lifetime (ExitThread, ExitProcess, exit, _exit and
+     * FreeLibraryAndExitThread are the loader's CPL3 stubs) */
+    { "kernel32.dll", "DisableThreadLibraryCalls", w32_DisableThreadLibraryCalls },
+    { "kernel32.dll", "TerminateProcess",     w32_TerminateProcess },
     /* W3: a DLL CRT's own atexit table (_execute_onexit_table is a CPL3 stub). */
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_onexit_table",  w32_initialize_onexit_table },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_register_onexit_function", w32_register_onexit_function },
@@ -25731,11 +25991,10 @@ int win32_gui_ink_stats(int fd, int rx, int ry, int rw, int rh, uint32_t bg,
 static long win32_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     if (n == ABI_SYS_WIN32_DISPATCH)
         return win32_dispatch((uint64_t)a1, (uint64_t)a2);
-    /* The C6 thread wrapper issues a raw ABI_SYS_THREAD_EXIT when its thread
-     * function returns -- that's expected; forward it (and anything else) to
-     * the native dispatcher, noting only the genuinely-unexpected ones. */
-    if (n != ABI_SYS_THREAD_EXIT)
-        kprintf("[win32] raw syscall %ld from a PE process -> native dispatch\n", n);
+    /* (Until W5 the C6 thread wrapper ended a thread with a raw
+     * ABI_SYS_THREAD_EXIT; the loader's stubs end it through __toby_ldr.)
+     * Anything else goes to the native dispatcher, noted. */
+    kprintf("[win32] raw syscall %ld from a PE process -> native dispatch\n", n);
     return do_syscall(n, a1, a2, a3, a4, a5);
 }
 

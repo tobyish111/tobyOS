@@ -88,6 +88,17 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_MT_TLS_NEXT      0x1D0   /* u64: W4: next free byte of the TLS area */
 #define WIN32_MT_TLS_END       0x1D8   /* u64: W4: end of the mapped TLS area    */
 #define WIN32_MT_TLS_USED      0x1E0   /* u32: W4: TLS slots in use (bit n = n)  */
+/* W5: the loader lock -- held by one thread at a time, again and again by the
+ * same one (a DllMain may load or free a DLL): who holds it (that thread's
+ * TEB) and how often. Every call that changes the table holds it, and so does
+ * every list of DllMain and TLS-callback calls, from the kernel's building of
+ * it to the stub's last call, as Windows holds its loader lock while a
+ * DllMain runs. */
+#define WIN32_MT_LOCK_DEPTH    0x1E4   /* u32: W5 */
+#define WIN32_MT_LOCK_OWNER    0x1E8   /* u64: W5: the holder's TEB, 0 when free */
+#define WIN32_MT_INIT_SEQ      0x1F0   /* u32: W5: the last initialization number given */
+#define WIN32_MT_MAIN_GONE     0x1F4   /* u32: W5: the main thread called ExitThread */
+#define WIN32_MT_EXITING       0x1F8   /* u64: W5: the TEB of the thread ending the process */
 #define WIN32_MT_MODS          0x200   /* module records                       */
 #define WIN32_MT_MOD_STRIDE    64
 #define WIN32_MT_STRINGS       0x600   /* W4: each slot's name + Windows path  */
@@ -105,24 +116,35 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_MTM_FLAGS        0x30    /* u32 */
 #define WIN32_MTM_REFS         0x34    /* u32: W4: LoadLibrary + import references */
 #define WIN32_MTM_TLS_SLOT     0x38    /* u32: W4: its TLS slot, 0 if none (the .exe's is 0) */
+#define WIN32_MTM_INIT_SEQ     0x3C    /* u32: W5: its initialization number, 0 before */
 #define WIN32_MTM_FLAG_DLL     1u
 #define WIN32_MTM_FLAG_PINNED  2u      /* W4: loaded with the process: never unloaded */
 #define WIN32_MTM_FLAG_INITED  4u      /* W4: its DLL_PROCESS_ATTACH was called      */
 #define WIN32_MTM_FLAG_UNLOAD  8u      /* W4: between FreeLibrary's DETACH and unmap */
+#define WIN32_MTM_FLAG_NOTHREAD 16u    /* W5: DisableThreadLibraryCalls took effect  */
 
 /* W3: CPL3 routines in the shim area's page 0 (the space W1 freed). */
-#define WIN32_INIT_TRAMP_VA    0x0000000030000200ULL   /* DllMains, then the .exe */
 #define WIN32_FAIL_ENTRY_VA    0x0000000030000280ULL   /* a load failure's entry  */
 #define WIN32_ONEXIT_EXEC_VA   0x00000000300002C0ULL   /* _execute_onexit_table   */
-/* W4: LoadLibrary and FreeLibrary run in CPL3 (they call DllMain); the source
- * is logs/w32/w4-ldr.S. Each entry point's VA, and the stubs' extent. */
+/* W4, W5: everything that calls a DllMain or a TLS callback runs in CPL3; the
+ * source is logs/w32/w5-ldr.S. Its jump table's slots: */
 #define WIN32_LDR_STUBS_VA     0x0000000030000300ULL
 #define WIN32_LDR_LOADA_VA     (WIN32_LDR_STUBS_VA + 0x00)   /* LoadLibraryA   */
 #define WIN32_LDR_LOADW_VA     (WIN32_LDR_STUBS_VA + 0x08)   /* LoadLibraryW   */
-#define WIN32_LDR_LOADEXA_VA   (WIN32_LDR_STUBS_VA + 0x18)   /* LoadLibraryExA */
-#define WIN32_LDR_LOADEXW_VA   (WIN32_LDR_STUBS_VA + 0x20)   /* LoadLibraryExW */
-#define WIN32_LDR_FREE_VA      (WIN32_LDR_STUBS_VA + 0x98)   /* FreeLibrary    */
-#define WIN32_LDR_BUF_MAX      WIN32_MAX_MODULES             /* {entry, base} pairs */
+#define WIN32_LDR_LOADEXA_VA   (WIN32_LDR_STUBS_VA + 0x10)   /* LoadLibraryExA */
+#define WIN32_LDR_LOADEXW_VA   (WIN32_LDR_STUBS_VA + 0x18)   /* LoadLibraryExW */
+#define WIN32_LDR_FREE_VA      (WIN32_LDR_STUBS_VA + 0x20)   /* FreeLibrary    */
+#define WIN32_LDR_EXITTHR_VA   (WIN32_LDR_STUBS_VA + 0x28)   /* ExitThread     */
+#define WIN32_LDR_EXITPROC_VA  (WIN32_LDR_STUBS_VA + 0x30)   /* ExitProcess, exit, _exit */
+#define WIN32_LDR_FREEEXIT_VA  (WIN32_LDR_STUBS_VA + 0x38)   /* FreeLibraryAndExitThread */
+#define WIN32_LDR_THREAD_VA    (WIN32_LDR_STUBS_VA + 0x40)   /* CreateThread's threads start here */
+#define WIN32_LDR_START_VA     (WIN32_LDR_STUBS_VA + 0x48)   /* a process with DLLs or TLS callbacks starts here */
+/* The list the kernel hands a stub: u64 count, then {u64 fn, u64 base, u64
+ * ctl} -- ctl's low byte the reason, and: */
+#define WIN32_LDR_BUF_MAX      (2 * WIN32_MAX_MODULES)       /* a module's TLS callbacks + its DllMain */
+#define WIN32_LDR_CTL_TLS      0x100u  /* fn is a NULL-terminated array of TLS callbacks */
+#define WIN32_LDR_CTL_RES      0x200u  /* lpReserved = 1 (else NULL)                    */
+#define WIN32_LDR_CTL_CHECK    0x400u  /* a FALSE return stops the list (DLL_PROCESS_ATTACH) */
 
 #define WIN32_STATUS_DLL_NOT_FOUND        0xC0000135u
 #define WIN32_STATUS_DLL_INIT_FAILED      0xC0000142u
@@ -166,6 +188,35 @@ uint64_t win32_builtin_proc_va(const char *dll, const char *func);
  * trailing '.' dropped. Returns its length, or -1 if it does not fit. */
 int pe_module_name(const char *in, char *out, int cap);
 
+/* W5: the DLL notifications (src/pe_loader.c), each a list for a stub to call
+ * (ubuf, as above); the caller holds the loader lock. Each returns the
+ * list's length, or -1 if the process's module table does not hold
+ * together. The order is Windows 11's, measured: a module's TLS callbacks
+ * before its DllMain, every DLL before the .exe's TLS callbacks; DLLs at
+ * DLL_PROCESS_ATTACH and DLL_THREAD_ATTACH in the order they were
+ * initialized, at DLL_PROCESS_DETACH and DLL_THREAD_DETACH in the reverse. */
+/* Process start: DLL_PROCESS_ATTACH for the DLLs loaded with the process (in
+ * the order the module table's init list gives), then the .exe's callbacks. */
+int pe_rt_start(uint64_t ubuf);
+/* After it: failed = the index of the DllMain that returned FALSE, or -1.
+ * Returns the .exe's entry point; or 0, with `who` = that DLL's name. */
+uint64_t pe_rt_started(int64_t failed, uint64_t ubuf, char *who, int cap);
+/* DLL_THREAD_ATTACH (2) or DLL_THREAD_DETACH (3) on the calling thread. */
+int pe_rt_thread_list(uint32_t reason, uint64_t ubuf);
+/* DLL_PROCESS_DETACH at the process's exit (lpReserved non-NULL). */
+int pe_rt_exit_list(uint64_t ubuf);
+/* DisableThreadLibraryCalls: 1 if hmod is a loaded module (the calls stop
+ * when it has no TLS directory: Windows 11 leaves them on when it has one),
+ * 0 if it is not. */
+int pe_rt_disable_thread_calls(uint64_t hmod);
+/* Each loaded module's static-TLS template, for a thread's own blocks. */
+struct pe_tls_tmpl {
+    uint32_t slot;          /* its index in a thread's TLS pointer array */
+    uint64_t raw, raw_size; /* the template's VA and size */
+    uint64_t total;         /* the block's size (the template + zero fill) */
+};
+int pe_rt_tls_templates(struct pe_tls_tmpl *out, int cap);
+
 /* W3 (src/syscall.c): 1 if tobyOS implements DLL `dll` itself -- a shim names
  * it, or it is an API-set name (api-ms-win-*, ext-ms-win-*) -- so the loader
  * binds its imports to shims and never looks for a file. */
@@ -206,11 +257,12 @@ int win32_kpath_to_winpath(const char *kpath, char *out, int cap);
 /* C16c: GetCommandLineW builds a UTF-16 copy of the ANSI command line here. */
 #define WIN32_CRT_CMDLINEW  0xC80  /* wide command line (<=0x300 bytes)  */
 
-/* C6 (multithreading): the CPL3 thread wrapper lives at this fixed VA in the
- * shim page (WIN32_SHIM_BASE 0x30000000 + WIN32_WRAPPER_OFF 0x80); CreateThread
- * starts each tobyOS thread there. And a Win32 thread HANDLE is tagged so it
- * is distinguishable from a file fd or a ucrt FILE* token. */
-#define WIN32_THREAD_WRAPPER_VA  0x0000000030000080ULL
+/* C6 (multithreading): CreateThread starts each tobyOS thread at this CPL3
+ * routine (W5: the loader stubs' thread start, which sends DLL_THREAD_ATTACH,
+ * calls the thread's function, then exits as ExitThread does). And a Win32
+ * thread HANDLE is tagged so it is distinguishable from a file fd or a ucrt
+ * FILE* token. */
+#define WIN32_THREAD_WRAPPER_VA  WIN32_LDR_THREAD_VA
 #define WIN32_THREAD_TAG         0x7400000000000000ULL  /* handle = TAG | tid */
 
 /* C7 (GUI): the DispatchMessage trampoline (calls the user WndProc directly in
