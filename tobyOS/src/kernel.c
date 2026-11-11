@@ -7747,9 +7747,18 @@ void _start(void) {
     defined(WINPE28B_BOOT) || defined(WINPE28C_BOOT) || defined(WINPE29A_BOOT) || \
     defined(WINPE30A_BOOT) || defined(WINPE30B_BOOT) || defined(WINPE31A_BOOT) || \
     defined(WINPE32A_BOOT) || defined(WINPE33A_BOOT) || defined(WINPE33B_BOOT) || \
-    defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT) || defined(WINPE34A_BOOT)
+    defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT) || defined(WINPE34A_BOOT) || \
+    defined(WINPE35A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
-     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W7c:
+     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W7d:
+     *   35A /bin/win-flt35.exe: CPU faults as SEH exceptions -- an access
+     *       violation (read, write, execute, non-canonical), divide by zero
+     *       and overflow, ud2, hlt/cli/in, int3, a single step, an SSE
+     *       divide by zero (shown as not run under QEMU, whose TCG raises no
+     *       SIMD exception), an x87 one; every register through a handler
+     *       and back; a fault caught two frames up; faults nobody handles
+     *       (15 checks), 35.
+     * W7c:
      *   34A /bin/win-veh34.exe: vectored exception and continue handlers --
      *       order, First, what ends each list, a noncontinuable exception,
      *       Remove -- GetExitCodeThread, and raises on one thread while
@@ -7888,6 +7897,10 @@ void _start(void) {
 #ifdef WINPE34A_BOOT
             { "WINPE34A", "/bin/win-veh34.exe", "win-veh34.exe", 34,
               "vectored exception and continue handlers, GetExitCodeThread (15 checks)" },
+#endif
+#ifdef WINPE35A_BOOT
+            { "WINPE35A", "/bin/win-flt35.exe", "win-flt35.exe", 35,
+              "CPU faults as SEH exceptions (15 checks)" },
 #endif
         };
         win32_gui_set_log(true);
