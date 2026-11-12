@@ -46,3 +46,11 @@ EXPORTS
     DispatchMessageW = rt_DispatchMessageA
     SendMessageA = rt_SendMessageA
     CreateWindowExA = rt_CreateWindowExA
+    strcpy_s = rt_strcpy_s
+    strcat_s = rt_strcat_s
+    __stdio_common_vsprintf_s = rt_stdio_common_vsprintf_s
+    set_terminate = rt_set_terminate
+    _get_terminate = rt_get_terminate
+    terminate = rt_crt_terminate
+    exit = rt_exit
+    InitOnceExecuteOnce = rt_InitOnceExecuteOnce

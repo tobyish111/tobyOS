@@ -18851,6 +18851,7 @@ static uint64_t win32_msize(uint64_t uptr) {
     return sz;
 }
 static long w32_malloc(uint64_t *a) { return (long)win32_malloc_hdr(a[0]); }
+static long win32_malloc_hdr_k(uint64_t n) { return (long)win32_malloc_hdr(n); }   /* W7k */
 static long w32_calloc(uint64_t *a) {
     uint64_t nmemb = a[0], sz = a[1], total = nmemb * sz;
     if (sz && total / sz != nmemb) return 0;       /* overflow */
@@ -21147,6 +21148,102 @@ static long w32_EnterCriticalSection(uint64_t *a) {
         sched_yield();
     }
 }
+
+
+/* ---- W7k: what msvcp140.dll (Microsoft's STL) asks of kernel32 --------- *
+ * std::mutex and std::shared_mutex are SRW locks, std::condition_variable a
+ * condition variable over one (measured: programs/win-cxx42 on Windows 11).
+ * Here, as the critical sections above: every shim runs under the BKL, so a
+ * read and write of the lock word is atomic against every other one; a
+ * waiter yields (sched_yield drops the BKL) and looks again.
+ *   SRWLOCK: 0 free, 1 held exclusive, 2n held shared by n.
+ *   CONDITION_VARIABLE: a sequence; a wake moves it, a sleeper waits for it
+ *     to move (Windows allows a wake to wake more than one -- the waiters
+ *     check their condition again, as they must anyway). */
+extern uint64_t pit_ticks(void);
+extern uint32_t pit_hz(void);
+static uint64_t win32_uget(uint64_t va) {
+    uint64_t v = 0;
+    (void)copy_from_user(&v, (const void *)(uintptr_t)va, 8);
+    return v;
+}
+static void win32_uput(uint64_t va, uint64_t v) {
+    (void)copy_to_user((void *)(uintptr_t)va, &v, 8);
+}
+static bool win32_srw_try(uint64_t lk, bool shared) {
+    uint64_t v = win32_uget(lk);
+    if (shared) {
+        if (v & 1) return false;
+        win32_uput(lk, v + 2);
+        return true;
+    }
+    if (v) return false;
+    win32_uput(lk, 1);
+    return true;
+}
+static void win32_srw_take(uint64_t lk, bool shared) {
+    while (!win32_srw_try(lk, shared)) sched_yield();
+}
+static void win32_srw_give(uint64_t lk, bool shared) {
+    uint64_t v = win32_uget(lk);
+    win32_uput(lk, shared ? (v >= 2 ? v - 2 : 0) : 0);
+}
+static long w32_InitializeSRWLock(uint64_t *a)          { win32_uput(a[0], 0); return 0; }
+static long w32_AcquireSRWLockExclusive(uint64_t *a)    { win32_srw_take(a[0], false); return 0; }
+static long w32_AcquireSRWLockShared(uint64_t *a)       { win32_srw_take(a[0], true); return 0; }
+static long w32_ReleaseSRWLockExclusive(uint64_t *a)    { win32_srw_give(a[0], false); return 0; }
+static long w32_ReleaseSRWLockShared(uint64_t *a)       { win32_srw_give(a[0], true); return 0; }
+static long w32_TryAcquireSRWLockExclusive(uint64_t *a) { return win32_srw_try(a[0], false) ? 1 : 0; }
+static long w32_TryAcquireSRWLockShared(uint64_t *a)    { return win32_srw_try(a[0], true) ? 1 : 0; }
+
+static long w32_InitializeConditionVariable(uint64_t *a) { win32_uput(a[0], 0); return 0; }
+static long w32_WakeConditionVariable(uint64_t *a) {
+    win32_uput(a[0], win32_uget(a[0]) + 1);
+    return 0;
+}
+/* the wait of SleepConditionVariableSRW/CS: the lock given back, the
+ * sequence watched until it moves or ms (INFINITE: ~0u) pass, the lock
+ * taken again; FALSE with ERROR_TIMEOUT when the time ran out */
+static long win32_cv_wait(uint64_t cv, uint32_t ms, void (*give)(uint64_t, bool), void (*take)(uint64_t, bool),
+                          uint64_t lk, bool shared) {
+    uint64_t seq = win32_uget(cv);
+    give(lk, shared);
+    uint64_t hz = pit_hz();
+    if (!hz) hz = 100;
+    uint64_t until = ms == 0xFFFFFFFFu ? ~0ull : pit_ticks() + ((uint64_t)ms * hz + 999) / 1000;
+    bool woken = false;
+    for (;;) {
+        if (win32_uget(cv) != seq) { woken = true; break; }
+        if (pit_ticks() >= until) break;
+        sched_yield();
+    }
+    take(lk, shared);
+    if (!woken) {
+        win32_set_last_error(1460 /* ERROR_TIMEOUT */);
+        return 0;
+    }
+    return 1;
+}
+/* SleepConditionVariableSRW(cv, lock, ms, flags): flags 1 =
+ * CONDITION_VARIABLE_LOCKMODE_SHARED */
+static long w32_SleepConditionVariableSRW(uint64_t *a) {
+    return win32_cv_wait(a[0], (uint32_t)a[2], win32_srw_give, win32_srw_take, a[1], ((uint32_t)a[3] & 1) != 0);
+}
+
+/* W7k: InitializeCriticalSectionEx(cs, spin, flags) -> TRUE: the critical
+ * section as InitializeCriticalSection's (vcruntime140.dll looks it up by
+ * name and takes a FALSE as its own initialization failing) */
+static long w32_InitializeCriticalSection(uint64_t *a);
+static long w32_InitializeCriticalSectionEx(uint64_t *a) {
+    (void)w32_InitializeCriticalSection(a);
+    return 1;
+}
+/* W7k: SwitchToThread -> TRUE (another thread ran, or may have);
+ * GetCurrentProcessorNumber -> this CPU's index; FlushProcessWriteBuffers:
+ * every shim runs under the BKL, whose taking and giving are full barriers */
+static long w32_SwitchToThread(uint64_t *a)           { (void)a; sched_yield(); return 1; }
+static long w32_GetCurrentProcessorNumber(uint64_t *a) { (void)a; return (long)smp_current_cpu_idx(); }
+static long w32_FlushProcessWriteBuffers(uint64_t *a)  { (void)a; __atomic_thread_fence(__ATOMIC_SEQ_CST); return 0; }
 
 /* W7: kernel32!TryEnterCriticalSection(cs) -> TRUE when taken (free, or
  * already the caller's), FALSE at once when another thread holds it. */
@@ -26793,7 +26890,33 @@ static long win32_invalid_parameter(int err) {
     }
     int32_t e = err;
     (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_ERRNO), &e, 4);
+    /* W7k: tobyrt.dll's wrapper of the checked function calls the handler */
+    struct proc *p = current_proc();
+    uint32_t one = 1;
+    if (p && p->gs_base) (void)copy_to_user((void *)(uintptr_t)(p->gs_base + WIN32_TEB_IPH_PENDING), &one, 4);
     return err;
+}
+/* W7k: _get_invalid_parameter_handler() -> the one set, or 0 */
+static long w32_get_invalid_parameter_handler(uint64_t *a) {
+    (void)a;
+    uint64_t h = 0;
+    (void)copy_from_user(&h, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_IPH), 8);
+    return (long)h;
+}
+/* W7k: _register_thread_local_exe_atexit_callback(cb): an MSVC .exe's
+ * thread_local destructors' callback, which exit() calls first (tobyrt.dll's
+ * exit reads it from the module table) */
+static long w32_register_tlexe_callback(uint64_t *a) {
+    (void)copy_to_user((void *)(uintptr_t)(WIN32_MODTAB_BASE + WIN32_MT_TLEXE_CB), &a[0], 8);
+    return 0;
+}
+/* W7k: _invoke_watson -- the UCRT's last resort: __fastfail, as an invalid
+ * parameter with no handler */
+static long w32_invoke_watson(uint64_t *a) {
+    (void)a;
+    kprintf("[win32] _invoke_watson: __fastfail (0xC0000409)\n");
+    proc_exit_group((int)WIN32_STATUS_STACK_BUFFER_OVERRUN);
+    return 0;
 }
 static long w32_set_invalid_parameter_handler(uint64_t *a) {
     uint64_t old = 0;
@@ -26962,6 +27085,92 @@ static long w32_EncodePointer(uint64_t *a) { return (long)a[0]; }
 static long w32_InitializeCriticalSectionAndSpinCount(uint64_t *a) {
     (void)w32_InitializeCriticalSection(a);
     return 1;
+}
+
+/* ---- W7k: the UCRT's locale, as msvcp140.dll's iostreams ask it --------- *
+ * The "C" locale's answers, as Windows 11's UCRT gives them a program that
+ * never called setlocale: code page 0 (no multibyte), no locale names, the
+ * classic ctype table; the day and month names and the time names NULL --
+ * msvcp140.dll then uses its own "C" ones. The ctype table (257 shorts, the
+ * EOF entry first) is made on the program's heap at the first ask; the CRT
+ * page keeps its pointer, the six locale names (all NULL), the new handler
+ * and the three stream-buffer slots. */
+#define WIN32_CRT_PCTYPE      0xF80   /* u64: the ctype table + 1 entry, 0 not made yet */
+#define WIN32_CRT_LCNAMES     0xF88   /* 6 x u64 NULL: ___lc_locale_name_func's */
+#define WIN32_CRT_NEWH        0xFB8   /* u64: _set_new_handler's */
+#define WIN32_CRT_STREAMBUF   0xFC0   /* 3 x u64 (0): _get_stream_buffer_pointers' */
+_Static_assert(WIN32_CRT_CMDLINEW + 0x300 <= WIN32_CRT_PCTYPE && WIN32_CRT_STREAMBUF + 0x18 <= 0x1000,
+               "W7k's locale slots fit after the wide command line, in the CRT page");
+static long w32_zero_locale(uint64_t *a) { (void)a; return 0; }      /* _lock_locales, codepages, names */
+static long w32_lc_locale_name_func(uint64_t *a) {
+    (void)a;
+    return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_LCNAMES);
+}
+static uint16_t win32_ctype1(int c) {
+    uint16_t f = 0;
+    if (c < 0x20 || c == 0x7F) f |= 0x20;                       /* _CONTROL */
+    if ((c >= 9 && c <= 13) || c == ' ') f |= 0x08;             /* _SPACE */
+    if (c == ' ' || c == '\t') f |= 0x40;                       /* _BLANK */
+    if (c >= '0' && c <= '9') f |= 0x04 | 0x80;                 /* _DIGIT _HEX */
+    if (c >= 'A' && c <= 'Z') f |= 0x01 | 0x100;                /* _UPPER, alpha */
+    if (c >= 'a' && c <= 'z') f |= 0x02 | 0x100;                /* _LOWER, alpha */
+    if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) f |= 0x80;
+    if (c > 0x20 && c < 0x7F && !(f & (0x04 | 0x100))) f |= 0x10;   /* _PUNCT */
+    return f;
+}
+static long win32_malloc_hdr_k(uint64_t n);
+static long w32_pctype_func(uint64_t *a) {
+    (void)a;
+    uint64_t t = 0;
+    (void)copy_from_user(&t, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_PCTYPE), 8);
+    if (t) return (long)t;
+    uint16_t tab[257];
+    tab[0] = 0;                                                 /* EOF */
+    for (int c = 0; c < 256; c++) tab[c + 1] = c < 0x80 ? win32_ctype1(c) : 0;
+    uint64_t m = (uint64_t)win32_malloc_hdr_k(sizeof tab);
+    if (!m || copy_to_user((void *)(uintptr_t)m, tab, sizeof tab) != 0) return 0;
+    t = m + 2;
+    (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_PCTYPE), &t, 8);
+    return (long)t;
+}
+static long w32_iswalnum(uint64_t *a)  { int c = (int)(uint16_t)a[0]; return c < 0x80 && (win32_ctype1(c) & (0x04 | 0x100)) ? 1 : 0; }
+static long w32_iswdigit(uint64_t *a)  { int c = (int)(uint16_t)a[0]; return c >= '0' && c <= '9'; }
+static long w32_iswspace(uint64_t *a)  { int c = (int)(uint16_t)a[0]; return c < 0x80 && (win32_ctype1(c) & 0x08) ? 1 : 0; }
+static long w32_iswxdigit(uint64_t *a) { int c = (int)(uint16_t)a[0]; return c < 0x80 && (win32_ctype1(c) & 0x80) ? 1 : 0; }
+/* btowc(c): the "C" locale's byte as itself; EOF: WEOF */
+static long w32_btowc(uint64_t *a) {
+    int c = (int)a[0];
+    return (c < 0 || c > 0xFF) ? 0xFFFF : c;
+}
+/* __strncnt(s, n): strnlen's */
+static long w32_strncnt(uint64_t *a) {
+    uint64_t sp = a[0], n = a[1], k = 0;
+    char b[64];
+    while (k < n) {
+        uint64_t want = n - k < sizeof b ? n - k : sizeof b;
+        if (copy_from_user(b, (const void *)(uintptr_t)(sp + k), want) != 0) break;
+        for (uint64_t i = 0; i < want; i++, k++) if (!b[i]) return (long)k;
+    }
+    return (long)k;
+}
+/* _callnewh(size): the new handler's verdict -- none is called (0: the
+ * allocation fails); _set_new_handler(h) -> the one before */
+static long w32_callnewh(uint64_t *a) { (void)a; return 0; }
+static long w32_set_new_handler(uint64_t *a) {
+    uint64_t old = 0;
+    (void)copy_from_user(&old, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_NEWH), 8);
+    (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_NEWH), &a[0], 8);
+    return (long)old;
+}
+/* _get_stream_buffer_pointers(FILE *, char ***base, char ***ptr, int **cnt):
+ * tobyOS's FILEs have no buffer the program can see -- the three point at
+ * empty slots, and a filebuf over the FILE writes through fputc/fwrite */
+static long w32_get_stream_buffer_pointers(uint64_t *a) {
+    for (int i = 0; i < 3; i++) {
+        uint64_t slot = WIN32_CRT_DATA_BASE + WIN32_CRT_STREAMBUF + (uint64_t)i * 8;
+        if (a[1 + i]) (void)copy_to_user((void *)(uintptr_t)a[1 + i], &slot, 8);
+    }
+    return 0;
 }
 
 /* ---- conversion ---- */
@@ -27481,6 +27690,19 @@ static long w32_com_Add(uint64_t *a){
  * exchanged as bit patterns since this file is -mno-sse. The gate does
  * `movq xmm0, rax` on the returned bits. One-arg funcs read xmm0 = a[4]; two-arg
  * read xmm0,xmm1 = a[4],a[5]; ldexp's int exponent is the 2nd integer arg a[1]. */
+/* W7k: _dclass(x) / _ldclass (a long double is a double here, as MSVC's):
+ * FP_INFINITE 1, FP_NAN 2, FP_NORMAL -1, FP_SUBNORMAL -2, FP_ZERO 0 (math.h
+ * of the UCRT) from the bits; copysign(x, y): x's magnitude, y's sign. Their
+ * double arguments come by the float gate (a[4], a[5]). */
+static long w32_dclass(uint64_t *a) {
+    uint64_t b = a[4], e = (b >> 52) & 0x7FF, m = b & ((1ull << 52) - 1);
+    if (e == 0x7FF) return m ? 2 : 1;
+    if (e == 0) return m ? -2 : 0;
+    return -1;
+}
+static long w32_copysign(uint64_t *a) {
+    return (long)((a[4] & ~(1ull << 63)) | (a[5] & (1ull << 63)));
+}
 static long w32_sqrt (uint64_t *a){ return (long)kmath_op1(KM_SQRT , a[4]); }
 static long w32_sin  (uint64_t *a){ return (long)kmath_op1(KM_SIN  , a[4]); }
 static long w32_cos  (uint64_t *a){ return (long)kmath_op1(KM_COS  , a[4]); }
@@ -27558,6 +27780,21 @@ static const struct win32_shim g_win32_shims[] = {
     /* kernel32. The critical-section funcs are REAL as of C6 (mutual
      * exclusion); DeleteCriticalSection stays a no-op. */
     { "kernel32.dll", "InitializeCriticalSection", w32_InitializeCriticalSection },
+    { "kernel32.dll", "InitializeCriticalSectionEx", w32_InitializeCriticalSectionEx },   /* W7k */
+    { "kernel32.dll", "InitializeSRWLock",         w32_InitializeSRWLock },
+    { "kernel32.dll", "AcquireSRWLockExclusive",   w32_AcquireSRWLockExclusive },
+    { "kernel32.dll", "AcquireSRWLockShared",      w32_AcquireSRWLockShared },
+    { "kernel32.dll", "ReleaseSRWLockExclusive",   w32_ReleaseSRWLockExclusive },
+    { "kernel32.dll", "ReleaseSRWLockShared",      w32_ReleaseSRWLockShared },
+    { "kernel32.dll", "TryAcquireSRWLockExclusive", w32_TryAcquireSRWLockExclusive },
+    { "kernel32.dll", "TryAcquireSRWLockShared",   w32_TryAcquireSRWLockShared },
+    { "kernel32.dll", "InitializeConditionVariable", w32_InitializeConditionVariable },
+    { "kernel32.dll", "WakeConditionVariable",     w32_WakeConditionVariable },
+    { "kernel32.dll", "WakeAllConditionVariable",  w32_WakeConditionVariable },
+    { "kernel32.dll", "SleepConditionVariableSRW", w32_SleepConditionVariableSRW },
+    { "kernel32.dll", "SwitchToThread",            w32_SwitchToThread },
+    { "kernel32.dll", "GetCurrentProcessorNumber", w32_GetCurrentProcessorNumber },
+    { "kernel32.dll", "FlushProcessWriteBuffers",  w32_FlushProcessWriteBuffers },
     /* W7h */
     { "kernel32.dll", "InitializeCriticalSectionAndSpinCount", w32_InitializeCriticalSectionAndSpinCount },
     { "kernel32.dll", "IsDebuggerPresent",         w32_zero },
@@ -27643,7 +27880,37 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_set_abort_behavior",    w32_set_abort_behavior },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_resetstkoflw",          w32_resetstkoflw },   /* W7i */
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_c_exit",                w32_zero },
-    { "api-ms-win-crt-runtime-l1-1-0.dll", "_register_thread_local_exe_atexit_callback", w32_zero },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_register_thread_local_exe_atexit_callback", w32_register_tlexe_callback },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_get_invalid_parameter_handler", w32_get_invalid_parameter_handler },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_invoke_watson",         w32_invoke_watson },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_strcpy_s",        w32_strcpy_s },   /* W7k: tobyrt.dll's */
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_strcat_s",        w32_strcat_s },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_stdio_common_vsprintf_s", w32_stdio_common_vsprintf_s },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_abort",           w32_abort },
+    { "api-ms-win-crt-locale-l1-1-0.dll", "_lock_locales",          w32_zero_locale },   /* W7k */
+    { "api-ms-win-crt-locale-l1-1-0.dll", "_unlock_locales",        w32_zero_locale },
+    { "api-ms-win-crt-locale-l1-1-0.dll", "___lc_codepage_func",    w32_zero_locale },
+    { "api-ms-win-crt-locale-l1-1-0.dll", "___lc_collate_cp_func",  w32_zero_locale },
+    { "api-ms-win-crt-locale-l1-1-0.dll", "___lc_locale_name_func", w32_lc_locale_name_func },
+    { "api-ms-win-crt-locale-l1-1-0.dll", "__pctype_func",          w32_pctype_func },
+    { "api-ms-win-crt-time-l1-1-0.dll",   "_Getdays",               w32_zero_locale },
+    { "api-ms-win-crt-time-l1-1-0.dll",   "_Getmonths",             w32_zero_locale },
+    { "api-ms-win-crt-time-l1-1-0.dll",   "_Gettnames",             w32_zero_locale },
+    { "api-ms-win-crt-time-l1-1-0.dll",   "_W_Getdays",             w32_zero_locale },
+    { "api-ms-win-crt-time-l1-1-0.dll",   "_W_Getmonths",           w32_zero_locale },
+    { "api-ms-win-crt-time-l1-1-0.dll",   "_W_Gettnames",           w32_zero_locale },
+    { "api-ms-win-crt-string-l1-1-0.dll", "iswalnum",               w32_iswalnum },
+    { "api-ms-win-crt-string-l1-1-0.dll", "iswdigit",               w32_iswdigit },
+    { "api-ms-win-crt-string-l1-1-0.dll", "iswspace",               w32_iswspace },
+    { "api-ms-win-crt-string-l1-1-0.dll", "iswxdigit",              w32_iswxdigit },
+    { "api-ms-win-crt-string-l1-1-0.dll", "__strncnt",              w32_strncnt },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "btowc",                 w32_btowc },
+    { "api-ms-win-crt-heap-l1-1-0.dll",   "_callnewh",              w32_callnewh },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_set_new_handler",      w32_set_new_handler },
+    { "api-ms-win-crt-stdio-l1-1-0.dll",  "_get_stream_buffer_pointers", w32_get_stream_buffer_pointers },
+    { "api-ms-win-crt-math-l1-1-0.dll",   "_dclass",                w32_dclass },
+    { "api-ms-win-crt-math-l1-1-0.dll",   "_ldclass",               w32_dclass },
+    { "api-ms-win-crt-math-l1-1-0.dll",   "copysign",               w32_copysign },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit",            w32_crt_atexit },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_cexit",                 w32_zero },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_initterm",              w32_initterm },
@@ -27957,6 +28224,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "QueryPerformanceCounter",   w32_QueryPerformanceCounter },
     { "kernel32.dll", "QueryPerformanceFrequency", w32_QueryPerformanceFrequency },
     { "kernel32.dll", "GetSystemInfo",       w32_GetSystemInfo },
+    { "kernel32.dll", "GetNativeSystemInfo", w32_GetSystemInfo },   /* W7k: x64 on x64: the same */
     /* file locking (single-process -> succeed) + mmap (fail -> normal I/O) */
     { "kernel32.dll", "LockFile",            w32_LockFileStub },
     { "kernel32.dll", "LockFileEx",          w32_LockFileStub },
@@ -28179,7 +28447,8 @@ int win32_shim_is_double_ret(int idx) {
            f == w32_acos || f == w32_sinh  || f == w32_cosh  || f == w32_tanh  ||
            f == w32_cbrt || f == w32_pow   || f == w32_fmod  || f == w32_atan2 ||
            f == w32_hypot|| f == w32_ldexp || f == w32_frexp ||
-           f == w32_strtod || f == w32_atof;   /* C22: string->double also returns in xmm0 */
+           f == w32_strtod || f == w32_atof ||  /* C22: string->double also returns in xmm0 */
+           f == w32_dclass || f == w32_copysign; /* W7k: a double argument (xmm0, xmm1) */
 }
 
 /* First shim-table index whose DLL matches `dll` (case-insensitive), or -1. The

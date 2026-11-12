@@ -1320,3 +1320,125 @@ HWND rt_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, i
     }
     return h;
 }
+
+/* ---- W7k: the CRT's calls of the program's own code ---------------------- *
+ * The UCRT calls code a program gave it: the invalid-parameter handler
+ * (_set_invalid_parameter_handler) when a checked function finds a bad
+ * argument, the terminate handler (set_terminate) when std::terminate runs,
+ * and an MSVC .exe's thread_local destructors' callback
+ * (_register_thread_local_exe_atexit_callback) when exit() starts; and
+ * kernel32's InitOnceExecuteOnce calls its function once. The kernel's shims
+ * cannot call it; these can (measured on Windows 11: programs/win-cxx42,
+ * logs/w32/w7k-host-run.txt). The fixed places are pe.h's. */
+#define RT_CRT_DATA        0x31001000ull   /* WIN32_CRT_DATA_BASE */
+#define RT_CRT_IPH         0x38            /* WIN32_CRT_IPH */
+#define RT_TEB_TERMINATE   0x308           /* WIN32_TEB_TERMINATE (u64) */
+#define RT_TEB_IPH_PENDING 0x310           /* WIN32_TEB_IPH_PENDING (u32) */
+#define RT_MT_TLEXE        0x31009FF0ull   /* WIN32_MODTAB_BASE + WIN32_MT_TLEXE_CB */
+#define RT_LDR_CRT_EXIT    0x30000350ull   /* WIN32_LDR_CRTEXIT_VA: the loader stubs' exit */
+typedef void (__cdecl *RT_IPH)(const wchar_t *, const wchar_t *, const wchar_t *, unsigned, uintptr_t);
+typedef void (__cdecl *RT_TERMINATE_HANDLER)(void);
+typedef void (NTAPI *RT_TLS_CALLBACK)(void *, DWORD, void *);
+typedef void (__cdecl *RT_EXIT)(int);
+
+static inline BYTE *rt_teb(void) {
+    BYTE *t;
+    __asm__ volatile("movq %%gs:0x30, %0" : "=r"(t));
+    return t;
+}
+
+/* The kernel's checked functions (src/syscall.c) under names of their own:
+ * an invalid parameter with a handler set gives the function's error code
+ * and marks the thread's TEB; with none the process ends there (the UCRT's
+ * __fastfail). tobyrt_crt.def's import library. */
+__declspec(dllimport) int __cdecl __toby_strcpy_s(char *, size_t, const char *);
+__declspec(dllimport) int __cdecl __toby_strcat_s(char *, size_t, const char *);
+__declspec(dllimport) int __cdecl __toby_stdio_common_vsprintf_s(unsigned __int64, char *, size_t, const char *,
+                                                                  void *, va_list);
+__declspec(dllimport) void __cdecl __toby_abort(void);
+
+/* After a checked function: the handler, when the function took the
+ * invalid-parameter path -- its arguments all empty, as a release UCRT
+ * passes them (measured) */
+static void rt_iph_after(void) {
+    volatile DWORD *pend = (volatile DWORD *)(rt_teb() + RT_TEB_IPH_PENDING);
+    if (!*pend) return;
+    *pend = 0;
+    RT_IPH h = *(RT_IPH volatile *)(RT_CRT_DATA + RT_CRT_IPH);
+    if (h) h(0, 0, 0, 0, 0);
+}
+int rt_strcpy_s(char *d, size_t n, const char *s) {
+    int e = __toby_strcpy_s(d, n, s);
+    rt_iph_after();
+    return e;
+}
+int rt_strcat_s(char *d, size_t n, const char *s) {
+    int e = __toby_strcat_s(d, n, s);
+    rt_iph_after();
+    return e;
+}
+int rt_stdio_common_vsprintf_s(unsigned __int64 o, char *b, size_t n, const char *f, void *l, va_list v) {
+    int r = __toby_stdio_common_vsprintf_s(o, b, n, f, l, v);
+    rt_iph_after();
+    return r;
+}
+
+/* set_terminate / _get_terminate / terminate: the handler is the thread's
+ * (the UCRT keeps one a thread); terminate calls it, and aborts when it
+ * returns or there is none (abort: exit 3, W7h). */
+RT_TERMINATE_HANDLER rt_set_terminate(RT_TERMINATE_HANDLER f) {
+    RT_TERMINATE_HANDLER volatile *slot = (RT_TERMINATE_HANDLER volatile *)(rt_teb() + RT_TEB_TERMINATE);
+    RT_TERMINATE_HANDLER old = *slot;
+    *slot = f;
+    return old;
+}
+RT_TERMINATE_HANDLER rt_get_terminate(void) {
+    return *(RT_TERMINATE_HANDLER volatile *)(rt_teb() + RT_TEB_TERMINATE);
+}
+void rt_crt_terminate(void) {
+    RT_TERMINATE_HANDLER f = rt_get_terminate();
+    if (f) f();
+    __toby_abort();
+    rt_terminate(3);
+}
+
+/* exit(code): an MSVC .exe's thread_local destructors' callback first, once
+ * (the UCRT calls it with DLL_PROCESS_DETACH before the atexit functions:
+ * measured, the main thread's thread_local died before the statics), then
+ * the loader stubs' exit -- the atexit functions, ExitProcess. */
+void rt_exit(int code) {
+    RT_TLS_CALLBACK volatile *slot = (RT_TLS_CALLBACK volatile *)RT_MT_TLEXE;
+    RT_TLS_CALLBACK cb = *slot;
+    if (cb) {
+        *slot = 0;
+        cb(0, DLL_PROCESS_DETACH, 0);
+    }
+    ((RT_EXIT)RT_LDR_CRT_EXIT)(code);
+    rt_terminate((DWORD)code);
+}
+
+/* InitOnceExecuteOnce(once, fn, param, &context): fn runs once; the others
+ * wait for it (Sleep(0)) -- the INIT_ONCE word: 0 not yet, 1 running, its
+ * context | 2 done (a context's two low bits are the system's, as on
+ * Windows). FALSE if fn did, and a later call runs fn again. */
+BOOL rt_InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, LPVOID *ctx) {
+    volatile LONG_PTR *w = (volatile LONG_PTR *)once;
+    for (;;) {
+        LONG_PTR v = *w;
+        if ((v & 3) == 2) {
+            if (ctx) *ctx = (LPVOID)(v & ~(LONG_PTR)3);
+            return TRUE;
+        }
+        if (v == 0 && __sync_bool_compare_and_swap(w, 0, 1)) {
+            PVOID c = 0;
+            if (fn(once, param, &c)) {
+                *w = ((LONG_PTR)c & ~(LONG_PTR)3) | 2;
+                if (ctx) *ctx = c;
+                return TRUE;
+            }
+            *w = 0;
+            return FALSE;
+        }
+        Sleep(0);
+    }
+}

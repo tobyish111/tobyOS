@@ -2639,11 +2639,14 @@ $(W33)/win-top33.exe: $(W33)/top33.c $(W33)/seh33s.S
 TRT := programs/tobyrt
 $(TRT)/libtobyrt_user32.a: $(TRT)/tobyrt_user32.def
 	TMP='C:\t' TEMP='C:\t' dlltool -m i386:x86-64 -d $< -l $@
-$(TRT)/tobyrt.dll: $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def $(TRT)/libtobyrt_user32.a
+$(TRT)/libtobyrt_crt.a: $(TRT)/tobyrt_crt.def
+	TMP='C:\t' TEMP='C:\t' dlltool -m i386:x86-64 -d $< -l $@
+$(TRT)/tobyrt.dll: $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def $(TRT)/libtobyrt_user32.a \
+                   $(TRT)/libtobyrt_crt.a
 	$(CC) --target=x86_64-w64-mingw32 -O2 -Wall -Wextra -shared -nostdlib -ffreestanding \
 	      -fasynchronous-unwind-tables -fno-builtin -fno-optimize-sibling-calls \
 	      -fno-stack-protector -mno-stack-arg-probe \
-	      -o $@ $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def -lkernel32 $(TRT)/libtobyrt_user32.a \
+	      -o $@ $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def -lkernel32 $(TRT)/libtobyrt_user32.a $(TRT)/libtobyrt_crt.a \
 	      -Wl,-e,0 -Wl,--image-base,0x32000000
 
 # Track C/W7c: win-veh34.exe (exit 34, as on Windows 11) -- vectored exception

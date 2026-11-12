@@ -47,6 +47,11 @@ struct pe_load_info {
 #define WIN32_STACK_GUARD_BYTES   (16u * 1024u)
 #define WIN32_TEB_STACK_BOTTOM    0x2F8   /* u64 */
 #define WIN32_TEB_STACK_SPENT     0x300   /* u32 */
+/* W7k: the thread's terminate handler (set_terminate: tobyrt.dll), and the
+ * mark a checked CRT function leaves when it took the invalid-parameter
+ * path with a handler set (tobyrt.dll calls the handler) */
+#define WIN32_TEB_TERMINATE       0x308   /* u64 */
+#define WIN32_TEB_IPH_PENDING     0x310   /* u32 */
 
 /* True if [image,size) looks like a PE/COFF image: 'MZ' DOS magic and a
  * 'PE\0\0' signature at e_lfanew. Cheap sniff used by the exec path to
@@ -119,6 +124,9 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_MT_NAME_MAX      64
 #define WIN32_MT_PATH_MAX      (WIN32_MT_STR_STRIDE - WIN32_MT_NAME_MAX)
 #define WIN32_MT_FAIL_AREA     0x1E00  /* W4: the process-start failure's text */
+#define WIN32_MT_TLEXE_CB      0x1FF0  /* u64: W7k: an MSVC .exe's thread_local destructors' callback
+                                        * (_register_thread_local_exe_atexit_callback), 0 none --
+                                        * tobyrt.dll's exit calls it */
 #define WIN32_MT_LDR_HANDLER   0x1FF8  /* u64: W7g: tobyrt.dll's handler of the loader's
                                         * ldr_run frame, 0 none (the stub function
                                         * table's trampoline jumps to it) */

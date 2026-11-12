@@ -903,6 +903,8 @@ _Static_assert(WIN32_MTM_TLS_SLOT + 4 <= WIN32_MTM_INIT_SEQ && WIN32_MTM_INIT_SE
                "a record overruns its stride");
 _Static_assert(WIN32_MT_STRINGS + WIN32_MAX_MODULES * WIN32_MT_STR_STRIDE <= WIN32_MT_FAIL_AREA,
                "the strings overrun the failure text");
+_Static_assert(WIN32_MT_FAIL_AREA < WIN32_MT_TLEXE_CB && WIN32_MT_TLEXE_CB + 8 <= WIN32_MT_LDR_HANDLER,
+               "W7k's slot sits between the failure's text and the loader handler's");
 _Static_assert(WIN32_MT_FAIL_AREA < WIN32_MT_LDR_HANDLER && WIN32_MT_LDR_HANDLER + 8 <= WIN32_MODTAB_BYTES,
                "the failure text and W7g's handler slot are outside the table");
 
@@ -1023,7 +1025,7 @@ static void pe_fail(struct pe_ctx *c, uint32_t status, const char *text) {
     kprintf("[pe] load failure (0x%08x): %s\n", status, text);
     if (c->rt) return;
     uint64_t va = WIN32_MODTAB_BASE + WIN32_MT_FAIL_AREA;
-    size_t n = strlen(text), room = WIN32_MT_LDR_HANDLER - WIN32_MT_FAIL_AREA - 1;
+    size_t n = strlen(text), room = WIN32_MT_TLEXE_CB - WIN32_MT_FAIL_AREA - 1;
     if (n > room) n = room;
     char nul = '\0';
     (void)pe_uwrite(c, va, text, n);
@@ -1361,6 +1363,11 @@ static const char *const g_pe_rt_names[] = {
      * window's procedure, CreateWindowEx's creation messages); the C7
      * DispatchMessage trampoline is the fallback without the runtime */
     "DispatchMessageA", "DispatchMessageW", "SendMessageA", "CreateWindowExA",
+    /* W7k: the CRT's calls of the program's code (the invalid-parameter
+     * handler after a checked function, the terminate handler, an MSVC
+     * .exe's thread_local destructors at exit) and InitOnceExecuteOnce's */
+    "strcpy_s", "strcat_s", "__stdio_common_vsprintf_s",
+    "set_terminate", "_get_terminate", "terminate", "exit", "InitOnceExecuteOnce",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)

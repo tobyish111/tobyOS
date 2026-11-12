@@ -1,0 +1,9 @@
+; tobyrt.dll's imports of the kernel's C runtime half (W7k): the checked
+; functions, whose invalid-parameter path tobyrt.dll finishes by calling the
+; program's handler, and abort. An import library dlltool makes of it.
+LIBRARY api-ms-win-crt-runtime-l1-1-0.dll
+EXPORTS
+    __toby_strcpy_s
+    __toby_strcat_s
+    __toby_stdio_common_vsprintf_s
+    __toby_abort
