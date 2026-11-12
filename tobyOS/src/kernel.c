@@ -7751,7 +7751,7 @@ void _start(void) {
     defined(WINPE35A_BOOT) || defined(WINPE35B_BOOT) || defined(WINPE36A_BOOT) || \
     defined(WINPE37A_BOOT) || defined(WINPE37B_BOOT) || defined(WINPE38A_BOOT) || \
     defined(WINPE39A_BOOT) || defined(WINPE40A_BOOT) || defined(WINPE41A_BOOT) || \
-    defined(WINPE42A_BOOT)
+    defined(WINPE42A_BOOT) || defined(WINPE43A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
      * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / (with
      * one argument when the entry gives one). W7h:
@@ -7977,6 +7977,10 @@ void _start(void) {
 #ifdef WINPE42A_BOOT
             { "WINPE42A", "/bin/win-cxx42.exe", "win-cxx42.exe", 44,
               "cl.exe's C++ on msvcp140: the CRT's callbacks, iostreams, threads (7 checks)" },
+#endif
+#ifdef WINPE43A_BOOT
+            { "WINPE43A", "/bin/win-text43.exe", "win-text43.exe", 45,
+              "the CRT's text mode: \\r\\n written and read, Ctrl-Z, _setmode, _fmode (10 checks)" },
 #endif
         };
         win32_gui_set_log(true);
