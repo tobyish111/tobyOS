@@ -2671,6 +2671,21 @@ W37 := programs/win-exc37
 $(W37)/win-lj37.exe: $(W37)/lj37.c $(W37)/lj37s.S
 	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W37)/lj37.c $(W37)/lj37s.S -lntdll
 
+# Track C/W7g: win-cb38.exe (exit 40, as on Windows 11) -- an exception
+# raised in code the system calls: a window procedure under DispatchMessage
+# and a dialog procedure under DialogBoxParam (it goes on to the caller), and
+# DllMain (dll38.dll's) under LoadLibrary and FreeLibrary (the loader takes
+# it), at process start, exit, and a thread's start and end -- those in
+# children, win-cb38s.exe, which imports dll38.dll.
+W38 := programs/win-exc38
+$(W38)/dll38.dll: $(W38)/dll38.c
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -shared -o $@ $(W38)/dll38.c -Wl,--out-implib,$(W38)/libdll38.a
+$(W38)/win-cb38s.exe: $(W38)/cb38s.c $(W38)/dll38.dll
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W38)/cb38s.c -L$(W38) -ldll38
+$(W38)/win-cb38.exe: $(W38)/cb38.c $(W38)/cb38s.S $(W38)/cb38.rc
+	windres -i $(W38)/cb38.rc -o $(W38)/cb38_res.o --target=pe-x86-64
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W38)/cb38.c $(W38)/cb38s.S $(W38)/cb38_res.o -luser32
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3222,6 +3237,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-exc35/win-so35.exe \
                programs/win-exc36/win-jit36.exe \
                programs/win-exc37/win-lj37.exe \
+               programs/win-exc38/win-cb38.exe \
+               programs/win-exc38/win-cb38s.exe \
+               programs/win-exc38/dll38.dll \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3431,6 +3449,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-exc35/win-so35.exe               $(INITRD_STAGE)/bin/win-so35.exe
 	cp programs/win-exc36/win-jit36.exe              $(INITRD_STAGE)/bin/win-jit36.exe
 	cp programs/win-exc37/win-lj37.exe               $(INITRD_STAGE)/bin/win-lj37.exe
+	cp programs/win-exc38/win-cb38.exe               $(INITRD_STAGE)/bin/win-cb38.exe
+	cp programs/win-exc38/win-cb38s.exe              $(INITRD_STAGE)/bin/win-cb38s.exe
+	cp programs/win-exc38/dll38.dll                  $(INITRD_STAGE)/bin/dll38.dll
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4439,6 +4460,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-exc33.exe bin/win-unc33.exe bin/win-seh33.exe         \
 	    bin/win-top33.exe bin/win-veh34.exe bin/win-flt35.exe         \
 	    bin/win-so35.exe bin/win-jit36.exe bin/win-lj37.exe           \
+	    bin/win-cb38.exe bin/win-cb38s.exe bin/dll38.dll              \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \

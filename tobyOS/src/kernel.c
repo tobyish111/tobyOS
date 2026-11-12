@@ -7749,10 +7749,17 @@ void _start(void) {
     defined(WINPE32A_BOOT) || defined(WINPE33A_BOOT) || defined(WINPE33B_BOOT) || \
     defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT) || defined(WINPE34A_BOOT) || \
     defined(WINPE35A_BOOT) || defined(WINPE35B_BOOT) || defined(WINPE36A_BOOT) || \
-    defined(WINPE37A_BOOT) || defined(WINPE37B_BOOT)
+    defined(WINPE37A_BOOT) || defined(WINPE37B_BOOT) || defined(WINPE38A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
      * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / (with
-     * one argument when the entry gives one). W7f:
+     * one argument when the entry gives one). W7g:
+     *   38A /bin/win-cb38.exe: an exception raised in code the system calls
+     *       -- a window procedure under DispatchMessage (twice nested) and a
+     *       dialog procedure under DialogBoxParam reach the caller's
+     *       __except; DllMain's (/bin/dll38.dll) under LoadLibrary and
+     *       FreeLibrary the loader takes; children (/bin/win-cb38s.exe) for
+     *       process start, exit and a thread's start and end (6 checks), 40.
+     * W7f:
      *   37A /bin/win-lj37.exe: a longjmp that unwinds -- a __finally between
      *       runs, the setjmp caller's own too; the registers come back from
      *       the jump buffer; a frame of 0 is not unwound; children whose
@@ -7940,6 +7947,10 @@ void _start(void) {
 #ifdef WINPE37B_BOOT
             { "WINPE37B", "/bin/win-lua.exe", "win-lua.exe", 39,
               "Lua's errors, longjmps out of the interpreter (10 lines as on Windows)", "/etc/w37lua.lua" },
+#endif
+#ifdef WINPE38A_BOOT
+            { "WINPE38A", "/bin/win-cb38.exe", "win-cb38.exe", 40,
+              "exceptions in code the system calls: WndProc, DialogProc, DllMain (6 checks)" },
 #endif
         };
         win32_gui_set_log(true);
