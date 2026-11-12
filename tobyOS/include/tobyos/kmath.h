@@ -52,4 +52,9 @@ int kmath_fmt_double(uint64_t bits, char conv, int prec, unsigned flags,
  * double-returning shim like strtod relies on the C20 float gate's movq). */
 uint64_t kmath_strtod(const char *s, int *consumed, uint32_t *fbits);
 
+/* W7m: a float's bits as a double's, and a double's rounded to a float's
+ * (logf and the float functions of the CRT go through double) */
+uint64_t kmath_f2d(uint32_t fbits);
+uint32_t kmath_d2f(uint64_t dbits);
+
 #endif

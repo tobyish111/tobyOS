@@ -1372,6 +1372,14 @@ static const char *const g_pe_rt_names[] = {
      * the program's invalid-parameter handler) */
     "_setmode", "_set_fmode", "_get_fmode", "_open", "_close", "_read", "_write",
     "_lseek", "_lseeki64", "_eof",
+    /* W7m: the thread pool (its callbacks are the program's), the INIT_ONCE
+     * pair, the stack walk, GetModuleHandleEx (a module of an address) */
+    "CreateThreadpoolWork", "SubmitThreadpoolWork", "WaitForThreadpoolWorkCallbacks",
+    "CloseThreadpoolWork", "CreateThreadpoolTimer", "SetThreadpoolTimer", "IsThreadpoolTimerSet",
+    "WaitForThreadpoolTimerCallbacks", "CloseThreadpoolTimer", "CreateThreadpoolWait",
+    "SetThreadpoolWait", "WaitForThreadpoolWaitCallbacks", "CloseThreadpoolWait",
+    "FreeLibraryWhenCallbackReturns", "InitOnceBeginInitialize", "InitOnceComplete",
+    "RtlCaptureStackBackTrace", "GetModuleHandleExW", "GetModuleHandleExA",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)
@@ -1423,7 +1431,7 @@ static uint64_t pe_export_lookup(struct pe_ctx *c, int mi, const char *name,
             mid = lo + (hi - lo) / 2;
             uint32_t nrva;
             pe_uread(c, &nrva, m->base + ed.names + (uint64_t)mid * 4, 4);
-            char cand[256];
+            char cand[1024];                /* W7m: so do msvcp140's exports */
             if (!pe_rva_ok(m, nrva, 1) ||
                 pe_ustr(c, cand, sizeof cand, m->base + nrva, m->base + m->size) < 0)
                 return 0;
@@ -1704,7 +1712,7 @@ static int pe_bind_module(struct pe_ctx *c, int mi) {
                 uint64_t ent;
                 pe_uread(c, &ent, names + k * 8, 8);
                 if (!ent) break;
-                char fname[128];
+                char fname[1024];               /* W7m: C++ names run past 128 */
                 bool by_ord = (ent & PE_ORDINAL_FLAG) != 0;
                 if (by_ord) {
                     ksnprintf(fname, sizeof fname, "#%u", (unsigned)(ent & 0xFFFFu));

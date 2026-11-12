@@ -18266,7 +18266,13 @@ static long win32_fd_write(int fd, const char *buf, size_t len) {
 #define W32FD_FERR      0x04           /* the stream had an error (ferror) */
 #define W32FD_LOOK      0x08           /* `look`: the byte after a '\r', from a pipe */
 #define W32FD_UNGET     0x10           /* `unget`: ungetc's byte */
-struct w32fd { uint8_t flags, mode, look, unget; };   /* mode: an index of g_w32fd_modes */
+#define W32FD_FBUF      0x20           /* W7m: buffered -- what the CRT writes waits in `buf` */
+#define W32FD_FBSET     0x40           /* W7m: buffered or not decided (stdout's at its first write) */
+#define W32FD_BUFSZ     4096u          /* the UCRT's buffer */
+/* mode: an index of g_w32fd_modes; bufn bytes wait at buf (W7m) */
+struct w32fd { uint8_t flags, mode, look, unget; uint32_t bufn; uint64_t buf; };
+#define W32FD_ESZ       16u
+_Static_assert(sizeof(struct w32fd) == W32FD_ESZ, "a descriptor's CRT state is 16 bytes");
 static const uint32_t g_w32fd_modes[5] = {
     0x4000 /* _O_TEXT */, 0x8000 /* _O_BINARY */, 0x10000 /* _O_WTEXT */,
     0x20000 /* _O_U16TEXT */, 0x40000 /* _O_U8TEXT */ };
@@ -18278,27 +18284,29 @@ static uint64_t win32_fdtab(bool make) {
     uint64_t t = 0;
     (void)copy_from_user(&t, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_FDTAB), 8);
     if (t || !make) return t;
-    t = win32_malloc_hdr(W32FD_MAX * 4);           /* the arena's memory is zeroed */
+    t = win32_malloc_hdr(W32FD_MAX * W32FD_ESZ);   /* the arena's memory is zeroed */
     if (t) (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_FDTAB), &t, 8);
     return t;
 }
 static struct w32fd win32_fd_get(int fd) {
-    struct w32fd e = { 0, 0, 0, 0 };
+    struct w32fd e = { 0, 0, 0, 0, 0, 0 };
     if (fd < 0 || fd >= W32FD_MAX) return e;
     uint64_t t = win32_fdtab(false);
-    if (t) (void)copy_from_user(&e, (const void *)(uintptr_t)(t + (uint64_t)fd * 4), 4);
+    if (t) (void)copy_from_user(&e, (const void *)(uintptr_t)(t + (uint64_t)fd * W32FD_ESZ), W32FD_ESZ);
+    if (e.bufn > W32FD_BUFSZ) e.bufn = 0;
     if (e.mode >= 5) e.mode = W32FD_TEXT;
     return e;
 }
 static void win32_fd_put(int fd, struct w32fd e) {
     if (fd < 0 || fd >= W32FD_MAX) return;
     uint64_t t = win32_fdtab(true);
-    if (t) (void)copy_to_user((void *)(uintptr_t)(t + (uint64_t)fd * 4), &e, 4);
+    if (t) (void)copy_to_user((void *)(uintptr_t)(t + (uint64_t)fd * W32FD_ESZ), &e, W32FD_ESZ);
 }
-/* A descriptor opened (in `mode`) or closed (text): nothing pending */
+/* A descriptor opened (in `mode`) or closed (text): nothing pending (its
+ * buffer, flushed by the caller, kept for the next stream on it) */
 static void win32_fd_reset(int fd, int mode) {
     if (mode == W32FD_TEXT && !win32_fdtab(false)) return;
-    struct w32fd e = { 0, (uint8_t)mode, 0, 0 };
+    struct w32fd e = { 0, (uint8_t)mode, 0, 0, 0, win32_fd_get(fd).buf };
     win32_fd_put(fd, e);
 }
 static void win32_fd_flag(int fd, uint8_t set, uint8_t clear) {
@@ -18320,42 +18328,114 @@ static void win32_crt_errno(int e) {
     (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_ERRNO), &v, 4);
 }
 
+/* W7m: the CRT's write buffer. A stream fopen opens is buffered (the UCRT's
+ * 4096 bytes), and so is stdout when it is a pipe or a file -- never a
+ * terminal, never stderr; setvbuf changes it. Measured on Windows 11
+ * (logs/w32/w7m-probe-flush.c): a program's printf to a pipe reached it after
+ * its WriteFile, and what a stream held reached its file at return, exit,
+ * _exit and ExitProcess, not at TerminateProcess. The bytes wait translated;
+ * a read, a seek, fflush, fclose and the process's end write them. _write
+ * goes past the buffer, as the UCRT's does. Before W7m every fputc was a
+ * write of its own -- msvcp140's filebuf writes a character at a time. */
+static int win32_crt_flush(int fd) {
+    struct w32fd e = win32_fd_get(fd);
+    if (!e.bufn || !e.buf) return 0;
+    uint32_t n = e.bufn;
+    e.bufn = 0;
+    win32_fd_put(fd, e);
+    for (uint64_t done = 0; done < n; ) {
+        long w = sys_write(fd, (const void *)(uintptr_t)(e.buf + done), n - done);
+        if (w <= 0) { win32_fd_flag(fd, W32FD_FERR, 0); return -1; }
+        done += (uint64_t)w;
+    }
+    return 0;
+}
+/* every descriptor's; the count of those that had something */
+static int win32_crt_flush_all(void) {
+    if (!win32_fdtab(false)) return 0;
+    int n = 0;
+    for (int fd = 0; fd < (int)W32FD_MAX; fd++)
+        if (win32_fd_get(fd).bufn) { (void)win32_crt_flush(fd); n++; }
+    return n;
+}
+static bool win32_fd_buffered(int fd, struct w32fd *e) {
+    if (!(e->flags & W32FD_FBSET)) {
+        e->flags |= W32FD_FBSET;
+        struct file *f = fd == 1 ? fd_lookup(1) : 0;
+        if (f && (f->kind == FILE_KIND_PIPE_W || f->kind == FILE_KIND_PIPE_RW || f->kind == FILE_KIND_VFS))
+            e->flags |= W32FD_FBUF;
+        win32_fd_put(fd, *e);
+    }
+    if (!(e->flags & W32FD_FBUF)) return false;
+    if (!e->buf) {
+        e->buf = win32_malloc_hdr(W32FD_BUFSZ);
+        if (!e->buf) e->flags &= (uint8_t)~W32FD_FBUF;
+        win32_fd_put(fd, *e);
+    }
+    return e->buf != 0;
+}
+/* n bytes (translated) to the descriptor: into its buffer when it has one */
+static long win32_crt_out(int fd, struct file *f, const char *k, size_t n, bool stdio) {
+    struct w32fd e = win32_fd_get(fd);
+    if (!stdio || !win32_fd_buffered(fd, &e)) return file_write(f, k, n) < 0 ? -1 : 0;
+    while (n) {
+        if (e.bufn == W32FD_BUFSZ) {
+            if (win32_crt_flush(fd) < 0) return -1;
+            e = win32_fd_get(fd);
+        }
+        uint32_t m = W32FD_BUFSZ - e.bufn;
+        if (m > n) m = (uint32_t)n;
+        if (copy_to_user((void *)(uintptr_t)(e.buf + e.bufn), k, m) != 0) return -1;
+        e.bufn += m;
+        k += m;
+        n -= m;
+        win32_fd_put(fd, e);
+    }
+    return 0;
+}
 /* What the CRT writes from a kernel buffer: in text mode each '\n' as
- * "\r\n". Answers len, or -1. */
-static long win32_crt_write(int fd, const char *buf, size_t len) {
+ * "\r\n"; stdio's through the buffer, _write's past it. Answers len, or -1. */
+static long win32_crt_write_x(int fd, const char *buf, size_t len, bool stdio) {
     if (len == 0) return 0;
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
-    if (!win32_fd_text(fd)) return file_write(f, buf, len) < 0 ? -1 : (long)len;
+    if (!win32_fd_text(fd)) return win32_crt_out(fd, f, buf, len, stdio) < 0 ? -1 : (long)len;
     char out[512];
     size_t k = 0;
     for (size_t i = 0; i < len; i++) {
         if (k + 2 > sizeof out) {
-            if (file_write(f, out, k) < 0) return -1;
+            if (win32_crt_out(fd, f, out, k, stdio) < 0) return -1;
             k = 0;
         }
         if (buf[i] == '\n') out[k++] = '\r';
         out[k++] = buf[i];
     }
-    if (k && file_write(f, out, k) < 0) return -1;
+    if (k && win32_crt_out(fd, f, out, k, stdio) < 0) return -1;
     return (long)len;
 }
-/* ... and from the program's buffer (binary: as it is, in one write) */
-static long win32_crt_write_u(int fd, uint64_t ubuf, size_t len) {
+static long win32_crt_write(int fd, const char *buf, size_t len) { return win32_crt_write_x(fd, buf, len, true); }
+/* ... and from the program's buffer (a binary write that the buffer would
+ * not hold goes out at once, after what waits) */
+static long win32_crt_write_ux(int fd, uint64_t ubuf, size_t len, bool stdio) {
     if (len == 0) return 0;
     if (!win32_fd_text(fd)) {
-        long w = sys_write(fd, (const void *)(uintptr_t)ubuf, len);
-        return w < 0 ? -1 : w;
+        struct w32fd e = win32_fd_get(fd);
+        if (!stdio || !win32_fd_buffered(fd, &e) || len >= W32FD_BUFSZ) {
+            if (stdio && win32_crt_flush(fd) < 0) return -1;
+            long w = sys_write(fd, (const void *)(uintptr_t)ubuf, len);
+            return w < 0 ? -1 : w;
+        }
     }
     char k[256];
     for (size_t done = 0; done < len; ) {
         size_t n = len - done < sizeof k ? len - done : sizeof k;
         if (copy_from_user(k, (const void *)(uintptr_t)(ubuf + done), n) != 0) return -1;
-        if (win32_crt_write(fd, k, n) < 0) return -1;
+        if (win32_crt_write_x(fd, k, n, stdio) < 0) return -1;
         done += n;
     }
     return (long)len;
 }
+static long win32_crt_write_u(int fd, uint64_t ubuf, size_t len) { return win32_crt_write_ux(fd, ubuf, len, true); }
 
 /* _read's work into a kernel buffer: the byte a pipe gave ahead first, then
  * one read of what is left of n; in text mode translated where it is (so it
@@ -18411,6 +18491,7 @@ static long win32_crt_read_k(int fd, char *kb, size_t n) {
 /* stdio's next byte: ungetc's first, else a read; -1 at the end (feof) or
  * on an error (ferror) */
 static int win32_stdio_getc(int fd) {
+    if (win32_crt_flush(fd) < 0) return -1;              /* W7m: what waits goes first */
     struct w32fd e = win32_fd_get(fd);
     if (e.flags & W32FD_UNGET) {
         e.flags &= (uint8_t)~W32FD_UNGET;
@@ -20865,6 +20946,7 @@ static long w32_CloseHandle(uint64_t *a) {
     if ((h & 0xFFFFFF00ULL) == WIN32_IOB_TAG) return 1;           /* stdio FILE token */
     int fd = (int)h;
     if (fd < 3) return 1;                                         /* keep std handles open */
+    (void)win32_crt_flush(fd);                                    /* W7m */
     win32_fd_reset(fd, W32FD_TEXT);                               /* W7l */
     return (sys_close(fd) == 0) ? 1 : 0;
 }
@@ -23468,72 +23550,9 @@ static long w32_GetFileAttributesA(uint64_t *a) {
     return (vs.type == VFS_TYPE_DIR) ? 0x10 /* DIRECTORY */ : 0x80 /* NORMAL */;
 }
 
-/* ---- FindFirstFile/FindNextFile/FindClose: directory enumeration ----
- * A find HANDLE is a tagged token (high byte 0x7E) carrying a slot in a small
- * table of open VFS directory cursors. */
+/* ---- FindFirstFile/FindNextFile/FindClose: W7m's, with the wide kernel32
+ * calls; a search HANDLE is a tagged token (high byte 0x7E) carrying its slot */
 #define WIN32_FIND_TAG    0x7E00000000000000ull
-#define WIN32_MAX_FINDS   4
-static struct { bool in_use; struct vfs_dir dir; } g_win32_find[WIN32_MAX_FINDS];
-
-/* Fill a WIN32_FIND_DATAA at user `out` from a VFS directory entry (we set only
- * the fields apps commonly read: attributes, low size, cFileName@0x2C). */
-static void win32_fill_find_data(uint64_t out, const struct vfs_dirent *e) {
-    uint8_t b[0x140];
-    memset(b, 0, sizeof(b));
-    uint32_t attr = (e->type == VFS_TYPE_DIR) ? 0x10u : 0x80u;
-    memcpy(&b[0x00], &attr, 4);                  /* dwFileAttributes */
-    uint32_t lo = (uint32_t)e->size;
-    memcpy(&b[0x20], &lo, 4);                     /* nFileSizeLow */
-    int n = 0;
-    for (; e->name[n] && n < 259; n++) b[0x2C + n] = (uint8_t)e->name[n];
-    b[0x2C + n] = 0;                              /* cFileName[MAX_PATH] @0x2C */
-    (void)copy_to_user((void *)(uintptr_t)out, b, 0x2C + 260);
-}
-
-/* kernel32!FindFirstFileA(pattern, &WIN32_FIND_DATAA) -> find HANDLE or INVALID.
- * The trailing wildcard is stripped to yield the directory to enumerate. */
-static long w32_FindFirstFileA(uint64_t *a) {
-    char kp[ABI_PATH_MAX];
-    int di = win32_translate_path_k((const char *)(uintptr_t)a[0], kp, sizeof(kp));
-    if (di < 0) return (long)WIN32_INVALID_HANDLE;
-    int cut = 0;                                 /* strip "/<wildcard>" -> dir */
-    for (int i = di - 1; i >= 0; i--) if (kp[i] == '/') { cut = i; break; }
-    kp[cut ? cut : 1] = '\0';
-    int slot = -1;
-    for (int i = 0; i < WIN32_MAX_FINDS; i++) if (!g_win32_find[i].in_use) { slot = i; break; }
-    if (slot < 0) return (long)WIN32_INVALID_HANDLE;
-    if (vfs_opendir(kp, &g_win32_find[slot].dir) != VFS_OK) return (long)WIN32_INVALID_HANDLE;
-    struct vfs_dirent e;
-    if (vfs_readdir(&g_win32_find[slot].dir, &e) != VFS_OK) {
-        vfs_closedir(&g_win32_find[slot].dir);
-        return (long)WIN32_INVALID_HANDLE;
-    }
-    g_win32_find[slot].in_use = true;
-    win32_fill_find_data(a[1], &e);
-    return (long)(WIN32_FIND_TAG | (uint64_t)slot);
-}
-
-/* kernel32!FindNextFileA(hFind, &WIN32_FIND_DATAA) -> TRUE, FALSE at end. */
-static long w32_FindNextFileA(uint64_t *a) {
-    if ((a[0] & WIN32_BRUSH_MASK) != WIN32_FIND_TAG) return 0;
-    int slot = (int)(a[0] & 0xFF);
-    if (slot < 0 || slot >= WIN32_MAX_FINDS || !g_win32_find[slot].in_use) return 0;
-    struct vfs_dirent e;
-    if (vfs_readdir(&g_win32_find[slot].dir, &e) != VFS_OK) return 0;
-    win32_fill_find_data(a[1], &e);
-    return 1;
-}
-
-/* kernel32!FindClose(hFind) -> TRUE. */
-static long w32_FindClose(uint64_t *a) {
-    if ((a[0] & WIN32_BRUSH_MASK) != WIN32_FIND_TAG) return 0;
-    int slot = (int)(a[0] & 0xFF);
-    if (slot >= 0 && slot < WIN32_MAX_FINDS && g_win32_find[slot].in_use) {
-        vfs_closedir(&g_win32_find[slot].dir);
-        g_win32_find[slot].in_use = false;
-    }
-    return 1;
-}
 
 /* ---- C12: bitmaps + BitBlt ----
  * A memory DC + bitmap let an app compose an off-screen image and BitBlt it onto
@@ -25046,6 +25065,7 @@ static long w32_toby_ldr(uint64_t *a) {
         (void)win32_mt_get(WIN32_MT_EXITING, &ex, 8);
         if (ex && ex == me->gs_base) {            /* an exit inside the exit's own calls */
             kprintf("[win32] ExitProcess(%u) during the exit\n", (unsigned)a[1]);
+            (void)win32_crt_flush_all();          /* W7m: as the UCRT does at its detach */
             proc_exit_group((int)(uint32_t)a[1]);
         }
         /* Windows ends the other threads first: none gets DLL_THREAD_DETACH,
@@ -25070,6 +25090,7 @@ static long w32_toby_ldr(uint64_t *a) {
         (void)win32_mt_get(WIN32_MT_EXITING, &ex, 8);
         if (ex && ex == me->gs_base) {
             kprintf("[win32] ExitProcess(%u)\n", (unsigned)code);
+            (void)win32_crt_flush_all();          /* W7m: as the UCRT does at its detach */
             proc_exit_group(code);
         }
         win32_ldr_unlock_as(true);
@@ -26630,66 +26651,6 @@ static long w32_WideCharToMultiByte(uint64_t *a) {
 static int win32_xlate_winpath(const char *wpath, char *kp, int cap) {
     return win32_winpath_to_k(wpath, kp, cap);
 }
-/* Open a KERNEL Windows path with the CreateFile access/disposition encoding. */
-static long win32_open_winpath(const char *wpath, uint32_t access, uint32_t disp) {
-    char kp[ABI_PATH_MAX];
-    int di = win32_xlate_winpath(wpath, kp, sizeof(kp));
-    if (di < 0) return (long)WIN32_INVALID_HANDLE;
-    uint64_t ubuf = WIN32_CRT_DATA_BASE + WIN32_CRT_PATHBUF;
-    if (copy_to_user((void *)(uintptr_t)ubuf, kp, (size_t)di + 1) != 0) return (long)WIN32_INVALID_HANDLE;
-    bool rd = (access & 0x80000000UL) != 0, wr = (access & 0x40000000UL) != 0;
-    int flags = (rd && wr) ? ABI_O_RDWR : (wr ? ABI_O_WRONLY : ABI_O_RDONLY);
-    switch (disp) {
-        case 1: flags |= ABI_O_CREAT | ABI_O_EXCL;  break;
-        case 2: flags |= ABI_O_CREAT | ABI_O_TRUNC; break;
-        case 3:                                      break;
-        case 4: flags |= ABI_O_CREAT;                break;
-        case 5: flags |= ABI_O_TRUNC;                break;
-        default: break;
-    }
-    long fd = sys_open((const char *)(uintptr_t)ubuf, flags, 0644);
-    return (fd < 0) ? (long)WIN32_INVALID_HANDLE : fd;
-}
-/* CreateFileW(name, access, share, sa, disp, flags, template). */
-static long w32_CreateFileW(uint64_t *a) {
-    char wp[ABI_PATH_MAX];
-    win32_wstr_to_k(a[0], wp, sizeof(wp));
-    return win32_open_winpath(wp, (uint32_t)a[1], (uint32_t)a[4]);
-}
-static long w32_GetFileAttributesW(uint64_t *a) {
-    char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0], wp, sizeof(wp));
-    char kp[ABI_PATH_MAX];
-    if (win32_xlate_winpath(wp, kp, sizeof(kp)) < 0) return (long)0xFFFFFFFFu;  /* W2: error set */
-    struct vfs_stat vs;
-    if (vfs_stat(kp, &vs) != VFS_OK) { win32_set_last_error(WIN32_ERR_FILE_NOT_FOUND); return (long)0xFFFFFFFFu; }
-    win32_set_last_error(0);
-    return (vs.type == VFS_TYPE_DIR) ? 0x10 : 0x80;
-}
-/* GetFileAttributesExW(name, infoLevel, lpFileInformation) ->
- * WIN32_FILE_ATTRIBUTE_DATA { DWORD attr; FILETIME c/a/w; DWORD szHi/szLo }. */
-static long w32_GetFileAttributesExW(uint64_t *a) {
-    char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0], wp, sizeof(wp));
-    char kp[ABI_PATH_MAX];
-    if (win32_xlate_winpath(wp, kp, sizeof(kp)) < 0) return 0;                  /* W2: error set */
-    struct vfs_stat vs;
-    if (vfs_stat(kp, &vs) != VFS_OK) { win32_set_last_error(WIN32_ERR_FILE_NOT_FOUND); return 0; }
-    uint8_t b[36]; memset(b, 0, sizeof(b));
-    uint32_t attr = (vs.type == VFS_TYPE_DIR) ? 0x10u : 0x80u;
-    memcpy(&b[0], &attr, 4);
-    uint32_t szlo = (uint32_t)vs.size, szhi = (uint32_t)(vs.size >> 32);
-    memcpy(&b[28], &szhi, 4); memcpy(&b[32], &szlo, 4);
-    (void)copy_to_user((void *)(uintptr_t)a[2], b, sizeof(b));
-    win32_set_last_error(0);
-    return 1;
-}
-static long w32_DeleteFileW(uint64_t *a) {
-    char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0], wp, sizeof(wp));
-    char kp[ABI_PATH_MAX]; int di = win32_xlate_winpath(wp, kp, sizeof(kp));
-    if (di < 0) return 0;
-    uint64_t ubuf = WIN32_CRT_DATA_BASE + WIN32_CRT_PATHBUF;
-    if (copy_to_user((void *)(uintptr_t)ubuf, kp, (size_t)di + 1) != 0) return 0;
-    return (sys_unlink((const char *)(uintptr_t)ubuf) == 0) ? 1 : 0;
-}
 /* ---- W2: the current directory, full paths, the drive list ----
  * The string-returning calls below follow Microsoft's buffer contract: when the
  * string (and its NUL) fits, it is copied and the length WITHOUT the NUL is
@@ -26829,7 +26790,6 @@ static long w32_GetTempPathA(uint64_t *a) {
     if (a[1] && cap >= 4) { (void)copy_to_user((void *)(uintptr_t)a[1], "C:\\", 4); }
     return 3;
 }
-static long w32_FindFirstFileW(uint64_t *a) { (void)a; g_wsa_lasterror = 2; return (long)WIN32_INVALID_HANDLE; }
 /* GetFileType(h): real fds -> DISK(1); std handles -> CHAR(2). */
 static long w32_GetFileType(uint64_t *a) { return ((int)a[0] < 3) ? 2 : 1; }
 static long w32_FlushFileBuffers(uint64_t *a) { (void)a; return 1; }
@@ -27471,6 +27431,7 @@ static long win32_fopen_k(const char *path, const char *mode) {
     if(fd<0){ win32_crt_errno(win32_crt_errno_of(fd)); return 0; }
     if(fd>=W32FD_MAX){ (void)sys_close((int)fd); win32_crt_errno(24); return 0; }   /* EMFILE */
     win32_fd_reset((int)fd, fmode);
+    win32_fd_flag((int)fd, W32FD_FBUF|W32FD_FBSET, 0);  /* W7m: buffered, as the UCRT's */
     return (long)(WIN32_IOB_TAG|(uint64_t)((uint32_t)fd&0xFF));
 }
 static long w32_fopen(uint64_t *a) {
@@ -27481,7 +27442,8 @@ static long w32_fopen(uint64_t *a) {
     return win32_fopen_k(path, mode);
 }
 static long w32_fclose(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return -1;
-    win32_fd_reset(fd, W32FD_TEXT); if(fd>=3)(void)sys_close(fd); return 0;}
+    int fr=win32_crt_flush(fd);                          /* W7m */
+    win32_fd_reset(fd, W32FD_TEXT); if(fd>=3)(void)sys_close(fd); return fr<0?-1:0;}
 /* fread(ptr=a0, size=a1, nmemb=a2, FILE*=a3). (C19b: the FILE* is a3 like
  * fwrite -- a latent arg-swap here read the fd from the buffer ptr and wrote
  * into the FILE* token; SQLite never hit it as its VFS uses ReadFile, but real
@@ -27492,6 +27454,7 @@ static long w32_fread(uint64_t *a){
     uint64_t sz=a[1],nm=a[2]; if(!sz||!nm)return 0;
     if(nm>(~0ULL)/sz)return 0;
     uint64_t want=sz*nm, done=0;
+    if(win32_crt_flush(fd)<0)return 0;                   /* W7m */
     struct w32fd e=win32_fd_get(fd);
     if(e.flags&W32FD_UNGET){
         if(copy_to_user((void*)(uintptr_t)a[0],&e.unget,1)!=0)return 0;
@@ -27540,6 +27503,7 @@ static long w32_fgets(uint64_t *a){int fd=win32_file_fd(a[2]); if(fd<0)return 0;
     return (long)a[0];}
 static long w32_fseek(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return -1;
     int64_t off=(int64_t)(int32_t)a[1]; int wh=(int)a[2];
+    if(win32_crt_flush(fd)<0)return -1;                 /* W7m */
     struct w32fd e=win32_fd_get(fd);
     if(wh==1&&(e.flags&W32FD_UNGET))off-=1;            /* SEEK_CUR from where the program is */
     if(sys_lseek(fd,off,wh)<0)return -1;
@@ -27547,8 +27511,9 @@ static long w32_fseek(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return -1
     return 0;}
 static long w32_ftell(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return -1;
     long p=sys_lseek(fd,0,1); if(p<0)return -1;
-    return (win32_fd_get(fd).flags&W32FD_UNGET)&&p>0?p-1:p;}
-static long w32_rewind(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd>=0){(void)sys_lseek(fd,0,0);
+    struct w32fd e=win32_fd_get(fd); p+=(long)e.bufn;   /* W7m: what waits counts */
+    return (e.flags&W32FD_UNGET)&&p>0?p-1:p;}
+static long w32_rewind(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd>=0){(void)win32_crt_flush(fd); (void)sys_lseek(fd,0,0);
     win32_fd_flag(fd,0,W32FD_CTRLZ|W32FD_FEOF|W32FD_FERR|W32FD_LOOK|W32FD_UNGET);} return 0;}
 static long w32_fileno(uint64_t *a){return win32_file_fd(a[0]);}
 static long w32_get_osfhandle(uint64_t *a){return (long)(int)a[0];}     /* HANDLE == fd */
@@ -27604,6 +27569,7 @@ static long w32_open(uint64_t *a) {
 static long w32_close(uint64_t *a) {
     int fd = (int)a[0];
     if (!win32_lowio_fd_ok(fd)) return -1;
+    (void)win32_crt_flush(fd);                                  /* W7m */
     win32_fd_reset(fd, W32FD_TEXT);
     return sys_close(fd) == 0 ? 0 : -1;
 }
@@ -27631,13 +27597,14 @@ static long w32_lowio_write(uint64_t *a) {
     if (!win32_lowio_fd_ok(fd)) return -1;
     if (n == 0) return 0;
     if (!a[1]) { win32_invalid_parameter(22); return -1; }
-    long w = win32_crt_write_u(fd, a[1], n);
+    long w = win32_crt_write_ux(fd, a[1], n, false);           /* W7m: past stdio's buffer */
     if (w < 0) { win32_crt_errno(28); return -1; }              /* ENOSPC */
     return w;
 }
 static long win32_lowio_seek(int fd, int64_t off, int wh) {
     if (!win32_lowio_fd_ok(fd)) return -1;
     if (wh < 0 || wh > 2) { win32_invalid_parameter(22); return -1; }
+    (void)win32_crt_flush(fd);                                  /* W7m */
     long p = sys_lseek(fd, off, wh);
     if (p < 0) { win32_crt_errno(p == -29 ? 29 : 22); return -1; }
     win32_fd_flag(fd, 0, W32FD_CTRLZ | W32FD_LOOK);
@@ -27821,6 +27788,7 @@ static long w32_vfscanf(uint64_t *a) {
     if (fd < 0 || !a[2] || !a[4]) return -1;
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
+    (void)win32_crt_flush(fd);                    /* W7m: what waits goes first */
     int64_t startpos = sys_lseek(fd, 0, 1);       /* SEEK_CUR; <0 if not seekable */
     /* W7l: ungetc's byte first; in text mode the chunk is translated, each
      * byte keeping its place in the file (pos[]), so the seek back lands
@@ -27871,6 +27839,7 @@ static long w32_ungetc(uint64_t *a){int fd=win32_file_fd(a[1]); int c=(int)a[0];
  * the stream's descriptor is closed and the file opened in its place. */
 static long w32_freopen(uint64_t *a){
     int fd=win32_file_fd(a[2]); if(fd<0)return 0;
+    (void)win32_crt_flush(fd);                           /* W7m */
     char mode[16]; mode[0]=0; if(a[1])(void)strncpy_from_user(mode,(const char*)(uintptr_t)a[1],sizeof(mode));
     mode[sizeof(mode)-1]=0;
     int flags,fmode;
@@ -27922,7 +27891,6 @@ static long w32_crt_unlink(uint64_t *a){uint64_t up=win32_stage_winpath((const c
 /* C19b: remove(path) == unlink. rename has no kernel primitive yet -> reports
  * failure (Lua's os.rename surfaces it as nil,errmsg; uncalled by the test). */
 static long w32_crt_remove(uint64_t *a){uint64_t up=win32_stage_winpath((const char*)(uintptr_t)a[0]); return (up&&sys_unlink((const char*)(uintptr_t)up)==0)?0:-1;}
-static long w32_crt_rename(uint64_t *a){(void)a;return -1;}
 static long w32_crt_wunlink(uint64_t *a){char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0],wp,sizeof(wp));
     char kp[ABI_PATH_MAX]; int di=win32_xlate_winpath(wp,kp,sizeof(kp)); if(di<0)return -1;
     uint64_t ubuf=WIN32_CRT_DATA_BASE+WIN32_CRT_PATHBUF; if(copy_to_user((void*)(uintptr_t)ubuf,kp,(size_t)di+1)!=0)return -1;
@@ -28180,6 +28148,1349 @@ struct win32_shim {
 /* The kernel32 subset for C1. Index into this table is what the PE loader
  * bakes into each IAT thunk; keep it append-only so existing thunks stay
  * valid. */
+/* ==== W7m: the rest of what msvcp140.dll asks of kernel32 and the UCRT ======
+ * (docs/roadmap-2026-11.md; measured on Windows 11 first: programs/win-cxx44,
+ * logs/w32/w7m-host-run.txt) -- std::filesystem's calls, the locale queries
+ * of its facets, the time facets' _Strftime, wide streams and wide paths.
+ * The thread pool, InitOnceBeginInitialize/Complete, RtlCaptureStackBackTrace
+ * and GetModuleHandleEx run in tobyrt.dll: they call the program's code or
+ * walk its stack. */
+
+/* -- wide paths: UTF-16 from the program, UTF-8 on the disk -------------- */
+static int win32_utf8_put(uint32_t c, char *out, int o, int cap) {
+    int need = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    if (o + need >= cap) return -1;
+    if (need == 1) out[o++] = (char)c;
+    else if (need == 2) { out[o++] = (char)(0xC0 | (c >> 6)); out[o++] = (char)(0x80 | (c & 0x3F)); }
+    else if (need == 3) {
+        out[o++] = (char)(0xE0 | (c >> 12)); out[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+        out[o++] = (char)(0x80 | (c & 0x3F));
+    } else {
+        out[o++] = (char)(0xF0 | (c >> 18)); out[o++] = (char)(0x80 | ((c >> 12) & 0x3F));
+        out[o++] = (char)(0x80 | ((c >> 6) & 0x3F)); out[o++] = (char)(0x80 | (c & 0x3F));
+    }
+    return o;
+}
+/* the program's NUL-terminated UTF-16 (n units, or -1: to its NUL) as UTF-8
+ * in out; the bytes, or -1 when it does not fit */
+static int win32_w16_to_utf8(uint64_t uw, long n, char *out, int cap) {
+    int o = 0;
+    for (long i = 0; n < 0 || i < n; i++) {
+        uint16_t w = 0;
+        if (copy_from_user(&w, (const void *)(uintptr_t)(uw + (uint64_t)i * 2), 2) != 0) break;
+        if (!w && n < 0) break;
+        uint32_t c = w;
+        if (w >= 0xD800 && w < 0xDC00) {
+            uint16_t w2 = 0;
+            if ((n < 0 || i + 1 < n) &&
+                copy_from_user(&w2, (const void *)(uintptr_t)(uw + (uint64_t)(i + 1) * 2), 2) == 0 &&
+                w2 >= 0xDC00 && w2 < 0xE000) {
+                c = 0x10000 + ((uint32_t)(w - 0xD800) << 10) + (uint32_t)(w2 - 0xDC00);
+                i++;
+            } else c = 0xFFFD;
+        } else if (w >= 0xDC00 && w < 0xE000) c = 0xFFFD;
+        o = win32_utf8_put(c, out, o, cap);
+        if (o < 0) { out[0] = 0; return -1; }
+    }
+    out[o] = 0;
+    return o;
+}
+/* UTF-8 (a name the disk gave) as UTF-16 code units in out (no NUL); the
+ * units, at most cap */
+static int win32_utf8_to_w16(const char *s, uint16_t *out, int cap) {
+    int n = 0;
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p && n < cap) {
+        uint32_t c = *p++;
+        int more = 0;
+        if (c >= 0xF0 && c < 0xF8) { c &= 0x07; more = 3; }
+        else if (c >= 0xE0) { c &= 0x0F; more = 2; }
+        else if (c >= 0xC0) { c &= 0x1F; more = 1; }
+        else if (c >= 0x80) c = 0xFFFD;
+        for (; more; more--) {
+            if ((*p & 0xC0) != 0x80) { c = 0xFFFD; break; }
+            c = (c << 6) | (*p++ & 0x3F);
+        }
+        if (c >= 0x10000) {
+            if (n + 2 > cap) break;
+            c -= 0x10000;
+            out[n++] = (uint16_t)(0xD800 + (c >> 10));
+            out[n++] = (uint16_t)(0xDC00 + (c & 0x3FF));
+        } else out[n++] = (uint16_t)c;
+    }
+    return n;
+}
+/* a UTF-8 kernel string to the program's UTF-16 buffer of cap units, with its
+ * NUL: Microsoft's contract -- the length without the NUL when it fits, else
+ * the size it needs with the NUL (nothing written) */
+static long win32_put_w16(const char *s, uint64_t ubuf, uint32_t cap) {
+    uint16_t w[ABI_PATH_MAX];
+    int n = win32_utf8_to_w16(s, w, ABI_PATH_MAX - 1);
+    if (!ubuf || cap < (uint32_t)n + 1) return n + 1;
+    w[n] = 0;
+    if (copy_to_user((void *)(uintptr_t)ubuf, w, (size_t)(n + 1) * 2) != 0) return 0;
+    return n;
+}
+/* a wide Windows path from the program -> an absolute tobyOS path; -(error),
+ * the error set as the last error, when it cannot be one */
+static int win32_wpath_k(uint64_t uw, char *kp, int cap) {
+    char wp[ABI_PATH_MAX];
+    kp[0] = 0;
+    if (!uw) { win32_set_last_error(3); return -3; }
+    if (win32_w16_to_utf8(uw, -1, wp, sizeof wp) < 0) { win32_set_last_error(206); return -206; }
+    return win32_winpath_to_k(wp, kp, cap);
+}
+/* the directory a tobyOS path names, in out */
+static void win32_kpath_parent(const char *kp, char *out, int cap) {
+    int n = (int)strlen(kp);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, kp, (size_t)n);
+    out[n] = 0;
+    while (n > 1 && out[n - 1] != '/') n--;
+    out[n > 1 ? n - 1 : 1] = 0;
+}
+/* the Win32 error for an errno at kp: a missing name is ERROR_FILE_NOT_FOUND,
+ * ERROR_PATH_NOT_FOUND when its directory is missing too */
+static uint32_t win32_errno_win(long e, const char *kp) {
+    switch (e) {
+    case ABI_ENOENT: {
+        char par[ABI_PATH_MAX];
+        struct vfs_stat vs;
+        win32_kpath_parent(kp, par, sizeof par);
+        return vfs_stat(par, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR ? 2 : 3;
+    }
+    case ABI_EEXIST:       return 183;   /* ERROR_ALREADY_EXISTS */
+    case ABI_EACCES: case ABI_EPERM: case ABI_EISDIR: case ABI_EROFS:
+                           return 5;     /* ERROR_ACCESS_DENIED */
+    case ABI_ENOTDIR:      return 3;
+    case ABI_ENOTEMPTY:    return 145;   /* ERROR_DIR_NOT_EMPTY */
+    case ABI_EXDEV:        return 17;    /* ERROR_NOT_SAME_DEVICE */
+    case ABI_ENOSPC:       return 112;   /* ERROR_DISK_FULL */
+    case ABI_ENAMETOOLONG: return 206;
+    case ABI_EBUSY:        return 32;    /* ERROR_SHARING_VIOLATION */
+    case ABI_EINVAL:       return 87;
+    case ABI_ELOOP:        return 1921;  /* ERROR_CANT_RESOLVE_FILENAME */
+    default:               return 31;    /* ERROR_GEN_FAILURE */
+    }
+}
+static uint32_t win32_vfs_error(int vrc, const char *kp) { return win32_errno_win(-vfs_err_to_abi(vrc), kp); }
+static long win32_fail(uint32_t err) { win32_set_last_error(err); return 0; }
+/* the CRT's errno for a Win32 error (the UCRT's table, the ones met here) */
+static int win32_crt_errno_of_win(uint32_t err) {
+    switch (err) {
+    case 2: case 3: case 206: return 2;     /* ENOENT */
+    case 5: case 32:          return 13;    /* EACCES */
+    case 80: case 183:        return 17;    /* EEXIST */
+    case 145:                 return 41;    /* ENOTEMPTY (the UCRT's number) */
+    case 17:                  return 18;    /* EXDEV */
+    case 112:                 return 28;    /* ENOSPC */
+    default:                  return 22;    /* EINVAL */
+    }
+}
+
+/* -- attributes and times ------------------------------------------------- */
+#define W32_FA_READONLY  0x01u
+#define W32_FA_DIRECTORY 0x10u
+#define W32_FA_NORMAL    0x80u
+static uint32_t win32_attrs_of(const struct vfs_stat *vs) {
+    if (vs->type == VFS_TYPE_DIR) return W32_FA_DIRECTORY;
+    if ((vs->mode & VFS_MODE_VALID) && !(vs->mode & 0222)) return W32_FA_READONLY;
+    return W32_FA_NORMAL;
+}
+static uint64_t win32_ft_of(uint64_t secs, uint32_t ns) {
+    return (secs + WIN32_FT_EPOCH_DIFF) * 10000000ull + ns / 100u;
+}
+
+/* kernel32!GetFileAttributesW / GetFileAttributesExW: W7m -- the wide path
+ * as UTF-8, READONLY for a file nobody may write, the times */
+static long w32_GetFileAttributesW(uint64_t *a) {
+    char kp[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], kp, sizeof kp) < 0) return (long)0xFFFFFFFFu;
+    struct vfs_stat vs;
+    int r = vfs_stat(kp, &vs);
+    if (r != VFS_OK) { win32_set_last_error(win32_vfs_error(r, kp)); return (long)0xFFFFFFFFu; }
+    win32_set_last_error(0);
+    return (long)win32_attrs_of(&vs);
+}
+/* WIN32_FILE_ATTRIBUTE_DATA { DWORD attr; FILETIME c, a, w; DWORD szHi, szLo } */
+static void win32_attr_data(uint8_t b[36], const struct vfs_stat *vs) {
+    memset(b, 0, 36);
+    uint32_t attr = win32_attrs_of(vs);
+    memcpy(&b[0], &attr, 4);
+    uint64_t c = win32_ft_of(vs->ctime, vs->ctime_ns), ac = win32_ft_of(vs->atime, vs->atime_ns),
+             w = win32_ft_of(vs->mtime, vs->mtime_ns);
+    memcpy(&b[4], &c, 8); memcpy(&b[12], &ac, 8); memcpy(&b[20], &w, 8);
+    uint64_t sz = vs->type == VFS_TYPE_DIR ? 0 : vs->size;
+    uint32_t szlo = (uint32_t)sz, szhi = (uint32_t)(sz >> 32);
+    memcpy(&b[28], &szhi, 4); memcpy(&b[32], &szlo, 4);
+}
+static long w32_GetFileAttributesExW(uint64_t *a) {
+    char kp[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], kp, sizeof kp) < 0) return 0;
+    struct vfs_stat vs;
+    int r = vfs_stat(kp, &vs);
+    if (r != VFS_OK) return win32_fail(win32_vfs_error(r, kp));
+    uint8_t b[36];
+    win32_attr_data(b, &vs);
+    if (copy_to_user((void *)(uintptr_t)a[2], b, sizeof b) != 0) return win32_fail(998);
+    win32_set_last_error(0);
+    return 1;
+}
+/* SetFileAttributesW(path, attrs): READONLY takes everyone's write bits away,
+ * anything else gives the owner's back */
+static long w32_SetFileAttributesW(uint64_t *a) {
+    char kp[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], kp, sizeof kp) < 0) return 0;
+    struct vfs_stat vs;
+    int r = vfs_stat(kp, &vs);
+    if (r != VFS_OK) return win32_fail(win32_vfs_error(r, kp));
+    uint32_t mode = (vs.mode & VFS_MODE_VALID) ? (vs.mode & 07777) : (vs.type == VFS_TYPE_DIR ? 0755 : 0644);
+    if ((uint32_t)a[1] & W32_FA_READONLY) mode &= ~0222u;
+    else mode |= 0200u;
+    r = vfs_chmod(kp, mode);
+    if (r != VFS_OK) return win32_fail(win32_vfs_error(r, kp));
+    return 1;
+}
+
+/* -- CreateFile: W7m -- its last error (the program's filesystem calls go
+ *    by it: msvcp140's "does it exist" is ERROR_FILE_NOT_FOUND or
+ *    ERROR_PATH_NOT_FOUND), a directory with FILE_FLAG_BACKUP_SEMANTICS,
+ *    ERROR_ALREADY_EXISTS after CREATE_ALWAYS/OPEN_ALWAYS found the file */
+#define W32_FLAG_BACKUP_SEMANTICS 0x02000000u
+static long win32_open_kpath(const char *kp, uint32_t access, uint32_t disp, uint32_t fflags) {
+    struct vfs_stat vs;
+    bool there = vfs_stat(kp, &vs) == VFS_OK;
+    if (disp < 1 || disp > 5) { win32_set_last_error(87); return (long)WIN32_INVALID_HANDLE; }
+    if (there && disp == 1) { win32_set_last_error(80); return (long)WIN32_INVALID_HANDLE; }   /* ERROR_FILE_EXISTS */
+    if (!there && (disp == 3 || disp == 5)) {
+        win32_set_last_error(win32_errno_win(ABI_ENOENT, kp));
+        return (long)WIN32_INVALID_HANDLE;
+    }
+    bool dir = there && vs.type == VFS_TYPE_DIR;
+    if (dir && (!(fflags & W32_FLAG_BACKUP_SEMANTICS) || disp == 2 || disp == 5)) {
+        win32_set_last_error(5);
+        return (long)WIN32_INVALID_HANDLE;
+    }
+    bool rd = (access & (0x80000000u | 0x10000000u | 0x1u)) != 0;            /* GENERIC_READ/ALL, FILE_READ_DATA */
+    bool wr = (access & (0x40000000u | 0x10000000u | 0x2u | 0x4u)) != 0;      /* GENERIC_WRITE/ALL, WRITE/APPEND_DATA */
+    int flags = dir ? ABI_O_RDONLY : (rd && wr) ? ABI_O_RDWR : (wr ? ABI_O_WRONLY : ABI_O_RDONLY);
+    if (!dir) switch (disp) {
+        case 1: flags |= ABI_O_CREAT | ABI_O_EXCL;  break;   /* CREATE_NEW */
+        case 2: flags |= ABI_O_CREAT | ABI_O_TRUNC; break;   /* CREATE_ALWAYS */
+        case 4: flags |= ABI_O_CREAT;               break;   /* OPEN_ALWAYS */
+        case 5: flags |= ABI_O_TRUNC;               break;   /* TRUNCATE_EXISTING */
+        default: break;
+    }
+    if ((flags & ABI_O_TRUNC) && !wr) flags = (flags & ~ABI_O_ACCMODE) | ABI_O_WRONLY;
+    int di = (int)strlen(kp);
+    uint64_t ubuf = WIN32_CRT_DATA_BASE + WIN32_CRT_PATHBUF;
+    if (copy_to_user((void *)(uintptr_t)ubuf, kp, (size_t)di + 1) != 0) {
+        win32_set_last_error(206);
+        return (long)WIN32_INVALID_HANDLE;
+    }
+    long fd = sys_open((const char *)(uintptr_t)ubuf, flags, 0644);
+    if (fd < 0) { win32_set_last_error(win32_errno_win(-fd, kp)); return (long)WIN32_INVALID_HANDLE; }
+    win32_set_last_error(there && (disp == 2 || disp == 4) ? 183 : 0);
+    return fd;
+}
+/* CreateFileW(name, access, share, sa, disp, flags, template) */
+static long w32_CreateFileW(uint64_t *a) {
+    char kp[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], kp, sizeof kp) < 0) return (long)WIN32_INVALID_HANDLE;
+    return win32_open_kpath(kp, (uint32_t)a[1], (uint32_t)a[4], (uint32_t)a[5]);
+}
+static long w32_DeleteFileW(uint64_t *a) {
+    char kp[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], kp, sizeof kp) < 0) return 0;
+    struct vfs_stat vs;
+    int r = vfs_stat(kp, &vs);
+    if (r != VFS_OK) return win32_fail(win32_vfs_error(r, kp));
+    if (vs.type == VFS_TYPE_DIR) return win32_fail(5);
+    if ((vs.mode & VFS_MODE_VALID) && !(vs.mode & 0222)) return win32_fail(5);   /* READONLY */
+    r = vfs_unlink(kp);
+    return r == VFS_OK ? 1 : win32_fail(win32_vfs_error(r, kp));
+}
+static long win32_rmdir_k(const char *kp) {
+    struct vfs_stat vs;
+    int r = vfs_stat(kp, &vs);
+    if (r != VFS_OK) return win32_fail(win32_vfs_error(r, kp));
+    if (vs.type != VFS_TYPE_DIR) return win32_fail(267);       /* ERROR_DIRECTORY */
+    r = vfs_unlink(kp);
+    if (r == VFS_ERR_INVAL || r == VFS_ERR_EXIST) return win32_fail(145);
+    return r == VFS_OK ? 1 : win32_fail(win32_vfs_error(r, kp));
+}
+static long w32_RemoveDirectoryW(uint64_t *a) {
+    char kp[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], kp, sizeof kp) < 0) return 0;
+    return win32_rmdir_k(kp);
+}
+static long w32_RemoveDirectoryA(uint64_t *a) {
+    char wp[ABI_PATH_MAX], kp[ABI_PATH_MAX];
+    if (strncpy_from_user(wp, (const char *)(uintptr_t)a[0], sizeof wp) < 0) return win32_fail(3);
+    if (win32_winpath_to_k(wp, kp, sizeof kp) < 0) return 0;
+    return win32_rmdir_k(kp);
+}
+static long win32_mkdir_k(const char *kp) {
+    struct vfs_stat vs;
+    if (vfs_stat(kp, &vs) == VFS_OK) return win32_fail(183);
+    char par[ABI_PATH_MAX];
+    win32_kpath_parent(kp, par, sizeof par);
+    if (vfs_stat(par, &vs) != VFS_OK || vs.type != VFS_TYPE_DIR) return win32_fail(3);
+    int r = vfs_mkdir_mode(kp, 0755);
+    return r == VFS_OK ? 1 : win32_fail(win32_vfs_error(r, kp));
+}
+static long w32_CreateDirectoryW(uint64_t *a) {
+    char kp[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], kp, sizeof kp) < 0) return 0;
+    return win32_mkdir_k(kp);
+}
+
+/* CopyFile: the bytes and the permission bits; ERROR_FILE_EXISTS when told to
+ * fail on a file that is there */
+static long win32_copy_k(const char *ks, const char *kd, bool fail_if_exists) {
+    struct vfs_stat vs, vd;
+    int r = vfs_stat(ks, &vs);
+    if (r != VFS_OK) return win32_fail(win32_vfs_error(r, ks));
+    if (vs.type == VFS_TYPE_DIR) return win32_fail(5);
+    bool there = vfs_stat(kd, &vd) == VFS_OK;
+    if (there && fail_if_exists) return win32_fail(80);
+    if (there && vd.type == VFS_TYPE_DIR) return win32_fail(5);
+    if (there && (vd.mode & VFS_MODE_VALID) && !(vd.mode & 0222)) return win32_fail(5);
+    long in = win32_open_kpath(ks, 0x80000000u, 3, 0);
+    if (in < 0) return 0;
+    long out = win32_open_kpath(kd, 0x40000000u, 2, 0);
+    if (out < 0) { (void)sys_close((int)in); return 0; }
+    struct file *fi = fd_lookup((int)in), *fo = fd_lookup((int)out);
+    long ok = 1;
+    char buf[1024];
+    for (;;) {
+        long g = fi ? file_read(fi, buf, sizeof buf) : -1;
+        if (g < 0) { ok = win32_fail(31); break; }
+        if (g == 0) break;
+        if (!fo || file_write(fo, buf, (size_t)g) != g) { ok = win32_fail(112); break; }
+    }
+    (void)sys_close((int)in);
+    (void)sys_close((int)out);
+    if (ok && (vs.mode & VFS_MODE_VALID)) (void)vfs_chmod(kd, vs.mode & 07777);
+    if (ok) win32_set_last_error(0);
+    return ok;
+}
+static long w32_CopyFileW(uint64_t *a) {
+    char ks[ABI_PATH_MAX], kd[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], ks, sizeof ks) < 0 || win32_wpath_k(a[1], kd, sizeof kd) < 0) return 0;
+    return win32_copy_k(ks, kd, a[2] != 0);
+}
+static long w32_CopyFileA(uint64_t *a) {
+    char ws[ABI_PATH_MAX], wd[ABI_PATH_MAX], ks[ABI_PATH_MAX], kd[ABI_PATH_MAX];
+    if (strncpy_from_user(ws, (const char *)(uintptr_t)a[0], sizeof ws) < 0 ||
+        strncpy_from_user(wd, (const char *)(uintptr_t)a[1], sizeof wd) < 0) return win32_fail(3);
+    if (win32_winpath_to_k(ws, ks, sizeof ks) < 0 || win32_winpath_to_k(wd, kd, sizeof kd) < 0) return 0;
+    return win32_copy_k(ks, kd, a[2] != 0);
+}
+/* MoveFileEx: a name that is there stays unless MOVEFILE_REPLACE_EXISTING;
+ * across volumes only with MOVEFILE_COPY_ALLOWED (then a copy and a delete) */
+static long win32_move_k(const char *ks, const char *kd, uint32_t flags) {
+    struct vfs_stat vs, vd;
+    int r = vfs_stat(ks, &vs);
+    if (r != VFS_OK) return win32_fail(win32_vfs_error(r, ks));
+    if (vfs_stat(kd, &vd) == VFS_OK && strcmp(ks, kd) != 0) {
+        if (!(flags & 1)) return win32_fail(183);
+        if (vd.type == VFS_TYPE_DIR || vs.type == VFS_TYPE_DIR) return win32_fail(5);
+    }
+    r = vfs_rename(ks, kd);
+    if (r == VFS_OK) return 1;
+    if (r == VFS_ERR_XDEV && (flags & 2) && vs.type != VFS_TYPE_DIR) {
+        if (!win32_copy_k(ks, kd, false)) return 0;
+        r = vfs_unlink(ks);
+        return r == VFS_OK ? 1 : win32_fail(win32_vfs_error(r, ks));
+    }
+    return win32_fail(win32_vfs_error(r, kd));
+}
+static long w32_MoveFileExW(uint64_t *a) {
+    char ks[ABI_PATH_MAX], kd[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], ks, sizeof ks) < 0) return 0;
+    if (!a[1]) return win32_fail(87);               /* (a delete at reboot: no reboots here) */
+    if (win32_wpath_k(a[1], kd, sizeof kd) < 0) return 0;
+    return win32_move_k(ks, kd, (uint32_t)a[2]);
+}
+static long w32_MoveFileW(uint64_t *a) { uint64_t b[3] = { a[0], a[1], 2 }; return w32_MoveFileExW(b); }
+static long w32_MoveFileExA(uint64_t *a) {
+    char ws[ABI_PATH_MAX], wd[ABI_PATH_MAX], ks[ABI_PATH_MAX], kd[ABI_PATH_MAX];
+    if (!a[1]) return win32_fail(87);
+    if (strncpy_from_user(ws, (const char *)(uintptr_t)a[0], sizeof ws) < 0 ||
+        strncpy_from_user(wd, (const char *)(uintptr_t)a[1], sizeof wd) < 0) return win32_fail(3);
+    if (win32_winpath_to_k(ws, ks, sizeof ks) < 0 || win32_winpath_to_k(wd, kd, sizeof kd) < 0) return 0;
+    return win32_move_k(ks, kd, (uint32_t)a[2]);
+}
+static long w32_MoveFileA(uint64_t *a) { uint64_t b[3] = { a[0], a[1], 2 }; return w32_MoveFileExA(b); }
+/* CreateHardLinkW(new, existing, sa) */
+static long w32_CreateHardLinkW(uint64_t *a) {
+    char kn[ABI_PATH_MAX], ke[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], kn, sizeof kn) < 0 || win32_wpath_k(a[1], ke, sizeof ke) < 0) return 0;
+    struct vfs_stat vs;
+    int r = vfs_stat(ke, &vs);
+    if (r != VFS_OK) return win32_fail(win32_vfs_error(r, ke));
+    if (vs.type == VFS_TYPE_DIR) return win32_fail(5);
+    if (vfs_stat(kn, &vs) == VFS_OK) return win32_fail(183);
+    r = vfs_link(ke, kn);
+    return r == VFS_OK ? 1 : win32_fail(win32_vfs_error(r, kn));
+}
+/* CreateSymbolicLinkW(link, target, flags) -> BOOLEAN: the target as the
+ * program wrote it, its separators made '/', an absolute one translated */
+static long w32_CreateSymbolicLinkW(uint64_t *a) {
+    char kl[ABI_PATH_MAX], wt[ABI_PATH_MAX], kt[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], kl, sizeof kl) < 0) return 0;
+    if (!a[1] || win32_w16_to_utf8(a[1], -1, wt, sizeof wt) < 0) return win32_fail(87);
+    bool abs = (wt[0] && wt[1] == ':') || wt[0] == '\\' || wt[0] == '/';
+    if (abs) { if (win32_winpath_to_k(wt, kt, sizeof kt) < 0) return 0; }
+    else { int i = 0; for (; wt[i]; i++) kt[i] = wt[i] == '\\' ? '/' : wt[i]; kt[i] = 0; }
+    struct vfs_stat vs;
+    if (vfs_stat(kl, &vs) == VFS_OK) return win32_fail(183);
+    int r = vfs_symlink(kl, kt);
+    return r == VFS_OK ? 1 : win32_fail(win32_vfs_error(r, kl));
+}
+/* GetDiskFreeSpaceExW/A(dir, &avail, &total, &free) from the volume's statfs */
+static long win32_disk_free_k(const char *kp, uint64_t *a) {
+    struct vfs_statfs st;
+    memset(&st, 0, sizeof st);
+    int r = vfs_statfs(kp, &st);
+    if (r != VFS_OK) return win32_fail(win32_vfs_error(r, kp));
+    uint64_t bs = st.bsize ? st.bsize : 4096, tot = bs * st.blocks, fr = bs * st.bfree;
+    if (a[1]) (void)copy_to_user((void *)(uintptr_t)a[1], &fr, 8);
+    if (a[2]) (void)copy_to_user((void *)(uintptr_t)a[2], &tot, 8);
+    if (a[3]) (void)copy_to_user((void *)(uintptr_t)a[3], &fr, 8);
+    return 1;
+}
+static long w32_GetDiskFreeSpaceExW(uint64_t *a) {
+    char kp[ABI_PATH_MAX];
+    if (!a[0]) { if (win32_cwd_winpath(kp, sizeof kp) < 0) return win32_fail(3); char k2[ABI_PATH_MAX];
+                 if (win32_winpath_to_k(kp, k2, sizeof k2) < 0) return 0; return win32_disk_free_k(k2, a); }
+    if (win32_wpath_k(a[0], kp, sizeof kp) < 0) return 0;
+    return win32_disk_free_k(kp, a);
+}
+static long w32_GetDiskFreeSpaceExA(uint64_t *a) {
+    char wp[ABI_PATH_MAX], kp[ABI_PATH_MAX];
+    if (!a[0]) { if (win32_cwd_winpath(wp, sizeof wp) < 0) return win32_fail(3); }
+    else if (strncpy_from_user(wp, (const char *)(uintptr_t)a[0], sizeof wp) < 0) return win32_fail(3);
+    if (win32_winpath_to_k(wp, kp, sizeof kp) < 0) return 0;
+    return win32_disk_free_k(kp, a);
+}
+
+/* -- FindFirstFile(Ex)A/W, FindNextFileA/W, FindClose ----------------------
+ * W7m: a search is the pattern's directory read through, each name matched
+ * against the pattern's last part ('*' and '?', case not minded; "*.*" is
+ * every name), "." and ".." first in a directory that is not a drive's root,
+ * as Windows gives them. A search handle is a slot of a table of 32 owned by
+ * a thread group (a group gone frees its slots for the next search); no
+ * match is ERROR_FILE_NOT_FOUND, no directory ERROR_PATH_NOT_FOUND. */
+#define WIN32_FIND_SLOTS 32
+static struct {
+    int owner;                       /* the thread group; 0 free */
+    struct vfs_dir dir;
+    char dpath[ABI_PATH_MAX];        /* the directory (tobyOS) */
+    char pat[96];                    /* the pattern's last part */
+    int dots;                        /* "." and ".." still to give (2, 1, 0) */
+} g_win32_find2[WIN32_FIND_SLOTS];
+static bool win32_wild_match(const char *p, const char *s) {
+    for (;;) {
+        char pc = *p, sc = *s;
+        if (pc >= 'A' && pc <= 'Z') pc = (char)(pc + 32);
+        if (sc >= 'A' && sc <= 'Z') sc = (char)(sc + 32);
+        if (!pc) return !sc;
+        if (pc == '*') {
+            while (*p == '*') p++;
+            if (!*p) return true;
+            for (; *s; s++) if (win32_wild_match(p, s)) return true;
+            return false;
+        }
+        if (!sc) return false;
+        if (pc != '?' && pc != sc) return false;
+        p++; s++;
+    }
+}
+static bool win32_find_matches(const char *pat, const char *name) {
+    if (!strcmp(pat, "*.*") || !strcmp(pat, "*")) return true;
+    return win32_wild_match(pat, name);
+}
+/* fill a WIN32_FIND_DATAA (wide = 0) or WIN32_FIND_DATAW */
+static void win32_fill_find(uint64_t out, const char *name, const struct vfs_stat *vs, bool wide) {
+    uint8_t b[0x250];
+    memset(b, 0, sizeof b);
+    uint32_t attr = vs ? win32_attrs_of(vs) : W32_FA_DIRECTORY;
+    memcpy(&b[0x00], &attr, 4);
+    if (vs) {
+        uint64_t c = win32_ft_of(vs->ctime, vs->ctime_ns), ac = win32_ft_of(vs->atime, vs->atime_ns),
+                 w = win32_ft_of(vs->mtime, vs->mtime_ns);
+        memcpy(&b[0x04], &c, 8); memcpy(&b[0x0C], &ac, 8); memcpy(&b[0x14], &w, 8);
+        uint64_t sz = vs->type == VFS_TYPE_DIR ? 0 : vs->size;
+        uint32_t hi = (uint32_t)(sz >> 32), lo = (uint32_t)sz;
+        memcpy(&b[0x1C], &hi, 4); memcpy(&b[0x20], &lo, 4);
+    }
+    if (wide) {
+        uint16_t w[260];
+        int n = win32_utf8_to_w16(name, w, 259);
+        memcpy(&b[0x2C], w, (size_t)n * 2);
+        (void)copy_to_user((void *)(uintptr_t)out, b, 0x250);
+    } else {
+        int n = 0;
+        for (; name[n] && n < 259; n++) b[0x2C + n] = (uint8_t)name[n];
+        (void)copy_to_user((void *)(uintptr_t)out, b, 0x2C + 260 + 14);
+    }
+}
+static bool win32_find_next_k(int s, uint64_t out, bool wide) {
+    if (g_win32_find2[s].dots) {
+        const char *dn = g_win32_find2[s].dots == 2 ? "." : "..";
+        g_win32_find2[s].dots--;
+        if (win32_find_matches(g_win32_find2[s].pat, dn)) {
+            struct vfs_stat vs;
+            bool ok = vfs_stat(g_win32_find2[s].dpath, &vs) == VFS_OK;
+            win32_fill_find(out, dn, ok ? &vs : 0, wide);
+            return true;
+        }
+        return win32_find_next_k(s, out, wide);
+    }
+    struct vfs_dirent e;
+    while (vfs_readdir(&g_win32_find2[s].dir, &e) == VFS_OK) {
+        if (!strcmp(e.name, ".") || !strcmp(e.name, "..")) continue;
+        if (!win32_find_matches(g_win32_find2[s].pat, e.name)) continue;
+        char full[ABI_PATH_MAX];
+        int dl = (int)strlen(g_win32_find2[s].dpath);
+        ksnprintf(full, sizeof full, "%s%s%s", g_win32_find2[s].dpath,
+                  dl && g_win32_find2[s].dpath[dl - 1] == '/' ? "" : "/", e.name);
+        struct vfs_stat vs;
+        bool ok = vfs_stat(full, &vs) == VFS_OK;
+        win32_fill_find(out, e.name, ok ? &vs : 0, wide);
+        return true;
+    }
+    return false;
+}
+/* a search of the Windows pattern wpat (UTF-8) */
+static long win32_find_first_k(const char *wpat, uint64_t out, bool wide) {
+    char full[ABI_PATH_MAX];
+    bool verbatim;
+    int n = win32_path_full(wpat, full, sizeof full, &verbatim);
+    if (n < 0) return (long)(win32_fail((uint32_t)-n), WIN32_INVALID_HANDLE);
+    int cut = n;
+    while (cut > 0 && full[cut - 1] != '\\') cut--;
+    if (cut == 0 || !full[cut]) return (long)(win32_fail(2), WIN32_INVALID_HANDLE);
+    char pat[96];
+    int pl = (int)strlen(full + cut);
+    if (pl >= (int)sizeof pat) return (long)(win32_fail(206), WIN32_INVALID_HANDLE);
+    memcpy(pat, full + cut, (size_t)pl + 1);
+    bool root = cut <= 3;                              /* "C:\" */
+    full[cut] = 0;
+    char kd[ABI_PATH_MAX];
+    if (win32_winpath_to_k(full, kd, sizeof kd) < 0) return (long)WIN32_INVALID_HANDLE;
+    struct vfs_stat vs;
+    if (vfs_stat(kd, &vs) != VFS_OK || vs.type != VFS_TYPE_DIR)
+        return (long)(win32_fail(3), WIN32_INVALID_HANDLE);
+    int me = win32_tgid(), s = -1;
+    for (int i = 0; i < WIN32_FIND_SLOTS && s < 0; i++) if (!g_win32_find2[i].owner) s = i;
+    for (int i = 0; i < WIN32_FIND_SLOTS && s < 0; i++)
+        if (!proc_lookup(g_win32_find2[i].owner)) { vfs_closedir(&g_win32_find2[i].dir); g_win32_find2[i].owner = 0; s = i; }
+    if (s < 0) return (long)(win32_fail(4 /* ERROR_TOO_MANY_OPEN_FILES */), WIN32_INVALID_HANDLE);
+    if (vfs_opendir(kd, &g_win32_find2[s].dir) != VFS_OK) return (long)(win32_fail(3), WIN32_INVALID_HANDLE);
+    g_win32_find2[s].owner = me;
+    memcpy(g_win32_find2[s].dpath, kd, strlen(kd) + 1);
+    memcpy(g_win32_find2[s].pat, pat, (size_t)pl + 1);
+    g_win32_find2[s].dots = root ? 0 : 2;
+    if (!win32_find_next_k(s, out, wide)) {
+        vfs_closedir(&g_win32_find2[s].dir);
+        g_win32_find2[s].owner = 0;
+        return (long)(win32_fail(2), WIN32_INVALID_HANDLE);
+    }
+    win32_set_last_error(0);
+    return (long)(WIN32_FIND_TAG | (uint64_t)s);
+}
+static int win32_find_slot(uint64_t h) {
+    if ((h & WIN32_BRUSH_MASK) != WIN32_FIND_TAG) return -1;
+    int s = (int)(h & 0xFF);
+    if (s < 0 || s >= WIN32_FIND_SLOTS || g_win32_find2[s].owner != win32_tgid()) return -1;
+    return s;
+}
+static long w32_FindFirstFileA(uint64_t *a) {
+    char wp[ABI_PATH_MAX];
+    if (strncpy_from_user(wp, (const char *)(uintptr_t)a[0], sizeof wp) < 0) return (long)(win32_fail(3), WIN32_INVALID_HANDLE);
+    return win32_find_first_k(wp, a[1], false);
+}
+static long w32_FindFirstFileW(uint64_t *a) {
+    char wp[ABI_PATH_MAX];
+    if (!a[0] || win32_w16_to_utf8(a[0], -1, wp, sizeof wp) < 0) return (long)(win32_fail(206), WIN32_INVALID_HANDLE);
+    return win32_find_first_k(wp, a[1], true);
+}
+/* FindFirstFileExW(pattern, level, data, search op, filter, flags): the
+ * basic level and the standard one fill the same here (no short names) */
+static long w32_FindFirstFileExW(uint64_t *a) {
+    if ((uint32_t)a[1] > 1 || (uint32_t)a[3] > 2) return (long)(win32_fail(87), WIN32_INVALID_HANDLE);
+    uint64_t b[2] = { a[0], a[2] };
+    return w32_FindFirstFileW(b);
+}
+static long w32_FindFirstFileExA(uint64_t *a) {
+    if ((uint32_t)a[1] > 1 || (uint32_t)a[3] > 2) return (long)(win32_fail(87), WIN32_INVALID_HANDLE);
+    uint64_t b[2] = { a[0], a[2] };
+    return w32_FindFirstFileA(b);
+}
+static long win32_find_next(uint64_t *a, bool wide) {
+    int s = win32_find_slot(a[0]);
+    if (s < 0) return win32_fail(6);
+    if (!win32_find_next_k(s, a[1], wide)) return win32_fail(18);   /* ERROR_NO_MORE_FILES */
+    return 1;
+}
+static long w32_FindNextFileA(uint64_t *a) { return win32_find_next(a, false); }
+static long w32_FindNextFileW(uint64_t *a) { return win32_find_next(a, true); }
+static long w32_FindClose(uint64_t *a) {
+    int s = win32_find_slot(a[0]);
+    if (s < 0) return win32_fail(6);
+    vfs_closedir(&g_win32_find2[s].dir);
+    g_win32_find2[s].owner = 0;
+    return 1;
+}
+
+/* -- what a handle is: its path, its stat ---------------------------------- */
+static const char *win32_handle_kpath(int fd) {
+    struct file *f = fd_lookup(fd);
+    if (!f) return 0;
+    if (f->kind == FILE_KIND_DIR && f->dirpath) return f->dirpath;
+    return f->open_path;
+}
+static int win32_handle_stat(int fd, struct vfs_stat *vs) {
+    struct file *f = fd_lookup(fd);
+    if (!f) return VFS_ERR_NOENT;
+    memset(vs, 0, sizeof *vs);
+    if (f->kind == FILE_KIND_VFS) return vfs_fstat(&f->vfs, vs);
+    const char *kp = win32_handle_kpath(fd);
+    return kp ? vfs_stat(kp, vs) : VFS_ERR_NOENT;
+}
+static uint32_t win32_volume_serial(const struct vfs_stat *vs) { return 0x544F4259u ^ vs->dev; }   /* "TOBY" */
+static uint64_t win32_file_index(int fd, const struct vfs_stat *vs) {
+    if (vs->ino) return vs->ino;
+    const char *kp = win32_handle_kpath(fd);
+    uint64_t h = 1469598103934665603ull;                 /* FNV-1a of the path */
+    for (; kp && *kp; kp++) { h ^= (uint8_t)*kp; h *= 1099511628211ull; }
+    return h;
+}
+static bool win32_handle_fd(uint64_t h, int *fd) {
+    if (h >> 32) return false;
+    *fd = (int)h;
+    return *fd >= 0 && fd_lookup(*fd) != 0;
+}
+/* GetFileInformationByHandle(h, BY_HANDLE_FILE_INFORMATION *) */
+static long w32_GetFileInformationByHandle(uint64_t *a) {
+    int fd;
+    if (!win32_handle_fd(a[0], &fd)) return win32_fail(6);
+    struct vfs_stat vs;
+    if (win32_handle_stat(fd, &vs) != VFS_OK) return win32_fail(1);   /* ERROR_INVALID_FUNCTION */
+    uint8_t b[52];
+    memset(b, 0, sizeof b);
+    uint32_t attr = win32_attrs_of(&vs);
+    memcpy(&b[0], &attr, 4);
+    uint64_t c = win32_ft_of(vs.ctime, vs.ctime_ns), ac = win32_ft_of(vs.atime, vs.atime_ns),
+             w = win32_ft_of(vs.mtime, vs.mtime_ns);
+    memcpy(&b[4], &c, 8); memcpy(&b[12], &ac, 8); memcpy(&b[20], &w, 8);
+    uint32_t ser = win32_volume_serial(&vs);
+    memcpy(&b[28], &ser, 4);
+    uint64_t sz = vs.type == VFS_TYPE_DIR ? 0 : vs.size;
+    uint32_t hi = (uint32_t)(sz >> 32), lo = (uint32_t)sz;
+    memcpy(&b[32], &hi, 4); memcpy(&b[36], &lo, 4);
+    uint32_t links = vs.nlink ? vs.nlink : 1;
+    memcpy(&b[40], &links, 4);
+    uint64_t idx = win32_file_index(fd, &vs);
+    uint32_t ih = (uint32_t)(idx >> 32), il = (uint32_t)idx;
+    memcpy(&b[44], &ih, 4); memcpy(&b[48], &il, 4);
+    if (copy_to_user((void *)(uintptr_t)a[1], b, sizeof b) != 0) return win32_fail(998);
+    return 1;
+}
+/* the path a handle names, as Windows writes it ("C:\dir\file"), in out */
+static int win32_handle_winpath(int fd, char *out, int cap) {
+    const char *kp = win32_handle_kpath(fd);
+    if (!kp) return -1;
+    return win32_kpath_to_winpath(kp, out, cap);
+}
+/* GetFileInformationByHandleEx(h, class, buf, size): FileBasicInfo,
+ * FileStandardInfo, FileNameInfo, FileAttributeTagInfo, FileIdInfo */
+static long w32_GetFileInformationByHandleEx(uint64_t *a) {
+    int fd;
+    if (!win32_handle_fd(a[0], &fd)) return win32_fail(6);
+    uint32_t cls = (uint32_t)a[1], size = (uint32_t)a[3];
+    struct vfs_stat vs;
+    if (win32_handle_stat(fd, &vs) != VFS_OK) return win32_fail(1);
+    uint8_t b[40];
+    memset(b, 0, sizeof b);
+    uint32_t attr = win32_attrs_of(&vs);
+    uint64_t sz = vs.type == VFS_TYPE_DIR ? 0 : vs.size;
+    uint32_t need;
+    switch (cls) {
+    case 0: {                                   /* FILE_BASIC_INFO */
+        uint64_t c = win32_ft_of(vs.ctime, vs.ctime_ns), ac = win32_ft_of(vs.atime, vs.atime_ns),
+                 w = win32_ft_of(vs.mtime, vs.mtime_ns);
+        memcpy(&b[0], &c, 8); memcpy(&b[8], &ac, 8); memcpy(&b[16], &w, 8); memcpy(&b[24], &c, 8);
+        memcpy(&b[32], &attr, 4);
+        need = 40;
+        break;
+    }
+    case 1: {                                   /* FILE_STANDARD_INFO */
+        uint64_t alloc = (sz + 4095) & ~4095ull;
+        memcpy(&b[0], &alloc, 8); memcpy(&b[8], &sz, 8);
+        uint32_t links = vs.nlink ? vs.nlink : 1;
+        memcpy(&b[16], &links, 4);
+        b[20] = 0;                              /* DeletePending */
+        b[21] = vs.type == VFS_TYPE_DIR;        /* Directory */
+        need = 24;
+        break;
+    }
+    case 2: {                                   /* FILE_NAME_INFO: the path without its drive */
+        char wp[ABI_PATH_MAX];
+        if (win32_handle_winpath(fd, wp, sizeof wp) < 0) return win32_fail(1);
+        const char *np = (wp[0] && wp[1] == ':') ? wp + 2 : wp;
+        uint16_t w[ABI_PATH_MAX];
+        int n = win32_utf8_to_w16(np, w, ABI_PATH_MAX);
+        uint32_t len = (uint32_t)n * 2;
+        if (size < 4) return win32_fail(24);    /* ERROR_BAD_LENGTH */
+        (void)copy_to_user((void *)(uintptr_t)a[2], &len, 4);
+        uint32_t room = size - 4;
+        if (room < len) {
+            (void)copy_to_user((void *)(uintptr_t)(a[2] + 4), w, room & ~1u);
+            return win32_fail(234);             /* ERROR_MORE_DATA */
+        }
+        (void)copy_to_user((void *)(uintptr_t)(a[2] + 4), w, len);
+        return 1;
+    }
+    case 9:                                     /* FILE_ATTRIBUTE_TAG_INFO */
+        memcpy(&b[0], &attr, 4);
+        need = 8;
+        break;
+    case 18: {                                  /* FILE_ID_INFO */
+        uint64_t ser = win32_volume_serial(&vs), idx = win32_file_index(fd, &vs);
+        memcpy(&b[0], &ser, 8); memcpy(&b[8], &idx, 8);
+        need = 24;
+        break;
+    }
+    default:
+        return win32_fail(87);
+    }
+    if (size < need) return win32_fail(24);
+    if (copy_to_user((void *)(uintptr_t)a[2], b, need) != 0) return win32_fail(998);
+    return 1;
+}
+/* SetFileInformationByHandle(h, class, buf, size): FileBasicInfo (its
+ * attributes), FileRenameInfo(Ex), FileDispositionInfo(Ex) (the name goes
+ * now: the file stays until its last handle closes, as Windows' POSIX
+ * deletion), FileAllocationInfo, FileEndOfFileInfo */
+static long w32_SetFileInformationByHandle(uint64_t *a) {
+    int fd;
+    if (!win32_handle_fd(a[0], &fd)) return win32_fail(6);
+    uint32_t cls = (uint32_t)a[1], size = (uint32_t)a[3];
+    const char *kp0 = win32_handle_kpath(fd);
+    char kp[ABI_PATH_MAX];
+    if (!kp0) return win32_fail(1);
+    memcpy(kp, kp0, strlen(kp0) + 1);
+    switch (cls) {
+    case 0: {                                   /* FILE_BASIC_INFO: the attributes */
+        if (size < 40) return win32_fail(24);
+        uint32_t attr = 0;
+        (void)copy_from_user(&attr, (const void *)(uintptr_t)(a[2] + 32), 4);
+        if (attr) {
+            struct vfs_stat vs;
+            if (vfs_stat(kp, &vs) != VFS_OK) return win32_fail(1);
+            uint32_t mode = (vs.mode & VFS_MODE_VALID) ? (vs.mode & 07777) : 0644;
+            mode = (attr & W32_FA_READONLY) ? (mode & ~0222u) : (mode | 0200u);
+            (void)vfs_chmod(kp, mode);
+        }
+        return 1;
+    }
+    case 3: case 22: {                          /* FILE_RENAME_INFO(_EX) */
+        if (size < 20) return win32_fail(24);
+        uint32_t flags = 0, len = 0;
+        uint64_t root = 0;
+        (void)copy_from_user(&flags, (const void *)(uintptr_t)a[2], 4);
+        (void)copy_from_user(&root, (const void *)(uintptr_t)(a[2] + 8), 8);
+        (void)copy_from_user(&len, (const void *)(uintptr_t)(a[2] + 16), 4);
+        if (root || len > size - 20) return win32_fail(87);
+        bool replace = cls == 3 ? (flags & 0xFF) != 0 : (flags & 1) != 0;
+        char wn[ABI_PATH_MAX], kn[ABI_PATH_MAX];
+        if (win32_w16_to_utf8(a[2] + 20, (long)(len / 2), wn, sizeof wn) < 0) return win32_fail(206);
+        if (win32_winpath_to_k(wn, kn, sizeof kn) < 0) return 0;
+        if (!win32_move_k(kp, kn, replace ? 1 : 0)) return 0;
+        struct file *f = fd_lookup(fd);
+        if (f && f->kind == FILE_KIND_DIR && f->dirpath) {
+            char *np = (char *)kmalloc(strlen(kn) + 1);
+            if (np) { memcpy(np, kn, strlen(kn) + 1); kfree(f->dirpath); f->dirpath = np; }
+        }
+        if (f) file_set_open_path(f, kn);
+        return 1;
+    }
+    case 4: case 21: {                          /* FILE_DISPOSITION_INFO(_EX) */
+        if (size < (cls == 4 ? 1u : 4u)) return win32_fail(24);
+        uint32_t v = 0;
+        (void)copy_from_user(&v, (const void *)(uintptr_t)a[2], cls == 4 ? 1 : 4);
+        if (!(v & (cls == 4 ? 0xFFu : 1u))) return 1;
+        struct vfs_stat vs;
+        int r = vfs_stat(kp, &vs);
+        if (r != VFS_OK) return win32_fail(win32_vfs_error(r, kp));
+        if (cls == 4 || !(v & 0x10)) {          /* FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE */
+            if (vs.type != VFS_TYPE_DIR && (vs.mode & VFS_MODE_VALID) && !(vs.mode & 0222)) return win32_fail(5);
+        }
+        if (vs.type == VFS_TYPE_DIR) return win32_rmdir_k(kp);
+        r = vfs_unlink(kp);
+        return r == VFS_OK ? 1 : win32_fail(win32_vfs_error(r, kp));
+    }
+    case 5:                                     /* FILE_ALLOCATION_INFO */
+        return 1;
+    case 6: {                                   /* FILE_END_OF_FILE_INFO */
+        if (size < 8) return win32_fail(24);
+        int64_t len = 0;
+        (void)copy_from_user(&len, (const void *)(uintptr_t)a[2], 8);
+        if (len < 0) return win32_fail(87);
+        long r = sys_ftruncate_fd(fd, (uint64_t)len);
+        return r == 0 ? 1 : win32_fail(win32_errno_win(-r, kp));
+    }
+    default:
+        return win32_fail(87);
+    }
+}
+/* GetFinalPathNameByHandleW(h, buf, cch, flags): "\\?\C:\dir\file", or the
+ * path without its drive (VOLUME_NAME_NONE) */
+static long w32_GetFinalPathNameByHandleW(uint64_t *a) {
+    int fd;
+    if (!win32_handle_fd(a[0], &fd)) return win32_fail(6);
+    char wp[ABI_PATH_MAX], out[ABI_PATH_MAX + 8];
+    if (win32_handle_winpath(fd, wp, sizeof wp) < 0) return win32_fail(1);
+    uint32_t vol = (uint32_t)a[3] & 0xF;
+    if (vol == 4) ksnprintf(out, sizeof out, "%s", (wp[0] && wp[1] == ':') ? wp + 2 : wp);
+    else if (vol == 0) ksnprintf(out, sizeof out, "\\\\?\\%s", wp);
+    else return win32_fail(87);
+    long n = win32_put_w16(out, a[1], (uint32_t)a[2]);
+    return n;
+}
+
+/* -- the UCRT's wide filesystem calls, _wcsdup ----------------------------- */
+static long win32_crt_fail_win(void) { win32_crt_errno(win32_crt_errno_of_win(win32_get_last_error())); return -1; }
+static long w32_wmkdir(uint64_t *a)  { char kp[ABI_PATH_MAX]; if (win32_wpath_k(a[0], kp, sizeof kp) < 0 || !win32_mkdir_k(kp)) return win32_crt_fail_win(); return 0; }
+static long w32_wrmdir(uint64_t *a)  { char kp[ABI_PATH_MAX]; if (win32_wpath_k(a[0], kp, sizeof kp) < 0 || !win32_rmdir_k(kp)) return win32_crt_fail_win(); return 0; }
+static long w32_wremove(uint64_t *a) { if (!w32_DeleteFileW(a)) return win32_crt_fail_win(); return 0; }
+static long w32_wrename(uint64_t *a) {
+    char ks[ABI_PATH_MAX], kd[ABI_PATH_MAX];
+    if (win32_wpath_k(a[0], ks, sizeof ks) < 0 || win32_wpath_k(a[1], kd, sizeof kd) < 0 ||
+        !win32_move_k(ks, kd, 2)) return win32_crt_fail_win();
+    return 0;
+}
+static long w32_crt_rename(uint64_t *a) {
+    char ws[ABI_PATH_MAX], wd[ABI_PATH_MAX], ks[ABI_PATH_MAX], kd[ABI_PATH_MAX];
+    if (strncpy_from_user(ws, (const char *)(uintptr_t)a[0], sizeof ws) < 0 ||
+        strncpy_from_user(wd, (const char *)(uintptr_t)a[1], sizeof wd) < 0) { win32_crt_errno(22); return -1; }
+    if (win32_winpath_to_k(ws, ks, sizeof ks) < 0 || win32_winpath_to_k(wd, kd, sizeof kd) < 0 ||
+        !win32_move_k(ks, kd, 2)) return win32_crt_fail_win();
+    return 0;
+}
+static long w32_wchdir(uint64_t *a) {
+    char wp[ABI_PATH_MAX];
+    if (!a[0] || win32_w16_to_utf8(a[0], -1, wp, sizeof wp) < 0) { win32_crt_errno(2); return -1; }
+    if (!win32_set_cwd(wp)) return win32_crt_fail_win();
+    return 0;
+}
+/* _wgetcwd(buf, n): the directory in buf (n characters); a NULL buf is
+ * malloc'd (n or what it needs); ERANGE when it does not fit */
+static long w32_wgetcwd(uint64_t *a) {
+    char cw[ABI_PATH_MAX];
+    if (win32_cwd_winpath(cw, sizeof cw) < 0) { win32_crt_errno(34); return 0; }
+    uint16_t w[ABI_PATH_MAX];
+    int n = win32_utf8_to_w16(cw, w, ABI_PATH_MAX - 1);
+    w[n] = 0;
+    int32_t cap = (int32_t)a[1];
+    uint64_t buf = a[0];
+    if (!buf) {
+        int units = cap > n + 1 ? cap : n + 1;
+        buf = win32_malloc_hdr((uint64_t)units * 2);
+        if (!buf) { win32_crt_errno(12); return 0; }
+    } else if (cap <= n) { win32_crt_errno(34); return 0; }
+    if (copy_to_user((void *)(uintptr_t)buf, w, (size_t)(n + 1) * 2) != 0) { win32_crt_errno(22); return 0; }
+    return (long)buf;
+}
+static long w32_wcsdup(uint64_t *a) {
+    if (!a[0]) return 0;
+    uint64_t n = 0;
+    for (;; n++) {
+        uint16_t w = 0;
+        if (copy_from_user(&w, (const void *)(uintptr_t)(a[0] + n * 2), 2) != 0) return 0;
+        if (!w) break;
+    }
+    uint64_t p = win32_malloc_hdr((n + 1) * 2);
+    if (!p) { win32_crt_errno(12); return 0; }
+    for (uint64_t i = 0; i <= n; i++) {
+        uint16_t w = 0;
+        (void)copy_from_user(&w, (const void *)(uintptr_t)(a[0] + i * 2), 2);
+        (void)copy_to_user((void *)(uintptr_t)(p + i * 2), &w, 2);
+    }
+    return (long)p;
+}
+
+/* -- stdio: the wide opens, fgetpos/fsetpos/_fseeki64/_ftelli64, fgetwc,
+ *    ungetwc ------------------------------------------------------------- */
+static long w32_fsopen(uint64_t *a) {   /* _fsopen(path, mode, shflag): no sharing modes here */
+    uint64_t b[2] = { a[0], a[1] };
+    return w32_fopen(b);
+}
+static long win32_wfopen_k(uint64_t uwpath, uint64_t uwmode) {
+    char path[ABI_PATH_MAX], mode[16];
+    if (!uwpath || win32_w16_to_utf8(uwpath, -1, path, sizeof path) < 0) { win32_crt_errno(22); return 0; }
+    if (!uwmode) { win32_crt_errno(22); return 0; }
+    win32_wstr_to_k(uwmode, mode, sizeof mode);
+    return win32_fopen_k(path, mode);
+}
+static long w32_wfopen(uint64_t *a)  { return win32_wfopen_k(a[0], a[1]); }
+static long w32_wfsopen(uint64_t *a) { return win32_wfopen_k(a[0], a[1]); }
+/* stdio's seek: ungetc's byte, the end, a Ctrl-Z and a pipe's byte forgotten */
+static long win32_stdio_seek(int fd, int64_t off, int wh) {
+    if (win32_crt_flush(fd) < 0) return -1;
+    struct w32fd e = win32_fd_get(fd);
+    if (wh == 1 && (e.flags & W32FD_UNGET)) off -= 1;
+    if (sys_lseek(fd, off, wh) < 0) return -1;
+    win32_fd_flag(fd, 0, W32FD_CTRLZ | W32FD_FEOF | W32FD_LOOK | W32FD_UNGET);
+    return 0;
+}
+static long win32_stdio_tell(int fd) {
+    long p = sys_lseek(fd, 0, 1);
+    if (p < 0) return -1;
+    struct w32fd e = win32_fd_get(fd);
+    p += (long)e.bufn;
+    return (e.flags & W32FD_UNGET) && p > 0 ? p - 1 : p;
+}
+/* fflush(stream), fflush(NULL): every stream's; _flushall: their count */
+static long w32_fflush(uint64_t *a) {
+    if (!a[0]) { (void)win32_crt_flush_all(); return 0; }
+    int fd = win32_file_fd(a[0]);
+    if (fd < 0) return 0;
+    return win32_crt_flush(fd) < 0 ? -1 : 0;
+}
+static long w32_flushall(uint64_t *a) { (void)a; return win32_crt_flush_all(); }
+/* setvbuf(stream, buf, mode, size): _IONBF unbuffered, _IOFBF / _IOLBF
+ * buffered (in the CRT's own 4096 bytes) */
+static long w32_setvbuf(uint64_t *a) {
+    int fd = win32_file_fd(a[0]);
+    uint32_t mode = (uint32_t)a[2];
+    if (fd < 0) return -1;
+    if (mode != 0 && mode != 0x40 && mode != 4) { (void)win32_invalid_parameter(22); return -1; }
+    (void)win32_crt_flush(fd);
+    if (mode == 4) win32_fd_flag(fd, W32FD_FBSET, W32FD_FBUF);
+    else win32_fd_flag(fd, W32FD_FBSET | W32FD_FBUF, 0);
+    return 0;
+}
+static long w32_fseeki64(uint64_t *a) { int fd = win32_file_fd(a[0]); return fd < 0 ? -1 : win32_stdio_seek(fd, (int64_t)a[1], (int)a[2]); }
+static long w32_ftelli64(uint64_t *a) { int fd = win32_file_fd(a[0]); return fd < 0 ? -1 : win32_stdio_tell(fd); }
+static long w32_fgetpos(uint64_t *a) {
+    int fd = win32_file_fd(a[0]);
+    if (fd < 0 || !a[1]) { win32_crt_errno(22); return 22; }
+    int64_t p = win32_stdio_tell(fd);
+    if (p < 0) { win32_crt_errno(22); return -1; }
+    return copy_to_user((void *)(uintptr_t)a[1], &p, 8) == 0 ? 0 : -1;
+}
+static long w32_fsetpos(uint64_t *a) {
+    int fd = win32_file_fd(a[0]);
+    int64_t p = 0;
+    if (fd < 0 || !a[1] || copy_from_user(&p, (const void *)(uintptr_t)a[1], 8) != 0) { win32_crt_errno(22); return 22; }
+    return win32_stdio_seek(fd, p, 0);
+}
+/* fgetwc on a narrow stream in the "C" locale: one byte is one character */
+static long w32_fgetwc(uint64_t *a) {
+    int fd = win32_file_fd(a[0]);
+    if (fd < 0) return 0xFFFF;
+    int c = win32_stdio_getc(fd);
+    return c < 0 ? 0xFFFF : c;
+}
+static long w32_ungetwc(uint64_t *a) {
+    uint16_t wc = (uint16_t)a[0];
+    if (wc == 0xFFFF || wc > 0xFF) return 0xFFFF;
+    uint64_t b[2] = { wc, a[1] };
+    return w32_ungetc(b) < 0 ? 0xFFFF : wc;
+}
+
+/* -- kernel32's sync objects, the Ex forms -------------------------------- */
+static long w32_CreateEventExW(uint64_t *a) {   /* (sa, name, flags, access) */
+    uint64_t b[4] = { a[0], (a[2] & 1) ? 1 : 0, (a[2] & 2) ? 1 : 0, a[1] };
+    return w32_CreateEvent(b);
+}
+static long w32_CreateSemaphoreExW(uint64_t *a) {   /* (sa, initial, max, name, flags, access) */
+    uint64_t b[4] = { a[0], a[1], a[2], a[3] };
+    return w32_CreateSemaphore(b);
+}
+
+/* -- the "C" locale's character tables, as kernel32 answers them ---------- */
+/* UTF-16 code points 0..0xFF: their CT_CTYPE1 class (Latin-1's letters too) */
+static uint16_t win32_ctype1_w(uint32_t c) {
+    uint16_t f = 0x200;                                        /* C1_DEFINED */
+    if (c > 0xFF) return (c >= 0x100 && c < 0x250) ? (uint16_t)(0x200 | 0x100 | ((c & 1) ? 2 : 1)) : 0x200;
+    if (c < 0x20 || (c >= 0x7F && c < 0xA0)) f |= 0x20;        /* C1_CNTRL */
+    if ((c >= 9 && c <= 13) || c == ' ' || c == 0x85 || c == 0xA0) f |= 0x08;   /* C1_SPACE */
+    if (c == ' ' || c == '\t' || c == 0xA0) f |= 0x40;        /* C1_BLANK */
+    if (c >= '0' && c <= '9') f |= 0x04 | 0x80;                /* C1_DIGIT C1_XDIGIT */
+    if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) f |= 0x80;
+    if ((c >= 'A' && c <= 'Z') || (c >= 0xC0 && c <= 0xDE && c != 0xD7)) f |= 0x100 | 0x01;
+    if ((c >= 'a' && c <= 'z') || (c >= 0xDF && c <= 0xFF && c != 0xF7) || c == 0xAA || c == 0xB5 || c == 0xBA)
+        f |= 0x100 | 0x02;
+    if (((c > 0x20 && c < 0x7F) || (c > 0xA0 && c <= 0xFF)) && !(f & (0x100 | 0x04))) f |= 0x10;   /* C1_PUNCT */
+    if (c == 0xB2 || c == 0xB3 || c == 0xB9) f = (uint16_t)((f & ~0x10) | 0x04 | 0x10);
+    return f;
+}
+static uint32_t win32_wupper(uint32_t c) {
+    if (c >= 'a' && c <= 'z') return c - 32;
+    if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return c - 32;
+    if (c == 0xFF) return 0x178;
+    if (c == 0xB5) return 0x39C;
+    if (c >= 0x100 && c < 0x180 && (c & 1) && c != 0x131 && c != 0x138 && c != 0x149) return c - 1;
+    return c;
+}
+static uint32_t win32_wlower(uint32_t c) {
+    if (c >= 'A' && c <= 'Z') return c + 32;
+    if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return c + 32;
+    if (c == 0x178) return 0xFF;
+    if (c >= 0x100 && c < 0x180 && !(c & 1) && c != 0x130 && c != 0x138) return c + 1;
+    return c;
+}
+/* the program's UTF-16 string of n units (-1: to its NUL, which then counts) */
+static long win32_wlen(uint64_t u, int32_t n, bool *with_nul) {
+    *with_nul = false;
+    if (n >= 0) return n;
+    long i = 0;
+    for (;; i++) {
+        uint16_t w = 1;
+        if (copy_from_user(&w, (const void *)(uintptr_t)(u + (uint64_t)i * 2), 2) != 0) return -1;
+        if (!w) break;
+    }
+    *with_nul = true;
+    return i + 1;
+}
+static uint16_t win32_wat(uint64_t u, long i) {
+    uint16_t w = 0;
+    (void)copy_from_user(&w, (const void *)(uintptr_t)(u + (uint64_t)i * 2), 2);
+    return w;
+}
+/* GetStringTypeW(type, src, n, out): CT_CTYPE1 classes; CT_CTYPE2 left to
+ * right for letters and digits, CT_CTYPE3 alphabetic */
+static long w32_GetStringTypeW(uint64_t *a) {
+    uint32_t type = (uint32_t)a[0];
+    bool z;
+    long n = win32_wlen(a[1], (int32_t)a[2], &z);
+    if (n < 0 || !a[3] || (type != 1 && type != 2 && type != 4)) return win32_fail(87);
+    for (long i = 0; i < n; i++) {
+        uint32_t c = win32_wat(a[1], i);
+        uint16_t t1 = win32_ctype1_w(c), t;
+        if (type == 1) t = t1;
+        else if (type == 2) t = (t1 & 0x100) ? 1 : (t1 & 0x04) ? 3 : (t1 & 0x08) ? 10 : (t1 & 0x10) ? 11 : 0;
+        else t = (uint16_t)(((t1 & 0x100) ? 0x8000 : 0) | ((t1 & 0x10) ? 0x0008 : 0));
+        (void)copy_to_user((void *)(uintptr_t)(a[3] + (uint64_t)i * 2), &t, 2);
+    }
+    return 1;
+}
+/* LCMapStringEx(name, flags, src, n, dst, dn, ver, res, param):
+ * LCMAP_LOWERCASE / LCMAP_UPPERCASE, and LCMAP_SORTKEY (bytes: each
+ * character's case-folded weight, then each one's case) */
+static long w32_LCMapStringEx(uint64_t *a) {
+    uint32_t flags = (uint32_t)a[1];
+    bool z;
+    long n = win32_wlen(a[2], (int32_t)a[3], &z);
+    int32_t dn = (int32_t)a[5];
+    if (n < 0 || n == 0 || dn < 0 || (dn && !a[4])) return win32_fail(87);
+    if (flags & 0x400) {                                   /* LCMAP_SORTKEY: a byte key */
+        long body = z ? n - 1 : n, need = body * 2 + 1 + body + 1;
+        if (!dn) return need;
+        if (dn < need) return win32_fail(122);             /* ERROR_INSUFFICIENT_BUFFER */
+        long o = 0;
+        for (long i = 0; i < body; i++) {
+            uint32_t c = win32_wupper(win32_wat(a[2], i));
+            uint8_t k[2] = { (uint8_t)(c >> 8), (uint8_t)c };
+            (void)copy_to_user((void *)(uintptr_t)(a[4] + (uint64_t)o), k, 2); o += 2;
+        }
+        uint8_t one = 1;
+        (void)copy_to_user((void *)(uintptr_t)(a[4] + (uint64_t)o++), &one, 1);
+        for (long i = 0; i < body; i++) {
+            uint32_t c = win32_wat(a[2], i);
+            uint8_t cw = (win32_ctype1_w(c) & 0x01) ? 0x12 : 0x02;
+            (void)copy_to_user((void *)(uintptr_t)(a[4] + (uint64_t)o++), &cw, 1);
+        }
+        uint8_t zero = 0;
+        (void)copy_to_user((void *)(uintptr_t)(a[4] + (uint64_t)o++), &zero, 1);
+        return o;
+    }
+    if (!dn) return n;
+    if (dn < n) return win32_fail(122);
+    for (long i = 0; i < n; i++) {
+        uint32_t c = win32_wat(a[2], i);
+        if (flags & 0x100) c = win32_wlower(c);
+        else if (flags & 0x200) c = win32_wupper(c);
+        uint16_t w = (uint16_t)c;
+        (void)copy_to_user((void *)(uintptr_t)(a[4] + (uint64_t)i * 2), &w, 2);
+    }
+    return n;
+}
+/* CompareStringEx(name, flags, s1, n1, s2, n2, ver, res, param) ->
+ * CSTR_LESS_THAN 1 / CSTR_EQUAL 2 / CSTR_GREATER_THAN 3: the case-folded
+ * characters first, then (unless NORM_IGNORECASE / LINGUISTIC_IGNORECASE)
+ * small letters before capitals, as a word sort orders them */
+static long w32_CompareStringEx(uint64_t *a) {
+    uint32_t flags = (uint32_t)a[1];
+    bool z1, z2;
+    long n1 = win32_wlen(a[2], (int32_t)a[3], &z1), n2 = win32_wlen(a[4], (int32_t)a[5], &z2);
+    if (n1 < 0 || n2 < 0 || !a[2] || !a[4]) return win32_fail(87);
+    if (z1) n1--;
+    if (z2) n2--;
+    bool icase = (flags & (0x1 | 0x10)) != 0;
+    int tie = 0;
+    long i = 0;
+    for (; i < n1 && i < n2; i++) {
+        uint32_t c1 = win32_wat(a[2], i), c2 = win32_wat(a[4], i);
+        uint32_t f1 = win32_wupper(c1), f2 = win32_wupper(c2);
+        if (f1 != f2) return f1 < f2 ? 1 : 3;
+        if (!tie && c1 != c2 && !icase) tie = (win32_ctype1_w(c1) & 0x02) ? 1 : 3;
+    }
+    if (n1 != n2) return n1 < n2 ? 1 : 3;
+    return tie ? tie : 2;
+}
+/* GetLocaleInfoEx(name, type, data, cch): the invariant locale's and
+ * en-US's answers to the questions the C++ library and programs ask; a
+ * number with LOCALE_RETURN_NUMBER */
+static long w32_GetLocaleInfoEx(uint64_t *a) {
+    char name[86];
+    name[0] = 0;
+    if (a[0]) win32_wstr_to_k(a[0], name, sizeof name);
+    bool inv = name[0] == 0;
+    bool us = inv || !strcmp(name, "en-US") || !strcmp(name, "!x-sys-default-locale");
+    if (!us) return win32_fail(87);
+    uint32_t type = (uint32_t)a[1] & 0x0FFFFFFFu;
+    bool num = ((uint32_t)a[1] & 0x20000000u) != 0;        /* LOCALE_RETURN_NUMBER */
+    static const char *const days[7] = { "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" };
+    static const char *const months[12] = { "January", "February", "March", "April", "May", "June", "July",
+                                            "August", "September", "October", "November", "December" };
+    char v[64];
+    uint32_t nv = 0;
+    bool isnum = false;
+    v[0] = 0;
+    switch (type) {
+    case 0x0E: ksnprintf(v, sizeof v, "."); break;                      /* LOCALE_SDECIMAL */
+    case 0x0F: ksnprintf(v, sizeof v, ","); break;                      /* LOCALE_STHOUSAND */
+    case 0x10: ksnprintf(v, sizeof v, "3;0"); break;                    /* LOCALE_SGROUPING */
+    case 0x14: ksnprintf(v, sizeof v, inv ? "\xC2\xA4" : "$"); break;   /* LOCALE_SCURRENCY */
+    case 0x16: ksnprintf(v, sizeof v, "."); break;                      /* LOCALE_SMONDECIMALSEP */
+    case 0x17: ksnprintf(v, sizeof v, ","); break;                      /* LOCALE_SMONTHOUSANDSEP */
+    case 0x50: ksnprintf(v, sizeof v, ""); break;                       /* LOCALE_SPOSITIVESIGN */
+    case 0x51: ksnprintf(v, sizeof v, "-"); break;                      /* LOCALE_SNEGATIVESIGN */
+    case 0x5C: ksnprintf(v, sizeof v, inv ? "" : "en-US"); break;       /* LOCALE_SNAME */
+    case 0x1001: ksnprintf(v, sizeof v, inv ? "Invariant Language" : "English"); break;
+    case 0x1002: ksnprintf(v, sizeof v, inv ? "Invariant Country" : "United States"); break;
+    case 0x0B: nv = 437; isnum = true; break;                           /* LOCALE_IDEFAULTCODEPAGE */
+    case 0x1004: nv = 1252; isnum = true; break;                        /* LOCALE_IDEFAULTANSICODEPAGE */
+    case 0x01: nv = inv ? 0x7F : 0x409; isnum = true; break;            /* LOCALE_ILANGUAGE */
+    case 0x1C: case 0x1E: ksnprintf(v, sizeof v, ":"); break;           /* LOCALE_SDATE? LOCALE_STIME */
+    case 0x1F: ksnprintf(v, sizeof v, inv ? "MM/dd/yyyy" : "M/d/yyyy"); break;          /* LOCALE_SSHORTDATE */
+    case 0x20: ksnprintf(v, sizeof v, inv ? "dddd, dd MMMM yyyy" : "dddd, MMMM d, yyyy"); break;
+    case 0x1003: ksnprintf(v, sizeof v, inv ? "HH:mm:ss" : "h:mm:ss tt"); break;        /* LOCALE_STIMEFORMAT */
+    case 0x28: ksnprintf(v, sizeof v, "AM"); break;                     /* LOCALE_S1159 */
+    case 0x29: ksnprintf(v, sizeof v, "PM"); break;                     /* LOCALE_S2359 */
+    case 0x100C: nv = 6; isnum = true; break;                           /* LOCALE_IFIRSTDAYOFWEEK: Sunday */
+    case 0x0D: nv = 1; isnum = true; break;                             /* LOCALE_IMEASURE: U.S. */
+    default:
+        if (type >= 0x2A && type <= 0x30) ksnprintf(v, sizeof v, "%s", days[type - 0x2A]);
+        else if (type >= 0x31 && type <= 0x37) { memcpy(v, days[type - 0x31], 3); v[3] = 0; }
+        else if (type >= 0x38 && type <= 0x43) ksnprintf(v, sizeof v, "%s", months[type - 0x38]);
+        else if (type >= 0x44 && type <= 0x4F) { memcpy(v, months[type - 0x44], 3); v[3] = 0; }
+        else return win32_fail(1004);                                   /* ERROR_INVALID_FLAGS */
+    }
+    uint32_t cch = (uint32_t)a[3];
+    if (num) {
+        if (!isnum) return win32_fail(1004);
+        if (!cch) return 2;
+        if (cch < 2) return win32_fail(122);
+        (void)copy_to_user((void *)(uintptr_t)a[2], &nv, 4);
+        return 2;
+    }
+    if (isnum) ksnprintf(v, sizeof v, "%u", nv);
+    long n = win32_put_w16(v, cch ? a[2] : 0, cch);
+    if (!cch) return n;                        /* (the size it needs, with the NUL) */
+    if (n > (long)cch - 1 && cch < (uint32_t)n) return win32_fail(122);
+    return n + 1;                              /* the characters with the NUL */
+}
+/* GetCPInfo(cp, CPINFO *): MaxCharSize, DefaultChar, LeadByte */
+static long w32_GetCPInfo(uint64_t *a) {
+    uint32_t cp = (uint32_t)a[0];
+    if (cp == 0 || cp == 3) cp = 1252;              /* CP_ACP, CP_THREAD_ACP */
+    if (cp == 1 || cp == 2) cp = 437;               /* CP_OEMCP, CP_MACCP */
+    uint8_t b[18];
+    memset(b, 0, sizeof b);
+    uint32_t max;
+    switch (cp) {
+    case 437: case 850: case 1250: case 1251: case 1252: case 1253: case 1254: case 20127: case 28591:
+        max = 1; break;
+    case 65001: max = 4; break;
+    case 65000: max = 5; break;
+    default: return win32_fail(87);
+    }
+    memcpy(&b[0], &max, 4);
+    b[4] = '?';
+    if (!a[1] || copy_to_user((void *)(uintptr_t)a[1], b, sizeof b) != 0) return win32_fail(87);
+    return 1;
+}
+
+/* -- strftime and its kin, the "C" locale's names --------------------------
+ * %c is "%m/%d/%y %H:%M:%S", %x "%m/%d/%y", %X "%H:%M:%S" in the C locale;
+ * '#' takes the leading zeros away (the UCRT's); the zone is UTC. The names
+ * a time-facet passes (_Strftime's last argument) are the C locale's when
+ * NULL, as msvcp140's are here (_Gettnames answers NULL). */
+static const char *const g_w32_days[7] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+static const char *const g_w32_months[12] = { "January", "February", "March", "April", "May", "June", "July",
+                                              "August", "September", "October", "November", "December" };
+struct w32_tm { int32_t sec, min, hour, mday, mon, year, wday, yday, isdst; };
+static int win32_iso_wday1(const struct w32_tm *t) { return t->wday ? t->wday : 7; }
+static int win32_is_leap(long y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+/* ISO 8601 week number and its year */
+static int win32_iso_week(const struct w32_tm *t, long *iy) {
+    long y = (long)t->year + 1900;
+    int wd = win32_iso_wday1(t);
+    int wk = (t->yday - wd + 10) / 7;
+    if (wk < 1) {
+        y--;
+        int dy = 365 + win32_is_leap(y);
+        int yday = t->yday + dy;
+        wk = (yday - wd + 10) / 7;
+    } else if (wk == 53) {
+        int dy = 365 + win32_is_leap(y);
+        if (t->yday - wd + 3 >= dy) { wk = 1; y++; }  /* the week holds 4 Jan of next year */
+    }
+    *iy = y;
+    return wk;
+}
+/* format into out (cap bytes, with the NUL); the length, or 0 when it does
+ * not fit (and out[0] = 0), as strftime answers */
+static size_t win32_strftime_k(char *out, size_t cap, const char *fmt, const struct w32_tm *t) {
+    size_t o = 0;
+#define W32F_PUT(s) do { const char *_s = (s); while (*_s) { if (o + 1 >= cap) goto full; out[o++] = *_s++; } } while (0)
+    for (const char *f = fmt; *f; f++) {
+        if (*f != '%') { if (o + 1 >= cap) goto full; out[o++] = *f; continue; }
+        f++;
+        bool alt = false;
+        if (*f == '#') { alt = true; f++; }
+        char b[64];
+        b[0] = 0;
+        int wd = t->wday >= 0 && t->wday < 7 ? t->wday : 0, mo = t->mon >= 0 && t->mon < 12 ? t->mon : 0;
+        int h12 = t->hour % 12 ? t->hour % 12 : 12;
+        const char *z2 = alt ? "%d" : "%02d", *z3 = alt ? "%d" : "%03d";
+        switch (*f) {
+        case 'a': memcpy(b, g_w32_days[wd], 3); b[3] = 0; break;
+        case 'A': ksnprintf(b, sizeof b, "%s", g_w32_days[wd]); break;
+        case 'b': case 'h': memcpy(b, g_w32_months[mo], 3); b[3] = 0; break;
+        case 'B': ksnprintf(b, sizeof b, "%s", g_w32_months[mo]); break;
+        case 'c':
+            if (alt) ksnprintf(b, sizeof b, "%s, %s %d, %d %02d:%02d:%02d", g_w32_days[wd], g_w32_months[mo],
+                               t->mday, t->year + 1900, t->hour, t->min, t->sec);
+            else ksnprintf(b, sizeof b, "%02d/%02d/%02d %02d:%02d:%02d", mo + 1, t->mday,
+                           (int)((t->year + 1900) % 100), t->hour, t->min, t->sec);
+            break;
+        case 'C': ksnprintf(b, sizeof b, z2, (t->year + 1900) / 100); break;
+        case 'd': ksnprintf(b, sizeof b, z2, t->mday); break;
+        case 'D': ksnprintf(b, sizeof b, "%02d/%02d/%02d", mo + 1, t->mday, (int)((t->year + 1900) % 100)); break;
+        case 'e': ksnprintf(b, sizeof b, alt ? "%d" : "%2d", t->mday); break;
+        case 'F': ksnprintf(b, sizeof b, "%d-%02d-%02d", t->year + 1900, mo + 1, t->mday); break;
+        case 'g': case 'G': case 'V': {
+            long iy; int wk = win32_iso_week(t, &iy);
+            if (*f == 'V') ksnprintf(b, sizeof b, z2, wk);
+            else if (*f == 'G') ksnprintf(b, sizeof b, "%ld", iy);
+            else ksnprintf(b, sizeof b, z2, (int)(iy % 100));
+            break;
+        }
+        case 'H': ksnprintf(b, sizeof b, z2, t->hour); break;
+        case 'I': ksnprintf(b, sizeof b, z2, h12); break;
+        case 'j': ksnprintf(b, sizeof b, z3, t->yday + 1); break;
+        case 'm': ksnprintf(b, sizeof b, z2, mo + 1); break;
+        case 'M': ksnprintf(b, sizeof b, z2, t->min); break;
+        case 'n': ksnprintf(b, sizeof b, "\n"); break;
+        case 'p': ksnprintf(b, sizeof b, t->hour < 12 ? "AM" : "PM"); break;
+        case 'r': ksnprintf(b, sizeof b, "%02d:%02d:%02d %s", h12, t->min, t->sec, t->hour < 12 ? "AM" : "PM"); break;
+        case 'R': ksnprintf(b, sizeof b, "%02d:%02d", t->hour, t->min); break;
+        case 'S': ksnprintf(b, sizeof b, z2, t->sec); break;
+        case 't': ksnprintf(b, sizeof b, "\t"); break;
+        case 'T': case 'X': ksnprintf(b, sizeof b, "%02d:%02d:%02d", t->hour, t->min, t->sec); break;
+        case 'u': ksnprintf(b, sizeof b, "%d", win32_iso_wday1(t)); break;
+        case 'U': ksnprintf(b, sizeof b, z2, (t->yday + 7 - wd) / 7); break;
+        case 'w': ksnprintf(b, sizeof b, "%d", wd); break;
+        case 'W': ksnprintf(b, sizeof b, z2, (t->yday + 7 - (wd ? wd - 1 : 6)) / 7); break;
+        case 'x':
+            if (alt) ksnprintf(b, sizeof b, "%s, %s %d, %d", g_w32_days[wd], g_w32_months[mo], t->mday, t->year + 1900);
+            else ksnprintf(b, sizeof b, "%02d/%02d/%02d", mo + 1, t->mday, (int)((t->year + 1900) % 100));
+            break;
+        case 'y': ksnprintf(b, sizeof b, z2, (int)((t->year + 1900) % 100)); break;
+        case 'Y': ksnprintf(b, sizeof b, "%d", t->year + 1900); break;
+        case 'z': ksnprintf(b, sizeof b, "+0000"); break;
+        case 'Z': ksnprintf(b, sizeof b, "UTC"); break;
+        case '%': ksnprintf(b, sizeof b, "%%"); break;
+        case 0: f--; break;
+        default: ksnprintf(b, sizeof b, "%%%c", *f); break;
+        }
+        W32F_PUT(b);
+    }
+    out[o] = 0;
+    return o;
+full:
+    if (cap) out[0] = 0;
+    return 0;
+#undef W32F_PUT
+}
+static bool win32_get_tm(uint64_t utm, struct w32_tm *t) {
+    return utm && copy_from_user(t, (const void *)(uintptr_t)utm, sizeof *t) == 0;
+}
+/* strftime(s, max, fmt, tm) / _Strftime(s, max, fmt, tm, names) */
+static long win32_strftime_u(uint64_t us, uint64_t max, uint64_t ufmt, uint64_t utm) {
+    char fmt[256], out[1024];
+    struct w32_tm t;
+    if (!us || !ufmt || !max || !win32_get_tm(utm, &t)) { win32_crt_errno(22); return 0; }
+    if (strncpy_from_user(fmt, (const char *)(uintptr_t)ufmt, sizeof fmt) < 0) { win32_crt_errno(22); return 0; }
+    size_t cap = max < sizeof out ? (size_t)max : sizeof out;
+    size_t n = win32_strftime_k(out, cap, fmt, &t);
+    if (!n && fmt[0]) { char z = 0; (void)copy_to_user((void *)(uintptr_t)us, &z, 1); win32_crt_errno(34); return 0; }
+    (void)copy_to_user((void *)(uintptr_t)us, out, n + 1);
+    return (long)n;
+}
+static long w32_strftime(uint64_t *a)  { return win32_strftime_u(a[0], a[1], a[2], a[3]); }
+static long w32_Strftime(uint64_t *a)  { return win32_strftime_u(a[0], a[1], a[2], a[3]); }
+/* wcsftime(s, max, fmt, tm) / _Wcsftime(s, max, fmt, tm, names): the format
+ * narrowed (its characters past ASCII kept as they are) */
+static long win32_wcsftime_u(uint64_t us, uint64_t max, uint64_t ufmt, uint64_t utm) {
+    char fmt[256], out[1024];
+    struct w32_tm t;
+    if (!us || !ufmt || !max || !win32_get_tm(utm, &t)) { win32_crt_errno(22); return 0; }
+    if (win32_w16_to_utf8(ufmt, -1, fmt, sizeof fmt) < 0) { win32_crt_errno(22); return 0; }
+    size_t n = win32_strftime_k(out, sizeof out, fmt, &t);
+    uint16_t w[1024];
+    int wn = win32_utf8_to_w16(out, w, 1023);
+    if ((uint64_t)wn + 1 > max || (!n && fmt[0])) {
+        uint16_t z = 0; (void)copy_to_user((void *)(uintptr_t)us, &z, 2);
+        win32_crt_errno(34);
+        return 0;
+    }
+    w[wn] = 0;
+    (void)copy_to_user((void *)(uintptr_t)us, w, (size_t)(wn + 1) * 2);
+    return wn;
+}
+static long w32_wcsftime(uint64_t *a) { return win32_wcsftime_u(a[0], a[1], a[2], a[3]); }
+static long w32_Wcsftime(uint64_t *a) { return win32_wcsftime_u(a[0], a[1], a[2], a[3]); }
+
+/* -- the rest: _seh_filter_dll, strtof, logf ------------------------------- */
+/* a DLL's CRT start's filter: nothing of the UCRT's own is a DLL's to take */
+static long w32_seh_filter_dll(uint64_t *a) { (void)a; return 0; }    /* EXCEPTION_CONTINUE_SEARCH */
+/* strtof(s, end): the float's bits (in xmm0 by the float gate) */
+static long w32_strtof(uint64_t *a) {
+    char s[128];
+    if (strncpy_from_user(s, (const char *)(uintptr_t)a[0], sizeof(s)) < 0) {
+        if (a[1]) (void)copy_to_user((void *)(uintptr_t)a[1], &a[0], 8);
+        return 0;
+    }
+    s[sizeof(s) - 1] = '\0';
+    int consumed = 0;
+    uint32_t fb = 0;
+    (void)kmath_strtod(s, &consumed, &fb);
+    if (a[1]) { uint64_t ep = a[0] + (uint64_t)consumed; (void)copy_to_user((void *)(uintptr_t)a[1], &ep, 8); }
+    return (long)fb;
+}
+/* logf(x): the float in xmm0's low half, by the float gate */
+static long w32_logf(uint64_t *a) { return (long)kmath_d2f(kmath_op1(KM_LOG, kmath_f2d((uint32_t)a[4]))); }
+
 static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetStdHandle", w32_GetStdHandle },
     { "kernel32.dll", "WriteFile",    w32_WriteFile },
@@ -28344,8 +29655,9 @@ static const struct win32_shim g_win32_shims[] = {
     /* ucrt: stdio (extras beyond the C2 set) */
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__p__commode",             w32_p_commode },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__p__fmode",               w32_p_fmode },
-    { "api-ms-win-crt-stdio-l1-1-0.dll", "fflush",                   w32_zero },
-    { "api-ms-win-crt-stdio-l1-1-0.dll", "setvbuf",                  w32_zero },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fflush",                   w32_fflush },   /* W7m */
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "setvbuf",                  w32_setvbuf },  /* W7m */
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_flushall",                w32_flushall }, /* W7m */
     /* ucrt: string */
     { "api-ms-win-crt-string-l1-1-0.dll", "strlen",                  w32_strlen },
     { "api-ms-win-crt-string-l1-1-0.dll", "strncmp",                 w32_strncmp },
@@ -28757,6 +30069,60 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby__lseek",     w32_lseek },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby__lseeki64",  w32_lseeki64 },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby__eof",       w32_eof },
+    /* W7m: the rest of what msvcp140.dll asks -- std::filesystem's kernel32
+     * calls, the locale's, the UCRT's wide ones, the time facets' */
+    { "kernel32.dll", "CreateDirectoryW",            w32_CreateDirectoryW },
+    { "kernel32.dll", "RemoveDirectoryW",            w32_RemoveDirectoryW },
+    { "kernel32.dll", "RemoveDirectoryA",            w32_RemoveDirectoryA },
+    { "kernel32.dll", "CopyFileW",                   w32_CopyFileW },
+    { "kernel32.dll", "CopyFileA",                   w32_CopyFileA },
+    { "kernel32.dll", "MoveFileExW",                 w32_MoveFileExW },
+    { "kernel32.dll", "MoveFileW",                   w32_MoveFileW },
+    { "kernel32.dll", "MoveFileExA",                 w32_MoveFileExA },
+    { "kernel32.dll", "MoveFileA",                   w32_MoveFileA },
+    { "kernel32.dll", "CreateHardLinkW",             w32_CreateHardLinkW },
+    { "kernel32.dll", "CreateSymbolicLinkW",         w32_CreateSymbolicLinkW },
+    { "kernel32.dll", "GetDiskFreeSpaceExW",         w32_GetDiskFreeSpaceExW },
+    { "kernel32.dll", "GetDiskFreeSpaceExA",         w32_GetDiskFreeSpaceExA },
+    { "kernel32.dll", "FindFirstFileExW",            w32_FindFirstFileExW },
+    { "kernel32.dll", "FindFirstFileExA",            w32_FindFirstFileExA },
+    { "kernel32.dll", "FindNextFileW",               w32_FindNextFileW },
+    { "kernel32.dll", "GetFileInformationByHandle",  w32_GetFileInformationByHandle },
+    { "kernel32.dll", "GetFileInformationByHandleEx", w32_GetFileInformationByHandleEx },
+    { "kernel32.dll", "SetFileInformationByHandle",  w32_SetFileInformationByHandle },
+    { "kernel32.dll", "GetFinalPathNameByHandleW",   w32_GetFinalPathNameByHandleW },
+    { "kernel32.dll", "SetFileAttributesW",          w32_SetFileAttributesW },
+    { "kernel32.dll", "CreateEventExW",              w32_CreateEventExW },
+    { "kernel32.dll", "CreateSemaphoreExW",          w32_CreateSemaphoreExW },
+    { "kernel32.dll", "GetStringTypeW",              w32_GetStringTypeW },
+    { "kernel32.dll", "LCMapStringEx",               w32_LCMapStringEx },
+    { "kernel32.dll", "CompareStringEx",             w32_CompareStringEx },
+    { "kernel32.dll", "GetLocaleInfoEx",             w32_GetLocaleInfoEx },
+    { "kernel32.dll", "GetCPInfo",                   w32_GetCPInfo },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_wmkdir",  w32_wmkdir },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_wrmdir",  w32_wrmdir },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_wremove", w32_wremove },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_wrename", w32_wrename },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_wchdir",  w32_wchdir },
+    { "api-ms-win-crt-environment-l1-1-0.dll", "_wgetcwd", w32_wgetcwd },
+    { "api-ms-win-crt-string-l1-1-0.dll", "_wcsdup",      w32_wcsdup },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_fsopen",       w32_fsopen },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_wfsopen",      w32_wfsopen },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_wfopen",       w32_wfopen },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_fseeki64",     w32_fseeki64 },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_ftelli64",     w32_ftelli64 },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fgetpos",       w32_fgetpos },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fsetpos",       w32_fsetpos },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fgetwc",        w32_fgetwc },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "getwc",         w32_fgetwc },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "ungetwc",       w32_ungetwc },
+    { "api-ms-win-crt-time-l1-1-0.dll", "strftime",       w32_strftime },
+    { "api-ms-win-crt-time-l1-1-0.dll", "wcsftime",       w32_wcsftime },
+    { "api-ms-win-crt-time-l1-1-0.dll", "_Strftime",      w32_Strftime },
+    { "api-ms-win-crt-time-l1-1-0.dll", "_Wcsftime",      w32_Wcsftime },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_seh_filter_dll", w32_seh_filter_dll },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "strtof",      w32_strtof },
+    { "api-ms-win-crt-math-l1-1-0.dll", "logf",           w32_logf },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vsscanf", w32_vsscanf },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vfscanf", w32_vfscanf },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "_popen",    w32_zero },
@@ -28894,7 +30260,8 @@ int win32_shim_is_double_ret(int idx) {
            f == w32_cbrt || f == w32_pow   || f == w32_fmod  || f == w32_atan2 ||
            f == w32_hypot|| f == w32_ldexp || f == w32_frexp ||
            f == w32_strtod || f == w32_atof ||  /* C22: string->double also returns in xmm0 */
-           f == w32_dclass || f == w32_copysign; /* W7k: a double argument (xmm0, xmm1) */
+           f == w32_dclass || f == w32_copysign || /* W7k: a double argument (xmm0, xmm1) */
+           f == w32_strtof || f == w32_logf;     /* W7m: a float, in xmm0's low half */
 }
 
 /* First shim-table index whose DLL matches `dll` (case-insensitive), or -1. The

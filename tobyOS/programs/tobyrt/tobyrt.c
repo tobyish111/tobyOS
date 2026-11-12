@@ -1466,3 +1466,298 @@ BOOL rt_InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, LPVO
         Sleep(0);
     }
 }
+
+/* ---- W7m: the thread pool, InitOnceBeginInitialize/Complete,
+ * RtlCaptureStackBackTrace, GetModuleHandleEx ------------------------------
+ * msvcp140.dll's std::async (its PPL chores) and its timers and waits run on
+ * the Windows thread pool: the program's callbacks, which the kernel cannot
+ * call. Here a submitted work item, a set timer and a set wait each run on a
+ * thread of their own (CreateThread), counted on the object: a callback runs
+ * once per submission, a one-shot timer once when it is due (a periodic one
+ * every period), a wait once its handle is signalled or its timeout passes
+ * (WAIT_OBJECT_0 / WAIT_TIMEOUT); setting a timer or a wait again, closing
+ * it, or WaitFor...Callbacks(TRUE) cancels what has not started. An object
+ * is freed when it is closed and nothing of it runs. Measured on Windows 11
+ * (programs/win-cxx44). */
+#define RT_TP_MAX 64
+enum { RT_TP_FREE = 0, RT_TP_WORK, RT_TP_TIMER, RT_TP_WAIT, RT_TP_MAKING };
+struct rt_tp {
+    volatile LONG kind;
+    volatile LONG closed;          /* 0 open, 1 closed, 2 freed */
+    PVOID fn, ctx;
+    volatile LONG refs;            /* threads that hold it */
+    volatile LONG running;         /* callbacks running, and work submitted not yet run */
+    volatile LONG epoch;           /* moved by a cancel or a new setting: older threads stop */
+    volatile LONG set;             /* a timer that is set */
+    volatile ULONGLONG due;        /* (timer, wait) when, on GetTickCount64's clock; ~0 never */
+    volatile DWORD period;         /* (timer) ms, 0 once */
+    HANDLE volatile h;             /* (wait) the handle */
+};
+static struct rt_tp g_rt_tp[RT_TP_MAX];
+struct rt_tp_inst { HMODULE free_mod; };       /* a PTP_CALLBACK_INSTANCE */
+
+static struct rt_tp *rt_tp_new(LONG kind, PVOID fn, PVOID ctx) {
+    for (int i = 0; i < RT_TP_MAX; i++) {
+        struct rt_tp *o = &g_rt_tp[i];
+        if (o->kind == RT_TP_FREE && __sync_bool_compare_and_swap(&o->kind, RT_TP_FREE, RT_TP_MAKING)) {
+            o->fn = fn; o->ctx = ctx; o->refs = 0; o->running = 0; o->set = 0;
+            o->due = ~0ull; o->period = 0; o->h = 0; o->closed = 0;
+            __sync_synchronize();
+            o->kind = kind;
+            return o;
+        }
+    }
+    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+    return 0;
+}
+static void rt_tp_maybe_free(struct rt_tp *o) {
+    if (o->refs == 0 && o->running == 0 && __sync_bool_compare_and_swap(&o->closed, 1, 2)) {
+        __sync_synchronize();
+        o->kind = RT_TP_FREE;
+    }
+}
+static void rt_tp_close(struct rt_tp *o, BOOL cancel) {
+    if (!o) return;
+    if (cancel) __sync_add_and_fetch(&o->epoch, 1);
+    o->set = 0;
+    __sync_bool_compare_and_swap(&o->closed, 0, 1);
+    rt_tp_maybe_free(o);
+}
+static void rt_tp_wait_running(struct rt_tp *o) {
+    while (o->running) Sleep(1);
+}
+/* a FILETIME due time (negative: 100 ns from now; else absolute, UTC) as a
+ * GetTickCount64 time */
+static ULONGLONG rt_tp_deadline(const FILETIME *ft) {
+    LONGLONG v = (LONGLONG)(((ULONGLONG)ft->dwHighDateTime << 32) | ft->dwLowDateTime);
+    ULONGLONG now = GetTickCount64();
+    if (v < 0) return now + (ULONGLONG)((-v + 9999) / 10000);
+    FILETIME n;
+    GetSystemTimeAsFileTime(&n);
+    LONGLONG nv = (LONGLONG)(((ULONGLONG)n.dwHighDateTime << 32) | n.dwLowDateTime);
+    return v <= nv ? now : now + (ULONGLONG)((v - nv + 9999) / 10000);
+}
+static void rt_tp_call(struct rt_tp *o, LONG kind, DWORD res) {
+    struct rt_tp_inst inst = { 0 };
+    if (kind == RT_TP_WORK) ((PTP_WORK_CALLBACK)o->fn)((PTP_CALLBACK_INSTANCE)&inst, o->ctx, (PTP_WORK)o);
+    else if (kind == RT_TP_TIMER) ((PTP_TIMER_CALLBACK)o->fn)((PTP_CALLBACK_INSTANCE)&inst, o->ctx, (PTP_TIMER)o);
+    else ((PTP_WAIT_CALLBACK)o->fn)((PTP_CALLBACK_INSTANCE)&inst, o->ctx, (PTP_WAIT)o, (TP_WAIT_RESULT)res);
+    if (inst.free_mod) FreeLibrary(inst.free_mod);
+}
+static DWORD WINAPI rt_tp_thread(LPVOID p) {
+    ULONG64 v = (ULONG64)p;
+    struct rt_tp *o = &g_rt_tp[v >> 32];
+    LONG ep = (LONG)(ULONG)v, kind = o->kind;
+    if (kind == RT_TP_WORK) {
+        if (o->epoch == ep) rt_tp_call(o, kind, 0);
+        __sync_sub_and_fetch(&o->running, 1);
+    } else if (kind == RT_TP_TIMER) {
+        ULONGLONG due = o->due;
+        DWORD per = o->period;
+        for (;;) {
+            for (;;) {
+                if (o->epoch != ep) goto out;
+                ULONGLONG now = GetTickCount64();
+                if (now >= due) break;
+                ULONGLONG left = due - now;
+                Sleep(left > 10 ? 10 : (DWORD)left);
+            }
+            __sync_add_and_fetch(&o->running, 1);
+            if (o->epoch == ep) rt_tp_call(o, kind, 0);
+            __sync_sub_and_fetch(&o->running, 1);
+            if (!per) { if (o->epoch == ep) o->set = 0; break; }
+            due += per;
+        }
+    } else if (kind == RT_TP_WAIT) {
+        HANDLE h = o->h;
+        ULONGLONG due = o->due;
+        DWORD res;
+        for (;;) {
+            if (o->epoch != ep) goto out;
+            DWORD slice = 10;
+            ULONGLONG now = GetTickCount64();
+            if (due != ~0ull) slice = now >= due ? 0 : (due - now < 10 ? (DWORD)(due - now) : 10);
+            DWORD r = WaitForSingleObject(h, slice);
+            if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) { res = WAIT_OBJECT_0; break; }
+            if (r == WAIT_FAILED) { res = WAIT_ABANDONED; break; }
+            if (due != ~0ull && GetTickCount64() >= due) { res = WAIT_TIMEOUT; break; }
+        }
+        __sync_add_and_fetch(&o->running, 1);
+        if (o->epoch == ep) rt_tp_call(o, kind, res);
+        __sync_sub_and_fetch(&o->running, 1);
+    }
+out:
+    __sync_sub_and_fetch(&o->refs, 1);
+    rt_tp_maybe_free(o);
+    return 0;
+}
+static BOOL rt_tp_start(struct rt_tp *o, LONG ep) {
+    __sync_add_and_fetch(&o->refs, 1);
+    ULONG64 v = ((ULONG64)(o - g_rt_tp) << 32) | (ULONG)ep;
+    HANDLE t = CreateThread(0, 0, rt_tp_thread, (LPVOID)v, 0, 0);
+    if (!t) { __sync_sub_and_fetch(&o->refs, 1); return FALSE; }
+    CloseHandle(t);
+    return TRUE;
+}
+PTP_WORK rt_CreateThreadpoolWork(PTP_WORK_CALLBACK fn, PVOID ctx, PTP_CALLBACK_ENVIRON env) {
+    (void)env;
+    if (!fn) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    return (PTP_WORK)rt_tp_new(RT_TP_WORK, (PVOID)fn, ctx);
+}
+void rt_SubmitThreadpoolWork(PTP_WORK w) {
+    struct rt_tp *o = (struct rt_tp *)w;
+    __sync_add_and_fetch(&o->running, 1);
+    if (!rt_tp_start(o, o->epoch)) {                 /* no thread: run it here */
+        rt_tp_call(o, RT_TP_WORK, 0);
+        __sync_sub_and_fetch(&o->running, 1);
+    }
+}
+void rt_WaitForThreadpoolWorkCallbacks(PTP_WORK w, BOOL cancel) {
+    struct rt_tp *o = (struct rt_tp *)w;
+    if (cancel) __sync_add_and_fetch(&o->epoch, 1);
+    rt_tp_wait_running(o);
+}
+void rt_CloseThreadpoolWork(PTP_WORK w) { rt_tp_close((struct rt_tp *)w, FALSE); }
+PTP_TIMER rt_CreateThreadpoolTimer(PTP_TIMER_CALLBACK fn, PVOID ctx, PTP_CALLBACK_ENVIRON env) {
+    (void)env;
+    if (!fn) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    return (PTP_TIMER)rt_tp_new(RT_TP_TIMER, (PVOID)fn, ctx);
+}
+void rt_SetThreadpoolTimer(PTP_TIMER t, PFILETIME due, DWORD period, DWORD window) {
+    (void)window;
+    struct rt_tp *o = (struct rt_tp *)t;
+    LONG ep = __sync_add_and_fetch(&o->epoch, 1);
+    if (!due) { o->set = 0; return; }
+    o->due = rt_tp_deadline(due);
+    o->period = period;
+    o->set = 1;
+    __sync_synchronize();
+    if (!rt_tp_start(o, ep)) o->set = 0;
+}
+BOOL rt_IsThreadpoolTimerSet(PTP_TIMER t) { return ((struct rt_tp *)t)->set != 0; }
+void rt_WaitForThreadpoolTimerCallbacks(PTP_TIMER t, BOOL cancel) {
+    struct rt_tp *o = (struct rt_tp *)t;
+    if (cancel) { __sync_add_and_fetch(&o->epoch, 1); o->set = 0; }
+    rt_tp_wait_running(o);
+}
+void rt_CloseThreadpoolTimer(PTP_TIMER t) { rt_tp_close((struct rt_tp *)t, TRUE); }
+PTP_WAIT rt_CreateThreadpoolWait(PTP_WAIT_CALLBACK fn, PVOID ctx, PTP_CALLBACK_ENVIRON env) {
+    (void)env;
+    if (!fn) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    return (PTP_WAIT)rt_tp_new(RT_TP_WAIT, (PVOID)fn, ctx);
+}
+void rt_SetThreadpoolWait(PTP_WAIT w, HANDLE h, PFILETIME timeout) {
+    struct rt_tp *o = (struct rt_tp *)w;
+    LONG ep = __sync_add_and_fetch(&o->epoch, 1);
+    if (!h) return;
+    o->h = h;
+    o->due = timeout ? rt_tp_deadline(timeout) : ~0ull;
+    __sync_synchronize();
+    (void)rt_tp_start(o, ep);
+}
+void rt_WaitForThreadpoolWaitCallbacks(PTP_WAIT w, BOOL cancel) {
+    struct rt_tp *o = (struct rt_tp *)w;
+    if (cancel) __sync_add_and_fetch(&o->epoch, 1);
+    rt_tp_wait_running(o);
+}
+void rt_CloseThreadpoolWait(PTP_WAIT w) { rt_tp_close((struct rt_tp *)w, TRUE); }
+void rt_FreeLibraryWhenCallbackReturns(PTP_CALLBACK_INSTANCE inst, HMODULE m) {
+    if (inst) ((struct rt_tp_inst *)inst)->free_mod = m;
+}
+
+/* InitOnceBeginInitialize(once, flags, &pending, &context) and
+ * InitOnceComplete(once, flags, context): InitOnceExecuteOnce's word, with
+ * the caller doing the work in between. INIT_ONCE_CHECK_ONLY answers without
+ * starting it; INIT_ONCE_ASYNC is taken as the synchronous kind. */
+BOOL rt_InitOnceBeginInitialize(LPINIT_ONCE once, DWORD flags, PBOOL pending, LPVOID *ctx) {
+    volatile LONG_PTR *w = (volatile LONG_PTR *)once;
+    if (!pending || (flags & ~(DWORD)(INIT_ONCE_CHECK_ONLY | INIT_ONCE_ASYNC))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    for (;;) {
+        LONG_PTR v = *w;
+        if ((v & 3) == 2) {
+            *pending = FALSE;
+            if (ctx) *ctx = (LPVOID)(v & ~(LONG_PTR)3);
+            return TRUE;
+        }
+        if (flags & INIT_ONCE_CHECK_ONLY) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
+        if (v == 0 && __sync_bool_compare_and_swap(w, 0, 1)) { *pending = TRUE; return TRUE; }
+        Sleep(0);
+    }
+}
+BOOL rt_InitOnceComplete(LPINIT_ONCE once, DWORD flags, LPVOID ctx) {
+    volatile LONG_PTR *w = (volatile LONG_PTR *)once;
+    if (flags & INIT_ONCE_INIT_FAILED) { *w = 0; return TRUE; }
+    if ((LONG_PTR)ctx & 3) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    *w = (LONG_PTR)ctx | 2;
+    return TRUE;
+}
+
+/* RtlCaptureStackBackTrace(skip, count, frames, hash): the return addresses
+ * of the caller's frames, the caller's first, by the unwinder the exception
+ * dispatch uses; it stops at the thread's first frame */
+__attribute__((noinline)) USHORT rt_RtlCaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash) {
+    CONTEXT ctx;
+    rt_capture_context(&ctx);
+    ULONG64 hi = rt_stack_base();
+    ULONG n = 0, h = 0, i = 0;
+    for (int depth = 0; depth < 4096 && n < count; depth++) {
+        ULONG64 pc = ctx.Rip;
+        if (!pc || ctx.Rsp >= hi || (ctx.Rsp & 7)) break;
+        ULONG64 base;
+        PRUNTIME_FUNCTION fe = rt_RtlLookupFunctionEntry(pc, &base, 0);
+        if (!fe && rt_is_system_pc(pc)) break;
+        if (!fe) {
+            ctx.Rip = *(const ULONG64 *)ctx.Rsp;
+            ctx.Rsp += 8;
+        } else {
+            PVOID hd;
+            ULONG64 est;
+            int bad = 0;
+            (void)rt_vunwind(UNW_FLAG_NHANDLER, base, pc, fe, &ctx, &hd, &est, 0, &bad);
+            if (bad) break;
+        }
+        if (!ctx.Rip) break;
+        if (i++ < skip) continue;
+        frames[n++] = (PVOID)ctx.Rip;
+        h += (ULONG)ctx.Rip;
+    }
+    if (hash) *hash = h;
+    return (USHORT)n;
+}
+
+/* GetModuleHandleExW/A(flags, name or address, &module): the module, its
+ * count raised unless GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT or PIN */
+static BOOL rt_module_ex(DWORD flags, HMODULE m, HMODULE *out) {
+    if (!m) { SetLastError(ERROR_MOD_NOT_FOUND); return FALSE; }
+    if (!(flags & (GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT | GET_MODULE_HANDLE_EX_FLAG_PIN))) {
+        WCHAR path[MAX_PATH];
+        if (GetModuleFileNameW(m, path, MAX_PATH)) (void)LoadLibraryW(path);
+    }
+    *out = m;
+    return TRUE;
+}
+BOOL rt_GetModuleHandleExW(DWORD flags, LPCWSTR name, HMODULE *out) {
+    if (!out) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    *out = 0;
+    if ((flags & GET_MODULE_HANDLE_EX_FLAG_PIN) && (flags & GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    HMODULE m = (flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS)
+                    ? (HMODULE)rt_module_of((ULONG64)name, 0, 0) : GetModuleHandleW(name);
+    return rt_module_ex(flags, m, out);
+}
+BOOL rt_GetModuleHandleExA(DWORD flags, LPCSTR name, HMODULE *out) {
+    if (!out) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    *out = 0;
+    if ((flags & GET_MODULE_HANDLE_EX_FLAG_PIN) && (flags & GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    HMODULE m = (flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS)
+                    ? (HMODULE)rt_module_of((ULONG64)name, 0, 0) : GetModuleHandleA(name);
+    return rt_module_ex(flags, m, out);
+}

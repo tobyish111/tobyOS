@@ -139,6 +139,25 @@ static double m_ldexp(double x, long n) {
     return x * p;
 }
 
+/* W7m: float <-> double, by the FPU (round to nearest) */
+uint64_t kmath_f2d(uint32_t fbits) {
+    kmfpu_begin();
+    float f;
+    __builtin_memcpy(&f, &fbits, 4);
+    volatile uint64_t rb = d2b((double)f);
+    kmfpu_end();
+    return rb;
+}
+uint32_t kmath_d2f(uint64_t dbits) {
+    kmfpu_begin();
+    float f = (float)b2d(dbits);
+    uint32_t r;
+    __builtin_memcpy(&r, &f, 4);
+    volatile uint32_t rv = r;
+    kmfpu_end();
+    return rv;
+}
+
 uint64_t kmath_op1(int op, uint64_t xbits) {
     kmfpu_begin();
     double x = b2d(xbits), r;
