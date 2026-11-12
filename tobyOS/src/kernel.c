@@ -7748,9 +7748,16 @@ void _start(void) {
     defined(WINPE30A_BOOT) || defined(WINPE30B_BOOT) || defined(WINPE31A_BOOT) || \
     defined(WINPE32A_BOOT) || defined(WINPE33A_BOOT) || defined(WINPE33B_BOOT) || \
     defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT) || defined(WINPE34A_BOOT) || \
-    defined(WINPE35A_BOOT) || defined(WINPE35B_BOOT)
+    defined(WINPE35A_BOOT) || defined(WINPE35B_BOOT) || defined(WINPE36A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
-     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W7d:
+     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W7e:
+     *   36A /bin/win-jit36.exe: code made at run time -- VirtualAlloc's
+     *       reserve/commit/decommit/release as VirtualQuery reports them, a
+     *       generated function's unwind information through
+     *       RtlAddFunctionTable, a callback and the growable tables, a raise
+     *       and a fault unwound through it; children's unreleased
+     *       reservations gone with them (10 checks), 37.
+     * W7d:
      *   35A /bin/win-flt35.exe: CPU faults as SEH exceptions -- an access
      *       violation (read, write, execute, non-canonical), divide by zero
      *       and overflow, ud2, hlt/cli/in, int3, a single step, an SSE
@@ -7909,6 +7916,10 @@ void _start(void) {
 #ifdef WINPE35B_BOOT
             { "WINPE35B", "/bin/win-so35.exe", "win-so35.exe", 36,
               "stack overflow: the reservations, caught, unhandled, a second one (6 checks)" },
+#endif
+#ifdef WINPE36A_BOOT
+            { "WINPE36A", "/bin/win-jit36.exe", "win-jit36.exe", 37,
+              "code made at run time: VirtualAlloc and the function tables (10 checks)" },
 #endif
         };
         win32_gui_set_log(true);
