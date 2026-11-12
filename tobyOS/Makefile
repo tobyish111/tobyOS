@@ -2714,6 +2714,16 @@ W40 := programs/win-mem40
 $(W40)/win-mem40.exe: $(W40)/mem40.c $(W40)/mem40s.S
 	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W40)/mem40.c $(W40)/mem40s.S
 
+# Track C/W7j: win-msg41.exe (exit 43, as on Windows 11) -- the program's
+# code user32 calls: CreateWindowEx's creation messages, SendMessage to its
+# own window, TimerProcs (a thread's timer too), an atexit function's
+# exception through exit(), a dialog an exception left. msg41.rc is its
+# dialog.
+W41 := programs/win-msg41
+$(W41)/win-msg41.exe: $(W41)/msg41.c $(W41)/msg41s.S $(W41)/msg41.rc
+	windres -i $(W41)/msg41.rc -o $(W41)/msg41_res.o --target=pe-x86-64
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W41)/msg41.c $(W41)/msg41s.S $(W41)/msg41_res.o -luser32
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3271,6 +3281,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-exc38/dll38.dll \
                $(if $(W39_HAVE),programs/win-exc39/win-cxx39.exe) \
                programs/win-mem40/win-mem40.exe \
+               programs/win-msg41/win-msg41.exe \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3485,6 +3496,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-exc38/win-cb38s.exe              $(INITRD_STAGE)/bin/win-cb38s.exe
 	cp programs/win-exc38/dll38.dll                  $(INITRD_STAGE)/bin/dll38.dll
 	cp programs/win-mem40/win-mem40.exe              $(INITRD_STAGE)/bin/win-mem40.exe
+	cp programs/win-msg41/win-msg41.exe              $(INITRD_STAGE)/bin/win-msg41.exe
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4494,7 +4506,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-top33.exe bin/win-veh34.exe bin/win-flt35.exe         \
 	    bin/win-so35.exe bin/win-jit36.exe bin/win-lj37.exe           \
 	    bin/win-cb38.exe bin/win-cb38s.exe bin/dll38.dll              \
-	    bin/win-mem40.exe                                             \
+	    bin/win-mem40.exe bin/win-msg41.exe                           \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
