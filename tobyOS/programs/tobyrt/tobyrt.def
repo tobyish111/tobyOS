@@ -39,3 +39,6 @@ EXPORTS
     setjmp = rt_setjmp
     longjmp = rt_longjmp
     __toby_ldr_handler = rt_ldr_handler
+    RtlPcToFileHeader = rt_RtlPcToFileHeader
+    _initterm = rt_initterm
+    _initterm_e = rt_initterm_e

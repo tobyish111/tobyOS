@@ -398,6 +398,37 @@ PRUNTIME_FUNCTION rt_RtlLookupFunctionEntry(ULONG64 pc, PULONG64 image_base,
     return 0;
 }
 
+/* _initterm, _initterm_e (W7h): the CRT's tables of initializers -- an MSVC
+ * program's static constructors and its CRT's own start-up steps (among
+ * them installing the filter that sends an uncaught C++ exception to
+ * terminate) -- each function from first to last, NULLs skipped;
+ * _initterm_e stops at the first that returns nonzero and returns that.
+ * They call the program's code, so they are here: the kernel shims they
+ * replace (the fallback without this DLL) could only skip every one. */
+typedef void (*rt_pvfv)(void);
+typedef int (*rt_pifv)(void);
+void rt_initterm(rt_pvfv *first, rt_pvfv *last) {
+    for (; first < last; first++)
+        if (*first) (*first)();
+}
+int rt_initterm_e(rt_pifv *first, rt_pifv *last) {
+    for (; first < last; first++)
+        if (*first) {
+            int r = (*first)();
+            if (r) return r;
+        }
+    return 0;
+}
+
+/* RtlPcToFileHeader (W7h): the base of the image pc is in, or NULL --
+ * vcruntime140.dll asks it for the image a throw's type information is
+ * relative to. */
+PVOID rt_RtlPcToFileHeader(PVOID pc, PVOID *base) {
+    ULONG64 size = 0, b = rt_module_of((ULONG64)pc, &size, 0);
+    if (base) *base = (PVOID)b;
+    return (PVOID)b;
+}
+
 /* ---- the unwinder ------------------------------------------------------- */
 
 #define UWOP_PUSH_NONVOL     0

@@ -262,12 +262,14 @@ const char *win32_spawn_cmdline(void);
 #define WIN32_CRT_ARGC      0x00   /* int   argc            */
 #define WIN32_CRT_COMMODE   0x04   /* int   _commode        */
 #define WIN32_CRT_FMODE     0x08   /* int   _fmode          */
+#define WIN32_CRT_ABORTF    0x0C   /* u32   W7h: _set_abort_behavior's flags, XOR their default 3 */
 #define WIN32_CRT_ARGV      0x10   /* char**argv  (a value) */
 #define WIN32_CRT_ENVIRON   0x18   /* char**environ (value) */
 #define WIN32_CRT_ERRNO     0x20   /* int   errno (for _errno())   */
 #define WIN32_CRT_WNDPROC   0x28   /* WNDPROC of the (single) window -- the C7
                                     * DispatchMessage trampoline reads [this]  */
 #define WIN32_CRT_ACMDLN    0x30   /* char* to the command line (__p__acmdln)  */
+#define WIN32_CRT_IPH       0x38   /* W7h: the invalid parameter handler the program set, 0 none */
 #define WIN32_CRT_ARGV_ARR  0x40   /* char* argv[]  array   */
 #define WIN32_CRT_ENVIRON_ARR 0x100/* char* environ[] array */
 #define WIN32_CRT_STRINGS   0x140  /* argv string bytes     */

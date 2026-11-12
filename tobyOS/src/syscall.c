@@ -18881,7 +18881,8 @@ static long w32_p_fmode(uint64_t *a)   { (void)a; return (long)(WIN32_CRT_DATA_B
  * pointers and call each non-NULL one. A plain C program's tables are empty
  * (all NULL) so nothing is called -- which is necessary, because a kernel
  * shim cannot call back into CPL3. A non-NULL entry (a C++ global ctor) is
- * logged + skipped (a later user-mode-trampoline milestone). */
+ * logged + skipped. W7h: the fallback only -- with tobyrt.dll there (every
+ * process) these names bind to its _initterm/_initterm_e, which call them. */
 static long w32_initterm(uint64_t *a) {
     uint64_t p = a[0], end = a[1];
     for (; p + 8 <= end; p += 8) {
@@ -26228,6 +26229,197 @@ static long w32_memmove(uint64_t *a) {
     return (long)d;
 }
 
+/* ---- W7h: what Microsoft's C++ runtime (vcruntime140.dll and _1) and an
+ * MSVC-built program's startup import besides -------------------------- */
+
+/* The UCRT's invalid-parameter path: a program that set a handler
+ * (_set_invalid_parameter_handler -- mingw's CRT sets one that returns) gets
+ * the function's error code, errno set; one with none (an MSVC program) the
+ * UCRT's default, __fastfail: the process ends with
+ * STATUS_STACK_BUFFER_OVERRUN (measured on Windows 11: a strcat_s overflow
+ * ended win-cxx39's first version so). The handler itself is the program's
+ * code and is not called from here. */
+#define WIN32_STATUS_STACK_BUFFER_OVERRUN 0xC0000409u
+static long win32_invalid_parameter(int err) {
+    uint64_t h = 0;
+    (void)copy_from_user(&h, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_IPH), 8);
+    if (!h) {
+        kprintf("[win32] an invalid parameter and no handler: __fastfail (0xC0000409)\n");
+        proc_exit_group((int)WIN32_STATUS_STACK_BUFFER_OVERRUN);
+    }
+    int32_t e = err;
+    (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_ERRNO), &e, 4);
+    return err;
+}
+static long w32_set_invalid_parameter_handler(uint64_t *a) {
+    uint64_t old = 0;
+    (void)copy_from_user(&old, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_IPH), 8);
+    (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_IPH), &a[0], 8);
+    return (long)old;
+}
+
+/* strcpy_s(dst, size, src), strcat_s(dst, size, src) -> 0, EINVAL (22) or
+ * ERANGE (34) through the invalid-parameter path; dst[0] = 0 on an error
+ * with a destination. */
+static long w32_strcpy_s(uint64_t *a) {
+    uint64_t d = a[0], size = a[1], s = a[2];
+    char z = 0;
+    if (!d || !size) return win32_invalid_parameter(22);
+    char buf[W32_STRCAP];
+    int n = s ? (int)strncpy_from_user(buf, (const char *)(uintptr_t)s, sizeof buf) : -1;
+    if (n < 0) {
+        (void)copy_to_user((void *)(uintptr_t)d, &z, 1);
+        return win32_invalid_parameter(22);
+    }
+    if ((uint64_t)n + 1 > size) {
+        (void)copy_to_user((void *)(uintptr_t)d, &z, 1);
+        return win32_invalid_parameter(34);
+    }
+    (void)copy_to_user((void *)(uintptr_t)d, buf, (size_t)n + 1);
+    return 0;
+}
+static long w32_strcat_s(uint64_t *a) {
+    uint64_t d = a[0], size = a[1], s = a[2];
+    char z = 0;
+    if (!d || !size) return win32_invalid_parameter(22);
+    char dst[W32_STRCAP], src[W32_STRCAP];
+    int dn = (int)strncpy_from_user(dst, (const char *)(uintptr_t)d, sizeof dst);
+    int sn = s ? (int)strncpy_from_user(src, (const char *)(uintptr_t)s, sizeof src) : -1;
+    if (dn < 0 || (uint64_t)dn >= size || sn < 0) {     /* unterminated within size, or no source */
+        (void)copy_to_user((void *)(uintptr_t)d, &z, 1);
+        return win32_invalid_parameter(22);
+    }
+    if ((uint64_t)dn + (uint64_t)sn + 1 > size) {
+        (void)copy_to_user((void *)(uintptr_t)d, &z, 1);
+        return win32_invalid_parameter(34);
+    }
+    (void)copy_to_user((void *)(uintptr_t)(d + (uint64_t)dn), src, (size_t)sn + 1);
+    return 0;
+}
+
+/* __stdio_common_vsprintf(options, buf, count, fmt, locale, va) -- sprintf,
+ * snprintf, _vsnprintf: the length the output has. With
+ * _CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR (options bit 1), C99's
+ * snprintf (cut, terminated); without, the legacy one (-1 when it does not
+ * fit, the count bytes unterminated). No buffer and no count: the length. */
+static long w32_stdio_common_vsprintf(uint64_t *a) {
+    uint64_t opt = a[0], ubuf = a[1], count = a[2], ufmt = a[3], uva = a[5];
+    char tmp[W32_STRCAP];
+    long n = win32_sformat(tmp, sizeof tmp, ufmt, uva);
+    if (n < 0) return -1;
+    uint64_t have = (uint64_t)n < sizeof tmp - 1 ? (uint64_t)n : sizeof tmp - 1;
+    if (!ubuf || !count) return n;
+    if ((uint64_t)n < count) {
+        (void)copy_to_user((void *)(uintptr_t)ubuf, tmp, (size_t)have + 1);
+        return n;
+    }
+    uint64_t put = (opt & 2) ? count - 1 : count;
+    if (put > have) put = have;
+    (void)copy_to_user((void *)(uintptr_t)ubuf, tmp, (size_t)put);
+    if (opt & 2) {
+        char z = 0;
+        (void)copy_to_user((void *)(uintptr_t)(ubuf + put), &z, 1);
+        return n;
+    }
+    return -1;
+}
+/* __stdio_common_vsprintf_s: the same, or -- it does not fit -- buf[0] = 0
+ * and the invalid-parameter path (ERANGE), -1. */
+static long w32_stdio_common_vsprintf_s(uint64_t *a) {
+    uint64_t ubuf = a[1], count = a[2], ufmt = a[3], uva = a[5];
+    if (!ubuf || !count) {
+        (void)win32_invalid_parameter(22);
+        return -1;
+    }
+    char tmp[W32_STRCAP];
+    long n = win32_sformat(tmp, sizeof tmp, ufmt, uva);
+    if (n < 0 || (uint64_t)n >= count || (uint64_t)n >= sizeof tmp) {
+        char z = 0;
+        (void)copy_to_user((void *)(uintptr_t)ubuf, &z, 1);
+        (void)win32_invalid_parameter(34);
+        return -1;
+    }
+    (void)copy_to_user((void *)(uintptr_t)ubuf, tmp, (size_t)n + 1);
+    return n;
+}
+
+/* _set_abort_behavior(flags, mask) -> the flags before (the default
+ * _WRITE_ABORT_MSG | _CALL_REPORTFAULT, 3); abort itself writes no message
+ * and reports nothing either way. _set_fmode(mode) -> 0, _fmode = mode. */
+static long w32_set_abort_behavior(uint64_t *a) {
+    uint32_t v = 0;
+    (void)copy_from_user(&v, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_ABORTF), 4);
+    uint32_t old = v ^ 3u, mask = (uint32_t)a[1];
+    uint32_t now = (old & ~mask) | ((uint32_t)a[0] & mask);
+    v = now ^ 3u;
+    (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_ABORTF), &v, 4);
+    return (long)old;
+}
+static long w32_set_fmode(uint64_t *a) {
+    int32_t m = (int32_t)a[0];
+    (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_FMODE), &m, 4);
+    return 0;
+}
+
+/* The interlocked singly linked list: an SLIST_HEADER (x64: u64 Depth:16 |
+ * Sequence:48, then u64 the first entry -- 16-aligned, so its low 4 bits
+ * are 0) of the program's SLIST_ENTRYs, each a u64 next. Atomic here as
+ * every shim is: they run under the big kernel lock. */
+static long w32_InitializeSListHead(uint64_t *a) {
+    uint64_t z[2] = { 0, 0 };
+    (void)copy_to_user((void *)(uintptr_t)a[0], z, 16);
+    return 0;
+}
+static long w32_InterlockedPushEntrySList(uint64_t *a) {
+    uint64_t h[2];
+    if (copy_from_user(h, (const void *)(uintptr_t)a[0], 16) != 0) return 0;
+    uint64_t first = h[1] & ~0xFull;
+    (void)copy_to_user((void *)(uintptr_t)a[1], &first, 8);
+    uint64_t depth = ((h[0] & 0xFFFFull) + 1) & 0xFFFFull, seq = (h[0] >> 16) + 1;
+    h[0] = depth | (seq << 16);
+    h[1] = a[1];
+    (void)copy_to_user((void *)(uintptr_t)a[0], h, 16);
+    return (long)first;
+}
+static long w32_InterlockedPopEntrySList(uint64_t *a) {
+    uint64_t h[2], next = 0;
+    if (copy_from_user(h, (const void *)(uintptr_t)a[0], 16) != 0) return 0;
+    uint64_t first = h[1] & ~0xFull;
+    if (!first) return 0;
+    if (copy_from_user(&next, (const void *)(uintptr_t)first, 8) != 0) return 0;
+    uint64_t depth = ((h[0] & 0xFFFFull) - 1) & 0xFFFFull, seq = (h[0] >> 16) + 1;
+    h[0] = depth | (seq << 16);
+    h[1] = next;
+    (void)copy_to_user((void *)(uintptr_t)a[0], h, 16);
+    return (long)first;
+}
+static long w32_InterlockedFlushSList(uint64_t *a) {
+    uint64_t h[2];
+    if (copy_from_user(h, (const void *)(uintptr_t)a[0], 16) != 0) return 0;
+    uint64_t first = h[1] & ~0xFull;
+    h[0] &= ~0xFFFFull;                                  /* depth 0, the sequence kept */
+    h[1] = 0;
+    (void)copy_to_user((void *)(uintptr_t)a[0], h, 16);
+    return (long)first;
+}
+static long w32_QueryDepthSList(uint64_t *a) {
+    uint64_t h0 = 0;
+    (void)copy_from_user(&h0, (const void *)(uintptr_t)a[0], 8);
+    return (long)(h0 & 0xFFFFull);
+}
+
+/* EncodePointer/DecodePointer: Windows XORs with a per-process secret; the
+ * identity is the same pair of functions for a program, which only ever
+ * decodes what it encoded. */
+static long w32_EncodePointer(uint64_t *a) { return (long)a[0]; }
+
+/* InitializeCriticalSectionAndSpinCount: the spin count means nothing here;
+ * TRUE. */
+static long w32_InitializeCriticalSectionAndSpinCount(uint64_t *a) {
+    (void)w32_InitializeCriticalSection(a);
+    return 1;
+}
+
 /* ---- conversion ---- */
 static long w32_atoi(uint64_t *a) {
     char s[64]; if(strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s))<0)return 0;
@@ -26810,6 +27002,9 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vfwprintf", w32_stdio_common_vfwprintf },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vswprintf", w32_stdio_common_vswprintf },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vswprintf_s", w32_stdio_common_vswprintf },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vsprintf",   w32_stdio_common_vsprintf },   /* W7h */
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vsprintf_s", w32_stdio_common_vsprintf_s },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_set_fmode",                w32_set_fmode },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "fputws",                   w32_fputws },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "_putws",                   w32_putws },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "fputwc",                   w32_fputwc },
@@ -26819,6 +27014,16 @@ static const struct win32_shim g_win32_shims[] = {
     /* kernel32. The critical-section funcs are REAL as of C6 (mutual
      * exclusion); DeleteCriticalSection stays a no-op. */
     { "kernel32.dll", "InitializeCriticalSection", w32_InitializeCriticalSection },
+    /* W7h */
+    { "kernel32.dll", "InitializeCriticalSectionAndSpinCount", w32_InitializeCriticalSectionAndSpinCount },
+    { "kernel32.dll", "IsDebuggerPresent",         w32_zero },
+    { "kernel32.dll", "InitializeSListHead",       w32_InitializeSListHead },
+    { "kernel32.dll", "InterlockedPushEntrySList", w32_InterlockedPushEntrySList },
+    { "kernel32.dll", "InterlockedPopEntrySList",  w32_InterlockedPopEntrySList },
+    { "kernel32.dll", "InterlockedFlushSList",     w32_InterlockedFlushSList },
+    { "kernel32.dll", "QueryDepthSList",           w32_QueryDepthSList },
+    { "kernel32.dll", "EncodePointer",             w32_EncodePointer },
+    { "kernel32.dll", "DecodePointer",             w32_EncodePointer },
     { "kernel32.dll", "DeleteCriticalSection",     w32_zero },
     { "kernel32.dll", "EnterCriticalSection",      w32_EnterCriticalSection },
     { "kernel32.dll", "LeaveCriticalSection",      w32_LeaveCriticalSection },
@@ -26885,7 +27090,13 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_narrow_environment", w32_zero },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_get_initial_narrow_environment", w32_p_environ },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_set_app_type",          w32_zero },
-    { "api-ms-win-crt-runtime-l1-1-0.dll", "_set_invalid_parameter_handler", w32_zero },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_set_invalid_parameter_handler", w32_set_invalid_parameter_handler },
+    /* W7h */
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_seh_filter_exe",        w32_zero },   /* no signal handlers: CONTINUE_SEARCH */
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "terminate",              w32_abort },  /* no set_terminate: abort */
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_set_abort_behavior",    w32_set_abort_behavior },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_c_exit",                w32_zero },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_register_thread_local_exe_atexit_callback", w32_zero },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit",            w32_crt_atexit },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_cexit",                 w32_zero },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_initterm",              w32_initterm },
@@ -27246,6 +27457,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-string-l1-1-0.dll", "strcmp",   w32_strcmp },
     { "api-ms-win-crt-string-l1-1-0.dll", "strcpy",   w32_strcpy },
     { "api-ms-win-crt-string-l1-1-0.dll", "strcat",   w32_strcat },
+    { "api-ms-win-crt-string-l1-1-0.dll", "strcpy_s", w32_strcpy_s },   /* W7h */
+    { "api-ms-win-crt-string-l1-1-0.dll", "strcat_s", w32_strcat_s },
     { "api-ms-win-crt-string-l1-1-0.dll", "strchr",   w32_strchr },
     { "api-ms-win-crt-string-l1-1-0.dll", "strrchr",  w32_strrchr },
     { "api-ms-win-crt-string-l1-1-0.dll", "strspn",   w32_strspn },
@@ -27259,6 +27472,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-private-l1-1-0.dll", "strrchr", w32_strrchr },
     /* conversion */
     { "api-ms-win-crt-convert-l1-1-0.dll", "atoi",    w32_atoi },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "atol",    w32_atoi },   /* W7h: long is 32 bits */
     { "api-ms-win-crt-convert-l1-1-0.dll", "strtol",  w32_strtol },
     { "api-ms-win-crt-convert-l1-1-0.dll", "strtoul", w32_strtoul },
     { "api-ms-win-crt-convert-l1-1-0.dll", "strtod",  w32_strtod },

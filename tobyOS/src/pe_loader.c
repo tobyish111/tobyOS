@@ -1333,6 +1333,8 @@ static const char *const g_pe_rt_names[] = {
     /* W7f: setjmp and a longjmp that unwinds (the C19b stubs, which do not,
      * are what these bind to without the runtime) */
     "__intrinsic_setjmp", "__intrinsic_setjmpex", "_setjmp", "_setjmpex", "setjmp", "longjmp",
+    /* W7h */
+    "RtlPcToFileHeader", "_initterm", "_initterm_e",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)
