@@ -45,6 +45,15 @@ EXPORTS
     DispatchMessageA = rt_DispatchMessageA
     DispatchMessageW = rt_DispatchMessageA
     SendMessageA = rt_SendMessageA
+    SendMessageW = rt_SendMessageW
+    SendMessageTimeoutA = rt_SendMessageTimeoutA
+    SendMessageTimeoutW = rt_SendMessageTimeoutW
+    GetMessageA = rt_GetMessageA
+    GetMessageW = rt_GetMessageA
+    PeekMessageA = rt_PeekMessageA
+    PeekMessageW = rt_PeekMessageA
+    WaitMessage = rt_WaitMessage
+    EnumWindows = rt_EnumWindows
     CreateWindowExA = rt_CreateWindowExA
     strcpy_s = rt_strcpy_s
     strcat_s = rt_strcat_s

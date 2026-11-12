@@ -22152,6 +22152,8 @@ struct win32_win {
     uint64_t menu;        /* HMENU of the bar (0 = none)                    */
     int      menu_open;   /* index of the top-level item whose dropdown is open (-1) */
     int      owner_tid;   /* W7o: the thread that made it -- its messages are that thread's */
+    char     cls[32];     /* W7r: its class's name (FindWindow, GetClassName) */
+    char     title[64];   /* W7r: its title (FindWindow, GetWindowText, WM_GETTEXT) */
 };
 /* W7o: a posted message, on thread `tid`'s queue (hwnd 0: a thread message) */
 struct win32_posted { int tid; uint32_t message; uint64_t hwnd, wParam, lParam; uint32_t time; };
@@ -22233,6 +22235,77 @@ static struct win32_win *win32_win_alloc(void) {
     for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
         if (g_win32_gui.win[i].fd == 0) return &g_win32_gui.win[i];
     return NULL;
+}
+
+/* ---- W7r: an HWND is the system's ---------------------------------------
+ * A window's number was its process's descriptor: the same number named
+ * another window, or none, in the next process, so no process could name
+ * another's window (W7n's "not done": FindWindow, PostMessage and SendMessage
+ * across processes). Now a window's descriptor moves, when the window is
+ * made, to a number the system gives out (768..1023: a descriptor table
+ * holds 1024): the same number in every process, and still the descriptor in
+ * its own, where every path reads the window by it. The system keeps whose
+ * each number is (the thread group and its leader's creation time); a number
+ * whose window or process is gone names no window, and is given out again --
+ * the one after the last given first, so an HWND kept past its window does
+ * not name the next one at once. Measured on Windows 11: programs/win-xwin49. */
+#define WIN32_GWIN_BASE 768
+#define WIN32_GWIN_N    256
+struct win32_gwin { int tgid; uint64_t born; };
+static struct win32_gwin g_win32_gwin[WIN32_GWIN_N];
+static int g_win32_gwin_next;
+/* the window numbered h, of any process (its record in *ps), or 0 */
+static struct win32_win *win32_gwin_win(uint64_t h, struct win32_pstate **ps) {
+    if (h < WIN32_GWIN_BASE || h >= WIN32_GWIN_BASE + WIN32_GWIN_N) return 0;
+    const struct win32_gwin *e = &g_win32_gwin[h - WIN32_GWIN_BASE];
+    if (!e->tgid) return 0;
+    for (int i = 0; i < WIN32_PS_MAX; i++) {
+        struct win32_pstate *s = &g_win32_ps[i];
+        if (s->tgid != e->tgid || s->born != e->born || !win32_ps_live(s)) continue;
+        struct win32_gui_core *g = (struct win32_gui_core *)s->part[W32P_GUI];
+        if (!g) return 0;
+        for (int k = 0; k < WIN32_MAX_WINDOWS; k++)
+            if (g->win[k].fd == (int)h) {
+                if (ps) *ps = s;
+                return &g->win[k];
+            }
+        return 0;
+    }
+    return 0;
+}
+/* the window h: the caller's own (by its descriptor), else another process's */
+static struct win32_win *win32_win_any(uint64_t h, struct win32_pstate **ps) {
+    if (!h || (h >> 32)) return 0;
+    struct win32_win *w = win32_win_find((int)h);
+    if (w) {
+        if (ps) *ps = win32_ps_cur();
+        return w;
+    }
+    return win32_gwin_win(h, ps);
+}
+/* a new window's descriptor, moved to the system's next free number; the
+ * number (fd itself when none is free) */
+static int win32_gwin_place(int fd) {
+    struct proc *p = current_proc();
+    struct file **fds = p ? proc_fds(p) : 0;
+    struct win32_pstate *me = win32_ps_cur();
+    if (!fds || !me->tgid || fd < 0 || fd >= WIN32_GWIN_BASE || !fds[fd]) return fd;
+    for (int k = 0; k < WIN32_GWIN_N; k++) {
+        int i = (g_win32_gwin_next + k) % WIN32_GWIN_N;
+        int g = WIN32_GWIN_BASE + i;
+        if (fds[g]) continue;                            /* the program's own descriptor */
+        if (win32_gwin_win((uint64_t)g, 0)) continue;    /* another's window */
+        /* the descriptor moves: the window's file is its creator's alone
+         * (file_clone refuses a window, so dup2 cannot) */
+        fds[g] = fds[fd];
+        fds[fd] = 0;
+        fd_cloexec_set(p, g, 0);
+        g_win32_gwin[i].tgid = me->tgid;
+        g_win32_gwin[i].born = me->born;
+        g_win32_gwin_next = (i + 1) % WIN32_GWIN_N;
+        return g;
+    }
+    return fd;
 }
 
 /* C12: case-insensitive string compare (for predefined control class names). */
@@ -22661,6 +22734,16 @@ static int win32_ctrl_make(int parent_fd, int type, int x, int y, int w, int h,
  * name=a2, style=a3, W=a6, H=a7, hWndParent=a8 (C11: reachable now the gate
  * marshals 10 args). Allocates a window-table slot bound to its class's WndProc;
  * a WS_CHILD style or a non-NULL parent records the parent/owner relationship. */
+/* W7r: a window's class name as the class was registered (else as given) */
+static void win32_win_setcls(struct win32_win *w, const char *cname) {
+    const char *nm = cname;
+    for (int i = 0; i < g_win32_gui.ncls; i++)
+        if (win32_streq_ci(g_win32_gui.cls[i].name, cname)) { nm = g_win32_gui.cls[i].name; break; }
+    size_t n = strlen(nm);
+    if (n > sizeof w->cls - 1) n = sizeof w->cls - 1;
+    memcpy(w->cls, nm, n);
+    w->cls[n] = 0;
+}
 static long w32_CreateWindowExA(uint64_t *a) {
     uint64_t cnameptr = a[1];
     uint64_t name     = a[2];
@@ -22708,6 +22791,7 @@ static long w32_CreateWindowExA(uint64_t *a) {
     if (!win) return 0;                          /* table full -> NULL HWND */
     long fd = sys_gui_create((uint32_t)w, (uint32_t)h, (const char *)(uintptr_t)name);
     if (fd < 0) return 0;                        /* NULL HWND */
+    fd = win32_gwin_place((int)fd);              /* W7r: the system's number */
 
     g_win32_ps_lastwin = win32_ps_cur();         /* W7n: the harness's view */
     win->owner_tid   = win32_tid();              /* W7o */
@@ -22733,6 +22817,10 @@ static long w32_CreateWindowExA(uint64_t *a) {
      * not a control id). menu_open = -1 = no dropdown showing. */
     win->menu        = ((a[9] & WIN32_TAG_MASK) == WIN32_MENU_TAG) ? a[9] : 0;
     win->menu_open   = -1;
+    win32_win_setcls(win, cname);                /* W7r */
+    win->title[0]    = 0;
+    if (name) (void)strncpy_from_user(win->title, (const char *)(uintptr_t)name, sizeof win->title);
+    win->title[sizeof win->title - 1] = 0;
     return fd;   /* HWND == HDC == fd */
 }
 
@@ -22762,6 +22850,27 @@ static long w32_TranslateMessage(uint64_t *a) { (void)a; return 0; }
  * destroying the window (which then sends WM_DESTROY). */
 static long w32_DefWindowProcA(uint64_t *a) {
     if ((uint32_t)a[1] == 0x0081 /* WM_NCCREATE */) return 1;   /* W7j: go on creating it */
+    uint32_t dm = (uint32_t)a[1];
+    if (dm == 0x000C || dm == 0x000D || dm == 0x000E) {          /* W7r: WM_SETTEXT, WM_GETTEXT, -LENGTH */
+        struct win32_win *w = win32_win_find((int)a[0]);
+        if (!w) return 0;
+        if (dm == 0x000C) {
+            w->title[0] = 0;
+            if (a[3]) (void)strncpy_from_user(w->title, (const char *)(uintptr_t)a[3], sizeof w->title);
+            w->title[sizeof w->title - 1] = 0;
+            if (w->gwin) (void)gui_window_set_title(w->gwin, w->title);
+            return 1;
+        }
+        int n = (int)strlen(w->title);
+        if (dm == 0x000E) return n;
+        int max = (int)(int32_t)a[2];
+        if (max <= 0 || !a[3]) return 0;
+        if (n > max - 1) n = max - 1;
+        if (n) (void)copy_to_user((void *)(uintptr_t)a[3], w->title, (size_t)n);
+        char z = 0;
+        (void)copy_to_user((void *)(uintptr_t)(a[3] + (uint64_t)n), &z, 1);
+        return n;
+    }
     if ((uint32_t)a[1] == WM_CLOSE) {
         struct win32_win *w = win32_win_find((int)a[0]);
         if (w) w->destroy = true;
@@ -22782,7 +22891,7 @@ static long w32_DestroyWindow(uint64_t *a) {
 static long w32_IsWindow(uint64_t *a) {
     if (!a[0]) return 0;
     if (win32_ctrl_find(a[0])) return 1;
-    return win32_win_find((int)a[0]) ? 1 : 0;
+    return win32_win_any(a[0], 0) ? 1 : 0;            /* W7r: anyone's */
 }
 
 /* InvalidateRect(hwnd, &RECT|NULL, erase) -> TRUE. Marks THIS window for a
@@ -22882,9 +22991,9 @@ static long w32_GetMessageTime(uint64_t *a) {
     return (long)(int32_t)t;
 }
 /* onto thread tid's queue (at its front: a message PeekMessage put back) */
-static bool win32_post(int tid, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, bool front) {
-    struct win32_gui_core *g = &g_win32_gui;
-    if (g->postn >= WIN32_POSTQ) return false;
+static bool win32_post_g(struct win32_gui_core *g, int tid, uint64_t hwnd, uint32_t msg, uint64_t wp,
+                         uint64_t lp, bool front) {
+    if (!g || g->postn >= WIN32_POSTQ) return false;
     struct win32_posted e = { tid, msg, hwnd, wp, lp, win32_msg_time() };
     if (front) {
         memmove(&g->postq[1], &g->postq[0], (size_t)g->postn * sizeof e);
@@ -22893,6 +23002,260 @@ static bool win32_post(int tid, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64
     g->postn++;
     return true;
 }
+static bool win32_post(int tid, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, bool front) {
+    return win32_post_g(&g_win32_gui, tid, hwnd, msg, wp, lp, front);
+}
+/* W7r: process s's GUI core, made if it has none yet (a thread message to a
+ * process that has made no window) */
+static struct win32_gui_core *win32_ps_gui_make(struct win32_pstate *s) {
+    if (!s->part[W32P_GUI]) {
+        void *m = kmalloc(sizeof(struct win32_gui_core));
+        if (!m) return 0;
+        memset(m, 0, sizeof(struct win32_gui_core));
+        s->part[W32P_GUI] = m;
+    }
+    return (struct win32_gui_core *)s->part[W32P_GUI];
+}
+
+/* ---- W7r: a message sent to a window of another thread -----------------
+ * SendMessage to a window another thread made -- of this process or of
+ * another's -- runs the window's procedure on that thread, when it waits for
+ * a message (GetMessage, PeekMessage, WaitMessage, or a SendMessage of its
+ * own), and the sender waits for the answer, running what is sent to it
+ * meanwhile; a message sent comes before the posted ones (W7o's "not done").
+ * Here a queue of the system's: tobyrt.dll's GetMessage, PeekMessage and
+ * WaitMessage hear from the kernel's (WIN32_GOT_SENT) that one waits and
+ * run it -- take it (__toby_msgsvc 7), its data into the process (8), the
+ * procedure, the answer back (9); its SendMessage queues one (5) and waits
+ * (6). Across processes WM_COPYDATA's data, WM_SETTEXT's text and
+ * WM_GETTEXT's buffer are copied, as Windows marshals them; other messages'
+ * pointers go as they are. A sender that gives up (SendMessageTimeout's
+ * time) leaves the message to be run, its answer nobody's. Measured on
+ * Windows 11: programs/win-xwin49. */
+#define WIN32_GOT_SENT 0x5E47
+#define WIN32_SENT_MAX 32
+#define W32S_COPYDATA  1
+#define W32S_SETTEXT   2
+#define W32S_GETTEXT   3
+struct win32_sent {
+    int      state;                 /* 0 free, 1 queued, 2 being run, 3 answered */
+    bool     gone;                  /* the sender stopped waiting */
+    bool     wide;                  /* SendMessageW's: WM_SETTEXT's, WM_GETTEXT's text is UTF-16 */
+    int      from, to;              /* the threads */
+    int      to_tg;                 /* the window's process */
+    uint64_t to_born;
+    uint64_t ticket;
+    uint64_t hwnd, wp, lp, result;
+    uint32_t msg;
+    int      kind;                  /* W32S_*: data copied across */
+    uint32_t dlen;
+    uint8_t *data;
+    uint64_t ulp, uwp;              /* WM_GETTEXT: the sender's buffer and its size */
+    uint64_t deadline;              /* perf_now_ns's, 0 none */
+};
+static struct win32_sent g_win32_sent[WIN32_SENT_MAX];
+static uint64_t g_win32_sent_tickets;
+static int win32_w16_to_utf8(uint64_t uw, long n, char *out, int cap);
+static int win32_utf8_to_w16(const char *s, uint16_t *out, int cap);
+static void win32_sent_free(struct win32_sent *e) {
+    if (e->data) kfree(e->data);
+    memset(e, 0, sizeof *e);
+}
+static bool win32_thread_live(int tid) {
+    struct proc *t = tid > 0 ? proc_lookup(tid) : 0;
+    return t && t->state != PROC_TERMINATED && t->state != PROC_UNUSED;
+}
+/* the receiving thread and its process are still there */
+static bool win32_sent_receiver(const struct win32_sent *e) {
+    struct proc *ld = proc_lookup(e->to_tg);
+    return win32_thread_live(e->to) && ld && ld->created_ns == e->to_born &&
+           ld->state != PROC_TERMINATED && ld->state != PROC_UNUSED;
+}
+static struct win32_sent *win32_sent_of(uint64_t ticket) {
+    for (int i = 0; i < WIN32_SENT_MAX; i++)
+        if (g_win32_sent[i].state && g_win32_sent[i].ticket == ticket) return &g_win32_sent[i];
+    return 0;
+}
+/* the first message sent to the calling thread that is in `state` */
+static struct win32_sent *win32_sent_mine(int state) {
+    struct win32_pstate *me = win32_ps_cur();
+    int tid = win32_tid();
+    struct win32_sent *best = 0;
+    for (int i = 0; i < WIN32_SENT_MAX; i++) {
+        struct win32_sent *e = &g_win32_sent[i];
+        if (e->state != state || e->to != tid || e->to_tg != me->tgid || e->to_born != me->born) continue;
+        if (!best || e->ticket < best->ticket) best = e;
+    }
+    return best;
+}
+static bool win32_sent_waiting(void) { return win32_sent_mine(1) != 0; }
+/* 5: queue {hwnd, msg, timeout ms (~0u none), wp, lp, wide} -> its ticket;
+ * -1 the caller's own thread's window (a call), -2 a control (the kernel's
+ * SendMessage), 0 no window (ERROR_INVALID_WINDOW_HANDLE) */
+static long win32_sent_queue(uint64_t uq) {
+    struct { uint64_t hwnd; uint32_t msg, timeout; uint64_t wp, lp; uint32_t wide, pad; } q;
+    if (copy_from_user(&q, (const void *)(uintptr_t)uq, sizeof q) != 0) return 0;
+    if (win32_ctrl_find(q.hwnd)) return -2;
+    struct win32_pstate *s = 0;
+    struct win32_win *w = win32_win_any(q.hwnd, &s);
+    if (!w || !s) { win32_set_last_error(1400); return 0; }
+    struct win32_pstate *me = win32_ps_cur();
+    int tid = win32_tid(), to = w->owner_tid ? w->owner_tid : s->tgid;
+    if (s == me && to == tid) return -1;
+    struct win32_sent *e = 0;
+    for (int i = 0; i < WIN32_SENT_MAX && !e; i++) {
+        struct win32_sent *x = &g_win32_sent[i];
+        if (x->state && x->state != 2 && !win32_thread_live(x->from)) win32_sent_free(x);   /* its sender gone */
+        if (x->state && x->gone && !win32_sent_receiver(x)) win32_sent_free(x);   /* nobody's, nobody to run it */
+        if (!x->state) e = x;
+    }
+    if (!e) { win32_set_last_error(1816); return 0; }   /* ERROR_NOT_ENOUGH_QUOTA */
+    e->state = 1; e->from = tid; e->to = to; e->to_tg = s->tgid; e->to_born = s->born;
+    e->ticket = ++g_win32_sent_tickets;
+    e->hwnd = q.hwnd; e->msg = q.msg; e->wp = q.wp; e->lp = q.lp; e->wide = q.wide != 0;
+    e->deadline = q.timeout == 0xFFFFFFFFu ? 0 : perf_now_ns() + (uint64_t)q.timeout * 1000000ull;
+    if (s == me) return (long)e->ticket;            /* one process: the pointers are the receiver's too */
+    if (q.msg == 0x004A /* WM_COPYDATA */ && q.lp) {
+        uint8_t cds[24];                            /* {dwData, cbData, lpData} */
+        if (copy_from_user(cds, (const void *)(uintptr_t)q.lp, sizeof cds) == 0) {
+            uint32_t cb; uint64_t src;
+            memcpy(&cb, cds + 8, 4);
+            memcpy(&src, cds + 16, 8);
+            if (cb > 0x100000) cb = 0x100000;
+            e->data = kmalloc(sizeof cds + (size_t)cb);
+            if (e->data) {
+                memcpy(e->data, cds, sizeof cds);
+                if (cb && copy_from_user(e->data + sizeof cds, (const void *)(uintptr_t)src, cb) != 0)
+                    memset(e->data + sizeof cds, 0, cb);
+                e->dlen = (uint32_t)(sizeof cds + cb);
+                e->kind = W32S_COPYDATA;
+            }
+        }
+    } else if (q.msg == 0x000C /* WM_SETTEXT */ && q.lp) {
+        char t[512];
+        int n;
+        if (e->wide) n = win32_w16_to_utf8(q.lp, -1, t, sizeof t);
+        else { long r = strncpy_from_user(t, (const char *)(uintptr_t)q.lp, sizeof t); n = r < 0 ? 0 : (int)r; }
+        if (n < 0) n = 0;
+        if (n > (int)sizeof t - 1) n = (int)sizeof t - 1;
+        t[n] = 0;
+        e->data = kmalloc((size_t)n + 1);
+        if (e->data) { memcpy(e->data, t, (size_t)n + 1); e->dlen = (uint32_t)n + 1; e->kind = W32S_SETTEXT; }
+    } else if (q.msg == 0x000D /* WM_GETTEXT */ && q.lp && q.wp) {
+        uint32_t n = q.wp > 4096 ? 4096 : (uint32_t)q.wp;
+        e->data = kmalloc(n);
+        if (e->data) {
+            memset(e->data, 0, n);
+            e->dlen = n; e->kind = W32S_GETTEXT; e->ulp = q.lp; e->uwp = q.wp;
+        }
+    }
+    return (long)e->ticket;
+}
+/* 6: the sender waits: 1 the answer (in *ures; WM_GETTEXT's text copied
+ * back), 2 a message sent to this thread waits (run it, wait again), 3 the
+ * time ran out (ERROR_TIMEOUT), 4 no receiver now, 5 a signal */
+static long win32_sent_wait(uint64_t ticket, uint64_t ures) {
+    int tid = win32_tid();
+    for (;;) {
+        struct win32_sent *e = win32_sent_of(ticket);
+        if (!e || e->from != tid) return 4;
+        if (e->state == 3) {
+            uint64_t r = e->result;
+            if (e->kind == W32S_GETTEXT && e->ulp && e->uwp && e->dlen) {
+                e->data[e->dlen - 1] = 0;
+                if (e->wide) {
+                    uint16_t wb[512];
+                    int cap = e->uwp - 1 < 511 ? (int)e->uwp - 1 : 511;
+                    int n = win32_utf8_to_w16((const char *)e->data, wb, cap);
+                    wb[n] = 0;
+                    (void)copy_to_user((void *)(uintptr_t)e->ulp, wb, (size_t)(n + 1) * 2);
+                    r = (uint64_t)n;
+                } else {
+                    size_t n = strlen((const char *)e->data);
+                    if (n > e->uwp - 1) n = (size_t)e->uwp - 1;
+                    (void)copy_to_user((void *)(uintptr_t)e->ulp, e->data, n);
+                    char z = 0;
+                    (void)copy_to_user((void *)(uintptr_t)(e->ulp + n), &z, 1);
+                }
+            }
+            if (ures) (void)copy_to_user((void *)(uintptr_t)ures, &r, 8);
+            win32_sent_free(e);
+            return 1;
+        }
+        if (!win32_sent_receiver(e)) { win32_sent_free(e); return 4; }
+        if (win32_sent_waiting()) return 2;
+        if (e->deadline && perf_now_ns() >= e->deadline) {
+            e->gone = true;
+            win32_set_last_error(1460);              /* ERROR_TIMEOUT */
+            return 3;
+        }
+        if (proc_wait_interrupted(current_proc())) { e->gone = true; return 5; }
+        sys_nanosleep(1000000);
+    }
+}
+/* tobyrt.dll's view of one: {ticket, hwnd, msg, wp, lp, proc, need, result} */
+/* 7: the receiver takes its first: 1 (the procedure 0 for a window that has
+ * none here: the kernel's SendMessage), 0 none */
+static long win32_sent_take(uint64_t uo) {
+    struct win32_sent *e = win32_sent_mine(1);
+    if (!e) return 0;
+    struct win32_win *w = win32_win_find((int)e->hwnd);
+    uint64_t o[8] = { e->ticket, e->hwnd, e->msg, e->wp, e->lp, (w && !w->is_dialog) ? w->wndproc : 0,
+                      e->kind ? e->dlen : 0, 0 };
+    if (e->kind == W32S_GETTEXT) o[3] = e->dlen;
+    if (copy_to_user((void *)(uintptr_t)uo, o, sizeof o) != 0) return 0;
+    e->state = 2;
+    return 1;
+}
+/* 8: its data into the receiver's buffer (need bytes), lp pointed at it */
+static long win32_sent_data(uint64_t uo, uint64_t ubuf) {
+    uint64_t o[8];
+    if (!ubuf || copy_from_user(o, (const void *)(uintptr_t)uo, sizeof o) != 0) return 0;
+    struct win32_sent *e = win32_sent_of(o[0]);
+    if (!e || e->state != 2 || e->to != win32_tid() || !e->data) return 0;
+    if (copy_to_user((void *)(uintptr_t)ubuf, e->data, e->dlen) != 0) return 0;
+    if (e->kind == W32S_COPYDATA) {
+        uint64_t p = ubuf + 24;
+        (void)copy_to_user((void *)(uintptr_t)(ubuf + 16), &p, 8);
+    }
+    o[4] = ubuf;
+    return copy_to_user((void *)(uintptr_t)uo, o, sizeof o) == 0 ? 1 : 0;
+}
+/* 9: the answer (o[7]; WM_GETTEXT's buffer read back) */
+static long win32_sent_reply(uint64_t uo, uint64_t ubuf) {
+    uint64_t o[8];
+    if (copy_from_user(o, (const void *)(uintptr_t)uo, sizeof o) != 0) return 0;
+    struct win32_sent *e = win32_sent_of(o[0]);
+    if (!e || e->state != 2 || e->to != win32_tid()) return 0;
+    e->result = o[7];
+    if (e->kind == W32S_GETTEXT && e->data && ubuf)
+        (void)copy_from_user(e->data, (const void *)(uintptr_t)ubuf, e->dlen);
+    if (e->gone) { win32_sent_free(e); return 1; }
+    e->state = 3;
+    return 1;
+}
+/* 10: the top-level windows of every process, into uh (cap of them) */
+static long win32_enum_windows(uint64_t uh, uint64_t cap) {
+    long n = 0;
+    for (int i = 0; i < WIN32_GWIN_N && (uint64_t)n < cap; i++) {
+        struct win32_win *w = win32_gwin_win((uint64_t)(WIN32_GWIN_BASE + i), 0);
+        if (!w || w->parent_fd) continue;
+        uint64_t h = (uint64_t)w->fd;
+        if (copy_to_user((void *)(uintptr_t)(uh + (uint64_t)n * 8), &h, 8) != 0) return n;
+        n++;
+    }
+    for (int i = 0; i < WIN32_MAX_WINDOWS && (uint64_t)n < cap; i++) {
+        struct win32_win *w = &g_win32_gui.win[i];
+        if (w->fd <= 0 || w->fd >= WIN32_GWIN_BASE || w->parent_fd) continue;
+        uint64_t h = (uint64_t)w->fd;
+        if (copy_to_user((void *)(uintptr_t)(uh + (uint64_t)n * 8), &h, 8) != 0) return n;
+        n++;
+    }
+    return n;
+}
+/* user32!InSendMessage(): the thread is running a message another thread sent */
+static long w32_InSendMessage(uint64_t *a) { (void)a; return win32_sent_mine(2) ? 1 : 0; }
+
 /* the next message for the calling thread that the filters ask for: 1 a
  * message, 2 WM_QUIT, 0 none; taken when `remove` */
 static int win32_msg_take(struct win32_msg *m, uint64_t hf, uint32_t lo, uint32_t hi, bool remove) {
@@ -23031,12 +23394,13 @@ static bool win32_hwnd_filter_bad(uint64_t hf) {
 }
 /* GetMessageA/W(&MSG, hwnd, min, max) -> 1, 0 for WM_QUIT, -1 for a window
  * that is not one: waits until there is a message the filters ask for */
-static long w32_GetMessageA(uint64_t *a) {
+static long win32_getmessage(uint64_t *a, bool sent) {
     uint64_t umsg = a[0], hf = a[1];
     uint32_t lo = (uint32_t)a[2], hi = (uint32_t)a[3];
     if (win32_hwnd_filter_bad(hf)) { win32_set_last_error(1400); return -1; }
     struct win32_msg m;
     for (;;) {
+        if (sent && win32_sent_waiting()) return WIN32_GOT_SENT;    /* W7r: tobyrt.dll runs it */
         int r = win32_msg_take(&m, hf, lo, hi, true);
         if (r) {
             win32_msgtime_set(m.time);                  /* W7q */
@@ -23047,12 +23411,17 @@ static long w32_GetMessageA(uint64_t *a) {
         sys_nanosleep(2000000);       /* posted by another thread, input, a timer */
     }
 }
+/* W7r: the program's GetMessage is tobyrt.dll's, which runs the messages
+ * other threads send (__toby_GetMessageA); this one is the fallback */
+static long w32_GetMessageA(uint64_t *a)      { return win32_getmessage(a, false); }
+static long w32_toby_GetMessageA(uint64_t *a) { return win32_getmessage(a, true); }
 /* PeekMessageA/W(&MSG, hwnd, min, max, flags) -> TRUE with a message (taken
  * with PM_REMOVE), FALSE at once with none (a yield first, unless PM_NOYIELD) */
-static long w32_PeekMessageA(uint64_t *a) {
+static long win32_peekmessage(uint64_t *a, bool sent) {
     uint64_t umsg = a[0], hf = a[1];
     uint32_t lo = (uint32_t)a[2], hi = (uint32_t)a[3], fl = (uint32_t)a[4];
     if (win32_hwnd_filter_bad(hf)) { win32_set_last_error(1400); return 0; }
+    if (sent && win32_sent_waiting()) return WIN32_GOT_SENT;        /* W7r */
     struct win32_msg m;
     int r = win32_msg_take(&m, hf, lo, hi, (fl & 1) != 0);
     if (!r) {
@@ -23062,19 +23431,24 @@ static long w32_PeekMessageA(uint64_t *a) {
     win32_msgtime_set(m.time);                          /* W7q */
     return copy_to_user((void *)(uintptr_t)umsg, &m, sizeof m) == 0 ? 1 : 0;
 }
+static long w32_PeekMessageA(uint64_t *a)      { return win32_peekmessage(a, false); }
+static long w32_toby_PeekMessageA(uint64_t *a) { return win32_peekmessage(a, true); }
 /* WaitMessage(): until the thread has a message (it stays where it is) */
-static long w32_WaitMessage(uint64_t *a) {
-    (void)a;
+static long win32_waitmessage(bool sent) {
     struct win32_msg m;
     for (;;) {
+        if (sent && win32_sent_waiting()) return WIN32_GOT_SENT;    /* W7r */
         if (win32_msg_take(&m, 0, 0, 0, false)) return 1;
         if (proc_wait_interrupted(current_proc())) return 0;
         sys_nanosleep(2000000);
     }
 }
+static long w32_WaitMessage(uint64_t *a)      { (void)a; return win32_waitmessage(false); }
+static long w32_toby_WaitMessage(uint64_t *a) { (void)a; return win32_waitmessage(true); }
 /* PostMessageA/W(hwnd, msg, wParam, lParam): on the queue of the window's
- * thread (a control's: its parent's); no window: the caller's thread's;
- * HWND_BROADCAST: each top-level window of the process's */
+ * thread (a control's: its parent's) in the window's process (W7r: another
+ * process's too); no window: the caller's thread's; HWND_BROADCAST: each
+ * top-level window's, every process's */
 static long w32_PostMessageA(uint64_t *a) {
     uint64_t h = a[0];
     uint32_t msg = (uint32_t)a[1];
@@ -23089,32 +23463,118 @@ static long w32_PostMessageA(uint64_t *a) {
             if (g->win[i].fd > 0 && !g->win[i].parent_fd)
                 (void)win32_post(g->win[i].owner_tid ? g->win[i].owner_tid : win32_tid(),
                                  (uint64_t)g->win[i].fd, msg, a[2], a[3], false);
+        struct win32_pstate *me = win32_ps_cur();
+        for (int i = 0; i < WIN32_GWIN_N; i++) {           /* W7r: the other processes' */
+            struct win32_pstate *ps = 0;
+            struct win32_win *fw = win32_gwin_win((uint64_t)(WIN32_GWIN_BASE + i), &ps);
+            if (!fw || fw->parent_fd || ps == me) continue;
+            (void)win32_post_g((struct win32_gui_core *)ps->part[W32P_GUI], fw->owner_tid ? fw->owner_tid : ps->tgid,
+                               (uint64_t)fw->fd, msg, a[2], a[3], false);
+        }
         return 1;
     }
     struct win32_win *w = 0;
+    struct win32_gui_core *tq = g;
+    int deftid = win32_tid();
     if ((h & WIN32_TAG_MASK) == WIN32_CTRL_TAG) {
         struct win32_ctrl *c = win32_ctrl_find(h);
         if (c) w = win32_win_find(c->parent_fd);
-    } else if (!(h >> 32)) w = win32_win_find((int)h);
+    } else if (!(h >> 32)) {
+        w = win32_win_find((int)h);
+        if (!w) {                                          /* W7r: another process's */
+            struct win32_pstate *ps = 0;
+            w = win32_gwin_win(h, &ps);
+            if (w) { tq = (struct win32_gui_core *)ps->part[W32P_GUI]; deftid = ps->tgid; }
+        }
+    }
     if (!w) { win32_set_last_error(1400); return 0; }   /* ERROR_INVALID_WINDOW_HANDLE */
-    if (!win32_post(w->owner_tid ? w->owner_tid : win32_tid(), h, msg, a[2], a[3], false)) {
+    if (!win32_post_g(tq, w->owner_tid ? w->owner_tid : deftid, h, msg, a[2], a[3], false)) {
         win32_set_last_error(1816);
         return 0;
     }
     return 1;
 }
-/* PostThreadMessageA/W(tid, msg, wParam, lParam): a thread of the process's */
+/* PostThreadMessageA/W(tid, msg, wParam, lParam): a thread of the process's,
+ * or (W7r) of another Win32 process's */
 static long w32_PostThreadMessageA(uint64_t *a) {
     int tid = (int)(uint32_t)a[0];
     struct proc *t = tid > 0 ? proc_lookup(tid) : 0;
-    int tg = win32_tgid();
-    if (!t || (t->is_thread ? t->tgid : t->pid) != tg ||
-        t->state == PROC_TERMINATED || t->state == PROC_UNUSED) {
+    if (!t || t->state == PROC_TERMINATED || t->state == PROC_UNUSED) {
         win32_set_last_error(1444);                      /* ERROR_INVALID_THREAD_ID */
         return 0;
     }
-    if (!win32_post(tid, 0, (uint32_t)a[1], a[2], a[3], false)) { win32_set_last_error(1816); return 0; }
+    int ttg = t->is_thread ? t->tgid : t->pid;
+    struct win32_gui_core *g = &g_win32_gui;
+    if (ttg != win32_tgid()) {
+        struct win32_pstate *ps = win32_ps_of(ttg);
+        g = ps ? win32_ps_gui_make(ps) : 0;
+        if (!g) { win32_set_last_error(1444); return 0; }
+    }
+    if (!win32_post_g(g, tid, 0, (uint32_t)a[1], a[2], a[3], false)) { win32_set_last_error(1816); return 0; }
     return 1;
+}
+
+/* ---- W7r: what a process can learn of a window, its own or another's ---- */
+/* FindWindowA/W(class, title): a top-level window of any process's whose
+ * class and title (NULL: any; neither's case counts) are those; NULL, the
+ * last error as it was, for none (measured) */
+static bool win32_win_named(const struct win32_win *w, const char *cls, const char *title) {
+    if (w->parent_fd) return false;
+    if (cls && !win32_streq_ci(w->cls, cls)) return false;
+    if (title && !win32_streq_ci(w->title, title)) return false;
+    return true;
+}
+static long win32_find_window(const char *cls, const char *title) {
+    for (int i = 0; i < WIN32_GWIN_N; i++) {
+        struct win32_win *w = win32_gwin_win((uint64_t)(WIN32_GWIN_BASE + i), 0);
+        if (w && win32_win_named(w, cls, title)) return w->fd;
+    }
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {       /* the process's own a number did not reach */
+        struct win32_win *w = &g_win32_gui.win[i];
+        if (w->fd > 0 && w->fd < WIN32_GWIN_BASE && win32_win_named(w, cls, title)) return w->fd;
+    }
+    return 0;
+}
+static long w32_FindWindowA(uint64_t *a) {
+    char c[64], t[128];
+    const char *cp = 0, *tp = 0;
+    if (a[0] >= 0x10000) {
+        if (strncpy_from_user(c, (const char *)(uintptr_t)a[0], sizeof c) < 0) return 0;
+        c[sizeof c - 1] = 0;
+        cp = c;
+    } else if (a[0]) return 0;                          /* a class atom: none are kept */
+    if (a[1]) {
+        if (strncpy_from_user(t, (const char *)(uintptr_t)a[1], sizeof t) < 0) return 0;
+        t[sizeof t - 1] = 0;
+        tp = t;
+    }
+    return win32_find_window(cp, tp);
+}
+static long w32_FindWindowW(uint64_t *a) {
+    char c[128], t[256];
+    const char *cp = 0, *tp = 0;
+    if (a[0] >= 0x10000) {
+        if (win32_w16_to_utf8(a[0], -1, c, sizeof c) < 0) return 0;
+        cp = c;
+    } else if (a[0]) return 0;
+    if (a[1]) {
+        if (win32_w16_to_utf8(a[1], -1, t, sizeof t) < 0) return 0;
+        tp = t;
+    }
+    return win32_find_window(cp, tp);
+}
+/* GetWindowThreadProcessId(hwnd, &pid): the thread that made the window,
+ * its process in *pid; 0 for no window (pid not written, measured) */
+static long w32_GetWindowThreadProcessId(uint64_t *a) {
+    uint64_t h = a[0];
+    struct win32_ctrl *c = win32_ctrl_find(h);
+    if (c) h = (uint64_t)c->parent_fd;
+    struct win32_pstate *ps = 0;
+    struct win32_win *w = win32_win_any(h, &ps);
+    if (!w || !ps) { win32_set_last_error(1400); return 0; }
+    uint32_t pid = (uint32_t)ps->tgid;
+    if (a[1]) (void)copy_to_user((void *)(uintptr_t)a[1], &pid, 4);
+    return (long)(uint32_t)(w->owner_tid ? w->owner_tid : ps->tgid);
 }
 
 /* BeginPaint(hwnd, &PAINTSTRUCT) -> HDC. EndPaint -> present (flip) the window. */
@@ -23645,6 +24105,7 @@ static int win32_dlg_build(int dlg_id, uint64_t dlgproc, bool modeless) {
         }
     }
     if (fd < 0) return -1;
+    fd = win32_gwin_place(fd);                   /* W7r: the system's number */
 
     g_win32_ps_lastwin = win32_ps_cur();         /* W7n: the harness's view */
     memset(wslot, 0, sizeof(*wslot));
@@ -23655,6 +24116,13 @@ static int win32_dlg_build(int dlg_id, uint64_t dlgproc, bool modeless) {
     wslot->pen_color  = WIN32_PEN_DEFAULT;
     wslot->font_scale = 1; wslot->text_color = 0x00101010; wslot->bk_mode = 2;
     wslot->is_dialog  = true;
+    memcpy(wslot->cls, "#32770", 7);             /* W7r: the dialog class's name */
+    {
+        size_t tn = strlen(title[0] ? title : "Dialog");
+        if (tn > sizeof wslot->title - 1) tn = sizeof wslot->title - 1;
+        memcpy(wslot->title, title[0] ? title : "Dialog", tn);
+        wslot->title[tn] = 0;
+    }
     (void)modeless;
 
     for (int i = 0; i < cdit && pos < tlen; i++) {
@@ -24909,6 +25377,7 @@ static long w32_toby_msgsvc(uint64_t *a) {
         if (win32_ctrl_find(a[1])) return 0;
         struct win32_win *w = win32_win_find((int)a[1]);
         uint64_t proc = (w && !w->is_dialog) ? w->wndproc : 0;
+        if (w && w->owner_tid && w->owner_tid != win32_tid()) proc = 0;  /* W7r: another thread's: sent */
         if (!proc || !a[2] || copy_to_user((void *)(uintptr_t)a[2], &proc, 8) != 0) return 0;
         return 1;
     }
@@ -24920,6 +25389,13 @@ static long w32_toby_msgsvc(uint64_t *a) {
         (void)sys_close(fd);
         return 1;
     }
+    /* W7r: the messages sent to another thread's window (above) */
+    case 5:  return win32_sent_queue(a[1]);
+    case 6:  return win32_sent_wait(a[1], a[2]);
+    case 7:  return win32_sent_take(a[1]);
+    case 8:  return win32_sent_data(a[1], a[2]);
+    case 9:  return win32_sent_reply(a[1], a[2]);
+    case 10: return win32_enum_windows(a[1], a[2]);
     }
     return 0;
 }
@@ -25181,21 +25657,79 @@ static bool win32_route_control_input(int parent_fd, const struct gui_event *ev)
 }
 
 /* user32!GetWindowTextA(hwnd, buf, max) -> length copied (a control's text). */
+/* W7r: the text of a control, or a window's title (another process's too) */
+static const char *win32_text_of(uint64_t h, int *lim) {
+    struct win32_ctrl *c = win32_ctrl_find(h);
+    if (c) { *lim = (int)sizeof(c->text) - 1; return c->text; }
+    struct win32_win *w = win32_win_any(h, 0);
+    if (w) { *lim = (int)sizeof(w->title) - 1; return w->title; }
+    return 0;
+}
 static long w32_GetWindowTextA(uint64_t *a) {
-    struct win32_ctrl *c = win32_ctrl_find(a[0]);
     int max = (int)(int32_t)a[2];
     if (max <= 0) return 0;
-    int n = 0;
-    if (c) { while (n < (int)sizeof(c->text) - 1 && c->text[n]) n++; }
+    int n = 0, lim = 0;
+    const char *src = win32_text_of(a[0], &lim);
+    if (src) { while (n < lim && src[n]) n++; }
     if (n > max - 1) n = max - 1;
-    if (c && n) (void)copy_to_user((void *)(uintptr_t)a[1], c->text, n);
+    if (src && n) (void)copy_to_user((void *)(uintptr_t)a[1], src, n);
     char z = 0; (void)copy_to_user((void *)(uintptr_t)(a[1] + n), &z, 1);
     return n;
 }
-/* user32!SetWindowTextA(hwnd, text) -> TRUE. Sets a control's text + redraws. */
+/* W7r: GetWindowTextLengthA(hwnd) */
+static long w32_GetWindowTextLengthA(uint64_t *a) {
+    int n = 0, lim = 0;
+    const char *src = win32_text_of(a[0], &lim);
+    if (src) { while (n < lim && src[n]) n++; }
+    return n;
+}
+/* W7r: GetClassNameA(hwnd, buf, max) -> the characters copied; a control's
+ * is its system class's name */
+static long w32_GetClassNameA(uint64_t *a) {
+    const char *nm = 0;
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    if (c) {
+        switch (c->type) {
+        case WIN32_CTRL_EDIT:      nm = "Edit"; break;
+        case WIN32_CTRL_STATIC:    nm = "Static"; break;
+        case WIN32_CTRL_LISTBOX:   nm = "ListBox"; break;
+        case WIN32_CTRL_SCROLLBAR: nm = "ScrollBar"; break;
+        case WIN32_CTRL_COMBOBOX:  nm = "ComboBox"; break;
+        case WIN32_CTRL_TAB:       nm = "SysTabControl32"; break;
+        case WIN32_CTRL_LISTVIEW:  nm = "SysListView32"; break;
+        case WIN32_CTRL_TREEVIEW:  nm = "SysTreeView32"; break;
+        case WIN32_CTRL_STATUSBAR: nm = "msctls_statusbar32"; break;
+        case WIN32_CTRL_PROGRESS:  nm = "msctls_progress32"; break;
+        case WIN32_CTRL_TOOLBAR:   nm = "ToolbarWindow32"; break;
+        default:                   nm = "Button"; break;
+        }
+    } else {
+        struct win32_win *w = win32_win_any(a[0], 0);
+        if (w) nm = w->cls;
+    }
+    if (!nm) { win32_set_last_error(1400); return 0; }
+    int max = (int)(int32_t)a[2];
+    if (max <= 0 || !a[1]) return 0;
+    int n = (int)strlen(nm);
+    if (n > max - 1) n = max - 1;
+    if (n) (void)copy_to_user((void *)(uintptr_t)a[1], nm, (size_t)n);
+    char z = 0;
+    (void)copy_to_user((void *)(uintptr_t)(a[1] + (uint64_t)n), &z, 1);
+    return n;
+}
+/* user32!SetWindowTextA(hwnd, text) -> TRUE. Sets a control's text + redraws;
+ * W7r: a window's title (the program's own) */
 static long w32_SetWindowTextA(uint64_t *a) {
     struct win32_ctrl *c = win32_ctrl_find(a[0]);
-    if (!c) return 0;
+    if (!c) {
+        struct win32_win *w = win32_win_find((int)a[0]);
+        if (!w) return 0;
+        w->title[0] = 0;
+        if (a[1]) (void)strncpy_from_user(w->title, (const char *)(uintptr_t)a[1], sizeof w->title);
+        w->title[sizeof w->title - 1] = 0;
+        if (w->gwin) (void)gui_window_set_title(w->gwin, w->title);
+        return 1;
+    }
     c->text[0] = 0;
     if (a[1])
         (void)strncpy_from_user(c->text, (const char *)(uintptr_t)a[1], sizeof(c->text));
@@ -30701,6 +31235,16 @@ static const struct win32_shim g_win32_shims[] = {
     { "user32.dll", "PostThreadMessageW", w32_PostThreadMessageA },
     { "user32.dll", "WaitMessage",       w32_WaitMessage },
     { "user32.dll", "GetMessageTime",    w32_GetMessageTime },                        /* W7q */
+    /* W7r: windows named across processes and threads */
+    { "user32.dll", "__toby_GetMessageA",  w32_toby_GetMessageA },     /* tobyrt.dll's */
+    { "user32.dll", "__toby_PeekMessageA", w32_toby_PeekMessageA },
+    { "user32.dll", "__toby_WaitMessage",  w32_toby_WaitMessage },
+    { "user32.dll", "FindWindowA",         w32_FindWindowA },
+    { "user32.dll", "FindWindowW",         w32_FindWindowW },
+    { "user32.dll", "GetWindowThreadProcessId", w32_GetWindowThreadProcessId },
+    { "user32.dll", "GetClassNameA",       w32_GetClassNameA },
+    { "user32.dll", "GetWindowTextLengthA", w32_GetWindowTextLengthA },
+    { "user32.dll", "InSendMessage",       w32_InSendMessage },
     { "user32.dll", "TranslateMessage",  w32_TranslateMessage },
     { "user32.dll", "DefWindowProcA",    w32_DefWindowProcA },
     { "user32.dll", "PostQuitMessage",   w32_PostQuitMessage },

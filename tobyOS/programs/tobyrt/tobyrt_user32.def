@@ -7,3 +7,6 @@ EXPORTS
     __toby_msgsvc
     __toby_CreateWindowExA
     __toby_SendMessageA
+    __toby_GetMessageA
+    __toby_PeekMessageA
+    __toby_WaitMessage

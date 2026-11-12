@@ -1386,6 +1386,11 @@ static const char *const g_pe_rt_names[] = {
     "__stdio_common_vfprintf", "fputs", "puts", "fputc", "putc", "putchar", "fgetc", "getc",
     "getchar", "fgets", "ungetc", "__stdio_common_vfscanf", "fopen", "_wfopen", "_fsopen",
     "_wfsopen", "freopen", "setvbuf",
+    /* W7r: the message loop runs what other threads send (their window
+     * procedures are the program's); SendMessage waits for another thread;
+     * EnumWindows calls the program back */
+    "GetMessageA", "GetMessageW", "PeekMessageA", "PeekMessageW", "WaitMessage", "SendMessageW",
+    "SendMessageTimeoutA", "SendMessageTimeoutW", "EnumWindows",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)

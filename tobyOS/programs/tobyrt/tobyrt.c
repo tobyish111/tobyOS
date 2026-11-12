@@ -1271,11 +1271,122 @@ LRESULT rt_DispatchMessageA(const MSG *m) {
     return 0;
 }
 
-LRESULT rt_SendMessageA(HWND h, UINT msg, WPARAM w, LPARAM l) {
+/* ---- W7r: messages sent to another thread's window ----------------------
+ * SendMessage to a window of another thread (of this process or another's)
+ * queues the message (the kernel's queue, __toby_msgsvc 5) and waits (6),
+ * running what other threads send this one meanwhile; the window's thread
+ * runs it when it waits for a message -- GetMessage, PeekMessage and
+ * WaitMessage here hear from the kernel's (RT_GOT_SENT), take it (7), bring
+ * its data into this process (8: WM_COPYDATA's, WM_SETTEXT's, WM_GETTEXT's
+ * buffer, across processes), call the window's procedure and give the
+ * answer back (9). Measured on Windows 11: programs/win-xwin49. */
+#define RT_MSG_SEND  5
+#define RT_MSG_WAIT  6
+#define RT_MSG_TAKE  7
+#define RT_MSG_DATA  8
+#define RT_MSG_REPLY 9
+#define RT_MSG_ENUM  10
+#define RT_GOT_SENT  0x5E47
+struct rt_sent { ULONG64 ticket, hwnd, msg, wp, lp, proc, need, result; };
+__declspec(dllimport) BOOL WINAPI __toby_GetMessageA(MSG *, HWND, UINT, UINT);
+__declspec(dllimport) BOOL WINAPI __toby_PeekMessageA(MSG *, HWND, UINT, UINT, UINT);
+__declspec(dllimport) BOOL WINAPI __toby_WaitMessage(void);
+
+/* run the first message another thread sent this one */
+static void rt_run_sent(void) {
+    struct rt_sent s;
+    s.ticket = 0;                                /* the kernel fills it in */
+    if (__toby_msgsvc(RT_MSG_TAKE, &s, 0) != 1) return;
+    BYTE small[512];
+    BYTE *buf = 0;
+    if (s.need) {
+        buf = s.need <= sizeof small ? small : (BYTE *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)s.need);
+        if (buf) (void)__toby_msgsvc(RT_MSG_DATA, &s, buf);
+    }
+    if (s.proc)
+        s.result = rt_call_callback(s.proc, s.hwnd, s.msg, s.wp, s.lp);
+    else
+        s.result = (ULONG64)__toby_SendMessageA((HWND)s.hwnd, (UINT)s.msg, (WPARAM)s.wp, (LPARAM)s.lp);
+    (void)__toby_msgsvc(RT_MSG_REPLY, &s, buf);
+    if (buf && buf != small) HeapFree(GetProcessHeap(), 0, buf);
+}
+BOOL rt_GetMessageA(MSG *m, HWND h, UINT lo, UINT hi) {
+    for (;;) {
+        BOOL r = __toby_GetMessageA(m, h, lo, hi);
+        if (r != RT_GOT_SENT) return r;
+        rt_run_sent();
+    }
+}
+BOOL rt_PeekMessageA(MSG *m, HWND h, UINT lo, UINT hi, UINT fl) {
+    for (;;) {
+        BOOL r = __toby_PeekMessageA(m, h, lo, hi, fl);
+        if (r != RT_GOT_SENT) return r;
+        rt_run_sent();
+    }
+}
+BOOL rt_WaitMessage(void) {
+    for (;;) {
+        BOOL r = __toby_WaitMessage();
+        if (r != RT_GOT_SENT) return r;
+        rt_run_sent();
+    }
+}
+/* the message to a window not the calling thread's: queued, its answer
+ * waited for (timeout ms, ~0u none); *ok FALSE when there is none */
+static LRESULT rt_send(HWND h, UINT msg, WPARAM w, LPARAM l, UINT timeout, BOOL wide, BOOL *ok) {
+    struct { ULONG64 hwnd; UINT msg, timeout; ULONG64 wp, lp; UINT wide, pad; } q =
+        { (ULONG64)h, msg, timeout, (ULONG64)w, (ULONG64)l, (UINT)wide, 0 };
+    *ok = TRUE;
+    LONG_PTR t = __toby_msgsvc(RT_MSG_SEND, &q, 0);
+    if (t == -1 || t == -2) return __toby_SendMessageA(h, msg, w, l);   /* a control's, a dialog's */
+    if (t <= 0) { *ok = FALSE; return 0; }
+    for (;;) {
+        ULONG64 res = 0;
+        LONG_PTR k = __toby_msgsvc(RT_MSG_WAIT, (const void *)t, &res);
+        if (k == 1) return (LRESULT)res;
+        if (k == 2) { rt_run_sent(); continue; }
+        *ok = FALSE;                         /* 3 the time ran out (ERROR_TIMEOUT), 4 gone */
+        return 0;
+    }
+}
+static LRESULT rt_send_any(HWND h, UINT msg, WPARAM w, LPARAM l, BOOL wide) {
     ULONG64 proc = 0;
-    if (__toby_msgsvc(RT_MSG_WNDPROC, h, &proc) == 1 && proc)
+    if (__toby_msgsvc(RT_MSG_WNDPROC, h, &proc) == 1 && proc)    /* the calling thread's: a call */
         return ((RT_WNDPROC)proc)(h, msg, w, l);
-    return __toby_SendMessageA(h, msg, w, l);       /* a control's, a dialog's: the kernel's */
+    BOOL ok;
+    return rt_send(h, msg, w, l, ~0u, wide, &ok);
+}
+LRESULT rt_SendMessageA(HWND h, UINT msg, WPARAM w, LPARAM l) { return rt_send_any(h, msg, w, l, FALSE); }
+LRESULT rt_SendMessageW(HWND h, UINT msg, WPARAM w, LPARAM l) { return rt_send_any(h, msg, w, l, TRUE); }
+static LRESULT rt_send_timeout(HWND h, UINT msg, WPARAM w, LPARAM l, UINT flags, UINT ms, PDWORD_PTR res,
+                               BOOL wide) {
+    (void)flags;
+    ULONG64 proc = 0;
+    LRESULT r;
+    if (__toby_msgsvc(RT_MSG_WNDPROC, h, &proc) == 1 && proc) {
+        r = ((RT_WNDPROC)proc)(h, msg, w, l);
+    } else {
+        BOOL ok;
+        r = rt_send(h, msg, w, l, ms == ~0u ? ms - 1 : ms, wide, &ok);
+        if (!ok) return 0;
+    }
+    if (res) *res = (DWORD_PTR)r;
+    return 1;
+}
+LRESULT rt_SendMessageTimeoutA(HWND h, UINT msg, WPARAM w, LPARAM l, UINT flags, UINT ms, PDWORD_PTR res) {
+    return rt_send_timeout(h, msg, w, l, flags, ms, res, FALSE);
+}
+LRESULT rt_SendMessageTimeoutW(HWND h, UINT msg, WPARAM w, LPARAM l, UINT flags, UINT ms, PDWORD_PTR res) {
+    return rt_send_timeout(h, msg, w, l, flags, ms, res, TRUE);
+}
+/* EnumWindows(proc, lParam): every process's top-level windows, until the
+ * program's procedure answers FALSE */
+BOOL rt_EnumWindows(WNDENUMPROC fn, LPARAM l) {
+    ULONG64 hw[512];
+    LONG_PTR n = __toby_msgsvc(RT_MSG_ENUM, hw, (void *)(ULONG_PTR)512);
+    for (LONG_PTR i = 0; i < n; i++)
+        if (!fn((HWND)hw[i], l)) return FALSE;
+    return TRUE;
 }
 
 HWND rt_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y, int cx, int cy,
