@@ -7749,10 +7749,19 @@ void _start(void) {
     defined(WINPE32A_BOOT) || defined(WINPE33A_BOOT) || defined(WINPE33B_BOOT) || \
     defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT) || defined(WINPE34A_BOOT) || \
     defined(WINPE35A_BOOT) || defined(WINPE35B_BOOT) || defined(WINPE36A_BOOT) || \
-    defined(WINPE37A_BOOT) || defined(WINPE37B_BOOT) || defined(WINPE38A_BOOT)
+    defined(WINPE37A_BOOT) || defined(WINPE37B_BOOT) || defined(WINPE38A_BOOT) || \
+    defined(WINPE39A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
      * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / (with
-     * one argument when the entry gives one). W7g:
+     * one argument when the entry gives one). W7h:
+     *   39A /bin/win-cxx39.exe: C++ built by Microsoft's cl.exe on Microsoft's
+     *       vcruntime140.dll and vcruntime140_1.dll (in /bin beside it) --
+     *       throw/catch of each kind, rethrow, a throw in a catch block, 200
+     *       frames of destructors, a destructor's own try/catch, catch (...),
+     *       another thread, an uncaught throw (exit 3), a throw out of a
+     *       window procedure through DispatchMessage (9 checks), 41. The
+     *       image has it only where Visual Studio built it.
+     * W7g:
      *   38A /bin/win-cb38.exe: an exception raised in code the system calls
      *       -- a window procedure under DispatchMessage (twice nested) and a
      *       dialog procedure under DialogBoxParam reach the caller's
@@ -7951,6 +7960,10 @@ void _start(void) {
 #ifdef WINPE38A_BOOT
             { "WINPE38A", "/bin/win-cb38.exe", "win-cb38.exe", 40,
               "exceptions in code the system calls: WndProc, DialogProc, DllMain (6 checks)" },
+#endif
+#ifdef WINPE39A_BOOT
+            { "WINPE39A", "/bin/win-cxx39.exe", "win-cxx39.exe", 41,
+              "C++ by cl.exe on Microsoft's vcruntime140 (9 checks)" },
 #endif
         };
         win32_gui_set_log(true);

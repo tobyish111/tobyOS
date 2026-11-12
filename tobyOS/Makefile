@@ -2686,6 +2686,18 @@ $(W38)/win-cb38.exe: $(W38)/cb38.c $(W38)/cb38s.S $(W38)/cb38.rc
 	windres -i $(W38)/cb38.rc -o $(W38)/cb38_res.o --target=pe-x86-64
 	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W38)/cb38.c $(W38)/cb38s.S $(W38)/cb38_res.o -luser32
 
+# Track C/W7h: win-cxx39.exe (exit 41, as on Windows 11) -- C++ built by
+# Microsoft's cl.exe (/EHs /MD) on Microsoft's redistributable
+# vcruntime140.dll and vcruntime140_1.dll, which build.sh copies from the
+# same toolset's Redist folder at build time (never committed). Built only
+# where Visual Studio's vcvars64.bat is (W39_VCVARS); elsewhere the image
+# goes without the three files and WINPE39A fails to spawn.
+W39 := programs/win-exc39
+W39_VCVARS ?= C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Auxiliary/Build/vcvars64.bat
+W39_HAVE := $(shell test -f "$(W39_VCVARS)" && echo 1)
+$(W39)/win-cxx39.exe: $(W39)/cxx39.cpp $(W39)/build.sh
+	bash $(W39)/build.sh "$(W39_VCVARS)" $(W39)
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3240,6 +3252,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-exc38/win-cb38.exe \
                programs/win-exc38/win-cb38s.exe \
                programs/win-exc38/dll38.dll \
+               $(if $(W39_HAVE),programs/win-exc39/win-cxx39.exe) \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -4610,6 +4623,16 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar \
 	    etc/oilspec/bin
+	@# W7h: the MSVC-built test and Microsoft's C++ runtime beside it, when
+	@# Visual Studio was there to build them (programs/win-exc39)
+	@if [ -f $(W39)/win-cxx39.exe ] && [ -f $(W39)/vcruntime140.dll ] && \
+	    [ -f $(W39)/vcruntime140_1.dll ]; then \
+	    cp $(W39)/win-cxx39.exe $(W39)/vcruntime140.dll $(W39)/vcruntime140_1.dll \
+	        $(INITRD_STAGE)/bin/ && \
+	    (cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 --owner=0 --group=0 \
+	        --numeric-owner -rf ../initrd.tar bin/win-cxx39.exe bin/vcruntime140.dll \
+	        bin/vcruntime140_1.dll); \
+	else echo "initrd: no MSVC build (W39_VCVARS): /bin/win-cxx39.exe left out"; fi
 	@# the FHS's mount points and homes, as Linux's modes (finding 217)
 	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 --owner=0 --group=0 \
 	    --numeric-owner --no-recursion -rf ../initrd.tar mnt media srv home \
