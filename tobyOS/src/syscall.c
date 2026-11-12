@@ -21723,11 +21723,20 @@ struct win32_win {
     /* C15: an attached menu bar (SetMenu); kernel-drawn into the client top. */
     uint64_t menu;        /* HMENU of the bar (0 = none)                    */
     int      menu_open;   /* index of the top-level item whose dropdown is open (-1) */
+    int      owner_tid;   /* W7o: the thread that made it -- its messages are that thread's */
 };
+/* W7o: a posted message, on thread `tid`'s queue (hwnd 0: a thread message) */
+struct win32_posted { int tid; uint32_t message; uint64_t hwnd, wParam, lParam; uint32_t time; };
+#define WIN32_POSTQ 256
+static int win32_tid(void) { struct proc *p = current_proc(); return p ? p->pid : 0; }
+static int win32_tgid(void);                                     /* (with the timers) */
 
 struct win32_gui_core {   /* W7n: a process's own (its record's part) */
     bool quit;            /* PostQuitMessage seen (thread-wide) */
     int  quitcode;
+    int  quit_tid;        /* W7o: the thread that posted it (0: any) */
+    int  postn;           /* W7o: the posted messages, in their order */
+    struct win32_posted postq[WIN32_POSTQ];
     struct win32_win win[WIN32_MAX_WINDOWS];
     struct { char name[32]; uint64_t wndproc; } cls[WIN32_MAX_CLASSES];
     int  ncls;
@@ -21877,7 +21886,8 @@ static void win32_ui_text(struct window *win, int x, int y, const char *s,
     }
 }
 struct win32_msg;
-static bool win32_timer_poll(int only_fd, struct win32_msg *m);        /* C15 timers */
+static bool win32_timer_take(uint64_t hf, uint32_t lo, uint32_t hi, bool remove, int me,
+                             struct win32_msg *m);                     /* C15 timers, W7o */
 /* C13: MessageBoxA (font section) draws via these, defined further below. */
 static struct window *win32_hdc_window(int fd);
 extern uint64_t pit_ticks(void);
@@ -22272,6 +22282,7 @@ static long w32_CreateWindowExA(uint64_t *a) {
     if (fd < 0) return 0;                        /* NULL HWND */
 
     g_win32_ps_lastwin = win32_ps_cur();         /* W7n: the harness's view */
+    win->owner_tid   = win32_tid();              /* W7o */
     win->fd          = (int)fd;
     win->gwin        = win32_hdc_window((int)fd);  /* C18c: stash for pixel readback */
     win->w           = w;
@@ -22311,7 +22322,9 @@ static long w32_ShowWindow(uint64_t *a) {
 }
 static long w32_UpdateWindow(uint64_t *a) { return w32_ShowWindow(a); }
 static long w32_PostQuitMessage(uint64_t *a) {
-    g_win32_gui.quit = true; g_win32_gui.quitcode = (int)a[0]; return 0;
+    g_win32_gui.quit = true; g_win32_gui.quitcode = (int)a[0];
+    g_win32_gui.quit_tid = win32_tid();                    /* W7o: this thread's */
+    return 0;
 }
 static long w32_TranslateMessage(uint64_t *a) { (void)a; return 0; }
 
@@ -22402,122 +22415,264 @@ static bool win32_event_to_msg(int fd, const struct gui_event *ev,
     }
 }
 
-/* GetMessageA(&MSG, hwnd, min, max) -> >0 normal / 0 on WM_QUIT. Scans ALL the
- * process's windows. Order: WM_QUIT (PostQuitMessage, thread-wide), then per
- * window a pending WM_DESTROY (after which the window is retired -- desktop
- * window closed + slot freed), then a queued WM_PAINT, then a drained input
- * event (mouse/keyboard/close -> WM_*); else yield + WM_NULL. Each delivered
- * message first stashes its window's WndProc so the following DispatchMessage
- * routes to the correct one (multi-window). */
-static long w32_GetMessageA(uint64_t *a) {
-    uint64_t msg = a[0];
-    struct win32_msg m;
-    memset(&m, 0, sizeof(m));
+/* ---- W7o: posted messages, and GetMessage's and PeekMessage's filters ----
+ * PostMessage puts a message on the queue of the thread that made the
+ * window (its owner_tid); PostThreadMessage -- and PostMessage with no
+ * window -- on a thread's own, with no window. GetMessage and PeekMessage
+ * take the first message of the calling thread's that their window (NULL:
+ * any of the thread's windows and the thread's own messages; -1: the
+ * thread's own only) and their range of message numbers (0, 0: all) ask
+ * for: the posted messages in their order; then WM_QUIT, whatever the range
+ * (a range that leaves out every posted one still gets it); then what the
+ * windows have -- a WM_DESTROY, a control's WM_COMMAND, a WM_PAINT, input, a
+ * due timer. With nothing, GetMessage waits for something (before W7o it
+ * handed out WM_NULL) and PeekMessage answers FALSE; PeekMessage without
+ * PM_REMOVE leaves the message where it was. Measured on Windows 11
+ * (programs/win-post46). */
+static bool win32_message_ok(uint64_t hwnd, uint32_t msg, uint64_t hf, uint32_t lo, uint32_t hi) {
+    if (hf == (uint64_t)-1) { if (hwnd) return false; }
+    else if (hf && hwnd != hf) return false;
+    if ((lo || hi) && (msg < lo || msg > hi)) return false;
+    return true;
+}
+static bool win32_win_mine(const struct win32_win *w, int me) {
+    return w->fd > 0 && (!w->owner_tid || w->owner_tid == me);
+}
+static uint32_t win32_msg_time(void) {
+    uint64_t hz = pit_hz();
+    return (uint32_t)(hz ? pit_ticks() * 1000 / hz : pit_ticks());
+}
+/* onto thread tid's queue (at its front: a message PeekMessage put back) */
+static bool win32_post(int tid, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, bool front) {
+    struct win32_gui_core *g = &g_win32_gui;
+    if (g->postn >= WIN32_POSTQ) return false;
+    struct win32_posted e = { tid, msg, hwnd, wp, lp, win32_msg_time() };
+    if (front) {
+        memmove(&g->postq[1], &g->postq[0], (size_t)g->postn * sizeof e);
+        g->postq[0] = e;
+    } else g->postq[g->postn] = e;
+    g->postn++;
+    return true;
+}
+/* the next message for the calling thread that the filters ask for: 1 a
+ * message, 2 WM_QUIT, 0 none; taken when `remove` */
+static int win32_msg_take(struct win32_msg *m, uint64_t hf, uint32_t lo, uint32_t hi, bool remove) {
+    int me = win32_tid();
+    struct win32_gui_core *g = &g_win32_gui;
+    memset(m, 0, sizeof *m);
 
-    if (g_win32_gui.quit) {
-        m.message = WM_QUIT; m.wParam = (uint64_t)(uint32_t)g_win32_gui.quitcode;
-        (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
-        return 0;
+    /* the posted messages, in their order */
+    for (int i = 0; i < g->postn; i++) {
+        struct win32_posted *e = &g->postq[i];
+        if (e->tid != me || !win32_message_ok(e->hwnd, e->message, hf, lo, hi)) continue;
+        m->hwnd = e->hwnd; m->message = e->message; m->wParam = e->wParam; m->lParam = e->lParam;
+        m->time = e->time;
+        struct win32_win *w = (e->hwnd >> 32) ? 0 : win32_win_find((int)e->hwnd);
+        if (w) win32_stash_wndproc(w);
+        if (remove) {
+            memmove(e, e + 1, (size_t)(g->postn - i - 1) * sizeof *e);
+            g->postn--;
+        }
+        return 1;
     }
+
+    /* WM_QUIT: the thread's, whatever the range */
+    if (g->quit && (!g->quit_tid || g->quit_tid == me)) {
+        m->message = WM_QUIT;
+        m->wParam = (uint64_t)(uint32_t)g->quitcode;
+        m->time = win32_msg_time();
+        if (remove) g->quit = false;
+        return 2;
+    }
+    if (hf == (uint64_t)-1) return 0;               /* the thread's own only */
 
     /* WM_DESTROY: deliver, then retire the window (close its desktop window +
-     * free the slot). C11: destroying a parent cascades to its children -- mark
-     * each child for destroy so it gets its own WM_DESTROY next. */
+     * free the slot). C11: destroying a parent cascades to its children --
+     * mark each child for destroy so it gets its own WM_DESTROY next. */
     for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
-        struct win32_win *w = &g_win32_gui.win[i];
-        if (w->fd > 0 && w->destroy) {
-            int fd = w->fd;
-            for (int j = 0; j < WIN32_MAX_WINDOWS; j++)
-                if (g_win32_gui.win[j].fd > 0 && g_win32_gui.win[j].parent_fd == fd)
-                    g_win32_gui.win[j].destroy = true;   /* cascade to children */
-            win32_stash_wndproc(w);
-            m.hwnd = (uint64_t)fd; m.message = WM_DESTROY;
-            if (g_win32_log_input)
-                kprintf("[winpe] GetMessage hwnd=%d -> WM_DESTROY\n", fd);
-            w->fd = 0; w->destroy = false; w->needs_paint = false;  /* retire */
-            (void)sys_close(fd);                                    /* remove from desktop */
-            (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+        struct win32_win *w = &g->win[i];
+        if (!win32_win_mine(w, me) || !w->destroy) continue;
+        if (!win32_message_ok((uint64_t)w->fd, WM_DESTROY, hf, lo, hi)) continue;
+        int fd = w->fd;
+        win32_stash_wndproc(w);
+        m->hwnd = (uint64_t)fd; m->message = WM_DESTROY; m->time = win32_msg_time();
+        if (!remove) return 1;
+        for (int j = 0; j < WIN32_MAX_WINDOWS; j++)
+            if (g->win[j].fd > 0 && g->win[j].parent_fd == fd)
+                g->win[j].destroy = true;               /* cascade to children */
+        if (g_win32_log_input)
+            kprintf("[winpe] GetMessage hwnd=%d -> WM_DESTROY\n", fd);
+        w->fd = 0; w->destroy = false; w->needs_paint = false;  /* retire */
+        (void)sys_close(fd);                                    /* remove from desktop */
+        return 1;
+    }
+
+    /* C12: a pending WM_COMMAND (e.g. a button click) to its parent. */
+    if (g->cmd_head != g->cmd_tail) {
+        int t = g->cmd_tail;
+        struct win32_win *pw = win32_win_find((int)g->cmd_q[t].hwnd);
+        if ((!pw || win32_win_mine(pw, me)) &&
+            win32_message_ok(g->cmd_q[t].hwnd, g->cmd_q[t].message, hf, lo, hi)) {
+            win32_stash_wndproc(pw);
+            m->hwnd    = g->cmd_q[t].hwnd;
+            m->message = g->cmd_q[t].message;
+            m->wParam  = g->cmd_q[t].wParam;
+            m->lParam  = g->cmd_q[t].lParam;
+            m->time    = win32_msg_time();
+            if (remove) {
+                g->cmd_tail = (t + 1) % WIN32_CMDQ;
+                if (g_win32_log_input)
+                    kprintf("[winpe] GetMessage hwnd=%d -> WM_COMMAND id=%d\n",
+                            (int)m->hwnd, (int)(m->wParam & 0xFFFF));
+            }
             return 1;
         }
     }
 
-    /* C12: deliver a pending WM_COMMAND (e.g. a button click) to its parent. */
-    if (g_win32_gui.cmd_head != g_win32_gui.cmd_tail) {
-        int t = g_win32_gui.cmd_tail;
-        struct win32_win *pw = win32_win_find((int)g_win32_gui.cmd_q[t].hwnd);
-        win32_stash_wndproc(pw);
-        m.hwnd    = g_win32_gui.cmd_q[t].hwnd;
-        m.message = g_win32_gui.cmd_q[t].message;
-        m.wParam  = g_win32_gui.cmd_q[t].wParam;
-        m.lParam  = g_win32_gui.cmd_q[t].lParam;
-        g_win32_gui.cmd_tail = (t + 1) % WIN32_CMDQ;
-        if (g_win32_log_input)
-            kprintf("[winpe] GetMessage hwnd=%d -> WM_COMMAND id=%d\n",
-                    (int)m.hwnd, (int)(m.wParam & 0xFFFF));
-        (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
-        return 1;
-    }
-
-    /* WM_PAINT for any window that needs one. (Controls are drawn into the
+    /* WM_PAINT for a window that needs one. (Controls are drawn into the
      * parent's backbuffer by EndPaint, after the app's own client paint.) */
     for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
-        struct win32_win *w = &g_win32_gui.win[i];
-        if (w->fd > 0 && w->needs_paint) {
-            w->needs_paint = false;
-            /* C14: a modeless dialog window is painted by the kernel (the app's
-             * DialogProc doesn't), so handle its WM_PAINT here + keep looping. */
-            if (w->is_dialog) { win32_dlg_paint(w->fd); continue; }
-            win32_stash_wndproc(w);
-            m.hwnd = (uint64_t)w->fd; m.message = WM_PAINT;
-            (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
-            return 1;
-        }
-    }
-
-    /* One real input event from any window -> WM_*. C12: if the window has child
-     * controls and the event hits one (button click / edit keystroke), the
-     * control consumes it (the app sees only the resulting WM_COMMAND); we
-     * return WM_NULL so the loop keeps turning. */
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
-        struct win32_win *w = &g_win32_gui.win[i];
-        if (w->fd <= 0) continue;
-        struct gui_event ev;
-        if (win32_poll_window_event(w->fd, &ev) <= 0) continue;
-        if (win32_route_menu_input(w->fd, &ev)) {     /* C15: menu bar / dropdown */
-            m.hwnd = (uint64_t)w->fd; m.message = WM_NULL;
-            (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
-            return 1;
-        }
-        if (win32_route_control_input(w->fd, &ev)) {
-            m.hwnd = (uint64_t)w->fd; m.message = WM_NULL;
-            (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
-            return 1;
-        }
-        if (win32_event_to_msg(w->fd, &ev, &m)) {
-            win32_stash_wndproc(w);
-            if (g_win32_log_input && m.message != WM_MOUSEMOVE)
-                kprintf("[winpe] GetMessage hwnd=%d -> WM_%04x wParam=0x%lx lParam=0x%lx\n",
-                        w->fd, (unsigned)m.message, (unsigned long)m.wParam,
-                        (unsigned long)m.lParam);
-            (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
-            return 1;
-        }
-    }
-
-    /* C15: a due timer -> WM_TIMER (after input, before idle). */
-    if (win32_timer_poll(-1, &m)) {
-        if (g_win32_log_input)
-            kprintf("[winpe] GetMessage hwnd=%d -> WM_TIMER id=%lu\n",
-                    (int)m.hwnd, (unsigned long)m.wParam);
-        (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+        struct win32_win *w = &g->win[i];
+        if (!win32_win_mine(w, me) || !w->needs_paint) continue;
+        /* C14: a modeless dialog window is painted by the kernel (the app's
+         * DialogProc doesn't), so handle its WM_PAINT here + keep looping. */
+        if (w->is_dialog) { w->needs_paint = false; win32_dlg_paint(w->fd); continue; }
+        if (!win32_message_ok((uint64_t)w->fd, WM_PAINT, hf, lo, hi)) continue;
+        win32_stash_wndproc(w);
+        m->hwnd = (uint64_t)w->fd; m->message = WM_PAINT; m->time = win32_msg_time();
+        if (remove) w->needs_paint = false;
         return 1;
     }
 
-    /* Nothing pending: yield and deliver WM_NULL so the loop keeps turning
-     * (and other procs run) without busy-spinning. */
-    sched_yield();
-    m.hwnd = 0; m.message = WM_NULL;
-    (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+    /* One real input event from a window -> WM_*. C12: if the window has child
+     * controls and the event hits one (button click / edit keystroke), the
+     * control consumes it (the app sees only the resulting WM_COMMAND). An
+     * event the filters do not ask for waits on the thread's queue; one
+     * PeekMessage only looks at goes back to its front. */
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
+        struct win32_win *w = &g->win[i];
+        if (!win32_win_mine(w, me)) continue;
+        if (hf && hf != (uint64_t)w->fd) continue;
+        struct gui_event ev;
+        if (win32_poll_window_event(w->fd, &ev) <= 0) continue;
+        if (win32_route_menu_input(w->fd, &ev)) continue;      /* C15: menu bar / dropdown */
+        if (win32_route_control_input(w->fd, &ev)) continue;
+        struct win32_msg im;
+        memset(&im, 0, sizeof im);
+        im.hwnd = (uint64_t)w->fd;
+        if (!win32_event_to_msg(w->fd, &ev, &im)) continue;
+        if (!win32_message_ok(im.hwnd, im.message, hf, lo, hi)) {
+            (void)win32_post(me, im.hwnd, im.message, im.wParam, im.lParam, false);
+            continue;
+        }
+        *m = im;
+        m->time = win32_msg_time();
+        win32_stash_wndproc(w);
+        if (!remove) (void)win32_post(me, im.hwnd, im.message, im.wParam, im.lParam, true);
+        else if (g_win32_log_input && m->message != WM_MOUSEMOVE)
+            kprintf("[winpe] GetMessage hwnd=%d -> WM_%04x wParam=0x%lx lParam=0x%lx\n",
+                    w->fd, (unsigned)m->message, (unsigned long)m->wParam,
+                    (unsigned long)m->lParam);
+        return 1;
+    }
+
+    /* C15: a due timer -> WM_TIMER (after input, last). */
+    if (win32_timer_take(hf, lo, hi, remove, me, m)) {
+        m->time = win32_msg_time();
+        if (remove && g_win32_log_input)
+            kprintf("[winpe] GetMessage hwnd=%d -> WM_TIMER id=%lu\n",
+                    (int)m->hwnd, (unsigned long)m->wParam);
+        return 1;
+    }
+    return 0;
+}
+/* a window filter that is no window of the process's */
+static bool win32_hwnd_filter_bad(uint64_t hf) {
+    return hf && hf != (uint64_t)-1 && ((hf >> 32) || !win32_win_find((int)hf));
+}
+/* GetMessageA/W(&MSG, hwnd, min, max) -> 1, 0 for WM_QUIT, -1 for a window
+ * that is not one: waits until there is a message the filters ask for */
+static long w32_GetMessageA(uint64_t *a) {
+    uint64_t umsg = a[0], hf = a[1];
+    uint32_t lo = (uint32_t)a[2], hi = (uint32_t)a[3];
+    if (win32_hwnd_filter_bad(hf)) { win32_set_last_error(1400); return -1; }
+    struct win32_msg m;
+    for (;;) {
+        int r = win32_msg_take(&m, hf, lo, hi, true);
+        if (r) {
+            if (copy_to_user((void *)(uintptr_t)umsg, &m, sizeof m) != 0) return -1;
+            return r == 2 ? 0 : 1;
+        }
+        if (proc_wait_interrupted(current_proc())) return -1;
+        sys_nanosleep(2000000);       /* posted by another thread, input, a timer */
+    }
+}
+/* PeekMessageA/W(&MSG, hwnd, min, max, flags) -> TRUE with a message (taken
+ * with PM_REMOVE), FALSE at once with none (a yield first, unless PM_NOYIELD) */
+static long w32_PeekMessageA(uint64_t *a) {
+    uint64_t umsg = a[0], hf = a[1];
+    uint32_t lo = (uint32_t)a[2], hi = (uint32_t)a[3], fl = (uint32_t)a[4];
+    if (win32_hwnd_filter_bad(hf)) { win32_set_last_error(1400); return 0; }
+    struct win32_msg m;
+    int r = win32_msg_take(&m, hf, lo, hi, (fl & 1) != 0);
+    if (!r) {
+        if (!(fl & 2)) sched_yield();
+        return 0;
+    }
+    return copy_to_user((void *)(uintptr_t)umsg, &m, sizeof m) == 0 ? 1 : 0;
+}
+/* WaitMessage(): until the thread has a message (it stays where it is) */
+static long w32_WaitMessage(uint64_t *a) {
+    (void)a;
+    struct win32_msg m;
+    for (;;) {
+        if (win32_msg_take(&m, 0, 0, 0, false)) return 1;
+        if (proc_wait_interrupted(current_proc())) return 0;
+        sys_nanosleep(2000000);
+    }
+}
+/* PostMessageA/W(hwnd, msg, wParam, lParam): on the queue of the window's
+ * thread (a control's: its parent's); no window: the caller's thread's;
+ * HWND_BROADCAST: each top-level window of the process's */
+static long w32_PostMessageA(uint64_t *a) {
+    uint64_t h = a[0];
+    uint32_t msg = (uint32_t)a[1];
+    struct win32_gui_core *g = &g_win32_gui;
+    if (!h) {
+        if (win32_post(win32_tid(), 0, msg, a[2], a[3], false)) return 1;
+        win32_set_last_error(1816);                      /* ERROR_NOT_ENOUGH_QUOTA */
+        return 0;
+    }
+    if (h == 0xFFFF) {
+        for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
+            if (g->win[i].fd > 0 && !g->win[i].parent_fd)
+                (void)win32_post(g->win[i].owner_tid ? g->win[i].owner_tid : win32_tid(),
+                                 (uint64_t)g->win[i].fd, msg, a[2], a[3], false);
+        return 1;
+    }
+    struct win32_win *w = 0;
+    if ((h & WIN32_TAG_MASK) == WIN32_CTRL_TAG) {
+        struct win32_ctrl *c = win32_ctrl_find(h);
+        if (c) w = win32_win_find(c->parent_fd);
+    } else if (!(h >> 32)) w = win32_win_find((int)h);
+    if (!w) { win32_set_last_error(1400); return 0; }   /* ERROR_INVALID_WINDOW_HANDLE */
+    if (!win32_post(w->owner_tid ? w->owner_tid : win32_tid(), h, msg, a[2], a[3], false)) {
+        win32_set_last_error(1816);
+        return 0;
+    }
+    return 1;
+}
+/* PostThreadMessageA/W(tid, msg, wParam, lParam): a thread of the process's */
+static long w32_PostThreadMessageA(uint64_t *a) {
+    int tid = (int)(uint32_t)a[0];
+    struct proc *t = tid > 0 ? proc_lookup(tid) : 0;
+    int tg = win32_tgid();
+    if (!t || (t->is_thread ? t->tgid : t->pid) != tg ||
+        t->state == PROC_TERMINATED || t->state == PROC_UNUSED) {
+        win32_set_last_error(1444);                      /* ERROR_INVALID_THREAD_ID */
+        return 0;
+    }
+    if (!win32_post(tid, 0, (uint32_t)a[1], a[2], a[3], false)) { win32_set_last_error(1816); return 0; }
     return 1;
 }
 
@@ -23052,6 +23207,7 @@ static int win32_dlg_build(int dlg_id, uint64_t dlgproc, bool modeless) {
 
     g_win32_ps_lastwin = win32_ps_cur();         /* W7n: the harness's view */
     memset(wslot, 0, sizeof(*wslot));
+    wslot->owner_tid = win32_tid();              /* W7o */
     wslot->fd = fd; wslot->w = cw; wslot->h = ch;
     wslot->wndproc = dlgproc;
     wslot->fill_color = 0x00DCDCDC;     /* dialog face gray */
@@ -24243,19 +24399,23 @@ static long w32_KillTimer(uint64_t *a) {
     }
     return r;
 }
-/* If a timer for window `only_fd` (or any live window when only_fd<=0) is due,
- * fill *m with WM_TIMER + stash the window's WndProc; returns true. */
-static bool win32_timer_poll(int only_fd, struct win32_msg *m) {
+/* A due timer of the thread's that the filters ask for (W7o: a window's
+ * timer is its thread's; a thread timer has no window) -> WM_TIMER in *m,
+ * the window's WndProc stashed; taken (its next time set) when `remove`. */
+static bool win32_message_ok(uint64_t hwnd, uint32_t msg, uint64_t hf, uint32_t lo, uint32_t hi);
+static bool win32_timer_take(uint64_t hf, uint32_t lo, uint32_t hi, bool remove, int me,
+                             struct win32_msg *m) {
     uint64_t now = pit_ticks();
     for (int i = 0; i < WIN32_MAX_TIMERS; i++) {
         struct win32_timer *t = &g_win32_timers[i];
         if (!t->in_use) continue;
-        if (only_fd > 0 && t->fd != only_fd) continue;
         struct win32_win *w = t->fd ? win32_win_find(t->fd) : 0;
         if (t->fd && !w) { t->in_use = false; continue; }   /* window gone -> drop */
         if (!t->fd && t->owner != win32_tgid()) continue;   /* W7j: another's thread timer */
+        if (w && w->owner_tid && w->owner_tid != me) continue;
+        if (!win32_message_ok((uint64_t)t->fd, WM_TIMER, hf, lo, hi)) continue;
         if (now >= t->next) {
-            t->next = now + t->interval;
+            if (remove) t->next = now + t->interval;
             memset(m, 0, sizeof(*m));
             m->hwnd = (uint64_t)t->fd; m->message = WM_TIMER;
             m->wParam = t->id; m->lParam = t->proc;
@@ -24297,7 +24457,9 @@ static long w32_toby_msgsvc(uint64_t *a) {
                 }
             }
         } else if (m.hwnd) {
-            (void)copy_from_user(&proc, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_WNDPROC), 8);
+            struct win32_win *mw = (m.hwnd >> 32) ? 0 : win32_win_find((int)m.hwnd);
+            if (mw) proc = mw->wndproc;                     /* W7o: the message's window */
+            else (void)copy_from_user(&proc, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_WNDPROC), 8);
             kind = proc ? 1 : 0;
         }
         if (!a[2] || copy_to_user((void *)(uintptr_t)a[2], &proc, 8) != 0) return 0;
@@ -29942,6 +30104,15 @@ static const struct win32_shim g_win32_shims[] = {
     { "user32.dll", "ShowWindow",        w32_ShowWindow },
     { "user32.dll", "UpdateWindow",      w32_UpdateWindow },
     { "user32.dll", "GetMessageA",       w32_GetMessageA },
+    /* W7o: posted messages, the filters; the W forms (no text in these) */
+    { "user32.dll", "GetMessageW",       w32_GetMessageA },
+    { "user32.dll", "PeekMessageA",      w32_PeekMessageA },
+    { "user32.dll", "PeekMessageW",      w32_PeekMessageA },
+    { "user32.dll", "PostMessageA",      w32_PostMessageA },
+    { "user32.dll", "PostMessageW",      w32_PostMessageA },
+    { "user32.dll", "PostThreadMessageA", w32_PostThreadMessageA },
+    { "user32.dll", "PostThreadMessageW", w32_PostThreadMessageA },
+    { "user32.dll", "WaitMessage",       w32_WaitMessage },
     { "user32.dll", "TranslateMessage",  w32_TranslateMessage },
     { "user32.dll", "DefWindowProcA",    w32_DefWindowProcA },
     { "user32.dll", "PostQuitMessage",   w32_PostQuitMessage },
