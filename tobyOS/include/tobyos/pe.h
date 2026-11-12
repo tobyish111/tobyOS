@@ -241,6 +241,10 @@ int pe_rt_tls_templates(struct pe_tls_tmpl *out, int cap);
  * for): the caller goes on as before. */
 struct regs;
 bool win32_fault_deliver(struct regs *r);
+/* W7i (src/syscall.c): the page at addr is a guard page whose protection
+ * allows this access (0 read, 1 write, 8 execute): its guard is taken and
+ * the fault is a STATUS_GUARD_PAGE_VIOLATION. */
+bool win32_guard_hit(uint64_t addr, uint32_t access);
 
 /* W3 (src/syscall.c): 1 if tobyOS implements DLL `dll` itself -- a shim names
  * it, or it is an API-set name (api-ms-win-*, ext-ms-win-*) -- so the loader

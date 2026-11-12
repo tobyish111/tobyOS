@@ -27,7 +27,9 @@
  * non-canonical address; divide by zero 0xC0000094 and divide overflow
  * 0xC0000095 told apart by the divisor; ud2 0xC000001D; a privileged
  * instruction 0xC0000096; int3 0x80000003 {0} with Rip back AT the int3; a
- * single step 0x80000004; an SSE exception 0xC000008E.. {0, MXCSR}.
+ * single step 0x80000004; an SSE exception 0xC000008E.. {0, MXCSR}; W7i: a
+ * guard page's first touch 0x80000001 {0 / 1 / 8, the address}, the guard
+ * gone (src/syscall.c's guard map: win32_guard_hit).
  *
  * Linux and native processes never come here (the caller checks the
  * personality); a Win32 process without the runtime, or whose stack cannot
@@ -50,6 +52,7 @@
 #define W32X_PRIV_INSTRUCTION       0xC0000096u
 #define W32X_BREAKPOINT             0x80000003u
 #define W32X_SINGLE_STEP            0x80000004u
+#define W32X_GUARD_PAGE_VIOLATION   0x80000001u
 #define W32X_DATATYPE_MISALIGNMENT  0x80000002u
 #define W32X_STACK_OVERFLOW         0xC00000FDu
 #define W32X_FLT_DENORMAL_OPERAND   0xC000008Du
@@ -329,10 +332,16 @@ bool win32_fault_deliver(struct regs *r) {
         rec.nparams = 2;
         rec.info[0] = (r->error_code & 0x10) ? 8 : (r->error_code & 0x02) ? 1 : 0;
         rec.info[1] = cr2;
+        /* W7i: a guard page (PAGE_GUARD): its first touch */
+        if (win32_guard_hit(cr2, (uint32_t)rec.info[0])) {
+            rec.code = W32X_GUARD_PAGE_VIOLATION;
+            break;
+        }
         /* W7d-2: into the thread's stack guard, the first time: a stack
          * overflow. The guard opens for the dispatch to run in (Windows
          * leaves about as much); a second overflow finds none, and the
-         * process ends with the access violation. */
+         * process ends with the access violation -- W7i: unless
+         * _resetstkoflw closed it again. */
         uint64_t bottom = 0;
         uint32_t spent = 1;
         if (p->gs_base &&
@@ -343,8 +352,9 @@ bool win32_fault_deliver(struct regs *r) {
             (void)copy_to_user((void *)(uintptr_t)(p->gs_base + WIN32_TEB_STACK_SPENT), &spent, 4);
             if (bottom >= USER_STACK_FLOOR_VA)
                 p->win_stack_floor = bottom;            /* the main thread: grow into it */
-            else
-                (void)sys_mprotect(bottom, WIN32_STACK_GUARD_BYTES, 3);   /* a thread's: open it */
+            /* open what is there of it: a thread's guard, or what the main
+             * thread grew into before a _resetstkoflw closed it (W7i) */
+            (void)sys_mprotect(bottom, WIN32_STACK_GUARD_BYTES, 3);
             rec.code = W32X_STACK_OVERFLOW;
         }
         break;
