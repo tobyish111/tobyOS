@@ -7748,9 +7748,21 @@ void _start(void) {
     defined(WINPE30A_BOOT) || defined(WINPE30B_BOOT) || defined(WINPE31A_BOOT) || \
     defined(WINPE32A_BOOT) || defined(WINPE33A_BOOT) || defined(WINPE33B_BOOT) || \
     defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT) || defined(WINPE34A_BOOT) || \
-    defined(WINPE35A_BOOT) || defined(WINPE35B_BOOT) || defined(WINPE36A_BOOT)
+    defined(WINPE35A_BOOT) || defined(WINPE35B_BOOT) || defined(WINPE36A_BOOT) || \
+    defined(WINPE37A_BOOT) || defined(WINPE37B_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
-     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / . W7e:
+     * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / (with
+     * one argument when the entry gives one). W7f:
+     *   37A /bin/win-lj37.exe: a longjmp that unwinds -- a __finally between
+     *       runs, the setjmp caller's own too; the registers come back from
+     *       the jump buffer; a frame of 0 is not unwound; children whose
+     *       longjmp's frame is no frame's establisher (STATUS_BAD_STACK) or
+     *       above them all (STATUS_BAD_FUNCTION_TABLE) -- and the
+     *       consolidation unwind's callback (8 checks), 38.
+     *   37B /bin/win-lua.exe /etc/w37lua.lua: Lua's errors, longjmps out of
+     *       the interpreter (pcall, error objects, the VM's own, nested,
+     *       xpcall, coroutines), each line as Windows 11 prints it, 39.
+     * W7e:
      *   36A /bin/win-jit36.exe: code made at run time -- VirtualAlloc's
      *       reserve/commit/decommit/release as VirtualQuery reports them, a
      *       generated function's unwind information through
@@ -7836,7 +7848,7 @@ void _start(void) {
      *   26C /bin/win-exit26.exe: a secondary thread's ExitProcess(26) must end
      *       the whole process (a kernel that ends only the thread gives 1). */
     {
-        static const struct { const char *tag, *path, *name; int want; const char *what; } w1[] = {
+        static const struct { const char *tag, *path, *name; int want; const char *what, *arg; } w1[] = {
 #ifdef WINPE26A_BOOT
             { "WINPE26A", "/bin/win-modh26.exe", "win-modh26.exe", 26,
               "GetModuleHandleA(NULL) is the slid base" },
@@ -7921,15 +7933,23 @@ void _start(void) {
             { "WINPE36A", "/bin/win-jit36.exe", "win-jit36.exe", 37,
               "code made at run time: VirtualAlloc and the function tables (10 checks)" },
 #endif
+#ifdef WINPE37A_BOOT
+            { "WINPE37A", "/bin/win-lj37.exe", "win-lj37.exe", 38,
+              "longjmp that unwinds, and the consolidation unwind (8 checks)" },
+#endif
+#ifdef WINPE37B_BOOT
+            { "WINPE37B", "/bin/win-lua.exe", "win-lua.exe", 39,
+              "Lua's errors, longjmps out of the interpreter (10 lines as on Windows)", "/etc/w37lua.lua" },
+#endif
         };
         win32_gui_set_log(true);
         for (unsigned i = 0; i < sizeof(w1) / sizeof(w1[0]); i++) {
             kprintf("[boot] %s: spawning %s\n", w1[i].tag, w1[i].path);
-            char *argv[] = { (char *)w1[i].name, 0 };
+            char *argv[] = { (char *)w1[i].name, (char *)w1[i].arg, 0 };
             char *envp[] = { (char *)"PATH=/bin", 0 };
             struct proc_spec spec = {
                 .path = w1[i].path, .name = w1[i].name,
-                .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+                .argc = w1[i].arg ? 2 : 1, .argv = argv, .envc = 1, .envp = envp,
             };
             int pid = proc_spawn(&spec);
             if (pid < 0) {

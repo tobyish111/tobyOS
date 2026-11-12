@@ -2661,6 +2661,16 @@ W36 := programs/win-exc36
 $(W36)/win-jit36.exe: $(W36)/jit36.c $(W36)/jit36s.S
 	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W36)/jit36.c $(W36)/jit36s.S -lntdll
 
+# Track C/W7f: win-lj37.exe (exit 38, as on Windows 11) -- a longjmp that
+# unwinds (a __finally between runs; the registers from the jump buffer; a
+# frame of 0 does not unwind; a frame that is no frame's establisher, or one
+# above them all, ends the process) and the consolidation unwind. Its frames
+# are hand-written (lj37s.S). With it, /etc/w37lua.lua: Lua's errors, which
+# are longjmps, through /bin/win-lua.exe.
+W37 := programs/win-exc37
+$(W37)/win-lj37.exe: $(W37)/lj37.c $(W37)/lj37s.S
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W37)/lj37.c $(W37)/lj37s.S -lntdll
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3211,6 +3221,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-exc35/win-flt35.exe \
                programs/win-exc35/win-so35.exe \
                programs/win-exc36/win-jit36.exe \
+               programs/win-exc37/win-lj37.exe \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3222,6 +3233,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                 initrd/etc/c19b.lua \
                 initrd/etc/c20.lua \
                 initrd/etc/c21.lua \
+                initrd/etc/w37lua.lua \
                initrd/etc/motd initrd/etc/anim.html initrd/etc/webgl.html initrd/etc/input.html initrd/etc/input2.html initrd/etc/fonttest.html initrd/etc/audiotone.html initrd/etc/start.html initrd/etc/egl_vendor.json \
                initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
@@ -3418,6 +3430,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-exc35/win-flt35.exe              $(INITRD_STAGE)/bin/win-flt35.exe
 	cp programs/win-exc35/win-so35.exe               $(INITRD_STAGE)/bin/win-so35.exe
 	cp programs/win-exc36/win-jit36.exe              $(INITRD_STAGE)/bin/win-jit36.exe
+	cp programs/win-exc37/win-lj37.exe               $(INITRD_STAGE)/bin/win-lj37.exe
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -3429,6 +3442,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp initrd/etc/c19b.lua                            $(INITRD_STAGE)/etc/c19b.lua
 	cp initrd/etc/c20.lua                             $(INITRD_STAGE)/etc/c20.lua
 	cp initrd/etc/c21.lua                             $(INITRD_STAGE)/etc/c21.lua
+	cp initrd/etc/w37lua.lua                          $(INITRD_STAGE)/etc/w37lua.lua
 	cp programs/lscpu/lscpu.elf                       $(INITRD_STAGE)/bin/lscpu
 	cp programs/lspci/lspci.elf                       $(INITRD_STAGE)/bin/lspci
 	cp programs/lsusb/lsusb.elf                       $(INITRD_STAGE)/bin/lsusb
@@ -4424,7 +4438,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/libwinpthread-1.dll                                       \
 	    bin/win-exc33.exe bin/win-unc33.exe bin/win-seh33.exe         \
 	    bin/win-top33.exe bin/win-veh34.exe bin/win-flt35.exe         \
-	    bin/win-so35.exe bin/win-jit36.exe                            \
+	    bin/win-so35.exe bin/win-jit36.exe bin/win-lj37.exe           \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
@@ -4529,7 +4543,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/at bin/batch bin/atq bin/atrm                                 \
 	  && tar --format=ustar --mode=0644 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
-	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
+	    etc/c19b.lua etc/c20.lua etc/c21.lua etc/w37lua.lua           \
 	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
 	    etc/Lato-BoldItalic.ttf etc/fallback.otf etc/emoji.ttf        \
 	    etc/DejaVuSerif.ttf etc/DejaVuSerif-Bold.ttf                  \
