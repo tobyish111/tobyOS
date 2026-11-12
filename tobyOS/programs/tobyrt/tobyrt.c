@@ -1383,6 +1383,30 @@ int rt_stdio_common_vsprintf_s(unsigned __int64 o, char *b, size_t n, const char
     return r;
 }
 
+/* W7l: text mode's checked functions -- a descriptor that is not open, a
+ * mode that is not one, a NULL buffer: the handler after (measured on
+ * Windows 11: programs/win-text43) */
+__declspec(dllimport) int __cdecl __toby__setmode(int, int);
+__declspec(dllimport) int __cdecl __toby__set_fmode(int);
+__declspec(dllimport) int __cdecl __toby__get_fmode(int *);
+__declspec(dllimport) int __cdecl __toby__open(const char *, int, int);
+__declspec(dllimport) int __cdecl __toby__close(int);
+__declspec(dllimport) int __cdecl __toby__read(int, void *, unsigned);
+__declspec(dllimport) int __cdecl __toby__write(int, const void *, unsigned);
+__declspec(dllimport) long __cdecl __toby__lseek(int, long, int);
+__declspec(dllimport) __int64 __cdecl __toby__lseeki64(int, __int64, int);
+__declspec(dllimport) int __cdecl __toby__eof(int);
+int rt__setmode(int fd, int m)                    { int r = __toby__setmode(fd, m); rt_iph_after(); return r; }
+int rt__set_fmode(int m)                          { int r = __toby__set_fmode(m); rt_iph_after(); return r; }
+int rt__get_fmode(int *p)                         { int r = __toby__get_fmode(p); rt_iph_after(); return r; }
+int rt__open(const char *p, int f, int m)         { int r = __toby__open(p, f, m); rt_iph_after(); return r; }
+int rt__close(int fd)                             { int r = __toby__close(fd); rt_iph_after(); return r; }
+int rt__read(int fd, void *b, unsigned n)         { int r = __toby__read(fd, b, n); rt_iph_after(); return r; }
+int rt__write(int fd, const void *b, unsigned n)  { int r = __toby__write(fd, b, n); rt_iph_after(); return r; }
+long rt__lseek(int fd, long o, int w)             { long r = __toby__lseek(fd, o, w); rt_iph_after(); return r; }
+__int64 rt__lseeki64(int fd, __int64 o, int w)    { __int64 r = __toby__lseeki64(fd, o, w); rt_iph_after(); return r; }
+int rt__eof(int fd)                               { int r = __toby__eof(fd); rt_iph_after(); return r; }
+
 /* set_terminate / _get_terminate / terminate: the handler is the thread's
  * (the UCRT keeps one a thread); terminate calls it, and aborts when it
  * returns or there is none (abort: exit 3, W7h). */

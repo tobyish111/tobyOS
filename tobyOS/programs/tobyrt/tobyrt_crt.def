@@ -7,3 +7,13 @@ EXPORTS
     __toby_strcat_s
     __toby_stdio_common_vsprintf_s
     __toby_abort
+    __toby__setmode
+    __toby__set_fmode
+    __toby__get_fmode
+    __toby__open
+    __toby__close
+    __toby__read
+    __toby__write
+    __toby__lseek
+    __toby__lseeki64
+    __toby__eof

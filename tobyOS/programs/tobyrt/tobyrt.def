@@ -54,3 +54,13 @@ EXPORTS
     terminate = rt_crt_terminate
     exit = rt_exit
     InitOnceExecuteOnce = rt_InitOnceExecuteOnce
+    _setmode = rt__setmode
+    _set_fmode = rt__set_fmode
+    _get_fmode = rt__get_fmode
+    _open = rt__open
+    _close = rt__close
+    _read = rt__read
+    _write = rt__write
+    _lseek = rt__lseek
+    _lseeki64 = rt__lseeki64
+    _eof = rt__eof

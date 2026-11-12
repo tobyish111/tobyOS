@@ -1368,6 +1368,10 @@ static const char *const g_pe_rt_names[] = {
      * .exe's thread_local destructors at exit) and InitOnceExecuteOnce's */
     "strcpy_s", "strcat_s", "__stdio_common_vsprintf_s",
     "set_terminate", "_get_terminate", "terminate", "exit", "InitOnceExecuteOnce",
+    /* W7l: text mode's checked functions (a bad descriptor or mode calls
+     * the program's invalid-parameter handler) */
+    "_setmode", "_set_fmode", "_get_fmode", "_open", "_close", "_read", "_write",
+    "_lseek", "_lseeki64", "_eof",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)
