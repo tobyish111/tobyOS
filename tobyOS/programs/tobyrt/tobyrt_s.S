@@ -409,3 +409,65 @@ memset:
 	popq	%rdi
 	ret
 	.seh_endproc
+
+/* W7j: ULONG64 rt_call_swallowing(fn, a, b, c, d) -- fn(a, b, c, d), its
+ * exception taken here (a __try / __except (EXCEPTION_EXECUTE_HANDLER) of
+ * rt_C_specific_handler's: the scope's filter field 1 is that constant)
+ * and 0 returned. DispatchMessage calls a TimerProc through it: Windows 11
+ * swallows a TimerProc's exception (the vectored handlers have seen it). */
+	.p2align 4
+	.globl	rt_call_swallowing
+	.def	rt_call_swallowing;	.scl	2;	.type	32;	.endef
+	.seh_proc	rt_call_swallowing
+rt_call_swallowing:
+	subq	$0x28, %rsp
+	.seh_stackalloc	0x28
+	.seh_endprologue
+	movq	%rcx, %rax
+	movq	%rdx, %rcx
+	movq	%r8, %rdx
+	movq	%r9, %r8
+	movq	0x50(%rsp), %r9
+.Lsw_b:
+	callq	*%rax
+	nop
+.Lsw_e:
+	nop
+	jmp	.Lsw_o
+.Lsw_x:
+	xorl	%eax, %eax
+.Lsw_o:
+	addq	$0x28, %rsp
+	ret
+	.seh_handler	rt_C_specific_handler, @except, @unwind
+	.seh_handlerdata
+	.long	1
+	.rva	.Lsw_b
+	.rva	.Lsw_e
+	.long	1
+	.rva	.Lsw_x
+	.text
+	.seh_endproc
+
+/* W7j: ULONG64 rt_call_callback(fn, a, b, c, d) -- fn(a, b, c, d) as the
+ * kernel calls a window procedure back during CreateWindowEx on Windows: an
+ * exception that reaches this frame ends the process (rt_callback_handler). */
+	.p2align 4
+	.globl	rt_call_callback
+	.def	rt_call_callback;	.scl	2;	.type	32;	.endef
+	.seh_proc	rt_call_callback
+rt_call_callback:
+	subq	$0x28, %rsp
+	.seh_stackalloc	0x28
+	.seh_endprologue
+	movq	%rcx, %rax
+	movq	%rdx, %rcx
+	movq	%r8, %rdx
+	movq	%r9, %r8
+	movq	0x50(%rsp), %r9
+	callq	*%rax
+	nop
+	addq	$0x28, %rsp
+	ret
+	.seh_handler	rt_callback_handler, @except
+	.seh_endproc

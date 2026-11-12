@@ -1,0 +1,9 @@
+; tobyrt.dll's imports of the kernel's user32 half (W7j): the window and
+; timer state DispatchMessage, SendMessage and CreateWindowEx ask about, and
+; the kernel's CreateWindowEx and SendMessage (for a control's, a dialog's).
+; The Makefile makes an import library of it with dlltool.
+LIBRARY user32.dll
+EXPORTS
+    __toby_msgsvc
+    __toby_CreateWindowExA
+    __toby_SendMessageA

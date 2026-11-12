@@ -42,3 +42,7 @@ EXPORTS
     RtlPcToFileHeader = rt_RtlPcToFileHeader
     _initterm = rt_initterm
     _initterm_e = rt_initterm_e
+    DispatchMessageA = rt_DispatchMessageA
+    DispatchMessageW = rt_DispatchMessageA
+    SendMessageA = rt_SendMessageA
+    CreateWindowExA = rt_CreateWindowExA

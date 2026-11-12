@@ -21867,6 +21867,7 @@ static long w32_TranslateMessage(uint64_t *a) { (void)a; return 0; }
  * handle WM_CLOSE in its WndProc passes it here, and Windows responds by
  * destroying the window (which then sends WM_DESTROY). */
 static long w32_DefWindowProcA(uint64_t *a) {
+    if ((uint32_t)a[1] == 0x0081 /* WM_NCCREATE */) return 1;   /* W7j: go on creating it */
     if ((uint32_t)a[1] == WM_CLOSE) {
         struct win32_win *w = win32_win_find((int)a[0]);
         if (w) w->destroy = true;
@@ -21880,6 +21881,14 @@ static long w32_DestroyWindow(uint64_t *a) {
     struct win32_win *w = win32_win_find((int)a[0]);
     if (w) w->destroy = true;
     return 1;
+}
+/* W7j: user32!IsWindow(hwnd): one of the program's windows (a dialog's
+ * too) or controls -- a control's token first, its low half may look like
+ * a window's descriptor. */
+static long w32_IsWindow(uint64_t *a) {
+    if (!a[0]) return 0;
+    if (win32_ctrl_find(a[0])) return 1;
+    return win32_win_find((int)a[0]) ? 1 : 0;
 }
 
 /* InvalidateRect(hwnd, &RECT|NULL, erase) -> TRUE. Marks THIS window for a
@@ -23764,34 +23773,52 @@ static bool win32_route_menu_input(int fd, const struct gui_event *ev) {
  * SetTimer registers a periodic WM_TIMER for a window; GetMessage / the dialog
  * pump synthesise the message when the interval elapses (PIT-tick based). */
 #define WIN32_MAX_TIMERS 8
-struct win32_timer { bool in_use; int fd; uint64_t id, interval, next, proc; };
+/* W7j: a timer with no window (SetTimer(NULL, ...)) is its thread group's
+ * (owner) and has an id of the system's. */
+struct win32_timer { bool in_use; int fd, owner; uint64_t id, interval, next, proc; };
 static struct win32_timer g_win32_timers[WIN32_MAX_TIMERS];
+static uint64_t g_win32_thread_timer_id = 0x7F00;
+static int win32_tgid(void) {
+    struct proc *p = current_proc();
+    return p ? (p->is_thread ? p->tgid : p->pid) : 0;
+}
 
 static long w32_SetTimer(uint64_t *a) {
     int fd = (int)a[0]; uint64_t id = a[1], ms = (uint32_t)a[2], proc = a[3];
     uint64_t hz = pit_hz(); if (!hz) hz = 100;
     uint64_t ticks = (ms * hz + 999) / 1000; if (ticks < 1) ticks = 1;
-    for (int i = 0; i < WIN32_MAX_TIMERS; i++)        /* update existing */
-        if (g_win32_timers[i].in_use && g_win32_timers[i].fd == fd && g_win32_timers[i].id == id) {
-            g_win32_timers[i].interval = ticks; g_win32_timers[i].next = pit_ticks() + ticks;
-            g_win32_timers[i].proc = proc; return (long)(id ? id : 1);
+    int tg = win32_tgid();
+    for (int i = 0; i < WIN32_MAX_TIMERS; i++) {      /* update existing */
+        struct win32_timer *t = &g_win32_timers[i];
+        if (t->in_use && t->fd == fd && t->id == id && (fd || t->owner == tg)) {
+            t->interval = ticks; t->next = pit_ticks() + ticks;
+            t->proc = proc; return (long)(fd ? (id ? id : 1) : id);
         }
+    }
+    /* W7j: SetTimer(NULL, nIDEvent, ...) with no such timer of the thread's:
+     * a new one, its id the system's (nIDEvent ignored), as on Windows 11 */
+    if (!fd) id = g_win32_thread_timer_id++;
     for (int i = 0; i < WIN32_MAX_TIMERS; i++)        /* allocate */
         if (!g_win32_timers[i].in_use) {
             g_win32_timers[i].in_use = true; g_win32_timers[i].fd = fd; g_win32_timers[i].id = id;
             g_win32_timers[i].interval = ticks; g_win32_timers[i].next = pit_ticks() + ticks;
-            g_win32_timers[i].proc = proc;
+            g_win32_timers[i].proc = proc; g_win32_timers[i].owner = tg;
             if (g_win32_log_input) kprintf("[winpe] SetTimer hwnd=%d id=%lu %lums\n", fd, (unsigned long)id, (unsigned long)ms);
-            return (long)(id ? id : 1);
+            return (long)(fd ? (id ? id : 1) : id);
         }
     return 0;
 }
+/* KillTimer: TRUE, or (W7j) FALSE for a timer there is not -- the last
+ * error untouched (measured) */
 static long w32_KillTimer(uint64_t *a) {
     int fd = (int)a[0]; uint64_t id = a[1];
-    for (int i = 0; i < WIN32_MAX_TIMERS; i++)
-        if (g_win32_timers[i].in_use && g_win32_timers[i].fd == fd && g_win32_timers[i].id == id)
-            g_win32_timers[i].in_use = false;
-    return 1;
+    int tg = win32_tgid();
+    long r = 0;
+    for (int i = 0; i < WIN32_MAX_TIMERS; i++) {
+        struct win32_timer *t = &g_win32_timers[i];
+        if (t->in_use && t->fd == fd && t->id == id && (fd || t->owner == tg)) { t->in_use = false; r = 1; }
+    }
+    return r;
 }
 /* If a timer for window `only_fd` (or any live window when only_fd<=0) is due,
  * fill *m with WM_TIMER + stash the window's WndProc; returns true. */
@@ -23801,19 +23828,77 @@ static bool win32_timer_poll(int only_fd, struct win32_msg *m) {
         struct win32_timer *t = &g_win32_timers[i];
         if (!t->in_use) continue;
         if (only_fd > 0 && t->fd != only_fd) continue;
-        struct win32_win *w = win32_win_find(t->fd);
-        if (!w) { t->in_use = false; continue; }     /* window gone -> drop */
+        struct win32_win *w = t->fd ? win32_win_find(t->fd) : 0;
+        if (t->fd && !w) { t->in_use = false; continue; }   /* window gone -> drop */
+        if (!t->fd && t->owner != win32_tgid()) continue;   /* W7j: another's thread timer */
         if (now >= t->next) {
             t->next = now + t->interval;
             memset(m, 0, sizeof(*m));
             m->hwnd = (uint64_t)t->fd; m->message = WM_TIMER;
             m->wParam = t->id; m->lParam = t->proc;
-            win32_stash_wndproc(w);
+            if (w) win32_stash_wndproc(w);
             return true;
         }
     }
     return false;
 }
+/* ---- W7j: __toby_msgsvc(op, a, b) -- what tobyrt.dll's DispatchMessage,
+ * SendMessage and CreateWindowEx (programs/tobyrt) ask of the windows and
+ * timers kept here; they make the calls of the program's code themselves.
+ *   1 RESOLVE(MSG *, &proc): 2 -- a TimerProc: a WM_TIMER whose lParam is
+ *     the TimerProc of a timer of that window (or the thread's, hwnd NULL)
+ *     with that id; such a WM_TIMER with none is dispatched nowhere (0), as
+ *     Windows 11 does; 1 -- the window procedure GetMessage published for
+ *     the message (C7's slot, which the old trampoline called); 0 -- a
+ *     message with no window.
+ *   2 WNDPROC(hwnd, &proc): 1 -- the program's own window (not a dialog's,
+ *     not a control) and its procedure.
+ *   3 ABORT(hwnd): a window whose WM_NCCREATE or WM_CREATE said no -- gone
+ *     now, with no WM_DESTROY of its own (tobyrt.dll sent them). */
+static long w32_toby_msgsvc(uint64_t *a) {
+    switch ((uint32_t)a[0]) {
+    case 1: {
+        struct { uint64_t hwnd; uint32_t message, pad; uint64_t wParam, lParam; } m;
+        if (copy_from_user(&m, (const void *)(uintptr_t)a[1], sizeof m) != 0) return 0;
+        uint64_t proc = 0;
+        long kind = 0;
+        if (m.message == WM_TIMER && m.lParam) {
+            int tg = win32_tgid();
+            for (int i = 0; i < WIN32_MAX_TIMERS; i++) {
+                struct win32_timer *t = &g_win32_timers[i];
+                if (t->in_use && (uint64_t)(int64_t)t->fd == m.hwnd && t->id == m.wParam &&
+                    t->proc == m.lParam && (t->fd || t->owner == tg)) {
+                    proc = t->proc;
+                    kind = 2;
+                    break;
+                }
+            }
+        } else if (m.hwnd) {
+            (void)copy_from_user(&proc, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_WNDPROC), 8);
+            kind = proc ? 1 : 0;
+        }
+        if (!a[2] || copy_to_user((void *)(uintptr_t)a[2], &proc, 8) != 0) return 0;
+        return kind;
+    }
+    case 2: {
+        if (win32_ctrl_find(a[1])) return 0;
+        struct win32_win *w = win32_win_find((int)a[1]);
+        uint64_t proc = (w && !w->is_dialog) ? w->wndproc : 0;
+        if (!proc || !a[2] || copy_to_user((void *)(uintptr_t)a[2], &proc, 8) != 0) return 0;
+        return 1;
+    }
+    case 3: {
+        struct win32_win *w = win32_ctrl_find(a[1]) ? 0 : win32_win_find((int)a[1]);
+        if (!w) return 0;
+        int fd = w->fd;
+        w->fd = 0; w->destroy = false; w->needs_paint = false;
+        (void)sys_close(fd);
+        return 1;
+    }
+    }
+    return 0;
+}
+
 /* Clear process-global menu + timer state on a fresh GUI app (alongside the
  * g_win32_gui memset; HMENU/timer tokens don't survive a process exit). */
 static void win32_reset_menus_timers(void) {
@@ -27738,6 +27823,10 @@ static const struct win32_shim g_win32_shims[] = {
 
     /* ---- C13: more controls + dialogs (user32) ---- */
     { "user32.dll", "SendMessageA",           w32_SendMessageA },
+    { "user32.dll", "__toby_msgsvc",          w32_toby_msgsvc },      /* W7j: tobyrt.dll's */
+    { "user32.dll", "__toby_CreateWindowExA", w32_CreateWindowExA },
+    { "user32.dll", "__toby_SendMessageA",    w32_SendMessageA },
+    { "user32.dll", "IsWindow",               w32_IsWindow },
     { "user32.dll", "DrawTextA",              w32_DrawTextA },
     { "user32.dll", "MessageBoxA",            w32_MessageBoxA },
     { "user32.dll", "SetScrollRange",         w32_SetScrollRange },

@@ -531,16 +531,22 @@ static const uint8_t g_win32_fail_entry[] = {
 /* _execute_onexit_table(table) (W3, same source file): call the functions in
  * [_first, _last) from the last to the first, skipping NULLs, then clear the
  * table's three pointers; returns 0. rbx/rsi/rdi are the x64 ABI's
- * callee-saved registers, so the walk survives each call. */
+ * callee-saved registers, so the walk survives each call. W7j (logs/w32/
+ * w7j-tramp.S): each entry comes off the table (_last moves down) before it
+ * is called, so an exception out of one leaves the rest for the next exit()
+ * -- and the stub function table describes this frame. */
 static const uint8_t g_win32_onexit_exec[] = {
     0x53, 0x56, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0xcf, 0x48, 0x8b,
-    0x1f, 0x48, 0x8b, 0x77, 0x08, 0x48, 0x39, 0xde, 0x76, 0x10, 0x48, 0x83,
-    0xee, 0x08, 0x48, 0x8b, 0x06, 0x48, 0x85, 0xc0, 0x74, 0xef, 0xff, 0xd0,
-    0xeb, 0xeb, 0x31, 0xc0, 0x48, 0x89, 0x07, 0x48, 0x89, 0x47, 0x08, 0x48,
-    0x89, 0x47, 0x10, 0x48, 0x83, 0xc4, 0x20, 0x5f, 0x5e, 0x5b, 0xc3,
+    0x1f, 0x48, 0x8b, 0x77, 0x08, 0x48, 0x39, 0xde, 0x76, 0x14, 0x48, 0x83,
+    0xee, 0x08, 0x48, 0x89, 0x77, 0x08, 0x48, 0x8b, 0x06, 0x48, 0x85, 0xc0,
+    0x74, 0xeb, 0xff, 0xd0, 0xeb, 0xe7, 0x31, 0xc0, 0x48, 0x89, 0x07, 0x48,
+    0x89, 0x47, 0x08, 0x48, 0x89, 0x47, 0x10, 0x48, 0x83, 0xc4, 0x20, 0x5f,
+    0x5e, 0x5b, 0xc3,
 };
-/* W4, W5: the loader's CPL3 half (logs/w32/w7g-ldr.S, which describes it --
- * W7g's change of logs/w32/w5-ldr.S, assembled the same way):
+/* W4, W5: the loader's CPL3 half (logs/w32/w7j-ldr.S, which describes it --
+ * W7j's change of W7g's logs/w32/w7g-ldr.S, itself W7g's of logs/w32/w5-ldr.S,
+ * assembled the same way; W7j: the C runtime's exit keeps rsi and its atexit
+ * table, and has unwind information):
  * LoadLibraryA/W/ExA/ExW, FreeLibrary, ExitThread, ExitProcess,
  * FreeLibraryAndExitThread, where CreateThread starts a thread, where a
  * process with DLLs or TLS callbacks starts, and (W7) the C runtime's exit,
@@ -589,9 +595,9 @@ static const uint8_t g_win32_ldr_stubs[] = {
     0xb9, 0x09, 0x00, 0x00, 0x00, 0x89, 0xf2, 0x45, 0x31, 0xc0, 0x4c, 0x8d,
     0x4c, 0x24, 0x20, 0xe8, 0x89, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x4c, 0x24,
     0x20, 0xe8, 0x8b, 0x00, 0x00, 0x00, 0xb9, 0x0a, 0x00, 0x00, 0x00, 0x89,
-    0xf2, 0xe8, 0x73, 0x00, 0x00, 0x00, 0x0f, 0x0b, 0x48, 0x83, 0xe4, 0xf0,
-    0x48, 0x83, 0xec, 0x20, 0x89, 0xce, 0x48, 0xb8, 0x30, 0x80, 0x00, 0x31,
-    0x00, 0x00, 0x00, 0x00, 0x31, 0xc9, 0x48, 0x87, 0x08, 0x48, 0x85, 0xc9,
+    0xf2, 0xe8, 0x73, 0x00, 0x00, 0x00, 0x0f, 0x0b, 0x56, 0x48, 0x83, 0xec,
+    0x20, 0x0f, 0x1f, 0x00, 0x89, 0xce, 0x48, 0xb8, 0x30, 0x80, 0x00, 0x31,
+    0x00, 0x00, 0x00, 0x00, 0x31, 0xc9, 0x48, 0x8b, 0x08, 0x48, 0x85, 0xc9,
     0x74, 0x0c, 0x48, 0xb8, 0xc0, 0x02, 0x00, 0x30, 0x00, 0x00, 0x00, 0x00,
     0xff, 0xd0, 0x89, 0xf1, 0xeb, 0x99, 0x48, 0x81, 0xec, 0x38, 0x03, 0x00,
     0x00, 0xb9, 0x05, 0x00, 0x00, 0x00, 0x31, 0xd2, 0x45, 0x31, 0xc0, 0x4c,
@@ -626,13 +632,18 @@ static const uint8_t g_win32_ldr_stubs[] = {
 #define WIN32_LDR_RUN_NEXT     0x2C2
 #define WIN32_LDR_RUN_RAISED   0x2F4
 #define WIN32_LDR_RUN_CTL_SLOT 0x20
+#define WIN32_LDR_CRT_EXIT_OFF 0x1E8   /* W7j: ldr_crt_exit, to its jmp's end */
+#define WIN32_LDR_CRT_EXIT_END 0x216
 _Static_assert(sizeof(g_win32_ldr_stubs) == WIN32_LDR_RUN_END, "ldr_run ends the loader stubs");
 
 /* W7g: the stub function table (pe.h, WIN32_STUBTAB_VA): RUNTIME_FUNCTIONs
  * and UNWIND_INFOs for the DispatchMessage trampoline (sub rsp,0x28), the
  * dialog trampoline (push rbx; sub rsp,0x60) and ldr_run (six pushes; sub
  * rsp,0x28; a handler with {ldr_run_raised, ldr_run_next, the control
- * word's slot} as its data), and the handler trampoline:
+ * word's slot} as its data) -- W7j: and the onexit executor (three pushes;
+ * sub rsp,0x20) and the C runtime's exit (push rsi; sub rsp,0x20), so that
+ * an atexit function's exception goes on to exit()'s caller -- and the
+ * handler trampoline:
  *   movabs rax, &module table's WIN32_MT_LDR_HANDLER ; mov rax, [rax]
  *   test rax, rax ; jz 1f ; jmp rax ; 1: mov eax, 1 (ExceptionContinueSearch) ; ret */
 static void pe_write_stubtab(void) {
@@ -640,7 +651,8 @@ static void pe_write_stubtab(void) {
     memset(t, 0, sizeof t);
     const uint8_t *lr = g_win32_ldr_stubs;
     if (lr[WIN32_LDR_RUN_OFF] != 0x53 || lr[WIN32_LDR_RUN_RAISED] != 0x44 ||
-        lr[WIN32_LDR_RUN_NEXT] != 0x49 || g_win32_dispatch_stub[0] != 0x48 || g_win32_dlg_tramp[0] != 0x53) {
+        lr[WIN32_LDR_RUN_NEXT] != 0x49 || g_win32_dispatch_stub[0] != 0x48 || g_win32_dlg_tramp[0] != 0x53 ||
+        lr[WIN32_LDR_CRT_EXIT_OFF] != 0x56 || g_win32_onexit_exec[0] != 0x53) {
         kprintf("[pe] the stub function table does not match the stubs; none written\n");
         memcpy((void *)WIN32_STUBTAB_VA, t, sizeof t);
         return;
@@ -653,10 +665,14 @@ static void pe_write_stubtab(void) {
     static const uint8_t ui_run[]  = { 0x19, 0x0D, 0x07, 0x00,             /* E|U handler */
                                        0x0D, 0x42, 0x09, 0xE0, 0x07, 0xD0, 0x05, 0xC0,
                                        0x03, 0x70, 0x02, 0x60, 0x01, 0x30, 0x00, 0x00 };
-    const uint32_t o_disp = 0x40, o_dlg = 0x50, o_run = 0x60, o_tramp = 0xA0;
+    static const uint8_t ui_onexit[] = { 0x01, 0x07, 0x04, 0x00, 0x07, 0x32, 0x03, 0x70, 0x02, 0x60, 0x01, 0x30 };
+    static const uint8_t ui_crt[]    = { 0x01, 0x05, 0x02, 0x00, 0x05, 0x32, 0x01, 0x60 };
+    const uint32_t o_disp = 0x50, o_dlg = 0x60, o_run = 0x70, o_tramp = 0xA0, o_onexit = 0xC0, o_crt = 0xD0;
     memcpy(t + o_disp, ui_disp, sizeof ui_disp);
     memcpy(t + o_dlg, ui_dlg, sizeof ui_dlg);
     memcpy(t + o_run, ui_run, sizeof ui_run);
+    memcpy(t + o_onexit, ui_onexit, sizeof ui_onexit);
+    memcpy(t + o_crt, ui_crt, sizeof ui_crt);
     uint32_t hd[4] = { tab + o_tramp, ldr + WIN32_LDR_RUN_RAISED, ldr + WIN32_LDR_RUN_NEXT,
                        WIN32_LDR_RUN_CTL_SLOT };
     memcpy(t + o_run + sizeof ui_run, hd, sizeof hd);
@@ -665,15 +681,21 @@ static void pe_write_stubtab(void) {
                      0x74, 0x02, 0xFF, 0xE0, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
     memcpy(tr + 2, &slot, 8);
     memcpy(t + o_tramp, tr, sizeof tr);
-    uint32_t rf[3][3] = {
+    const uint32_t onx = (uint32_t)(WIN32_ONEXIT_EXEC_VA - WIN32_SHIM_BASE);
+    uint32_t rf[5][3] = {
         { (uint32_t)WIN32_DISPATCH_OFF, (uint32_t)(WIN32_DISPATCH_OFF + WIN32_DISPATCH_SIZE), tab + o_disp },
         { (uint32_t)WIN32_DLGTRAMP_OFF, (uint32_t)(WIN32_DLGTRAMP_OFF + WIN32_DLG_TRAMP_SIZE), tab + o_dlg },
+        { onx, onx + (uint32_t)sizeof g_win32_onexit_exec, tab + o_onexit },
+        { ldr + WIN32_LDR_CRT_EXIT_OFF, ldr + WIN32_LDR_CRT_EXIT_END, tab + o_crt },
         { ldr + WIN32_LDR_RUN_OFF, ldr + WIN32_LDR_RUN_END, tab + o_run },
     };
     _Static_assert(WIN32_DISPATCH_OFF < WIN32_DLGTRAMP_OFF &&
-                   WIN32_DLGTRAMP_OFF < WIN32_LDR_STUBS_VA - WIN32_SHIM_BASE, "the entries go by address");
+                   WIN32_DLGTRAMP_OFF < WIN32_ONEXIT_EXEC_VA - WIN32_SHIM_BASE &&
+                   WIN32_ONEXIT_EXEC_VA < WIN32_LDR_STUBS_VA &&
+                   WIN32_LDR_CRT_EXIT_END <= WIN32_LDR_RUN_OFF, "the entries go by address");
+    _Static_assert(0x10 + 5 * 12 <= 0x50, "the RUNTIME_FUNCTIONs end before the first UNWIND_INFO");
     memcpy(t + 0x10, rf, sizeof rf);
-    uint32_t hdr[2] = { 3, WIN32_STUBTAB_MAGIC };
+    uint32_t hdr[2] = { 5, WIN32_STUBTAB_MAGIC };
     memcpy(t, hdr, sizeof hdr);
     memcpy((void *)WIN32_STUBTAB_VA, t, sizeof t);
 }
@@ -1335,6 +1357,10 @@ static const char *const g_pe_rt_names[] = {
     "__intrinsic_setjmp", "__intrinsic_setjmpex", "_setjmp", "_setjmpex", "setjmp", "longjmp",
     /* W7h */
     "RtlPcToFileHeader", "_initterm", "_initterm_e",
+    /* W7j: user32's calls of the program's own code (a TimerProc, its own
+     * window's procedure, CreateWindowEx's creation messages); the C7
+     * DispatchMessage trampoline is the fallback without the runtime */
+    "DispatchMessageA", "DispatchMessageW", "SendMessageA", "CreateWindowExA",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)

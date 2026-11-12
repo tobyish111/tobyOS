@@ -1210,3 +1210,113 @@ LONG rt_UnhandledExceptionFilter(EXCEPTION_POINTERS *ep) {
     if (ep && ep->ExceptionRecord) rt_report(ep->ExceptionRecord);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+
+/* ---- W7j: user32's calls of the program's own code ---------------------- *
+ * On Windows the window procedure, a TimerProc and the CREATESTRUCT
+ * messages are called by user32 in the caller's thread, and an exception in
+ * them goes where Windows 11 sends it (measured: programs/win-msg41,
+ * logs/w32/w7j-host-run.txt):
+ *   - DispatchMessage: a WM_TIMER naming a TimerProc is a call of it -- if a
+ *     timer of the window (or the thread) has that TimerProc, else nothing --
+ *     with (hwnd, WM_TIMER, id, the time), its exception swallowed; any
+ *     other message the window procedure's, its exception the caller's;
+ *   - SendMessage to the program's own window: a call of its window
+ *     procedure, the exception the caller's;
+ *   - CreateWindowEx: WM_GETMINMAXINFO, WM_NCCREATE (FALSE: WM_NCDESTROY, no
+ *     window), WM_NCCALCSIZE, WM_CREATE (-1: WM_DESTROY, WM_NCDESTROY, no
+ *     window) before it returns -- through a kernel callback on Windows, and
+ *     an exception that leaves them ends the process with 0xC000041D after
+ *     the top-level filter (whatever it answers); the caller's handlers are
+ *     not asked.
+ * The kernel keeps the windows, the timers and the controls (src/syscall.c,
+ * __toby_msgsvc); these do the calls. */
+#define RT_MSG_RESOLVE 1                     /* (MSG *, &proc): 1 window procedure, 2 TimerProc, 0 none */
+#define RT_MSG_WNDPROC 2                     /* (hwnd, &proc): 1 if the program's own window has one */
+#define RT_MSG_ABORT   3                     /* (hwnd): a window whose creation was refused, gone */
+#define RT_STATUS_FATAL_USER_CALLBACK_EXCEPTION 0xC000041Du
+typedef LRESULT (WINAPI *RT_WNDPROC)(HWND, UINT, WPARAM, LPARAM);
+__declspec(dllimport) LONG_PTR WINAPI __toby_msgsvc(UINT op, const void *a, void *b);
+__declspec(dllimport) HWND WINAPI __toby_CreateWindowExA(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int,
+                                                        HWND, HMENU, HINSTANCE, LPVOID);
+__declspec(dllimport) LRESULT WINAPI __toby_SendMessageA(HWND, UINT, WPARAM, LPARAM);
+/* tobyrt_s.S: fn(a, b, c, d) under a frame that swallows an exception (0
+ * then), and under the kernel-callback frame (rt_callback_handler's) */
+extern ULONG64 rt_call_swallowing(ULONG64 fn, ULONG64 a, ULONG64 b, ULONG64 c, ULONG64 d);
+extern ULONG64 rt_call_callback(ULONG64 fn, ULONG64 a, ULONG64 b, ULONG64 c, ULONG64 d);
+
+/* The kernel-callback frame's handler: an exception reaching it ends the
+ * process -- the top-level filter first, its answer not asked (measured: a
+ * filter returning EXCEPTION_EXECUTE_HANDLER, or none at all, makes no
+ * difference). */
+EXCEPTION_DISPOSITION rt_callback_handler(EXCEPTION_RECORD *rec, ULONG64 frame, CONTEXT *ctx,
+                                          DISPATCHER_CONTEXT *dc) {
+    (void)frame;
+    (void)dc;
+    if (rec->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)) return ExceptionContinueSearch;
+    LPTOP_LEVEL_EXCEPTION_FILTER f = g_top_filter;
+    if (f) {
+        EXCEPTION_POINTERS ep = { rec, ctx };
+        (void)f(&ep);
+    }
+    rt_terminate(RT_STATUS_FATAL_USER_CALLBACK_EXCEPTION);
+}
+
+LRESULT rt_DispatchMessageA(const MSG *m) {
+    ULONG64 proc = 0;
+    LONG_PTR kind = __toby_msgsvc(RT_MSG_RESOLVE, m, &proc);
+    if (kind == 2)
+        return (LRESULT)rt_call_swallowing(proc, (ULONG64)m->hwnd, WM_TIMER, m->wParam, GetTickCount());
+    if (kind == 1 && proc)
+        return ((RT_WNDPROC)proc)(m->hwnd, m->message, m->wParam, m->lParam);
+    return 0;
+}
+
+LRESULT rt_SendMessageA(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    ULONG64 proc = 0;
+    if (__toby_msgsvc(RT_MSG_WNDPROC, h, &proc) == 1 && proc)
+        return ((RT_WNDPROC)proc)(h, msg, w, l);
+    return __toby_SendMessageA(h, msg, w, l);       /* a control's, a dialog's: the kernel's */
+}
+
+HWND rt_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y, int cx, int cy,
+                        HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
+    HWND h = __toby_CreateWindowExA(ex, cls, name, style, x, y, cx, cy, parent, menu, inst, param);
+    ULONG64 proc = 0;
+    if (!h || __toby_msgsvc(RT_MSG_WNDPROC, h, &proc) != 1 || !proc) return h;
+    CREATESTRUCTA cs;
+    cs.lpCreateParams = param;
+    cs.hInstance = inst;
+    cs.hMenu = menu;
+    cs.hwndParent = parent;
+    cs.cy = cy;
+    cs.cx = cx;
+    cs.y = y;
+    cs.x = x;
+    cs.style = (LONG)style;
+    cs.lpszName = name;
+    cs.lpszClass = cls;
+    cs.dwExStyle = ex;
+    MINMAXINFO mmi;
+    mmi.ptReserved.x = cx;   mmi.ptReserved.y = cy;
+    mmi.ptMaxSize.x = 1024;  mmi.ptMaxSize.y = 768;
+    mmi.ptMaxPosition.x = 0; mmi.ptMaxPosition.y = 0;
+    mmi.ptMinTrackSize.x = 0; mmi.ptMinTrackSize.y = 0;
+    mmi.ptMaxTrackSize.x = 4096; mmi.ptMaxTrackSize.y = 4096;
+    ULONG64 hw = (ULONG64)h;
+    (void)rt_call_callback(proc, hw, WM_GETMINMAXINFO, 0, (ULONG64)&mmi);
+    if (!(LRESULT)rt_call_callback(proc, hw, WM_NCCREATE, 0, (ULONG64)&cs)) {
+        (void)rt_call_callback(proc, hw, WM_NCDESTROY, 0, 0);
+        (void)__toby_msgsvc(RT_MSG_ABORT, h, 0);
+        return 0;
+    }
+    RECT rc;
+    rc.left = x; rc.top = y; rc.right = x + cx; rc.bottom = y + cy;
+    (void)rt_call_callback(proc, hw, WM_NCCALCSIZE, FALSE, (ULONG64)&rc);
+    if ((LRESULT)rt_call_callback(proc, hw, WM_CREATE, 0, (ULONG64)&cs) == -1) {
+        (void)rt_call_callback(proc, hw, WM_DESTROY, 0, 0);
+        (void)rt_call_callback(proc, hw, WM_NCDESTROY, 0, 0);
+        (void)__toby_msgsvc(RT_MSG_ABORT, h, 0);
+        return 0;
+    }
+    return h;
+}

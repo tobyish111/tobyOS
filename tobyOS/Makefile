@@ -2628,19 +2628,22 @@ $(W33)/win-top33.exe: $(W33)/top33.c $(W33)/seh33s.S
 # x64 unwinder (RtlLookupFunctionEntry, RtlVirtualUnwind, RtlUnwindEx),
 # RtlCaptureContext/RtlRestoreContext, __C_specific_handler and the top-level
 # exception filter. The loader binds those names, imported from any built-in
-# DLL, to it (src/pe_loader.c: g_pe_rt_names). Freestanding: it imports four
-# kernel32 functions and nothing else; unwind tables for every function (a
+# DLL, to it (src/pe_loader.c: g_pe_rt_names). Freestanding: it imports a
+# few kernel32 functions and (W7j) three of the kernel's user32 half, through
+# an import library dlltool makes of tobyrt_user32.def; unwind tables for every function (a
 # walk goes through its own frames: -fasynchronous-unwind-tables, which
 # -ffreestanding would otherwise drop); no sibling calls (a frame that
 # captured its own context must stay); no entry point; no fixups (all its
 # addressing is RIP-relative), so it has a base of its own, just above the
 # loader's fixed Win32 pages (pe.h: 0x30000000..0x32000000).
 TRT := programs/tobyrt
-$(TRT)/tobyrt.dll: $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def
+$(TRT)/libtobyrt_user32.a: $(TRT)/tobyrt_user32.def
+	TMP='C:\t' TEMP='C:\t' dlltool -m i386:x86-64 -d $< -l $@
+$(TRT)/tobyrt.dll: $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def $(TRT)/libtobyrt_user32.a
 	$(CC) --target=x86_64-w64-mingw32 -O2 -Wall -Wextra -shared -nostdlib -ffreestanding \
 	      -fasynchronous-unwind-tables -fno-builtin -fno-optimize-sibling-calls \
 	      -fno-stack-protector -mno-stack-arg-probe \
-	      -o $@ $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def -lkernel32 \
+	      -o $@ $(TRT)/tobyrt.c $(TRT)/tobyrt_s.S $(TRT)/tobyrt.def -lkernel32 $(TRT)/libtobyrt_user32.a \
 	      -Wl,-e,0 -Wl,--image-base,0x32000000
 
 # Track C/W7c: win-veh34.exe (exit 34, as on Windows 11) -- vectored exception
