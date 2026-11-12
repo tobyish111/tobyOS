@@ -38,3 +38,4 @@ EXPORTS
     _setjmpex = rt_setjmp
     setjmp = rt_setjmp
     longjmp = rt_longjmp
+    __toby_ldr_handler = rt_ldr_handler

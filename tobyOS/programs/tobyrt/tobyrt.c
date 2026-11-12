@@ -48,6 +48,8 @@
 /* include/tobyos/pe.h */
 #define RT_SHIM_LO        0x0000000030000000ULL   /* WIN32_SHIM_BASE */
 #define RT_SHIM_HI        0x0000000030006000ULL   /* WIN32_MISSING_END_VA */
+#define RT_STUBTAB        0x0000000030000C00ULL   /* W7g: WIN32_STUBTAB_VA */
+#define RT_STUBTAB_MAGIC  0x37425453u             /* WIN32_STUBTAB_MAGIC */
 #define RT_MODTAB         0x0000000031008000ULL   /* WIN32_MODTAB_BASE */
 #define RT_MT_MOD_COUNT   0x024
 #define RT_MT_MODS        0x200
@@ -354,9 +356,27 @@ static PRUNTIME_FUNCTION rt_dyn_lookup(ULONG64 pc, PULONG64 base) {
  * of its image's array, which is sorted by address), NULL for none -- a leaf
  * function; a pc no image holds, the run-time tables' (W7e). The history
  * table is optional and not used. */
+/* W7g: a pc in the shim area -- one of the loader's CPL3 stubs: its entry in
+ * the stub function table (pe.h, WIN32_STUBTAB_VA), or none (the top of the
+ * stack: a thread's first frame). */
+static PRUNTIME_FUNCTION rt_stub_lookup(ULONG64 pc) {
+    const DWORD *h = (const DWORD *)RT_STUBTAB;
+    if (h[1] != RT_STUBTAB_MAGIC || h[0] > 16) return 0;
+    RUNTIME_FUNCTION *t = (RUNTIME_FUNCTION *)(RT_STUBTAB + 0x10);
+    DWORD rva = (DWORD)(pc - RT_SHIM_LO);
+    for (DWORD i = 0; i < h[0]; i++)
+        if (rva >= t[i].BeginAddress && rva < t[i].EndAddress) return &t[i];
+    return 0;
+}
+
 PRUNTIME_FUNCTION rt_RtlLookupFunctionEntry(ULONG64 pc, PULONG64 image_base,
                                             PUNWIND_HISTORY_TABLE hist) {
     (void)hist;
+    if (rt_is_system_pc(pc)) {
+        PRUNTIME_FUNCTION f = rt_stub_lookup(pc);
+        if (image_base) *image_base = f ? RT_SHIM_LO : 0;
+        return f;
+    }
     ULONG64 size = 0, base = rt_module_of(pc, &size, 0);
     if (image_base) *image_base = base;
     if (!base) {                              /* W7e: code made at run time */
@@ -626,10 +646,11 @@ __attribute__((noinline)) static int rt_dispatch(EXCEPTION_RECORD *rec, CONTEXT 
     ULONG64 lo = orig->Rsp, hi = rt_stack_base(), nested = 0;
     for (int depth = 0; depth < 100000; depth++) {
         ULONG64 pc = ctx.Rip;
-        if (!pc || rt_is_system_pc(pc)) return 0;           /* the top of the stack */
+        if (!pc) return 0;                                  /* the top of the stack */
         if (ctx.Rsp < lo || ctx.Rsp >= hi || (ctx.Rsp & 7)) break;
         ULONG64 base;
         PRUNTIME_FUNCTION fe = rt_RtlLookupFunctionEntry(pc, &base, 0);
+        if (!fe && rt_is_system_pc(pc)) return 0;           /* so is a stub with no entry (W7g) */
         if (!fe) {                                          /* a leaf: [rsp] is the return */
             ctx.Rip = *(const ULONG64 *)ctx.Rsp;
             ctx.Rsp += 8;
@@ -843,13 +864,13 @@ __attribute__((noinline)) static void rt_unwind_loop(ULONG64 target, ULONG64 tip
     ULONG64 lo = cur->Rsp, hi = rt_stack_base();
     for (int depth = 0; ; depth++) {
         ULONG64 pc = cur->Rip;
-        if (!pc || rt_is_system_pc(pc) || depth > 100000) {
+        ULONG64 base = 0;
+        PRUNTIME_FUNCTION fe = pc ? rt_RtlLookupFunctionEntry(pc, &base, hist) : 0;
+        if (!pc || (!fe && rt_is_system_pc(pc)) || depth > 100000) {   /* the top (W7g: a stub with no entry) */
             if (to_end) return;
             rt_raise_status(RT_STATUS_BAD_FUNCTION_TABLE);      /* W7f: as Windows 11 */
         }
         if (cur->Rsp < lo || cur->Rsp >= hi || (cur->Rsp & 7)) rt_raise_status(RT_STATUS_BAD_STACK);
-        ULONG64 base;
-        PRUNTIME_FUNCTION fe = rt_RtlLookupFunctionEntry(pc, &base, hist);
         next = *cur;
         if (!fe) {
             next.Rip = *(const ULONG64 *)next.Rsp;
@@ -1024,6 +1045,51 @@ __attribute__((noreturn)) void rt_longjmp(const struct rt_jump_buffer *jb, int v
     rec.ExceptionInformation[0] = (ULONG_PTR)jb;
     rt_RtlUnwind((PVOID)jb->Frame, (PVOID)jb->Rip, &rec, (PVOID)(ULONG_PTR)(ULONG)value);
     rt_terminate(RT_STATUS_BAD_STACK);              /* an unwind does not come back */
+}
+
+/* ---- the loader's DllMain calls (W7g) ---------------------------------- */
+
+/* The handler of the loader stubs' ldr_run frame -- where every DllMain and
+ * TLS callback is called from (pe_loader.c's stub function table names it,
+ * through a trampoline reading the module table). What Windows 11 does with
+ * an exception such a call lets out (measured: programs/win-exc38,
+ * logs/w32/w7g-host-run.txt), by the call's reason and lpReserved (the
+ * control word ldr_run keeps in its frame; the handler data says where, and
+ * where the two landings are):
+ *   DLL_PROCESS_ATTACH -- the loader takes it: LoadLibrary fails
+ *     (ERROR_DLL_INIT_FAILED, and that DLL is not called with
+ *     DLL_PROCESS_DETACH), or the process's start does (STATUS_DLL_INIT_FAILED):
+ *     unwound to ldr_run_raised;
+ *   DLL_PROCESS_DETACH from FreeLibrary (lpReserved NULL) -- taken, and on
+ *     with the next call (FreeLibrary succeeds): unwound to ldr_run_next;
+ *     at the process's exit (lpReserved set) -- not taken: unhandled;
+ *   DLL_THREAD_ATTACH -- the process ends with the code, the top-level
+ *     filter not asked;
+ *   DLL_THREAD_DETACH -- not taken: unhandled. */
+EXCEPTION_DISPOSITION rt_ldr_handler(EXCEPTION_RECORD *rec, ULONG64 frame, CONTEXT *ctx,
+                                     DISPATCHER_CONTEXT *dc) {
+    (void)ctx;
+    if (rec->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)) return ExceptionContinueSearch;
+    const DWORD *hd = (const DWORD *)dc->HandlerData;   /* raised, next (RVAs), the control word's slot */
+    ULONG64 ctl = *(const ULONG64 *)(frame + hd[2]);
+    unsigned reason = (unsigned)(ctl & 0xFF);
+    int reserved = (int)((ctl >> 9) & 1);
+    ULONG64 to;
+    switch (reason) {
+    case DLL_PROCESS_ATTACH:
+        to = dc->ImageBase + hd[0];
+        break;
+    case DLL_PROCESS_DETACH:
+        if (reserved) return ExceptionContinueSearch;
+        to = dc->ImageBase + hd[1];
+        break;
+    case DLL_THREAD_ATTACH:
+        rt_terminate(rec->ExceptionCode);
+    default:
+        return ExceptionContinueSearch;
+    }
+    rt_RtlUnwindEx((PVOID)frame, (PVOID)to, rec, 0, dc->ContextRecord, dc->HistoryTable);
+    return ExceptionContinueSearch;
 }
 
 /* ---- __C_specific_handler ----------------------------------------------- */

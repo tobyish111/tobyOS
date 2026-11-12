@@ -18720,18 +18720,21 @@ static long w32_toby_missing(uint64_t *a) {
  * STATUS_DLL_INIT_FAILED. Windows shows these in a message box and ends the
  * process with the status before its entry point runs; tobyOS writes them to
  * the program's stderr and the kernel log, and does the same. */
-static __attribute__((noreturn)) void win32_load_failure(const char *text, uint32_t status) {
+static __attribute__((noreturn)) void win32_load_failure_as(const char *text, uint32_t status,
+                                                           const char *why) {
     struct proc *p = current_proc();
     const char *prog = p ? p->name : "?";
     char msg[300];
     int n = (status == WIN32_STATUS_DLL_INIT_FAILED)
-        ? ksnprintf(msg, sizeof(msg), "%s: %s failed to initialize (its DllMain returned FALSE)\n",
-                    prog, text)
+        ? ksnprintf(msg, sizeof(msg), "%s: %s failed to initialize (%s)\n", prog, text, why)
         : ksnprintf(msg, sizeof(msg), "%s: %s\n", prog, text);
     if (n > (int)sizeof(msg) - 1) n = (int)sizeof(msg) - 1;
     kprintf("[pe] load failure, status 0x%08x, pid %d: %s", status, p ? p->pid : -1, msg);
     if (n > 0) (void)win32_fd_write(2, msg, (size_t)n);
     proc_exit_group((int)status);
+}
+static __attribute__((noreturn)) void win32_load_failure(const char *text, uint32_t status) {
+    win32_load_failure_as(text, status, "its DllMain returned FALSE");
 }
 static long w32_toby_loadfail(uint64_t *a) {
     char text[200];
@@ -24185,7 +24188,11 @@ static long w32_toby_ldr(uint64_t *a) {
     case 6: {                                     /* STARTED(failed, 0, buf) */
         char who[WIN32_MT_NAME_MAX];
         uint64_t entry = pe_rt_started((int64_t)a[1], buf, who, sizeof who);
-        if (!entry) win32_load_failure(who[0] ? who : "a DLL", WIN32_STATUS_DLL_INIT_FAILED);
+        /* W7g: bit 32 of the index -- the call raised an exception */
+        bool raised = (int64_t)a[1] >= 0 && (a[1] >> 32) != 0;
+        if (!entry)
+            win32_load_failure_as(who[0] ? who : "a DLL", WIN32_STATUS_DLL_INIT_FAILED,
+                                  raised ? "its DllMain raised an exception" : "its DllMain returned FALSE");
         win32_ldr_unlock();
         return (long)entry;
     }

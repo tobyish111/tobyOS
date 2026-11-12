@@ -119,6 +119,9 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_MT_NAME_MAX      64
 #define WIN32_MT_PATH_MAX      (WIN32_MT_STR_STRIDE - WIN32_MT_NAME_MAX)
 #define WIN32_MT_FAIL_AREA     0x1E00  /* W4: the process-start failure's text */
+#define WIN32_MT_LDR_HANDLER   0x1FF8  /* u64: W7g: tobyrt.dll's handler of the loader's
+                                        * ldr_run frame, 0 none (the stub function
+                                        * table's trampoline jumps to it) */
 #define WIN32_MTM_BASE         0x00    /* u64 */
 #define WIN32_MTM_SIZE         0x08    /* u64 */
 #define WIN32_MTM_ENTRY        0x10    /* u64: 0 if none */
@@ -311,6 +314,22 @@ const char *win32_spawn_cmdline(void);
  * Placed high in page 0, above the import-thunk region. */
 #define WIN32_SETJMP_STUB_VA     0x0000000030000E00ULL
 #define WIN32_LONGJMP_STUB_VA    0x0000000030000E80ULL
+
+/* W7g: the stub function table -- unwind information for the CPL3 stubs a
+ * walk can pass through (the DispatchMessage trampoline, the dialog
+ * trampoline, the loader stubs' ldr_run), so an exception raised in code one
+ * of them called goes on to its caller, as through user32's and ntdll's
+ * frames on Windows; ldr_run's names a handler (tobyrt.dll's, through a
+ * trampoline that reads WIN32_MT_LDR_HANDLER) with what Windows 11 does with
+ * an exception a DllMain lets out. Written once by pe_setup_shim_area; read
+ * by tobyrt.dll's RtlLookupFunctionEntry for a pc in the shim area (a pc
+ * there no entry covers -- a thread's first frame -- is the top of the
+ * stack). Layout: +0 u32 count, +4 u32 WIN32_STUBTAB_MAGIC, then from +0x10
+ * RUNTIME_FUNCTION[count] (RVAs from WIN32_SHIM_BASE, by address), then the
+ * UNWIND_INFOs and the trampoline. */
+#define WIN32_STUBTAB_VA         0x0000000030000C00ULL
+#define WIN32_STUBTAB_END        0x0000000030000E00ULL
+#define WIN32_STUBTAB_MAGIC      0x37425453u           /* "STB7" */
 
 /* C20 (float-return marshalling): the integer gate captures only rcx/rdx/r8/r9 +
  * stack and returns rax, so a `double`-returning Win32/CRT function (libm sqrt,
