@@ -7752,7 +7752,8 @@ void _start(void) {
     defined(WINPE37A_BOOT) || defined(WINPE37B_BOOT) || defined(WINPE38A_BOOT) || \
     defined(WINPE39A_BOOT) || defined(WINPE40A_BOOT) || defined(WINPE41A_BOOT) || \
     defined(WINPE42A_BOOT) || defined(WINPE43A_BOOT) || defined(WINPE44A_BOOT) || \
-    defined(WINPE45A_BOOT) || defined(WINPE46A_BOOT) || defined(WINPE47A_BOOT)
+    defined(WINPE45A_BOOT) || defined(WINPE46A_BOOT) || defined(WINPE47A_BOOT) || \
+    defined(WINPE48A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
      * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / (with
      * one argument when the entry gives one). W7h:
@@ -7998,6 +7999,10 @@ void _start(void) {
 #ifdef WINPE47A_BOOT
             { "WINPE47A", "/bin/win-wide47.exe", "win-wide47.exe", 49,
               "the CRT's wide text modes: UTF-16LE and UTF-8 out and in, ccs=, byte order marks (12 checks)" },
+#endif
+#ifdef WINPE48A_BOOT
+            { "WINPE48A", "/bin/win-clock48.exe", "win-clock48.exe", 50,
+              "kernel32's clocks as one clock: QPF 10 MHz, GetTickCount(64), QPC, message time, time(), clock() (6 checks)" },
 #endif
         };
         win32_gui_set_log(true);
