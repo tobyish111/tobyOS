@@ -41,6 +41,9 @@
 #define RT_STATUS_UNWIND                0xC0000027u
 #define RT_STATUS_BAD_STACK             0xC0000028u
 #define RT_STATUS_INVALID_UNWIND_TARGET 0xC0000029u
+#define RT_STATUS_BAD_FUNCTION_TABLE    0xC00000FFu
+#define RT_STATUS_LONGJUMP              0x80000026u
+#define RT_STATUS_UNWIND_CONSOLIDATE    0x80000029u
 
 /* include/tobyos/pe.h */
 #define RT_SHIM_LO        0x0000000030000000ULL   /* WIN32_SHIM_BASE */
@@ -55,6 +58,9 @@
 /* tobyrt_s.S */
 void rt_capture_context(CONTEXT *ctx);
 __attribute__((noreturn)) void rt_restore_context(CONTEXT *ctx, EXCEPTION_RECORD *rec);
+__attribute__((noreturn)) void rt_consolidate(CONTEXT *ctx, EXCEPTION_RECORD *rec);
+struct rt_jump_buffer;
+__attribute__((noreturn)) void rt_longjmp_direct(const struct rt_jump_buffer *jb, int value);
 EXCEPTION_DISPOSITION rt_call_dispatch_handler(EXCEPTION_RECORD *rec, ULONG64 frame,
                                                CONTEXT *ctx, DISPATCHER_CONTEXT *dc);
 EXCEPTION_DISPOSITION rt_call_unwind_handler(EXCEPTION_RECORD *rec, ULONG64 frame,
@@ -64,6 +70,8 @@ EXCEPTION_DISPOSITION rt_call_unwind_handler(EXCEPTION_RECORD *rec, ULONG64 fram
 void rt_RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args);
 void rt_RtlUnwindEx(PVOID target_frame, PVOID target_ip, EXCEPTION_RECORD *rec,
                     PVOID retval, CONTEXT *ctx, PUNWIND_HISTORY_TABLE hist);
+void rt_RtlUnwind(PVOID target_frame, PVOID target_ip, EXCEPTION_RECORD *rec, PVOID retval);
+__attribute__((noreturn)) void rt_RtlRestoreContext(CONTEXT *ctx, EXCEPTION_RECORD *rec);
 LONG rt_UnhandledExceptionFilter(EXCEPTION_POINTERS *ep);
 
 static LPTOP_LEVEL_EXCEPTION_FILTER volatile g_top_filter;
@@ -837,7 +845,7 @@ __attribute__((noinline)) static void rt_unwind_loop(ULONG64 target, ULONG64 tip
         ULONG64 pc = cur->Rip;
         if (!pc || rt_is_system_pc(pc) || depth > 100000) {
             if (to_end) return;
-            rt_raise_status(RT_STATUS_INVALID_UNWIND_TARGET);
+            rt_raise_status(RT_STATUS_BAD_FUNCTION_TABLE);      /* W7f: as Windows 11 */
         }
         if (cur->Rsp < lo || cur->Rsp >= hi || (cur->Rsp & 7)) rt_raise_status(RT_STATUS_BAD_STACK);
         ULONG64 base;
@@ -854,7 +862,7 @@ __attribute__((noinline)) static void rt_unwind_loop(ULONG64 target, ULONG64 tip
         int bad = 0;
         PEXCEPTION_ROUTINE h = rt_vunwind(UNW_FLAG_UHANDLER, base, pc, fe, &next, &hdata, &est, 0, &bad);
         if (bad || est < lo || est >= hi || (est & 7)) rt_raise_status(RT_STATUS_BAD_STACK);
-        if (!to_end && target && est > target) rt_raise_status(RT_STATUS_INVALID_UNWIND_TARGET);
+        if (!to_end && target && est > target) rt_raise_status(RT_STATUS_BAD_STACK);
         if (h) {
             ULONG scope = 0;
             for (;;) {
@@ -898,9 +906,12 @@ __attribute__((noinline)) static void rt_unwind_loop(ULONG64 target, ULONG64 tip
         if (!to_end && est == target) break;
         *cur = next;
     }
+    /* W7f: a consolidation goes on in the target frame where its callback
+     * says, so the context keeps the frame's own pc (a walk from the
+     * callback goes through it: programs/win-exc37) */
     cur->Rax = retval;
-    cur->Rip = tip;
-    rt_restore_context(cur, rec);
+    if (rec->ExceptionCode != RT_STATUS_UNWIND_CONSOLIDATE) cur->Rip = tip;
+    rt_RtlRestoreContext(cur, rec);
 }
 
 /* RtlUnwindEx: unwind from the caller up to target_frame, then continue at
@@ -930,6 +941,89 @@ __attribute__((noinline)) void rt_RtlUnwind(PVOID target_frame, PVOID target_ip,
                                             EXCEPTION_RECORD *rec, PVOID retval) {
     CONTEXT ctx;
     rt_RtlUnwindEx(target_frame, target_ip, rec, retval, &ctx, 0);
+}
+
+/* ---- RtlRestoreContext, setjmp and longjmp (W7f) ---------------------- */
+
+/* The x64 _JUMP_BUFFER (setjmp.h): what setjmp saves (tobyrt_s.S, rt_setjmp). */
+struct rt_jump_buffer {
+    ULONG64 Frame, Rbx, Rsp, Rbp, Rsi, Rdi, R12, R13, R14, R15, Rip;
+    ULONG MxCsr;
+    USHORT FpCsr, Spare;
+    M128A Xmm6, Xmm7, Xmm8, Xmm9, Xmm10, Xmm11, Xmm12, Xmm13, Xmm14, Xmm15;
+};
+_Static_assert(__builtin_offsetof(struct rt_jump_buffer, Rip) == 0x50 &&
+               __builtin_offsetof(struct rt_jump_buffer, MxCsr) == 0x58 &&
+               __builtin_offsetof(struct rt_jump_buffer, FpCsr) == 0x5C &&
+               __builtin_offsetof(struct rt_jump_buffer, Xmm6) == 0x60 &&
+               sizeof(struct rt_jump_buffer) == 0x100, "the x64 _JUMP_BUFFER's layout");
+
+/* RtlRestoreContext: continue at ctx. Two records change what that means
+ * (measured on Windows 11: programs/win-exc37, logs/w32/w7f-host-run.txt):
+ *   STATUS_LONGJUMP -- the registers setjmp saved, from the jump buffer its
+ *     first parameter points at: the integer nonvolatiles, Rsp, Rip,
+ *     XMM6-15, MXCSR and the x87 control word (rax stays: longjmp's value);
+ *   STATUS_UNWIND_CONSOLIDATE -- the callback its first parameter is,
+ *     called with the record from a frame below the stack pointer that
+ *     unwinds to ctx (tobyrt_s.S, rt_consolidate): a walk from inside the
+ *     callback goes on in ctx's frame. It returns where to continue in ctx. */
+__attribute__((noreturn)) void rt_RtlRestoreContext(CONTEXT *ctx, EXCEPTION_RECORD *rec) {
+    if (rec && rec->ExceptionCode == RT_STATUS_LONGJUMP && rec->NumberParameters >= 1) {
+        const struct rt_jump_buffer *jb = (const struct rt_jump_buffer *)rec->ExceptionInformation[0];
+        if (!(ctx->ContextFlags & 8)) {             /* no x87/SSE state in it: the current one */
+            CONTEXT now;
+            rt_capture_context(&now);
+            ctx->FltSave = now.FltSave;
+            ctx->ContextFlags |= CONTEXT_FLOATING_POINT;
+        }
+        ctx->Rbx = jb->Rbx;
+        ctx->Rsp = jb->Rsp;
+        ctx->Rbp = jb->Rbp;
+        ctx->Rsi = jb->Rsi;
+        ctx->Rdi = jb->Rdi;
+        ctx->R12 = jb->R12;
+        ctx->R13 = jb->R13;
+        ctx->R14 = jb->R14;
+        ctx->R15 = jb->R15;
+        ctx->Rip = jb->Rip;
+        ctx->MxCsr = jb->MxCsr;
+        ctx->FltSave.MxCsr = jb->MxCsr;
+        ctx->FltSave.ControlWord = jb->FpCsr;
+        ctx->Xmm6 = jb->Xmm6;
+        ctx->Xmm7 = jb->Xmm7;
+        ctx->Xmm8 = jb->Xmm8;
+        ctx->Xmm9 = jb->Xmm9;
+        ctx->Xmm10 = jb->Xmm10;
+        ctx->Xmm11 = jb->Xmm11;
+        ctx->Xmm12 = jb->Xmm12;
+        ctx->Xmm13 = jb->Xmm13;
+        ctx->Xmm14 = jb->Xmm14;
+        ctx->Xmm15 = jb->Xmm15;
+    } else if (rec && rec->ExceptionCode == RT_STATUS_UNWIND_CONSOLIDATE && rec->NumberParameters >= 1) {
+        rt_consolidate(ctx, rec);
+    }
+    rt_restore_context(ctx, rec);
+}
+
+/* longjmp: back to where setjmp saved jb, value what it returns there (0
+ * comes back 1). A buffer with a frame -- mingw's setjmp is _setjmp(buf, its
+ * frame) -- is unwound to: RtlUnwind to that frame with a STATUS_LONGJUMP
+ * record whose parameter is the buffer, so every __finally between runs
+ * (abnormal termination), the frame's own too (it is the target, and the
+ * buffer's Rip is outside its __try), and RtlRestoreContext takes the
+ * registers from the buffer. A frame that is no frame's establisher is
+ * STATUS_BAD_STACK, raised by the unwind. A frame of 0: straight there, no
+ * unwind. (Measured on Windows 11: programs/win-exc37.) */
+__attribute__((noreturn)) void rt_longjmp(const struct rt_jump_buffer *jb, int value) {
+    if (!value) value = 1;
+    if (!jb->Frame) rt_longjmp_direct(jb, value);
+    EXCEPTION_RECORD rec;
+    __builtin_memset(&rec, 0, sizeof rec);
+    rec.ExceptionCode = RT_STATUS_LONGJUMP;
+    rec.NumberParameters = 1;
+    rec.ExceptionInformation[0] = (ULONG_PTR)jb;
+    rt_RtlUnwind((PVOID)jb->Frame, (PVOID)jb->Rip, &rec, (PVOID)(ULONG_PTR)(ULONG)value);
+    rt_terminate(RT_STATUS_BAD_STACK);              /* an unwind does not come back */
 }
 
 /* ---- __C_specific_handler ----------------------------------------------- */

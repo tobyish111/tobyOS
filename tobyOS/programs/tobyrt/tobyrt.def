@@ -6,7 +6,7 @@ EXPORTS
     RaiseException = rt_RaiseException
     RtlRaiseException = rt_RtlRaiseException
     RtlCaptureContext = rt_capture_context
-    RtlRestoreContext = rt_restore_context
+    RtlRestoreContext = rt_RtlRestoreContext
     RtlLookupFunctionEntry = rt_RtlLookupFunctionEntry
     RtlVirtualUnwind = rt_RtlVirtualUnwind
     RtlUnwindEx = rt_RtlUnwindEx
@@ -32,3 +32,9 @@ EXPORTS
     RtlAddGrowableFunctionTable = rt_RtlAddGrowableFunctionTable
     RtlGrowFunctionTable = rt_RtlGrowFunctionTable
     RtlDeleteGrowableFunctionTable = rt_RtlDeleteGrowableFunctionTable
+    __intrinsic_setjmp = rt_setjmp
+    __intrinsic_setjmpex = rt_setjmp
+    _setjmp = rt_setjmp
+    _setjmpex = rt_setjmp
+    setjmp = rt_setjmp
+    longjmp = rt_longjmp

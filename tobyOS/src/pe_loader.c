@@ -424,7 +424,9 @@ static uint64_t win32_user_stub_va(const char *dll, const char *func) {
     if (strcmp(func, "DialogBoxParamA") == 0)
         return WIN32_DLG_TRAMP_VA;
     /* C19b: setjmp/longjmp run entirely in CPL3 (save/restore the caller's
-     * context); mingw emits the setjmp side as __intrinsic_setjmp. */
+     * context); mingw emits the setjmp side as __intrinsic_setjmp. W7f: with
+     * the runtime there these names bind to its exports (g_pe_rt_names),
+     * whose longjmp unwinds as Windows' does; these stubs are the fallback. */
     if (strcmp(func, "__intrinsic_setjmp") == 0 ||
         strcmp(func, "_setjmp") == 0 || strcmp(func, "setjmp") == 0)
         return WIN32_SETJMP_STUB_VA;
@@ -1262,6 +1264,9 @@ static const char *const g_pe_rt_names[] = {
     /* W7e */
     "RtlAddFunctionTable", "RtlDeleteFunctionTable", "RtlInstallFunctionTableCallback",
     "RtlAddGrowableFunctionTable", "RtlGrowFunctionTable", "RtlDeleteGrowableFunctionTable",
+    /* W7f: setjmp and a longjmp that unwinds (the C19b stubs, which do not,
+     * are what these bind to without the runtime) */
+    "__intrinsic_setjmp", "__intrinsic_setjmpex", "_setjmp", "_setjmpex", "setjmp", "longjmp",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)

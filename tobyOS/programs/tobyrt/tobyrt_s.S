@@ -75,12 +75,12 @@ rt_capture_context:
 	ret
 	.seh_endproc
 
-/* void RtlRestoreContext(CONTEXT *ctx, EXCEPTION_RECORD *rec): continue at
+/* void rt_restore_context(CONTEXT *ctx, EXCEPTION_RECORD *rec): continue at
  * ctx -- every integer register, the arithmetic flags, and (with
  * CONTEXT_FLOATING_POINT) the x87/SSE state, then Rsp and Rip at once through
- * an IRETQ (same privilege, so nothing else changes).
- * rec is not used: STATUS_LONGJUMP and STATUS_UNWIND_CONSOLIDATE records are
- * not handled. */
+ * an IRETQ (same privilege, so nothing else changes). rec is not used: the
+ * records that change what restoring means are RtlRestoreContext's
+ * (tobyrt.c, rt_RtlRestoreContext), which ends here. */
 	.p2align 4
 	.globl	rt_restore_context
 	.def	rt_restore_context;	.scl	2;	.type	32;	.endef
@@ -216,6 +216,158 @@ rt_KiUserExceptionDispatcher:
 	leaq	0x4F0(%rsp), %rcx
 	leaq	0x20(%rsp), %rdx
 	call	rt_dispatch_fault
+	int3
+	.seh_endproc
+
+/* W7f: int setjmp(jmp_buf jb, void *frame) -- mingw's _setjmp(buf, frame),
+ * the UCRT's __intrinsic_setjmp: into the x64 _JUMP_BUFFER, frame (what a
+ * longjmp unwinds to; 0, none), the caller's nonvolatile registers, its Rsp
+ * and Rip as when this returns, MXCSR, the x87 control word, XMM6-15 (the
+ * buffer need not be aligned); 0. */
+	.p2align 4
+	.globl	rt_setjmp
+	.def	rt_setjmp;	.scl	2;	.type	32;	.endef
+	.seh_proc	rt_setjmp
+rt_setjmp:
+	.seh_endprologue
+	movq	%rdx, 0x00(%rcx)		/* Frame */
+	movq	%rbx, 0x08(%rcx)
+	leaq	8(%rsp), %rax
+	movq	%rax, 0x10(%rcx)		/* Rsp */
+	movq	%rbp, 0x18(%rcx)
+	movq	%rsi, 0x20(%rcx)
+	movq	%rdi, 0x28(%rcx)
+	movq	%r12, 0x30(%rcx)
+	movq	%r13, 0x38(%rcx)
+	movq	%r14, 0x40(%rcx)
+	movq	%r15, 0x48(%rcx)
+	movq	(%rsp), %rax
+	movq	%rax, 0x50(%rcx)		/* Rip */
+	stmxcsr	0x58(%rcx)
+	fnstcw	0x5C(%rcx)
+	movdqu	%xmm6, 0x60(%rcx)
+	movdqu	%xmm7, 0x70(%rcx)
+	movdqu	%xmm8, 0x80(%rcx)
+	movdqu	%xmm9, 0x90(%rcx)
+	movdqu	%xmm10, 0xA0(%rcx)
+	movdqu	%xmm11, 0xB0(%rcx)
+	movdqu	%xmm12, 0xC0(%rcx)
+	movdqu	%xmm13, 0xD0(%rcx)
+	movdqu	%xmm14, 0xE0(%rcx)
+	movdqu	%xmm15, 0xF0(%rcx)
+	xorl	%eax, %eax
+	ret
+	.seh_endproc
+
+/* W7f: void rt_longjmp_direct(const _JUMP_BUFFER *jb, int value) -- a
+ * longjmp to a buffer with no frame: everything setjmp saved, straight back
+ * (no unwind), eax = value. */
+	.p2align 4
+	.globl	rt_longjmp_direct
+	.def	rt_longjmp_direct;	.scl	2;	.type	32;	.endef
+	.seh_proc	rt_longjmp_direct
+rt_longjmp_direct:
+	.seh_endprologue
+	movq	0x08(%rcx), %rbx
+	movq	0x18(%rcx), %rbp
+	movq	0x20(%rcx), %rsi
+	movq	0x28(%rcx), %rdi
+	movq	0x30(%rcx), %r12
+	movq	0x38(%rcx), %r13
+	movq	0x40(%rcx), %r14
+	movq	0x48(%rcx), %r15
+	ldmxcsr	0x58(%rcx)
+	fnclex
+	fldcw	0x5C(%rcx)
+	movdqu	0x60(%rcx), %xmm6
+	movdqu	0x70(%rcx), %xmm7
+	movdqu	0x80(%rcx), %xmm8
+	movdqu	0x90(%rcx), %xmm9
+	movdqu	0xA0(%rcx), %xmm10
+	movdqu	0xB0(%rcx), %xmm11
+	movdqu	0xC0(%rcx), %xmm12
+	movdqu	0xD0(%rcx), %xmm13
+	movdqu	0xE0(%rcx), %xmm14
+	movdqu	0xF0(%rcx), %xmm15
+	movl	%edx, %eax
+	movq	0x10(%rcx), %rsp
+	jmpq	*0x50(%rcx)
+	.seh_endproc
+
+/* W7f: void rt_consolidate(CONTEXT *ctx, EXCEPTION_RECORD *rec) --
+ * RtlRestoreContext's STATUS_UNWIND_CONSOLIDATE. Below the stack pointer, a
+ * frame laid out as KiUserExceptionDispatcher's (S: home space; S + 0x20 a
+ * copy of ctx; S + 0x4F0 the record's address; S + 0x590 a machine frame of
+ * ctx's Rip, CS, RFLAGS, Rsp, SS), then on in rt_consolidate_frame, whose
+ * unwind information describes it: a walk from inside the callback unwinds
+ * that frame into ctx -- the target frame, as on Windows 11, where an
+ * exception raised in the callback is seen by the target frame's handler and
+ * no frame's below it (programs/win-exc37). */
+	.p2align 4
+	.globl	rt_consolidate
+	.def	rt_consolidate;	.scl	2;	.type	32;	.endef
+	.seh_proc	rt_consolidate
+rt_consolidate:
+	.seh_endprologue
+	movq	%rcx, %r8
+	movq	%rdx, %r9
+	subq	$0x5C0, %rsp
+	andq	$-16, %rsp
+	leaq	0x20(%rsp), %rdi
+	movq	%r8, %rsi
+	movl	$0x4D0, %ecx
+	cld
+	rep movsb
+	movq	%r9, 0x4F0(%rsp)
+	movq	0xF8(%r8), %rax
+	movq	%rax, 0x590(%rsp)		/* Rip */
+	movzwl	0x38(%r8), %eax
+	movq	%rax, 0x598(%rsp)		/* CS */
+	movl	0x44(%r8), %eax
+	movq	%rax, 0x5A0(%rsp)		/* RFLAGS */
+	movq	0x98(%r8), %rax
+	movq	%rax, 0x5A8(%rsp)		/* Rsp */
+	movzwl	0x42(%r8), %eax
+	movq	%rax, 0x5B0(%rsp)		/* SS */
+	jmp	rt_consolidate_frame
+	.seh_endproc
+
+/* Entered by the jump above with Rsp = S, never by a call: the "prolog" is a
+ * description only (as rt_KiUserExceptionDispatcher's). Calls the callback
+ * (the record's first parameter) with the record; it returns where to go on
+ * in the copy of ctx, which is then restored. */
+	.p2align 4
+	.globl	rt_consolidate_frame
+	.def	rt_consolidate_frame;	.scl	2;	.type	32;	.endef
+	.seh_proc	rt_consolidate_frame
+rt_consolidate_frame:
+	.seh_pushframe
+	.seh_stackalloc	0x590
+	.seh_savereg	%rbx, 0xB0		/* 0x20 + CONTEXT.Rbx (0x90) */
+	.seh_savereg	%rbp, 0xC0
+	.seh_savereg	%rsi, 0xC8
+	.seh_savereg	%rdi, 0xD0
+	.seh_savereg	%r12, 0xF8
+	.seh_savereg	%r13, 0x100
+	.seh_savereg	%r14, 0x108
+	.seh_savereg	%r15, 0x110
+	.seh_savexmm	%xmm6, 0x220		/* 0x20 + CONTEXT.Xmm6 (0x200) */
+	.seh_savexmm	%xmm7, 0x230
+	.seh_savexmm	%xmm8, 0x240
+	.seh_savexmm	%xmm9, 0x250
+	.seh_savexmm	%xmm10, 0x260
+	.seh_savexmm	%xmm11, 0x270
+	.seh_savexmm	%xmm12, 0x280
+	.seh_savexmm	%xmm13, 0x290
+	.seh_savexmm	%xmm14, 0x2A0
+	.seh_savexmm	%xmm15, 0x2B0
+	.seh_endprologue
+	movq	0x4F0(%rsp), %rcx
+	callq	*0x20(%rcx)			/* EXCEPTION_RECORD.ExceptionInformation[0] */
+	movq	%rax, 0x118(%rsp)		/* 0x20 + CONTEXT.Rip (0xF8) */
+	leaq	0x20(%rsp), %rcx
+	xorl	%edx, %edx
+	call	rt_restore_context
 	int3
 	.seh_endproc
 
