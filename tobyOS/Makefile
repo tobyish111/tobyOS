@@ -2113,6 +2113,15 @@ programs/linux-mmaptest/linux-mmaptest.elf: programs/linux-mmaptest/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# W7i: a Linux x86-64 static ELF (raw syscalls) proving mprotect(PROT_NONE)
+# on pages that are there: no access from the program, EFAULT for the
+# kernel's (exit 63, as on WSL's Linux).
+programs/linux-mprot/linux-mprot.elf: programs/linux-mprot/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
 # Track B/B9: a genuine Linux x86-64 static ELF proving thread support --
 # spawns a thread with clone(CLONE_VM) and verifies it ran in shared memory.
 programs/linux-thread/linux-thread.elf: programs/linux-thread/main.c
@@ -2698,6 +2707,13 @@ W39_HAVE := $(shell test -f "$(W39_VCVARS)" && echo 1)
 $(W39)/win-cxx39.exe: $(W39)/cxx39.cpp $(W39)/build.sh
 	bash $(W39)/build.sh "$(W39_VCVARS)" $(W39)
 
+# Track C/W7i: win-mem40.exe (exit 42, as on Windows 11) -- guard pages,
+# write watch, MEM_RESET, VirtualProtect on pages not committed, a touched
+# page made PAGE_NOACCESS, 1500 reservations, _resetstkoflw.
+W40 := programs/win-mem40
+$(W40)/win-mem40.exe: $(W40)/mem40.c $(W40)/mem40s.S
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W40)/mem40.c $(W40)/mem40s.S
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3150,6 +3166,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/linux-crashpad/linux-crashpad.elf \
                programs/linux-sigtest/linux-sigtest.elf \
                programs/linux-mmaptest/linux-mmaptest.elf \
+               programs/linux-mprot/linux-mprot.elf \
                programs/linux-thread/linux-thread.elf \
                programs/linux-fb/linux-fb.elf \
                programs/linux-fbwin/linux-fbwin.elf \
@@ -3253,6 +3270,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-exc38/win-cb38s.exe \
                programs/win-exc38/dll38.dll \
                $(if $(W39_HAVE),programs/win-exc39/win-cxx39.exe) \
+               programs/win-mem40/win-mem40.exe \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3354,6 +3372,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/linux-hello/linux-hello.elf           $(INITRD_STAGE)/bin/linux-hello
 	cp programs/linux-sigtest/linux-sigtest.elf       $(INITRD_STAGE)/bin/linux-sigtest
 	cp programs/linux-mmaptest/linux-mmaptest.elf     $(INITRD_STAGE)/bin/linux-mmaptest
+	cp programs/linux-mprot/linux-mprot.elf           $(INITRD_STAGE)/bin/linux-mprot
 	cp programs/linux-thread/linux-thread.elf         $(INITRD_STAGE)/bin/linux-thread
 	cp programs/linux-fb/linux-fb.elf                 $(INITRD_STAGE)/bin/linux-fb
 	cp programs/linux-fbwin/linux-fbwin.elf           $(INITRD_STAGE)/bin/linux-fbwin
@@ -3465,6 +3484,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-exc38/win-cb38.exe               $(INITRD_STAGE)/bin/win-cb38.exe
 	cp programs/win-exc38/win-cb38s.exe              $(INITRD_STAGE)/bin/win-cb38s.exe
 	cp programs/win-exc38/dll38.dll                  $(INITRD_STAGE)/bin/dll38.dll
+	cp programs/win-mem40/win-mem40.exe              $(INITRD_STAGE)/bin/win-mem40.exe
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4433,7 +4453,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
 	    bin/nsetuid \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
-	    bin/linux-mmaptest bin/linux-thread bin/linux-fb bin/linux-fbwin bin/linux-join bin/linux-poll \
+	    bin/linux-mmaptest bin/linux-mprot bin/linux-thread bin/linux-fb bin/linux-fbwin bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
 	    bin/linux-scmsg bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-demrace bin/linux-mlkem \
@@ -4474,6 +4494,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-top33.exe bin/win-veh34.exe bin/win-flt35.exe         \
 	    bin/win-so35.exe bin/win-jit36.exe bin/win-lj37.exe           \
 	    bin/win-cb38.exe bin/win-cb38s.exe bin/dll38.dll              \
+	    bin/win-mem40.exe                                             \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \

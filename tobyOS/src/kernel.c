@@ -7750,7 +7750,7 @@ void _start(void) {
     defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT) || defined(WINPE34A_BOOT) || \
     defined(WINPE35A_BOOT) || defined(WINPE35B_BOOT) || defined(WINPE36A_BOOT) || \
     defined(WINPE37A_BOOT) || defined(WINPE37B_BOOT) || defined(WINPE38A_BOOT) || \
-    defined(WINPE39A_BOOT)
+    defined(WINPE39A_BOOT) || defined(WINPE40A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
      * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / (with
      * one argument when the entry gives one). W7h:
@@ -7964,6 +7964,10 @@ void _start(void) {
 #ifdef WINPE39A_BOOT
             { "WINPE39A", "/bin/win-cxx39.exe", "win-cxx39.exe", 41,
               "C++ by cl.exe on Microsoft's vcruntime140 (9 checks)" },
+#endif
+#ifdef WINPE40A_BOOT
+            { "WINPE40A", "/bin/win-mem40.exe", "win-mem40.exe", 42,
+              "guard pages, write watch, MEM_RESET, _resetstkoflw (13 checks)" },
 #endif
         };
         win32_gui_set_log(true);
@@ -9480,6 +9484,11 @@ void _start(void) {
              * host's resolver to answer (LAN router). */
             { "/bin/linux-v6host", "linux-v6host", 0, 63,
               "v6 wire: SLAAC + DNS relay + RST" },
+            /* 2026-11-11 (W7i): mprotect(PROT_NONE) on a page that is
+             * there -- until then still readable (the entry kept its user
+             * bit); the kernel's own read and write of one EFAULT. */
+            { "/bin/linux-mprot", "linux-mprot", 0, 63,
+              "PROT_NONE on touched pages" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write
