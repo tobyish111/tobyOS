@@ -7750,7 +7750,8 @@ void _start(void) {
     defined(WINPE33C_BOOT) || defined(WINPE33D_BOOT) || defined(WINPE34A_BOOT) || \
     defined(WINPE35A_BOOT) || defined(WINPE35B_BOOT) || defined(WINPE36A_BOOT) || \
     defined(WINPE37A_BOOT) || defined(WINPE37B_BOOT) || defined(WINPE38A_BOOT) || \
-    defined(WINPE39A_BOOT) || defined(WINPE40A_BOOT) || defined(WINPE41A_BOOT)
+    defined(WINPE39A_BOOT) || defined(WINPE40A_BOOT) || defined(WINPE41A_BOOT) || \
+    defined(WINPE42A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
      * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / (with
      * one argument when the entry gives one). W7h:
@@ -7972,6 +7973,10 @@ void _start(void) {
 #ifdef WINPE41A_BOOT
             { "WINPE41A", "/bin/win-msg41.exe", "win-msg41.exe", 43,
               "the program's code user32 calls: creation messages, SendMessage, TimerProcs, atexit (9 checks)" },
+#endif
+#ifdef WINPE42A_BOOT
+            { "WINPE42A", "/bin/win-cxx42.exe", "win-cxx42.exe", 44,
+              "cl.exe's C++ on msvcp140: the CRT's callbacks, iostreams, threads (7 checks)" },
 #endif
         };
         win32_gui_set_log(true);
