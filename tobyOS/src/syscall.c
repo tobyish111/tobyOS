@@ -21974,6 +21974,13 @@ static long w32_WakeConditionVariable(uint64_t *a) {
     win32_uput(a[0], win32_uget(a[0]) + 1);
     return 0;
 }
+/* W7q: the Win32 layer's one clock, in milliseconds -- the kernel's
+ * nanosecond clock, which Sleep and the system time read. GetTickCount,
+ * QueryPerformanceCounter, a message's time, the window timers and these
+ * waits counted the PIT's interrupts, which QEMU drops when the host is busy
+ * (a Sleep(150) read as about 100 ms of GetTickCount); measured on Windows 11
+ * (programs/win-clock48): all of them are one clock. */
+static uint64_t win32_ms_now(void) { return perf_now_ns() / 1000000ull; }
 /* the wait of SleepConditionVariableSRW/CS: the lock given back, the
  * sequence watched until it moves or ms (INFINITE: ~0u) pass, the lock
  * taken again; FALSE with ERROR_TIMEOUT when the time ran out */
@@ -21981,13 +21988,11 @@ static long win32_cv_wait(uint64_t cv, uint32_t ms, void (*give)(uint64_t, bool)
                           uint64_t lk, bool shared) {
     uint64_t seq = win32_uget(cv);
     give(lk, shared);
-    uint64_t hz = pit_hz();
-    if (!hz) hz = 100;
-    uint64_t until = ms == 0xFFFFFFFFu ? ~0ull : pit_ticks() + ((uint64_t)ms * hz + 999) / 1000;
+    uint64_t until = ms == 0xFFFFFFFFu ? ~0ull : win32_ms_now() + ms;   /* W7q */
     bool woken = false;
     for (;;) {
         if (win32_uget(cv) != seq) { woken = true; break; }
-        if (pit_ticks() >= until) break;
+        if (win32_ms_now() >= until) break;
         sched_yield();
     }
     take(lk, shared);
@@ -22861,9 +22866,20 @@ static bool win32_message_ok(uint64_t hwnd, uint32_t msg, uint64_t hf, uint32_t 
 static bool win32_win_mine(const struct win32_win *w, int me) {
     return w->fd > 0 && (!w->owner_tid || w->owner_tid == me);
 }
-static uint32_t win32_msg_time(void) {
-    uint64_t hz = pit_hz();
-    return (uint32_t)(hz ? pit_ticks() * 1000 / hz : pit_ticks());
+static uint32_t win32_msg_time(void) { return (uint32_t)win32_ms_now(); }   /* W7q: GetTickCount's */
+/* W7q: GetMessageTime's -- the last message GetMessage or PeekMessage gave
+ * the thread, in its TEB */
+#define WIN32_TEB_MSGTIME_OFF 0x314
+static void win32_msgtime_set(uint32_t t) {
+    struct proc *p = current_proc();
+    if (p && p->gs_base) (void)copy_to_user((void *)(uintptr_t)(p->gs_base + WIN32_TEB_MSGTIME_OFF), &t, 4);
+}
+static long w32_GetMessageTime(uint64_t *a) {
+    (void)a;
+    struct proc *p = current_proc();
+    uint32_t t = 0;
+    if (p && p->gs_base) (void)copy_from_user(&t, (const void *)(uintptr_t)(p->gs_base + WIN32_TEB_MSGTIME_OFF), 4);
+    return (long)(int32_t)t;
 }
 /* onto thread tid's queue (at its front: a message PeekMessage put back) */
 static bool win32_post(int tid, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, bool front) {
@@ -23023,6 +23039,7 @@ static long w32_GetMessageA(uint64_t *a) {
     for (;;) {
         int r = win32_msg_take(&m, hf, lo, hi, true);
         if (r) {
+            win32_msgtime_set(m.time);                  /* W7q */
             if (copy_to_user((void *)(uintptr_t)umsg, &m, sizeof m) != 0) return -1;
             return r == 2 ? 0 : 1;
         }
@@ -23042,6 +23059,7 @@ static long w32_PeekMessageA(uint64_t *a) {
         if (!(fl & 2)) sched_yield();
         return 0;
     }
+    win32_msgtime_set(m.time);                          /* W7q */
     return copy_to_user((void *)(uintptr_t)umsg, &m, sizeof m) == 0 ? 1 : 0;
 }
 /* WaitMessage(): until the thread has a message (it stays where it is) */
@@ -24787,13 +24805,12 @@ static int win32_tgid(void) {
 
 static long w32_SetTimer(uint64_t *a) {
     int fd = (int)a[0]; uint64_t id = a[1], ms = (uint32_t)a[2], proc = a[3];
-    uint64_t hz = pit_hz(); if (!hz) hz = 100;
-    uint64_t ticks = (ms * hz + 999) / 1000; if (ticks < 1) ticks = 1;
+    uint64_t ticks = ms < 10 ? 10 : ms;      /* W7q: ms of win32_ms_now; USER_TIMER_MINIMUM 10 */
     int tg = win32_tgid();
     for (int i = 0; i < WIN32_MAX_TIMERS; i++) {      /* update existing */
         struct win32_timer *t = &g_win32_timers[i];
         if (t->in_use && t->fd == fd && t->id == id && (fd || t->owner == tg)) {
-            t->interval = ticks; t->next = pit_ticks() + ticks;
+            t->interval = ticks; t->next = win32_ms_now() + ticks;
             t->proc = proc; return (long)(fd ? (id ? id : 1) : id);
         }
     }
@@ -24803,7 +24820,7 @@ static long w32_SetTimer(uint64_t *a) {
     for (int i = 0; i < WIN32_MAX_TIMERS; i++)        /* allocate */
         if (!g_win32_timers[i].in_use) {
             g_win32_timers[i].in_use = true; g_win32_timers[i].fd = fd; g_win32_timers[i].id = id;
-            g_win32_timers[i].interval = ticks; g_win32_timers[i].next = pit_ticks() + ticks;
+            g_win32_timers[i].interval = ticks; g_win32_timers[i].next = win32_ms_now() + ticks;
             g_win32_timers[i].proc = proc; g_win32_timers[i].owner = tg;
             if (g_win32_log_input) kprintf("[winpe] SetTimer hwnd=%d id=%lu %lums\n", fd, (unsigned long)id, (unsigned long)ms);
             return (long)(fd ? (id ? id : 1) : id);
@@ -24828,7 +24845,7 @@ static long w32_KillTimer(uint64_t *a) {
 static bool win32_message_ok(uint64_t hwnd, uint32_t msg, uint64_t hf, uint32_t lo, uint32_t hi);
 static bool win32_timer_take(uint64_t hf, uint32_t lo, uint32_t hi, bool remove, int me,
                              struct win32_msg *m) {
-    uint64_t now = pit_ticks();
+    uint64_t now = win32_ms_now();                     /* W7q */
     for (int i = 0; i < WIN32_MAX_TIMERS; i++) {
         struct win32_timer *t = &g_win32_timers[i];
         if (!t->in_use) continue;
@@ -27616,17 +27633,18 @@ static long w32_SystemTimeToFileTime(uint64_t *a) {
     if (a[1]) win32_put_filetime(a[1], secs);
     return 1;
 }
-static long w32_GetTickCount(uint64_t *a) {
-    (void)a; uint64_t hz = pit_hz(); if (!hz) hz = 100;
-    return (long)(uint32_t)(pit_ticks() * 1000ull / hz);
-}
+/* W7q: GetTickCount is GetTickCount64's low 32 bits, both the milliseconds
+ * since the boot; QueryPerformanceCounter counts 100 ns from the same start,
+ * at QueryPerformanceFrequency's 10 MHz (Windows 10 and 11's) */
+static long w32_GetTickCount(uint64_t *a)   { (void)a; return (long)(uint32_t)win32_ms_now(); }
+static long w32_GetTickCount64(uint64_t *a) { (void)a; return (long)win32_ms_now(); }
 static long w32_QueryPerformanceCounter(uint64_t *a) {
-    uint64_t v = pit_ticks();
+    uint64_t v = perf_now_ns() / 100;
     if (a[0]) (void)copy_to_user((void *)(uintptr_t)a[0], &v, 8);
     return 1;
 }
 static long w32_QueryPerformanceFrequency(uint64_t *a) {
-    uint64_t hz = pit_hz(); if (!hz) hz = 100;
+    uint64_t hz = 10000000;
     if (a[0]) (void)copy_to_user((void *)(uintptr_t)a[0], &hz, 8);
     return 1;
 }
@@ -28820,14 +28838,18 @@ static long w32_localtime64(uint64_t *a) {
 /* C19b: time()/clock() return integer time_t/clock_t (marshal fine through the
  * gate; difftime/gmtime/strftime stay out -- difftime returns a double). Real
  * Lua seeds its RNG from time(NULL) in luaopen_math, so this is on the startup
- * path. Epoch base is uptime-relative -- adequate for a seed; tobyOS has no RTC
- * wall-clock plumbed into the Win32 layer. */
+ * path. (W7q: the epoch's seconds now, not the uptime's.) */
+/* W7q: time() is the system time's seconds since 1970 (it was the uptime's);
+ * clock() the milliseconds since the program started (CLOCKS_PER_SEC 1000) */
 static long w32_time64(uint64_t *a){
-    uint64_t hz=pit_hz(); if(!hz)hz=100; int64_t secs=(int64_t)(pit_ticks()/hz);
+    int64_t secs=(int64_t)(lx_realtime_ns(perf_now_ns())/1000000000ull);
     if(a[0])(void)copy_to_user((void*)(uintptr_t)a[0],&secs,8); return (long)secs;
 }
 static long w32_clock(uint64_t *a){(void)a;
-    uint64_t hz=pit_hz(); if(!hz)hz=100; return (long)(pit_ticks()*1000ull/hz);  /* CLOCKS_PER_SEC=1000 */
+    struct proc *p=current_proc();
+    struct proc *ld=p&&p->is_thread?proc_lookup(p->tgid):p;
+    uint64_t now=perf_now_ns(), st=ld?ld->created_ns:0;
+    return (long)(now>st?(now-st)/1000000ull:0);
 }
 
 /* ---- a few more kernel32 ---- */
@@ -30678,6 +30700,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "user32.dll", "PostThreadMessageA", w32_PostThreadMessageA },
     { "user32.dll", "PostThreadMessageW", w32_PostThreadMessageA },
     { "user32.dll", "WaitMessage",       w32_WaitMessage },
+    { "user32.dll", "GetMessageTime",    w32_GetMessageTime },                        /* W7q */
     { "user32.dll", "TranslateMessage",  w32_TranslateMessage },
     { "user32.dll", "DefWindowProcA",    w32_DefWindowProcA },
     { "user32.dll", "PostQuitMessage",   w32_PostQuitMessage },
@@ -30881,7 +30904,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetSystemTime",       w32_GetSystemTime },
     { "kernel32.dll", "SystemTimeToFileTime",w32_SystemTimeToFileTime },
     { "kernel32.dll", "GetTickCount",        w32_GetTickCount },
-    { "kernel32.dll", "GetTickCount64",      w32_GetTickCount },
+    { "kernel32.dll", "GetTickCount64",      w32_GetTickCount64 },              /* W7q */
     { "kernel32.dll", "QueryPerformanceCounter",   w32_QueryPerformanceCounter },
     { "kernel32.dll", "QueryPerformanceFrequency", w32_QueryPerformanceFrequency },
     { "kernel32.dll", "GetSystemInfo",       w32_GetSystemInfo },
