@@ -7752,7 +7752,7 @@ void _start(void) {
     defined(WINPE37A_BOOT) || defined(WINPE37B_BOOT) || defined(WINPE38A_BOOT) || \
     defined(WINPE39A_BOOT) || defined(WINPE40A_BOOT) || defined(WINPE41A_BOOT) || \
     defined(WINPE42A_BOOT) || defined(WINPE43A_BOOT) || defined(WINPE44A_BOOT) || \
-    defined(WINPE45A_BOOT)
+    defined(WINPE45A_BOOT) || defined(WINPE46A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
      * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / (with
      * one argument when the entry gives one). W7h:
@@ -7990,6 +7990,10 @@ void _start(void) {
 #ifdef WINPE45A_BOOT
             { "WINPE45A", "/bin/win-gui45.exe", "win-gui45.exe", 47,
               "a process's own classes, windows, menus, bitmaps, timers, TLS, environment (6 checks)" },
+#endif
+#ifdef WINPE46A_BOOT
+            { "WINPE46A", "/bin/win-post46.exe", "win-post46.exe", 48,
+              "posted messages, GetMessage/PeekMessage filters, WM_QUIT, a waiting GetMessage (8 checks)" },
 #endif
         };
         win32_gui_set_log(true);
