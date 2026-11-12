@@ -18956,22 +18956,182 @@ static long w32_strstr(uint64_t *a) {
     return 0;
 }
 
-/* VirtualQuery(addr, buf, len): fill a minimal MEMORY_BASIC_INFORMATION
- * (committed, private, read-write). Enough for the CRT's startup probes. */
+
+/* W7e: the mmap VMA table's read-only view (src/mmap.c; procfs uses it too). */
+extern int mmap_vma_snapshot(struct proc *, int, uint64_t *, uint64_t *, uint32_t *, uint32_t *);
+/* ---- W7e: VirtualAlloc, VirtualFree ------------------------------------- *
+ * An allocation is a reservation -- 64 KiB-aligned (Windows' allocation
+ * granularity), an mmap of its own -- whose pages are committed (the
+ * protection asked for) or merely reserved (no access: a touch is an access
+ * violation). The reservations are kept here, for MEM_RELEASE (which takes
+ * no size) and VirtualQuery (AllocationBase, AllocationProtect). Measured on
+ * Windows 11 (programs/win-exc36).
+ *
+ * Each is keyed by its address space's VMA-table key (proc_mm_pid) and
+ * dropped with that table (mmap_cleanup_proc calls win32_res_drop): the key
+ * is a recycled proc slot, so a process that ends with reservations it never
+ * released -- most do -- must not leave them to the next process in its slot
+ * (which would find reservations it never made), nor keep the slots taken. */
+#define WIN32_RES_MAX 1024
+static struct win32_res { int mm; uint64_t base, len; uint32_t allocprot; } g_win32_res[WIN32_RES_MAX];
+static int g_win32_res_used;
+
+static struct win32_res *win32_res_of(int mm, uint64_t addr) {
+    if (!g_win32_res_used) return 0;
+    for (int i = 0; i < WIN32_RES_MAX; i++) {
+        struct win32_res *r = &g_win32_res[i];
+        if (r->len && r->mm == mm && addr >= r->base && addr - r->base < r->len) return r;
+    }
+    return 0;
+}
+
+/* mmap_cleanup_proc's: the address space keyed mm is gone (its process
+ * ended, or exec'd into a new image) -- and its reservations with it. */
+void win32_res_drop(int mm) {
+    if (!g_win32_res_used) return;
+    for (int i = 0; i < WIN32_RES_MAX; i++)
+        if (g_win32_res[i].len && g_win32_res[i].mm == mm) {
+            g_win32_res[i].len = 0;
+            g_win32_res_used--;
+        }
+}
+
+/* PAGE_* -> mmap protection (PROT_READ 1, WRITE 2, EXEC 4); -1 unknown */
+static int win32_page_to_prot(uint32_t page) {
+    switch (page & 0xFFu) {
+    case 0x01: return 0;
+    case 0x02: return 1;
+    case 0x04: case 0x08: return 3;
+    case 0x10: case 0x20: return 5;
+    case 0x40: case 0x80: return 7;
+    default: return -1;
+    }
+}
+static uint32_t win32_prot_to_page(uint32_t prot) {
+    switch (prot & 7u) {
+    case 0: return 0x01;
+    case 1: return 0x02;
+    case 3: case 2: return 0x04;
+    case 4: case 5: return 0x20;
+    default: return 0x40;
+    }
+}
+
+/* The mmap VMA holding addr: its [start, end) and protection; false if none. */
+static bool win32_vma_at(struct proc *p, uint64_t addr, uint64_t *s, uint64_t *e, uint32_t *prot) {
+    int n = mmap_vma_snapshot(p, -1, 0, 0, 0, 0);
+    for (int i = 0; i < n; i++) {
+        uint64_t vs, ve;
+        uint32_t vp, vf;
+        if (mmap_vma_snapshot(p, i, &vs, &ve, &vp, &vf) != 0) continue;
+        if (addr >= vs && addr < ve) { *s = vs; *e = ve; *prot = vp; return true; }
+    }
+    return false;
+}
+
+/* kernel32!VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect). */
+static long w32_VirtualAlloc(uint64_t *a) {
+    uint64_t addr = a[0], size = a[1];
+    uint32_t type = (uint32_t)a[2], page = (uint32_t)a[3];
+    struct proc *me = current_proc();
+    int prot = win32_page_to_prot(page);
+    if (!me || !size || prot < 0 || !(type & 0x3000u)) {
+        win32_set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+        return 0;
+    }
+    int mm = proc_mm_pid(me);
+    if (type & 0x2000u) {                                 /* MEM_RESERVE (and maybe MEM_COMMIT) */
+        uint64_t base = addr & ~0xFFFFull;
+        uint64_t len = ((addr ? addr : 0) + size - base + 0xFFFull) & ~0xFFFull;
+        if (!addr) len = (size + 0xFFFull) & ~0xFFFull;
+        struct win32_res *slot = 0;
+        for (int i = 0; i < WIN32_RES_MAX && !slot; i++) if (!g_win32_res[i].len) slot = &g_win32_res[i];
+        if (!slot) { win32_set_last_error(8 /* ERROR_NOT_ENOUGH_MEMORY */); return 0; }
+        uint32_t initial = (type & 0x1000u) ? (uint32_t)prot : 0;
+        if (addr) {
+            uint64_t vs, ve; uint32_t vp;
+            for (uint64_t v = base; v < base + len; v += PAGE_SIZE)
+                if (win32_vma_at(me, v, &vs, &ve, &vp) || (get_pte(me->cr3, v) && (*get_pte(me->cr3, v) & PTE_PRESENT))) {
+                    win32_set_last_error(487 /* ERROR_INVALID_ADDRESS */);
+                    return 0;
+                }
+            if (sys_mmap(base, len, initial, 0x01 | 0x02 | 0x08 /* ANON PRIVATE FIXED */, -1, 0) != (long)base) {
+                win32_set_last_error(487);
+                return 0;
+            }
+        } else {
+            long m = sys_mmap(0, len + 0x10000, initial, 0x01 | 0x02 /* ANON PRIVATE */, -1, 0);
+            if (m < 0) { win32_set_last_error(8); return 0; }
+            uint64_t raw = (uint64_t)m;
+            base = (raw + 0xFFFFull) & ~0xFFFFull;
+            if (base > raw) (void)sys_munmap(raw, base - raw);
+            if (raw + len + 0x10000 > base + len) (void)sys_munmap(base + len, raw + len + 0x10000 - (base + len));
+        }
+        slot->mm = mm;
+        slot->base = base;
+        slot->len = len;
+        slot->allocprot = page & 0xFFFu;
+        g_win32_res_used++;
+        return (long)base;
+    }
+    /* MEM_COMMIT alone: pages of a reservation */
+    struct win32_res *r = win32_res_of(mm, addr);
+    uint64_t start = addr & ~0xFFFull, end = (addr + size + 0xFFFull) & ~0xFFFull;
+    if (!r || end > r->base + r->len) { win32_set_last_error(487); return 0; }
+    if (sys_mprotect(start, end - start, (uint32_t)prot) < 0) { win32_set_last_error(487); return 0; }
+    return (long)start;
+}
+
+/* kernel32!VirtualFree(lpAddress, dwSize, dwFreeType): MEM_RELEASE (0x8000,
+ * dwSize 0, lpAddress the allocation's base) gives the reservation back;
+ * MEM_DECOMMIT (0x4000) drops the pages' contents and leaves them reserved
+ * (dwSize 0: from lpAddress to the reservation's end). */
+static long w32_VirtualFree(uint64_t *a) {
+    uint64_t addr = a[0], size = a[1];
+    uint32_t type = (uint32_t)a[2];
+    struct proc *me = current_proc();
+    struct win32_res *r = me ? win32_res_of(proc_mm_pid(me), addr) : 0;
+    if (!r) { win32_set_last_error(487 /* ERROR_INVALID_ADDRESS */); return 0; }
+    if (type == 0x8000u) {
+        if (size || addr != r->base) { win32_set_last_error(87); return 0; }
+        (void)sys_munmap(r->base, r->len);
+        r->len = 0;
+        g_win32_res_used--;
+        return 1;
+    }
+    if (type == 0x4000u) {
+        uint64_t start = addr & ~0xFFFull;
+        uint64_t end = size ? (addr + size + 0xFFFull) & ~0xFFFull : r->base + r->len;
+        if (end > r->base + r->len) { win32_set_last_error(87); return 0; }
+        (void)sys_munmap(start, end - start);
+        if (sys_mmap(start, end - start, 0, 0x01 | 0x02 | 0x08, -1, 0) != (long)start) {
+            win32_set_last_error(487);
+            return 0;
+        }
+        return 1;
+    }
+    win32_set_last_error(87);
+    return 0;
+}
+
 /* W7: a present page's protection, as a PAGE_* value. */
 static uint32_t win32_page_prot(uint64_t pte) {
     bool w = (pte & PTE_WRITABLE) != 0, x = !(pte & (1ULL << 63));
     return x ? (w ? 0x40u : 0x20u) : (w ? 0x04u : 0x02u);
 }
 /* kernel32!VirtualQuery(lpAddress, lpBuffer, dwLength) -> bytes written.
- * W7: the truth about the page -- its protection from its page-table entry,
- * the region as the run of pages after it with the same protection (at most
- * 16 MiB), MEM_IMAGE with the module's base as the allocation base for a
- * loaded image's pages. Until W7 it answered "1 MiB of PAGE_READWRITE" for
- * everything, and the mingw C runtime's pseudo-relocation pass, which asks
- * before it opens a read-only section, never opened one. A page not mapped
- * yet (demand-paged memory not touched) is reported as before: committed,
- * read-write. */
+ * The region from lpAddress's page to the end of the pages alike (Windows'
+ * BaseAddress and RegionSize, measured: programs/win-exc36), and which kind:
+ *   - a loaded image's page (W7): MEM_IMAGE, the module's base;
+ *   - an allocation's page (W7e): reserved or committed -- its mmap VMA's
+ *     protection -- the allocation's base and protection;
+ *   - the calling thread's stack (W7e): its reservation (W7d-2's TEB slot)
+ *     as the allocation, a page not yet there reserved;
+ *   - a page that is there: its protection from its page-table entry (W7);
+ *   - mapped memory not touched yet: committed, its VMA's protection;
+ *   - none of these: MEM_FREE.
+ * Until W7 it answered "1 MiB of PAGE_READWRITE" for everything; until W7e
+ * an untouched or unmapped page was "committed, read-write". */
 static long w32_VirtualQuery(uint64_t *a) {
     struct {
         uint64_t BaseAddress, AllocationBase;
@@ -18982,37 +19142,126 @@ static long w32_VirtualQuery(uint64_t *a) {
     memset(&mbi, 0, sizeof(mbi));
     if (a[2] < sizeof mbi) { win32_set_last_error(24 /* ERROR_BAD_LENGTH */); return 0; }
     struct proc *p = current_proc();
+    if (!p) return 0;
     uint64_t page = a[0] & ~0xFFFull;
-    uint64_t *pte = p ? get_pte(p->cr3, page) : 0;
-    bool present = pte && (*pte & PTE_PRESENT);
-    uint32_t prot = present ? win32_page_prot(*pte) : 0x04u;
-    uint64_t end = page + PAGE_SIZE;
-    for (uint64_t n = 1; n < 4096; n++, end += PAGE_SIZE) {
-        uint64_t *q = get_pte(p->cr3, end);
-        bool qp = q && (*q & PTE_PRESENT);
-        if (qp != present || (qp && win32_page_prot(*q) != prot)) break;
-    }
     mbi.BaseAddress = page;
-    mbi.AllocationBase = page;
-    mbi.AllocationProtect = prot;
-    mbi.RegionSize = end - page;
-    mbi.State = 0x1000;                           /* MEM_COMMIT */
-    mbi.Protect = prot;
-    mbi.Type = 0x20000;                           /* MEM_PRIVATE */
-    /* a loaded image's page: its module (the module table's records) */
+    uint64_t vs, ve;
+    uint32_t vp;
+
+    /* a loaded image's page */
     for (uint32_t i = 0; i < WIN32_MAX_MODULES; i++) {
         uint64_t r[2] = { 0, 0 };
         if (copy_from_user(r, (const void *)(uintptr_t)(WIN32_MODTAB_BASE + WIN32_MT_MODS +
                                                       (uint64_t)i * WIN32_MT_MOD_STRIDE), sizeof r) != 0)
             break;
         if (r[0] && page >= r[0] && page < r[0] + r[1]) {
+            uint64_t *pte = get_pte(p->cr3, page);
+            uint32_t prot = (pte && (*pte & PTE_PRESENT)) ? win32_page_prot(*pte) : 0x02u;
+            uint64_t end = page + PAGE_SIZE;
+            while (end < r[0] + r[1]) {
+                uint64_t *q = get_pte(p->cr3, end);
+                if (!(q && (*q & PTE_PRESENT)) || win32_page_prot(*q) != prot) break;
+                end += PAGE_SIZE;
+            }
             mbi.AllocationBase = r[0];
             mbi.AllocationProtect = 0x80;         /* PAGE_EXECUTE_WRITECOPY, as Windows says of an image */
+            mbi.RegionSize = end - page;
+            mbi.State = 0x1000;                   /* MEM_COMMIT */
+            mbi.Protect = prot;
             mbi.Type = 0x1000000;                 /* MEM_IMAGE */
-            if (end > r[0] + r[1]) mbi.RegionSize = r[0] + r[1] - page;
-            break;
+            goto out;
         }
     }
+
+    /* an allocation's page */
+    struct win32_res *res = win32_res_of(proc_mm_pid(p), page);
+    if (res) {
+        uint64_t rend = res->base + res->len;
+        bool have = win32_vma_at(p, page, &vs, &ve, &vp);
+        uint32_t prot0 = have ? vp : 0;
+        uint64_t end = have ? ve : page + PAGE_SIZE;
+        while (end < rend) {                      /* the next VMA alike */
+            uint64_t s2, e2;
+            uint32_t p2;
+            if (!win32_vma_at(p, end, &s2, &e2, &p2) || p2 != prot0) break;
+            end = e2;
+        }
+        if (end > rend) end = rend;
+        mbi.AllocationBase = res->base;
+        mbi.AllocationProtect = res->allocprot;
+        mbi.RegionSize = end - page;
+        mbi.State = prot0 ? 0x1000u : 0x2000u;    /* MEM_COMMIT : MEM_RESERVE */
+        mbi.Protect = prot0 ? win32_prot_to_page(prot0) : 0;
+        mbi.Type = 0x20000;                       /* MEM_PRIVATE */
+        goto out;
+    }
+
+    /* the calling thread's stack */
+    uint64_t sbot = 0, stop = 0;
+    if (p->gs_base &&
+        copy_from_user(&sbot, (const void *)(uintptr_t)(p->gs_base + WIN32_TEB_STACK_BOTTOM), 8) == 0 &&
+        copy_from_user(&stop, (const void *)(uintptr_t)(p->gs_base + 0x08 /* TEB.StackBase */), 8) == 0 &&
+        sbot && page >= sbot && page < stop) {
+        uint64_t *pte = get_pte(p->cr3, page);
+        bool there = pte && (*pte & PTE_PRESENT);
+        uint32_t prot = there ? win32_page_prot(*pte) : 0;
+        uint64_t end = page + PAGE_SIZE;
+        while (end < stop) {
+            uint64_t *q = get_pte(p->cr3, end);
+            bool qt = q && (*q & PTE_PRESENT);
+            if (qt != there || (qt && win32_page_prot(*q) != prot)) break;
+            end += PAGE_SIZE;
+        }
+        mbi.AllocationBase = sbot;
+        mbi.AllocationProtect = 0x04;
+        mbi.RegionSize = end - page;
+        mbi.State = there ? 0x1000u : 0x2000u;
+        mbi.Protect = prot;
+        mbi.Type = 0x20000;
+        goto out;
+    }
+
+    /* a page that is there, or mapped memory not touched yet */
+    uint64_t *pte = get_pte(p->cr3, page);
+    bool present = pte && (*pte & PTE_PRESENT);
+    bool mapped = win32_vma_at(p, page, &vs, &ve, &vp);
+    if (present || mapped) {
+        uint32_t prot = present ? win32_page_prot(*pte) : win32_prot_to_page(vp);
+        uint64_t end = page + PAGE_SIZE;
+        for (uint64_t n = 1; n < 4096; n++, end += PAGE_SIZE) {
+            uint64_t *q = get_pte(p->cr3, end);
+            bool qp = q && (*q & PTE_PRESENT);
+            if (present ? (!qp || win32_page_prot(*q) != prot) : (qp || end >= ve)) break;
+        }
+        mbi.AllocationBase = mapped ? vs : page;
+        mbi.AllocationProtect = prot;
+        mbi.RegionSize = end - page;
+        mbi.State = 0x1000;                       /* MEM_COMMIT */
+        mbi.Protect = prot;
+        mbi.Type = 0x20000;
+        goto out;
+    }
+
+    /* nothing there: to the next mapping or present page, 16 MiB at most */
+    {
+        uint64_t next = page + 4096ull * PAGE_SIZE;
+        int nv = mmap_vma_snapshot(p, -1, 0, 0, 0, 0);
+        for (int i = 0; i < nv; i++) {
+            uint64_t s2, e2;
+            uint32_t p2, f2;
+            if (mmap_vma_snapshot(p, i, &s2, &e2, &p2, &f2) == 0 && s2 > page && s2 < next) next = s2;
+        }
+        uint64_t end = page + PAGE_SIZE;
+        while (end < next) {
+            uint64_t *q = get_pte(p->cr3, end);
+            if (q && (*q & PTE_PRESENT)) break;
+            end += PAGE_SIZE;
+        }
+        mbi.RegionSize = end - page;
+        mbi.State = 0x10000;                      /* MEM_FREE */
+        mbi.Protect = 0x01;                       /* PAGE_NOACCESS */
+    }
+out:
     if (copy_to_user((void *)(uintptr_t)a[1], &mbi, sizeof(mbi)) != 0) return 0;
     return (long)sizeof(mbi);
 }
@@ -26576,6 +26825,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "TlsSetValue",               w32_TlsSetValue },
     { "kernel32.dll", "VirtualProtect",            w32_VirtualProtect },
     { "kernel32.dll", "VirtualQuery",              w32_VirtualQuery },
+    { "kernel32.dll", "VirtualAlloc",              w32_VirtualAlloc },
+    { "kernel32.dll", "VirtualFree",               w32_VirtualFree },
     /* ucrt: environment */
     { "api-ms-win-crt-environment-l1-1-0.dll", "__p__environ",       w32_p_environ },
     /* ucrt: heap */
@@ -27191,6 +27442,19 @@ int win32_dll_is_builtin(const char *dll) {
             if (c != sets[s][i]) break;
         }
         if (!sets[s][i]) return 1;
+    }
+    /* W7e: ntdll.dll, which no shim names -- its imports (the Rtl* function
+     * tables, the unwinder) bind to tobyrt.dll or name what is missing,
+     * instead of the load failing on a DLL tobyOS has no file of. */
+    static const char *const names[] = { "ntdll.dll" };
+    for (unsigned s = 0; s < sizeof(names) / sizeof(names[0]); s++) {
+        int i = 0;
+        for (; names[s][i]; i++) {
+            char c = dll[i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            if (c != names[s][i]) break;
+        }
+        if (!names[s][i] && !dll[i]) return 1;
     }
     return 0;
 }

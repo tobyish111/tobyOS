@@ -179,6 +179,9 @@ long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot);
 void mmap_init_proc(int pid);
 /* Clean up VMAs on process exit */
 void mmap_cleanup_proc(int pid);
+/* W7e (src/syscall.c): the Win32 reservations (VirtualAlloc) of the address
+ * space keyed pid, dropped with its VMA table by mmap_cleanup_proc. */
+void win32_res_drop(int pid);
 /* Handle page fault (demand paging / COW). Returns true if handled. */
 bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code);
 /* Clone VMAs for COW fork */

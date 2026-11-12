@@ -26,3 +26,9 @@ EXPORTS
     RtlRemoveVectoredContinueHandler = rt_RemoveVectoredContinueHandler
     KiUserExceptionDispatcher = rt_KiUserExceptionDispatcher
     GetCurrentThreadStackLimits = rt_GetCurrentThreadStackLimits
+    RtlAddFunctionTable = rt_RtlAddFunctionTable
+    RtlDeleteFunctionTable = rt_RtlDeleteFunctionTable
+    RtlInstallFunctionTableCallback = rt_RtlInstallFunctionTableCallback
+    RtlAddGrowableFunctionTable = rt_RtlAddGrowableFunctionTable
+    RtlGrowFunctionTable = rt_RtlGrowFunctionTable
+    RtlDeleteGrowableFunctionTable = rt_RtlDeleteGrowableFunctionTable

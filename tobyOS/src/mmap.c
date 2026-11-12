@@ -1550,6 +1550,7 @@ void mmap_cleanup_proc(int pid) {
     if (!vt) return;
     memset(vt, 0, sizeof(*vt));
     vt->mmap_hint = 0;
+    win32_res_drop(pid);        /* W7e: VirtualAlloc's record of them, too */
 }
 
 void mmap2_cleanup_proc(int pid) {

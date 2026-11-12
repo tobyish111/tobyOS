@@ -1259,6 +1259,9 @@ static const char *const g_pe_rt_names[] = {
     "RtlAddVectoredContinueHandler", "RtlRemoveVectoredContinueHandler",
     /* W7d-2 */
     "GetCurrentThreadStackLimits",
+    /* W7e */
+    "RtlAddFunctionTable", "RtlDeleteFunctionTable", "RtlInstallFunctionTableCallback",
+    "RtlAddGrowableFunctionTable", "RtlGrowFunctionTable", "RtlDeleteGrowableFunctionTable",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)

@@ -198,15 +198,165 @@ static const RUNTIME_FUNCTION *rt_pdata(ULONG64 base, ULONG64 size, DWORD *count
     return (const RUNTIME_FUNCTION *)(base + d->VirtualAddress);
 }
 
+/* ---- function tables for code made at run time (W7e) ------------------- *
+ * RtlAddFunctionTable, RtlInstallFunctionTableCallback and the growable
+ * tables: entries from a fixed pool, a spin lock around the list.
+ * RtlLookupFunctionEntry asks them for a pc no image holds. The rules
+ * (measured on Windows 11, programs/win-exc36): a table's RVAs are relative
+ * to the base it is given, which the lookup reports as the image base; a
+ * callback table's identifier must have its low two bits set (else FALSE)
+ * and is the handle RtlDeleteFunctionTable takes; a growable table answers
+ * for its first `count` entries, nothing until RtlGrowFunctionTable; a
+ * table deleted twice: FALSE. */
+#define RT_DYN_MAX 64
+enum { RT_DYN_FREE, RT_DYN_STATIC, RT_DYN_CALLBACK, RT_DYN_GROWABLE };
+struct rt_dyn {
+    int kind;
+    PRUNTIME_FUNCTION table;            /* static, growable */
+    volatile DWORD count;               /* static, growable */
+    DWORD max;                          /* growable */
+    ULONG64 base;                       /* the RVAs' base */
+    ULONG64 lo, hi;                     /* the pcs it answers for */
+    ULONG64 id;                         /* callback: the identifier */
+    PGET_RUNTIME_FUNCTION_CALLBACK callback;
+    PVOID context;
+};
+static struct rt_dyn g_dyn[RT_DYN_MAX];
+static volatile LONG g_dyn_lock;
+static void rt_dyn_lock(void) {
+    while (__atomic_exchange_n(&g_dyn_lock, 1, __ATOMIC_ACQUIRE)) __builtin_ia32_pause();
+}
+static void rt_dyn_unlock(void) { __atomic_store_n(&g_dyn_lock, 0, __ATOMIC_RELEASE); }
+
+static struct rt_dyn *rt_dyn_new(void) {
+    for (int i = 0; i < RT_DYN_MAX; i++)
+        if (g_dyn[i].kind == RT_DYN_FREE) return &g_dyn[i];
+    return 0;
+}
+
+BOOLEAN rt_RtlAddFunctionTable(PRUNTIME_FUNCTION table, DWORD count, DWORD64 base) {
+    if (!table || !count) return FALSE;
+    ULONG64 lo = ~0ULL, hi = 0;
+    for (DWORD i = 0; i < count; i++) {
+        if (base + table[i].BeginAddress < lo) lo = base + table[i].BeginAddress;
+        if (base + table[i].EndAddress > hi) hi = base + table[i].EndAddress;
+    }
+    rt_dyn_lock();
+    struct rt_dyn *d = rt_dyn_new();
+    if (d) {
+        d->table = table; d->count = count; d->max = count; d->base = base;
+        d->lo = lo; d->hi = hi; d->id = 0; d->callback = 0; d->context = 0;
+        d->kind = RT_DYN_STATIC;
+    }
+    rt_dyn_unlock();
+    return d != 0;
+}
+
+BOOLEAN rt_RtlInstallFunctionTableCallback(DWORD64 id, DWORD64 base, DWORD length,
+                                           PGET_RUNTIME_FUNCTION_CALLBACK callback,
+                                           PVOID context, PCWSTR dll) {
+    (void)dll;
+    if ((id & 3) != 3 || !callback || !length) return FALSE;
+    rt_dyn_lock();
+    struct rt_dyn *d = rt_dyn_new();
+    if (d) {
+        d->table = 0; d->count = 0; d->max = 0; d->base = base;
+        d->lo = base; d->hi = base + length; d->id = id; d->callback = callback; d->context = context;
+        d->kind = RT_DYN_CALLBACK;
+    }
+    rt_dyn_unlock();
+    return d != 0;
+}
+
+BOOLEAN rt_RtlDeleteFunctionTable(PRUNTIME_FUNCTION table) {
+    BOOLEAN done = FALSE;
+    rt_dyn_lock();
+    for (int i = 0; i < RT_DYN_MAX && !done; i++) {
+        struct rt_dyn *d = &g_dyn[i];
+        if ((d->kind == RT_DYN_STATIC && d->table == table) ||
+            (d->kind == RT_DYN_CALLBACK && d->id == (ULONG64)table)) {
+            d->kind = RT_DYN_FREE;
+            done = TRUE;
+        }
+    }
+    rt_dyn_unlock();
+    return done;
+}
+
+DWORD rt_RtlAddGrowableFunctionTable(PVOID *handle, PRUNTIME_FUNCTION table, DWORD count,
+                                     DWORD max, ULONG_PTR range_base, ULONG_PTR range_end) {
+    if (!handle || !table || count > max) return 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
+    rt_dyn_lock();
+    struct rt_dyn *d = rt_dyn_new();
+    if (d) {
+        d->table = table; d->count = count; d->max = max; d->base = range_base;
+        d->lo = range_base; d->hi = range_end; d->id = 0; d->callback = 0; d->context = 0;
+        d->kind = RT_DYN_GROWABLE;
+    }
+    rt_dyn_unlock();
+    if (!d) return 0xC0000017u;                                   /* STATUS_NO_MEMORY */
+    *handle = d;
+    return 0;
+}
+
+void rt_RtlGrowFunctionTable(PVOID handle, DWORD count) {
+    struct rt_dyn *d = (struct rt_dyn *)handle;
+    if (d && d->kind == RT_DYN_GROWABLE && count <= d->max && count >= d->count) d->count = count;
+}
+
+void rt_RtlDeleteGrowableFunctionTable(PVOID handle) {
+    struct rt_dyn *d = (struct rt_dyn *)handle;
+    rt_dyn_lock();
+    if (d >= g_dyn && d < g_dyn + RT_DYN_MAX && d->kind == RT_DYN_GROWABLE) d->kind = RT_DYN_FREE;
+    rt_dyn_unlock();
+}
+
+/* The entry for pc in the run-time tables, or NULL; *base its RVAs' base. */
+static PRUNTIME_FUNCTION rt_dyn_lookup(ULONG64 pc, PULONG64 base) {
+    PGET_RUNTIME_FUNCTION_CALLBACK cb = 0;
+    PVOID cb_ctx = 0;
+    ULONG64 cb_base = 0;
+    PRUNTIME_FUNCTION found = 0;
+    rt_dyn_lock();
+    for (int i = 0; i < RT_DYN_MAX && !found && !cb; i++) {
+        struct rt_dyn *d = &g_dyn[i];
+        if (d->kind == RT_DYN_FREE || pc < d->lo || pc >= d->hi) continue;
+        if (d->kind == RT_DYN_CALLBACK) {
+            cb = d->callback; cb_ctx = d->context; cb_base = d->base;
+            continue;
+        }
+        DWORD rva = (DWORD)(pc - d->base);
+        for (DWORD k = 0; k < d->count; k++) {
+            if (rva >= d->table[k].BeginAddress && rva < d->table[k].EndAddress) {
+                found = &d->table[k];
+                if (base) *base = d->base;
+                break;
+            }
+        }
+    }
+    rt_dyn_unlock();
+    if (!found && cb) {                       /* called without the lock */
+        found = cb(pc, cb_ctx);
+        if (found && base) *base = cb_base;
+    }
+    return found;
+}
+
 /* RtlLookupFunctionEntry: the function table entry for pc (a binary search
  * of its image's array, which is sorted by address), NULL for none -- a leaf
- * function, or no image. The history table is optional and not used. */
+ * function; a pc no image holds, the run-time tables' (W7e). The history
+ * table is optional and not used. */
 PRUNTIME_FUNCTION rt_RtlLookupFunctionEntry(ULONG64 pc, PULONG64 image_base,
                                             PUNWIND_HISTORY_TABLE hist) {
     (void)hist;
     ULONG64 size = 0, base = rt_module_of(pc, &size, 0);
     if (image_base) *image_base = base;
-    if (!base) return 0;
+    if (!base) {                              /* W7e: code made at run time */
+        ULONG64 db = 0;
+        PRUNTIME_FUNCTION f = rt_dyn_lookup(pc, &db);
+        if (image_base) *image_base = f ? db : 0;
+        return f;
+    }
     DWORD n = 0;
     const RUNTIME_FUNCTION *t = rt_pdata(base, size, &n);
     if (!t) return 0;
