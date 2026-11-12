@@ -1407,6 +1407,50 @@ long rt__lseek(int fd, long o, int w)             { long r = __toby__lseek(fd, o
 __int64 rt__lseeki64(int fd, __int64 o, int w)    { __int64 r = __toby__lseeki64(fd, o, w); rt_iph_after(); return r; }
 int rt__eof(int fd)                               { int r = __toby__eof(fd); rt_iph_after(); return r; }
 
+/* W7p: the narrow stdio functions, which refuse a stream in a wide mode
+ * (EINVAL), the opens, which refuse a ccs= that is not one, and setvbuf: the
+ * handler after, as for the others (measured: programs/win-wide47) */
+__declspec(dllimport) int __cdecl __toby_stdio_common_vfprintf(unsigned __int64, void *, const char *, void *, va_list);
+__declspec(dllimport) int __cdecl __toby_fputs(const char *, void *);
+__declspec(dllimport) int __cdecl __toby_puts(const char *);
+__declspec(dllimport) int __cdecl __toby_fputc(int, void *);
+__declspec(dllimport) int __cdecl __toby_putchar(int);
+__declspec(dllimport) int __cdecl __toby_fgetc(void *);
+__declspec(dllimport) int __cdecl __toby_getchar(void);
+__declspec(dllimport) char *__cdecl __toby_fgets(char *, int, void *);
+__declspec(dllimport) int __cdecl __toby_ungetc(int, void *);
+__declspec(dllimport) int __cdecl __toby_stdio_common_vfscanf(unsigned __int64, void *, const char *, void *, va_list);
+__declspec(dllimport) void *__cdecl __toby_fopen(const char *, const char *);
+__declspec(dllimport) void *__cdecl __toby__wfopen(const unsigned short *, const unsigned short *);
+__declspec(dllimport) void *__cdecl __toby__fsopen(const char *, const char *, int);
+__declspec(dllimport) void *__cdecl __toby__wfsopen(const unsigned short *, const unsigned short *, int);
+__declspec(dllimport) void *__cdecl __toby_freopen(const char *, const char *, void *);
+__declspec(dllimport) int __cdecl __toby_setvbuf(void *, char *, int, size_t);
+int rt_stdio_common_vfprintf(unsigned __int64 o, void *s, const char *f, void *l, va_list v) {
+    int r = __toby_stdio_common_vfprintf(o, s, f, l, v); rt_iph_after(); return r;
+}
+int rt_stdio_common_vfscanf(unsigned __int64 o, void *s, const char *f, void *l, va_list v) {
+    int r = __toby_stdio_common_vfscanf(o, s, f, l, v); rt_iph_after(); return r;
+}
+int rt_fputs(const char *p, void *s)               { int r = __toby_fputs(p, s); rt_iph_after(); return r; }
+int rt_puts(const char *p)                         { int r = __toby_puts(p); rt_iph_after(); return r; }
+int rt_fputc(int c, void *s)                       { int r = __toby_fputc(c, s); rt_iph_after(); return r; }
+int rt_putchar(int c)                              { int r = __toby_putchar(c); rt_iph_after(); return r; }
+int rt_fgetc(void *s)                              { int r = __toby_fgetc(s); rt_iph_after(); return r; }
+int rt_getchar(void)                               { int r = __toby_getchar(); rt_iph_after(); return r; }
+char *rt_fgets(char *b, int n, void *s)            { char *r = __toby_fgets(b, n, s); rt_iph_after(); return r; }
+int rt_ungetc(int c, void *s)                      { int r = __toby_ungetc(c, s); rt_iph_after(); return r; }
+void *rt_fopen(const char *p, const char *m)       { void *r = __toby_fopen(p, m); rt_iph_after(); return r; }
+void *rt__wfopen(const unsigned short *p, const unsigned short *m) {
+    void *r = __toby__wfopen(p, m); rt_iph_after(); return r;
+}
+void *rt__fsopen(const char *p, const char *m, int sh) { void *r = __toby__fsopen(p, m, sh); rt_iph_after(); return r; }
+void *rt__wfsopen(const unsigned short *p, const unsigned short *m, int sh) {
+    void *r = __toby__wfsopen(p, m, sh); rt_iph_after(); return r;
+}
+void *rt_freopen(const char *p, const char *m, void *s) { void *r = __toby_freopen(p, m, s); rt_iph_after(); return r; }
+int rt_setvbuf(void *s, char *b, int m, size_t n)  { int r = __toby_setvbuf(s, b, m, n); rt_iph_after(); return r; }
+
 /* set_terminate / _get_terminate / terminate: the handler is the thread's
  * (the UCRT keeps one a thread); terminate calls it, and aborts when it
  * returns or there is none (abort: exit 3, W7h). */

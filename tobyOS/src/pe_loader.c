@@ -1380,6 +1380,12 @@ static const char *const g_pe_rt_names[] = {
     "SetThreadpoolWait", "WaitForThreadpoolWaitCallbacks", "CloseThreadpoolWait",
     "FreeLibraryWhenCallbackReturns", "InitOnceBeginInitialize", "InitOnceComplete",
     "RtlCaptureStackBackTrace", "GetModuleHandleExW", "GetModuleHandleExA",
+    /* W7p: the narrow stdio functions refuse a stream in a wide mode, and
+     * the opens a ccs= that is not one, through the invalid-parameter
+     * handler; setvbuf's mode */
+    "__stdio_common_vfprintf", "fputs", "puts", "fputc", "putc", "putchar", "fgetc", "getc",
+    "getchar", "fgets", "ungetc", "__stdio_common_vfscanf", "fopen", "_wfopen", "_fsopen",
+    "_wfsopen", "freopen", "setvbuf",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)

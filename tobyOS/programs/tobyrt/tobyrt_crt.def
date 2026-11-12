@@ -17,3 +17,19 @@ EXPORTS
     __toby__lseek
     __toby__lseeki64
     __toby__eof
+    __toby_stdio_common_vfprintf
+    __toby_stdio_common_vfscanf
+    __toby_fputs
+    __toby_puts
+    __toby_fputc
+    __toby_putchar
+    __toby_fgetc
+    __toby_getchar
+    __toby_fgets
+    __toby_ungetc
+    __toby_fopen
+    __toby__wfopen
+    __toby__fsopen
+    __toby__wfsopen
+    __toby_freopen
+    __toby_setvbuf

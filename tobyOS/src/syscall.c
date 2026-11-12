@@ -18269,15 +18269,23 @@ static long win32_fd_write(int fd, const char *buf, size_t len) {
 #define W32FD_FBUF      0x20           /* W7m: buffered -- what the CRT writes waits in `buf` */
 #define W32FD_FBSET     0x40           /* W7m: buffered or not decided (stdout's at its first write) */
 #define W32FD_BUFSZ     4096u          /* the UCRT's buffer */
-/* mode: an index of g_w32fd_modes; bufn bytes wait at buf (W7m) */
-struct w32fd { uint8_t flags, mode, look, unget; uint32_t bufn; uint64_t buf; };
-#define W32FD_ESZ       16u
-_Static_assert(sizeof(struct w32fd) == W32FD_ESZ, "a descriptor's CRT state is 16 bytes");
+/* mode: an index of g_w32fd_modes; bufn bytes wait at buf (W7m). W7p: rpn
+ * bytes of what a wide read decoded past what it was asked for wait in rp
+ * (ungetwc's unit, fread's odd byte); rwn bytes a wide read took from a pipe
+ * past its characters wait in rw (a file seeks back); flags2 */
+struct w32fd { uint8_t flags, mode, look, unget; uint32_t bufn; uint64_t buf;
+               uint8_t rp[4], rw[8]; uint8_t rpn, rwn, flags2, pad; };
+#define W32FD_ESZ       32u
+#define W32FD2_WERR     0x01           /* W7p: the end cut a UTF-8 character short: the next read EINVAL */
+_Static_assert(sizeof(struct w32fd) == W32FD_ESZ, "a descriptor's CRT state is 32 bytes");
 static const uint32_t g_w32fd_modes[5] = {
     0x4000 /* _O_TEXT */, 0x8000 /* _O_BINARY */, 0x10000 /* _O_WTEXT */,
     0x20000 /* _O_U16TEXT */, 0x40000 /* _O_U8TEXT */ };
 #define W32FD_TEXT 0
 #define W32FD_BIN  1
+#define W32FD_W16  2                   /* W7p: _O_WTEXT and _O_U16TEXT (_setmode answers both 0x10000) */
+#define W32FD_U8   4                   /* W7p: _O_U8TEXT */
+static bool win32_mode_wide(int m) { return m == W32FD_W16 || m == 3 || m == W32FD_U8; }
 static uint64_t win32_malloc_hdr(uint64_t n);
 static long win32_invalid_parameter(int err);
 static uint64_t win32_fdtab(bool make) {
@@ -18289,12 +18297,15 @@ static uint64_t win32_fdtab(bool make) {
     return t;
 }
 static struct w32fd win32_fd_get(int fd) {
-    struct w32fd e = { 0, 0, 0, 0, 0, 0 };
+    struct w32fd e;
+    memset(&e, 0, sizeof e);
     if (fd < 0 || fd >= W32FD_MAX) return e;
     uint64_t t = win32_fdtab(false);
     if (t) (void)copy_from_user(&e, (const void *)(uintptr_t)(t + (uint64_t)fd * W32FD_ESZ), W32FD_ESZ);
     if (e.bufn > W32FD_BUFSZ) e.bufn = 0;
     if (e.mode >= 5) e.mode = W32FD_TEXT;
+    if (e.rpn > sizeof e.rp) e.rpn = 0;
+    if (e.rwn > sizeof e.rw) e.rwn = 0;
     return e;
 }
 static void win32_fd_put(int fd, struct w32fd e) {
@@ -18306,7 +18317,10 @@ static void win32_fd_put(int fd, struct w32fd e) {
  * buffer, flushed by the caller, kept for the next stream on it) */
 static void win32_fd_reset(int fd, int mode) {
     if (mode == W32FD_TEXT && !win32_fdtab(false)) return;
-    struct w32fd e = { 0, (uint8_t)mode, 0, 0, 0, win32_fd_get(fd).buf };
+    struct w32fd e;
+    memset(&e, 0, sizeof e);
+    e.mode = (uint8_t)mode;
+    e.buf = win32_fd_get(fd).buf;
     win32_fd_put(fd, e);
 }
 static void win32_fd_flag(int fd, uint8_t set, uint8_t clear) {
@@ -18316,7 +18330,16 @@ static void win32_fd_flag(int fd, uint8_t set, uint8_t clear) {
     e.flags = f;
     win32_fd_put(fd, e);
 }
-static bool win32_fd_text(int fd) { return win32_fd_get(fd).mode != W32FD_BIN; }
+/* W7p: a seek: the flags named cleared, and what a wide read kept */
+static void win32_fd_seeked(int fd, uint8_t clear) {
+    if (!win32_fdtab(false)) return;
+    struct w32fd e = win32_fd_get(fd);
+    e.flags &= (uint8_t)~clear;
+    e.rpn = 0;
+    e.rwn = 0;
+    e.flags2 = 0;
+    win32_fd_put(fd, e);
+}
 /* _fmode's mode for an open that says neither binary nor text */
 static int win32_fmode_mode(void) {
     int32_t m = 0;
@@ -18333,21 +18356,120 @@ static void win32_crt_errno(int e) {
  * terminal, never stderr; setvbuf changes it. Measured on Windows 11
  * (logs/w32/w7m-probe-flush.c): a program's printf to a pipe reached it after
  * its WriteFile, and what a stream held reached its file at return, exit,
- * _exit and ExitProcess, not at TerminateProcess. The bytes wait translated;
- * a read, a seek, fflush, fclose and the process's end write them. _write
+ * _exit and ExitProcess, not at TerminateProcess. The bytes wait as the
+ * program wrote them (W7p: their write translates them, as the UCRT's); a
+ * read, a seek, fflush, fclose and the process's end write them. _write
  * goes past the buffer, as the UCRT's does. Before W7m every fputc was a
  * write of its own -- msvcp140's filebuf writes a character at a time. */
+/* W7p: the CRT's low-level write (_write's, a flush's, an unbuffered
+ * stream's): the mode's translation of what the program wrote. Text: each
+ * '\n' as "\r\n". A wide mode takes the bytes as UTF-16LE code units --
+ * _O_WTEXT and _O_U16TEXT write them with each L'\n' as L"\r\n", _O_U8TEXT
+ * as UTF-8 with each '\n' as "\r\n", a surrogate pair one character and a
+ * lone surrogate U+FFFD; to a terminal a wide mode writes UTF-8 (Windows'
+ * console takes the characters; tobyOS's terminals read UTF-8). Binary: as
+ * it is. One write is one run of units: a pair a flush splits is two
+ * U+FFFDs, as on Windows (measured: logs/w32/w7p-probe*.c). */
+struct w32out {
+    struct file *f; int mode; bool utf8, err, odd; uint8_t ob; uint16_t hi;
+    size_t n; char o[512];
+};
+static void w32out_init(struct w32out *s, struct file *f, int mode) {
+    s->f = f; s->mode = mode; s->err = false; s->odd = false; s->ob = 0; s->hi = 0; s->n = 0;
+    bool term = f && (f->kind == FILE_KIND_CONSOLE || f->kind == FILE_KIND_TERM ||
+                      f->kind == FILE_KIND_PTY_SLAVE);
+    s->utf8 = mode == W32FD_U8 || (term && win32_mode_wide(mode));
+}
+static void w32out_drain(struct w32out *s) {
+    if (s->n && !s->err && file_write(s->f, s->o, s->n) < 0) s->err = true;
+    s->n = 0;
+}
+static void w32out_b(struct w32out *s, uint8_t b) {
+    if (s->n == sizeof s->o) w32out_drain(s);
+    s->o[s->n++] = (char)b;
+}
+static void w32out_cp(struct w32out *s, uint32_t cp) {          /* a character, UTF-8 */
+    if (cp < 0x80) { w32out_b(s, (uint8_t)cp); return; }
+    if (cp < 0x800) {
+        w32out_b(s, (uint8_t)(0xC0 | (cp >> 6)));
+    } else if (cp < 0x10000) {
+        w32out_b(s, (uint8_t)(0xE0 | (cp >> 12)));
+        w32out_b(s, (uint8_t)(0x80 | ((cp >> 6) & 0x3F)));
+    } else {
+        w32out_b(s, (uint8_t)(0xF0 | (cp >> 18)));
+        w32out_b(s, (uint8_t)(0x80 | ((cp >> 12) & 0x3F)));
+        w32out_b(s, (uint8_t)(0x80 | ((cp >> 6) & 0x3F)));
+    }
+    w32out_b(s, (uint8_t)(0x80 | (cp & 0x3F)));
+}
+static void w32out_unit(struct w32out *s, uint16_t u) {
+    if (!s->utf8) {                                             /* UTF-16LE */
+        if (u == '\n') { w32out_b(s, '\r'); w32out_b(s, 0); }
+        w32out_b(s, (uint8_t)u);
+        w32out_b(s, (uint8_t)(u >> 8));
+        return;
+    }
+    if (s->hi) {
+        uint32_t h = s->hi;
+        s->hi = 0;
+        if (u >= 0xDC00 && u <= 0xDFFF) {
+            w32out_cp(s, 0x10000u + ((h - 0xD800u) << 10) + (uint32_t)(u - 0xDC00u));
+            return;
+        }
+        w32out_cp(s, 0xFFFD);
+    }
+    if (u >= 0xD800 && u <= 0xDBFF) { s->hi = u; return; }
+    if (u >= 0xDC00 && u <= 0xDFFF) { w32out_cp(s, 0xFFFD); return; }
+    if (u == '\n') w32out_b(s, '\r');
+    w32out_cp(s, u);
+}
+static void w32out_put(struct w32out *s, const char *k, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = (uint8_t)k[i];
+        if (s->mode == W32FD_BIN) { w32out_b(s, b); continue; }
+        if (!win32_mode_wide(s->mode)) {
+            if (b == '\n') w32out_b(s, '\r');
+            w32out_b(s, b);
+            continue;
+        }
+        if (!s->odd) { s->ob = b; s->odd = true; continue; }
+        s->odd = false;
+        w32out_unit(s, (uint16_t)(s->ob | ((uint16_t)b << 8)));
+    }
+}
+/* the write's end: a high surrogate nothing followed is U+FFFD; 0, or -1 (an
+ * odd byte left, or the file's error) */
+static int w32out_end(struct w32out *s) {
+    if (s->hi) { s->hi = 0; w32out_cp(s, 0xFFFD); }
+    w32out_drain(s);
+    return s->err || s->odd ? -1 : 0;
+}
 static int win32_crt_flush(int fd) {
     struct w32fd e = win32_fd_get(fd);
     if (!e.bufn || !e.buf) return 0;
     uint32_t n = e.bufn;
     e.bufn = 0;
     win32_fd_put(fd, e);
-    for (uint64_t done = 0; done < n; ) {
-        long w = sys_write(fd, (const void *)(uintptr_t)(e.buf + done), n - done);
-        if (w <= 0) { win32_fd_flag(fd, W32FD_FERR, 0); return -1; }
-        done += (uint64_t)w;
+    if (e.mode == W32FD_BIN) {
+        for (uint64_t done = 0; done < n; ) {
+            long w = sys_write(fd, (const void *)(uintptr_t)(e.buf + done), n - done);
+            if (w <= 0) { win32_fd_flag(fd, W32FD_FERR, 0); return -1; }
+            done += (uint64_t)w;
+        }
+        return 0;
     }
+    struct file *f = fd_lookup(fd);
+    if (!f) return -1;
+    struct w32out s;
+    w32out_init(&s, f, e.mode);
+    char k[256];
+    for (uint32_t done = 0; done < n && !s.err; ) {
+        uint32_t m = n - done < sizeof k ? n - done : (uint32_t)sizeof k;
+        if (copy_from_user(k, (const void *)(uintptr_t)(e.buf + done), m) != 0) { s.err = true; break; }
+        w32out_put(&s, k, m);
+        done += m;
+    }
+    if (w32out_end(&s) < 0) { win32_fd_flag(fd, W32FD_FERR, 0); return -1; }
     return 0;
 }
 /* every descriptor's; the count of those that had something */
@@ -18374,66 +18496,63 @@ static bool win32_fd_buffered(int fd, struct w32fd *e) {
     }
     return e->buf != 0;
 }
-/* n bytes (translated) to the descriptor: into its buffer when it has one */
-static long win32_crt_out(int fd, struct file *f, const char *k, size_t n, bool stdio) {
-    struct w32fd e = win32_fd_get(fd);
-    if (!stdio || !win32_fd_buffered(fd, &e)) return file_write(f, k, n) < 0 ? -1 : 0;
-    while (n) {
-        if (e.bufn == W32FD_BUFSZ) {
-            if (win32_crt_flush(fd) < 0) return -1;
-            e = win32_fd_get(fd);
-        }
-        uint32_t m = W32FD_BUFSZ - e.bufn;
-        if (m > n) m = (uint32_t)n;
-        if (copy_to_user((void *)(uintptr_t)(e.buf + e.bufn), k, m) != 0) return -1;
-        e.bufn += m;
-        k += m;
-        n -= m;
-        win32_fd_put(fd, e);
-    }
-    return 0;
-}
-/* What the CRT writes from a kernel buffer: in text mode each '\n' as
- * "\r\n"; stdio's through the buffer, _write's past it. Answers len, or -1. */
+/* W7p: what the CRT writes from a kernel buffer: stdio's into the stream's
+ * buffer when it has one -- as the program wrote it, as the UCRT's holds it
+ * -- else, and _write's, through the mode's translation. Answers len, or -1. */
 static long win32_crt_write_x(int fd, const char *buf, size_t len, bool stdio) {
     if (len == 0) return 0;
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
-    if (!win32_fd_text(fd)) return win32_crt_out(fd, f, buf, len, stdio) < 0 ? -1 : (long)len;
-    char out[512];
-    size_t k = 0;
-    for (size_t i = 0; i < len; i++) {
-        if (k + 2 > sizeof out) {
-            if (win32_crt_out(fd, f, out, k, stdio) < 0) return -1;
-            k = 0;
+    struct w32fd e = win32_fd_get(fd);
+    if (stdio && win32_fd_buffered(fd, &e)) {
+        for (size_t done = 0; done < len; ) {
+            if (e.bufn == W32FD_BUFSZ) {
+                if (win32_crt_flush(fd) < 0) return -1;
+                e = win32_fd_get(fd);
+            }
+            uint32_t m = W32FD_BUFSZ - e.bufn;
+            if (m > len - done) m = (uint32_t)(len - done);
+            if (copy_to_user((void *)(uintptr_t)(e.buf + e.bufn), buf + done, m) != 0) return -1;
+            e.bufn += m;
+            done += m;
+            win32_fd_put(fd, e);
         }
-        if (buf[i] == '\n') out[k++] = '\r';
-        out[k++] = buf[i];
+        return (long)len;
     }
-    if (k && win32_crt_out(fd, f, out, k, stdio) < 0) return -1;
-    return (long)len;
+    struct w32out s;
+    w32out_init(&s, f, e.mode);
+    w32out_put(&s, buf, len);
+    return w32out_end(&s) < 0 ? -1 : (long)len;
 }
 static long win32_crt_write(int fd, const char *buf, size_t len) { return win32_crt_write_x(fd, buf, len, true); }
 /* ... and from the program's buffer (a binary write that the buffer would
  * not hold goes out at once, after what waits) */
 static long win32_crt_write_ux(int fd, uint64_t ubuf, size_t len, bool stdio) {
     if (len == 0) return 0;
-    if (!win32_fd_text(fd)) {
-        struct w32fd e = win32_fd_get(fd);
-        if (!stdio || !win32_fd_buffered(fd, &e) || len >= W32FD_BUFSZ) {
-            if (stdio && win32_crt_flush(fd) < 0) return -1;
-            long w = sys_write(fd, (const void *)(uintptr_t)ubuf, len);
-            return w < 0 ? -1 : w;
-        }
+    struct file *f = fd_lookup(fd);
+    if (!f) return -1;
+    struct w32fd e = win32_fd_get(fd);
+    bool buffered = stdio && win32_fd_buffered(fd, &e);
+    if (e.mode == W32FD_BIN && (!buffered || len >= W32FD_BUFSZ)) {
+        if (stdio && win32_crt_flush(fd) < 0) return -1;
+        long w = sys_write(fd, (const void *)(uintptr_t)ubuf, len);
+        return w < 0 ? -1 : w;
     }
     char k[256];
+    struct w32out s;
+    w32out_init(&s, f, e.mode);
     for (size_t done = 0; done < len; ) {
         size_t n = len - done < sizeof k ? len - done : sizeof k;
         if (copy_from_user(k, (const void *)(uintptr_t)(ubuf + done), n) != 0) return -1;
-        if (win32_crt_write_x(fd, k, n, stdio) < 0) return -1;
+        if (buffered) {
+            if (win32_crt_write_x(fd, k, n, true) < 0) return -1;
+        } else {
+            w32out_put(&s, k, n);
+        }
         done += n;
     }
-    return (long)len;
+    if (buffered) return (long)len;
+    return w32out_end(&s) < 0 ? -1 : (long)len;
 }
 static long win32_crt_write_u(int fd, uint64_t ubuf, size_t len) { return win32_crt_write_ux(fd, ubuf, len, true); }
 
@@ -18507,6 +18626,223 @@ static int win32_stdio_getc(int fd) {
     return (unsigned char)c;
 }
 
+/* W7p: a narrow stdio function on a stream in a wide mode: EINVAL through the
+ * invalid-parameter handler (measured: printf, puts, fputs, fputc, fgetc,
+ * fgets, fscanf, getc, ungetc refuse it; fwrite and fread take its code
+ * units) */
+static bool win32_narrow_refused(int fd) {
+    if (fd < 0 || !win32_mode_wide(win32_fd_get(fd).mode)) return false;
+    (void)win32_invalid_parameter(22);
+    return true;
+}
+
+/* ---- W7p: reading in a wide mode ----
+ * _read in _O_WTEXT/_O_U16TEXT gives UTF-16LE code units, in _O_U8TEXT the
+ * UTF-8 it read as UTF-16LE; each "\r\n" as L'\n' (a '\r' at the end of what
+ * came decided by the next character), a Ctrl-Z the end until a seek, an odd
+ * byte at the end dropped. UTF-8 that is not is U+FFFD as Windows counts it
+ * (measured: logs/w32/w7p-probe3.c): a byte that starts nothing, one each; a
+ * lead and a second byte out of the lead's range, one; a sequence a byte
+ * that does not continue it cuts short, one (that byte read after); one the
+ * end cuts short makes the next read EINVAL. */
+struct w32in { struct file *f; size_t n, i; bool eof, err; uint8_t b[528]; };
+static int w32in_peek(struct w32in *s) {
+    if (s->i < s->n) return s->b[s->i];
+    if (s->eof || s->n >= sizeof s->b) return -1;
+    long r = file_read(s->f, s->b + s->n, 1);       /* past the read: what a character needs */
+    if (r <= 0) { s->eof = true; if (r < 0) s->err = true; return -1; }
+    s->n++;
+    return s->b[s->i];
+}
+static int w32in_byte(struct w32in *s) {
+    int c = w32in_peek(s);
+    if (c >= 0) s->i++;
+    return c;
+}
+/* the next character: 1, 0 at the end, -2 the end cut a UTF-8 one short */
+static int w32in_char(struct w32in *s, bool u8, uint32_t *cp) {
+    int b0 = w32in_byte(s);
+    if (b0 < 0) return 0;
+    if (!u8) {
+        int b1 = w32in_byte(s);
+        if (b1 < 0) return 0;                       /* an odd byte at the end */
+        *cp = (uint32_t)b0 | ((uint32_t)b1 << 8);
+        return 1;
+    }
+    if (b0 < 0x80) { *cp = (uint32_t)b0; return 1; }
+    int need, lo = 0x80, hi = 0xBF;
+    uint32_t v;
+    if (b0 >= 0xC2 && b0 <= 0xDF) { need = 1; v = (uint32_t)b0 & 0x1F; }
+    else if (b0 >= 0xE0 && b0 <= 0xEF) {
+        need = 2; v = (uint32_t)b0 & 0x0F;
+        if (b0 == 0xE0) lo = 0xA0;
+        if (b0 == 0xED) hi = 0x9F;
+    } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+        need = 3; v = (uint32_t)b0 & 0x07;
+        if (b0 == 0xF0) lo = 0x90;
+        if (b0 == 0xF4) hi = 0x8F;
+    } else { *cp = 0xFFFD; return 1; }             /* 80..C1, F5..FF */
+    for (int k = 0; k < need; k++) {
+        int c = w32in_peek(s);
+        if (c < 0) return -2;
+        if (c < 0x80 || c > 0xBF) { *cp = 0xFFFD; return 1; }        /* it is read after */
+        s->i++;
+        if (k == 0 && (c < lo || c > hi)) { *cp = 0xFFFD; return 1; } /* the lead and it */
+        v = (v << 6) | ((uint32_t)c & 0x3F);
+    }
+    *cp = v;
+    return 1;
+}
+/* up to n bytes (UTF-16LE) of what a wide mode reads, into kb: what waits
+ * first, then one read and what its last character needs; a unit's byte past
+ * n waits (rp), and so do bytes a pipe gave past the characters (rw). Answers
+ * the bytes, 0 at the end, -1 an error (errno). */
+static long win32_wread_k(int fd, uint8_t *kb, size_t n) {
+    struct file *f = fd_lookup(fd);
+    if (!f) return -1;
+    if (n == 0) return 0;
+    struct w32fd e = win32_fd_get(fd);
+    size_t o = 0;
+    while (e.rpn && o < n) {
+        kb[o++] = e.rp[0];
+        for (int j = 1; j < e.rpn; j++) e.rp[j - 1] = e.rp[j];
+        e.rpn--;
+    }
+    if (o == n) { win32_fd_put(fd, e); return (long)o; }
+    if (e.flags2 & W32FD2_WERR) {
+        e.flags2 &= (uint8_t)~W32FD2_WERR;
+        win32_fd_put(fd, e);
+        if (o) return (long)o;
+        win32_crt_errno(22);
+        return -1;
+    }
+    if (e.flags & W32FD_CTRLZ) {
+        if (o) win32_fd_put(fd, e);
+        return (long)o;
+    }
+    bool u8 = e.mode == W32FD_U8;
+    size_t units = (n - o + 1) / 2;
+    struct w32in s;
+    s.f = f; s.n = 0; s.i = 0; s.eof = false; s.err = false;
+    for (int j = 0; j < e.rwn; j++) s.b[s.n++] = e.rw[j];
+    e.rwn = 0;
+    if (e.flags & W32FD_LOOK) { s.b[s.n++] = e.look; e.flags &= (uint8_t)~W32FD_LOOK; }
+    size_t want = u8 ? units : units * 2;           /* a byte makes at most a unit */
+    if (want > 512) want = 512;
+    if (s.n < want) {
+        long r = file_read(f, s.b + s.n, want - s.n);
+        if (r < 0) { s.err = true; s.eof = true; }
+        else if (r == 0) s.eof = true;
+        else s.n += (size_t)r;
+    }
+    size_t made = 0;
+    while (made < units && s.i < s.n) {
+        uint32_t cp;
+        int r = w32in_char(&s, u8, &cp);
+        if (r == 0) break;
+        if (r == -2) {
+            if (o) { e.flags2 |= W32FD2_WERR; break; }
+            win32_fd_put(fd, e);
+            win32_crt_errno(22);
+            return -1;
+        }
+        if (cp == 0x1A) { e.flags |= W32FD_CTRLZ; break; }
+        if (cp == '\r') {
+            size_t mark = s.i;
+            uint32_t c2;
+            if (w32in_char(&s, u8, &c2) == 1 && c2 == '\n') cp = '\n';
+            else s.i = mark;                        /* not a '\n': it is read after the '\r' */
+        }
+        uint16_t u[2];
+        int nu = 0;
+        if (cp > 0xFFFF) {
+            cp -= 0x10000;
+            u[nu++] = (uint16_t)(0xD800 + (cp >> 10));
+            u[nu++] = (uint16_t)(0xDC00 + (cp & 0x3FF));
+        } else {
+            u[nu++] = (uint16_t)cp;
+        }
+        for (int j = 0; j < nu; j++) {
+            uint8_t ub[2] = { (uint8_t)u[j], (uint8_t)(u[j] >> 8) };
+            for (int k = 0; k < 2; k++) {
+                if (o < n) kb[o++] = ub[k];
+                else if (e.rpn < sizeof e.rp) e.rp[e.rpn++] = ub[k];
+            }
+        }
+        made += (size_t)nu;
+    }
+    size_t left = s.n - s.i;
+    if (left && sys_lseek(fd, -(int64_t)left, 1 /* SEEK_CUR */) < 0)
+        for (size_t j = 0; j < left && e.rwn < sizeof e.rw; j++) e.rw[e.rwn++] = s.b[s.i + j];
+    win32_fd_put(fd, e);
+    if (!o && s.err) { win32_crt_errno(5); return -1; }
+    return (long)o;
+}
+/* fgetwc's next unit, 0..0xFFFF; -1 at the end or an error (feof, ferror):
+ * a text stream's byte is its character in the "C" locale; a binary
+ * stream's two bytes are the unit; a wide mode's is the read's */
+static long win32_wgetc(int fd) {
+    if (win32_crt_flush(fd) < 0) return -1;
+    struct w32fd e = win32_fd_get(fd);
+    if (!win32_mode_wide(e.mode) && e.mode != W32FD_BIN) return win32_stdio_getc(fd);
+    uint8_t b[2];
+    if (e.mode == W32FD_BIN) {
+        int k = 0;
+        if (e.rpn) {
+            while (e.rpn && k < 2) {
+                b[k++] = e.rp[0];
+                for (int j = 1; j < e.rpn; j++) e.rp[j - 1] = e.rp[j];
+                e.rpn--;
+            }
+            win32_fd_put(fd, e);
+        }
+        while (k < 2) {
+            int c = win32_stdio_getc(fd);
+            if (c < 0) return -1;
+            b[k++] = (uint8_t)c;
+        }
+        return (long)(b[0] | ((uint16_t)b[1] << 8));
+    }
+    long r = win32_wread_k(fd, b, 2);
+    if (r == 2) return (long)(b[0] | ((uint16_t)b[1] << 8));
+    win32_fd_flag(fd, r < 0 ? W32FD_FERR : W32FD_FEOF, 0);
+    return -1;
+}
+/* W7p: what fputwc, fputws and the wprintf family write: in a wide mode or a
+ * binary stream the code units themselves, little-endian (a wide mode's
+ * translation is the write's); in a text stream each character's byte in the
+ * "C" locale -- one past 0xFF is '?' for the wprintf family (qm), else EILSEQ
+ * with what came before it written (measured). 0, or -1 (errno). */
+static long win32_wstdio_out(int fd, const uint16_t *w, size_t n, bool qm) {
+    struct w32fd e = win32_fd_get(fd);
+    bool text = !win32_mode_wide(e.mode) && e.mode != W32FD_BIN;
+    char k[512];
+    size_t kn = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (kn + 2 > sizeof k) {
+            if (win32_crt_write(fd, k, kn) < 0) goto ioerr;
+            kn = 0;
+        }
+        if (!text) {
+            k[kn++] = (char)w[i];
+            k[kn++] = (char)(w[i] >> 8);
+        } else if (w[i] <= 0xFF) {
+            k[kn++] = (char)w[i];
+        } else if (qm) {
+            k[kn++] = '?';
+        } else {
+            if (kn && win32_crt_write(fd, k, kn) < 0) goto ioerr;
+            win32_crt_errno(42);                    /* EILSEQ */
+            return -1;
+        }
+    }
+    if (kn && win32_crt_write(fd, k, kn) < 0) goto ioerr;
+    return 0;
+ioerr:
+    win32_fd_flag(fd, W32FD_FERR, 0);
+    return -1;
+}
+
 /* W2: GetLastError's value lives in each THREAD's TEB at 0x68 (LastErrorValue,
  * where Windows x64 keeps it), reached through the calling thread's GS base --
  * every Win32 thread has its own TEB (C16e), the main thread's is
@@ -18537,23 +18873,46 @@ static int win32_wstr_to_k(uint64_t uwide, char *out, int cap);
  *               still counts every char attempted, so the return value is the
  *               would-be length even when the buffer truncates. */
 struct win32_fmtbuf {
-    int fd; size_t n; long total; char buf[256];
+    int fd; size_t n; long total; uint16_t buf[256];
     char  *cap; size_t cap_n, cap_max;
+    uint16_t *wcap;        /* W7p: a wide capture (swprintf): cap_n, cap_max in units */
+    bool wide;             /* W7p: a wide printf -- its units are characters */
+    int err;               /* W7p: EILSEQ -- a narrow printf's wide character past 0xFF */
 };
+/* W7p: the units go out as the printf's kind asks: a narrow one's are bytes
+ * (each fits: fb_putw refused the others); a wide one's through the wide
+ * stdio write (a text stream's '?' past 0xFF) or into a wide capture */
 static void fb_flush(struct win32_fmtbuf *fb) {
     if (!fb->n) return;
     if (fb->fd >= 0) {
-        win32_crt_write(fb->fd, fb->buf, fb->n);       /* W7l: text mode */
+        if (fb->wide) {
+            (void)win32_wstdio_out(fb->fd, fb->buf, fb->n, true);
+        } else {
+            char k[256];
+            for (size_t i = 0; i < fb->n; i++) k[i] = (char)fb->buf[i];
+            win32_crt_write(fb->fd, k, fb->n);       /* W7l: text mode */
+        }
+    } else if (fb->wcap) {
+        for (size_t i = 0; i < fb->n && fb->cap_n < fb->cap_max; i++)
+            fb->wcap[fb->cap_n++] = fb->buf[i];
     } else if (fb->cap) {
         for (size_t i = 0; i < fb->n && fb->cap_n < fb->cap_max; i++)
-            fb->cap[fb->cap_n++] = fb->buf[i];
+            fb->cap[fb->cap_n++] = (char)fb->buf[i];
     }
     fb->n = 0;
 }
-static void fb_putc(struct win32_fmtbuf *fb, char c) {
-    if (fb->n == sizeof(fb->buf)) fb_flush(fb);
-    fb->buf[fb->n++] = c;
+static void fb_putu(struct win32_fmtbuf *fb, uint16_t u) {
+    if (fb->err) return;
+    if (fb->n == sizeof(fb->buf) / sizeof(fb->buf[0])) fb_flush(fb);
+    fb->buf[fb->n++] = u;
     fb->total++;
+}
+static void fb_putc(struct win32_fmtbuf *fb, char c) { fb_putu(fb, (uint8_t)c); }
+/* W7p: a wide character: a narrow printf writes its byte in the "C" locale,
+ * and one past 0xFF fails it (EILSEQ, measured) */
+static void fb_putw(struct win32_fmtbuf *fb, uint16_t u) {
+    if (!fb->wide && u > 0xFF) { fb->err = 42; return; }
+    fb_putu(fb, u);
 }
 static void fb_pad(struct win32_fmtbuf *fb, char c, int count) {
     for (int i = 0; i < count; i++) fb_putc(fb, c);
@@ -18592,21 +18951,48 @@ static void emit_field(struct win32_fmtbuf *fb, const char *pre, int pl,
     if (left) fb_pad(fb, ' ', pad);
 }
 
+/* W7p: a string or character conversion's units, padded */
+static void emit_field_u(struct win32_fmtbuf *fb, const uint16_t *body, int bl, int width, bool left) {
+    int pad = width > bl ? width - bl : 0;
+    if (!left) fb_pad(fb, ' ', pad);
+    for (int i = 0; i < bl; i++) fb_putw(fb, body[i]);
+    if (left) fb_pad(fb, ' ', pad);
+}
+
 #define WIN32_FMT_MAX  4096
 
 /* The printf engine core. Renders a KERNEL format string `fmt` + the user
  * variadic block `uva` into either `fd` (>=0) or a capture buffer `cap`
  * (cap_max bytes, used when fd<0). Returns chars written (the would-be
  * length in capture mode, even if `cap` truncates). */
-static long win32_format_core(int fd, char *cap, size_t cap_max,
-                              const char *fmt, uint64_t uva) {
+/* W7p: `wide` -- a wprintf's: its format's characters past ASCII come as
+ * the transcoder's UTF-8 (a unit each), its strings and characters are
+ * units, its narrow ones the "C" locale's; `wcap` a wide capture. A narrow
+ * printf's wide character past 0xFF fails it: -1, EILSEQ. */
+static long win32_format_core_w(int fd, char *cap, uint16_t *wcap, size_t cap_max, bool wide,
+                                const char *fmt, uint64_t uva) {
     struct win32_fmtbuf fb = { .fd = fd, .n = 0, .total = 0,
-                               .cap = cap, .cap_n = 0, .cap_max = cap_max };
+                               .cap = cap, .cap_n = 0, .cap_max = cap_max,
+                               .wcap = wcap, .wide = wide, .err = 0 };
     int ai = 0;
     const char *p = fmt;
 
-    while (*p) {
-        if (*p != '%') { fb_putc(&fb, *p++); continue; }
+    while (*p && !fb.err) {
+        if (*p != '%') {
+            uint8_t c0 = (uint8_t)*p;
+            if (wide && c0 >= 0xC0) {                  /* W7p: a unit the transcoder wrote */
+                uint16_t u = '?';
+                if (c0 < 0xE0 && p[1]) { u = (uint16_t)(((c0 & 0x1F) << 6) | (p[1] & 0x3F)); p += 2; }
+                else if (c0 >= 0xE0 && p[1] && p[2]) {
+                    u = (uint16_t)(((c0 & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F));
+                    p += 3;
+                } else p++;
+                fb_putu(&fb, u);
+                continue;
+            }
+            fb_putc(&fb, *p++);
+            continue;
+        }
         p++;
         if (*p == '%') { fb_putc(&fb, '%'); p++; continue; }
 
@@ -18690,37 +19076,44 @@ static long win32_format_core(int fd, char *cap, size_t cap_max,
         }
         case 'C':                 /* C23: %C == wide char in a narrow printf */
         case 'c': {
-            /* Wide when the conversion is %C, or %lc. The arg occupies one
-             * va slot either way; for a wide char we down-convert U+0000..7F
-             * to ASCII (others -> '?'), matching our UTF-16<->ASCII policy. */
+            /* Wide when the conversion is %C, or %lc (one va slot either
+             * way). W7p: a wide character is its unit (a narrow printf's
+             * byte, fb_putw), a narrow one its byte (a wprintf's unit: the
+             * "C" locale's character) */
             bool wch = (conv == 'C') || lmod;
             uint64_t raw = va_next(uva, &ai);
-            char ch = wch ? ((raw < 0x80) ? (char)raw : '?') : (char)raw;
-            emit_field(&fb, pre, 0, &ch, 1, width, left, false);
+            uint16_t u = wch ? (uint16_t)raw : (uint16_t)(uint8_t)raw;
+            emit_field_u(&fb, &u, 1, width, left);
             break;
         }
         case 'S':                 /* C23: %S == wide string in a narrow printf */
         case 's': {
-            /* Wide when the conversion is %S, or %ls (and not %hs). */
+            /* Wide when the conversion is %S, or %ls (and not %hs). W7p: as
+             * units, as %c's */
             bool wstr = (conv == 'S') || (lmod && !hmod);
             uint64_t sp = va_next(uva, &ai);
-            char sbuf[1024];
-            int sl = 0;
-            if (sp) {
-                if (wstr) {
-                    sl = win32_wstr_to_k(sp, sbuf, sizeof(sbuf));
-                } else {
-                    long n = strncpy_from_user(sbuf, (const char *)(uintptr_t)sp, sizeof(sbuf));
-                    if (n < 0) { const char *bad = "(badptr)"; fb_write(&fb, bad, 8); break; }
-                    sl = (n >= (long)sizeof(sbuf)) ? (int)sizeof(sbuf) - 1 : (int)n;
-                }
-            } else {
-                const char *nul = "(null)";
-                emit_field(&fb, pre, 0, nul, 6, width, left, false);
+            if (!sp) {
+                static const uint16_t nul[6] = { '(', 'n', 'u', 'l', 'l', ')' };
+                emit_field_u(&fb, nul, 6, width, left);
                 break;
             }
-            if (prec >= 0 && prec < sl) sl = prec;
-            emit_field(&fb, pre, 0, sbuf, sl, width, left, false);
+            uint16_t sbuf[1024];
+            int sl = 0;
+            int lim = (prec >= 0 && prec < 1023) ? prec : 1023;
+            if (wstr) {
+                for (; sl < lim; sl++) {
+                    uint16_t w = 0;
+                    if (copy_from_user(&w, (const void *)(uintptr_t)(sp + (uint64_t)sl * 2), 2) != 0 || !w) break;
+                    sbuf[sl] = w;
+                }
+            } else {
+                char nb[1024];
+                long n = strncpy_from_user(nb, (const char *)(uintptr_t)sp, sizeof(nb));
+                if (n < 0) { const char *bad = "(badptr)"; fb_write(&fb, bad, 8); break; }
+                if (n > lim) n = lim;
+                for (sl = 0; sl < (int)n; sl++) sbuf[sl] = (uint8_t)nb[sl];
+            }
+            emit_field_u(&fb, sbuf, sl, width, left);
             break;
         }
         case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
@@ -18748,8 +19141,16 @@ static long win32_format_core(int fd, char *cap, size_t cap_max,
         }
     }
 
+    if (fb.err) {                                       /* W7p: EILSEQ */
+        fb.n = 0;
+        win32_crt_errno(fb.err);
+        return -1;
+    }
     fb_flush(&fb);
     return fb.total;
+}
+static long win32_format_core(int fd, char *cap, size_t cap_max, const char *fmt, uint64_t uva) {
+    return win32_format_core_w(fd, cap, 0, cap_max, false, fmt, uva);
 }
 
 /* The classic narrow printf engine: copy the user format string into the
@@ -18790,7 +19191,18 @@ static int win32_wfmt_transcode(uint64_t uwfmt, char *out, int cap) {
         uint16_t wc = 0;
         if (copy_from_user(&wc, (const void *)(uintptr_t)(uwfmt + wi * 2), 2) != 0) break;
         if (wc == 0) break;
-        char c = (wc < 0x80) ? (char)wc : '?';
+        if (wc >= 0x80) {                   /* W7p: a unit past ASCII as UTF-8, each alone */
+            if (oi + 3 >= cap) break;
+            if (wc < 0x800) {
+                out[oi++] = (char)(0xC0 | (wc >> 6));
+            } else {
+                out[oi++] = (char)(0xE0 | (wc >> 12));
+                out[oi++] = (char)(0x80 | ((wc >> 6) & 0x3F));
+            }
+            out[oi++] = (char)(0x80 | (wc & 0x3F));
+            continue;
+        }
+        char c = (char)wc;
         if (c != '%') { out[oi++] = c; continue; }
         out[oi++] = '%';
         /* copy the rest of the spec, tracking h/l, until the conversion char */
@@ -18827,7 +19239,7 @@ static int win32_wfmt_transcode(uint64_t uwfmt, char *out, int cap) {
 static long win32_wvformat(int fd, uint64_t uwfmt, uint64_t uva) {
     char fmt[1024];
     win32_wfmt_transcode(uwfmt, fmt, sizeof(fmt));
-    return win32_format_core(fd, 0, 0, fmt, uva);
+    return win32_format_core_w(fd, 0, 0, 0, true, fmt, uva);   /* W7p: units */
 }
 
 /* api-ms-win-crt-stdio-l1-1-0.dll!__acrt_iob_func(unsigned index) -> FILE*.
@@ -18849,12 +19261,14 @@ static long w32_stdio_common_vfprintf(uint64_t *args) {
     int fd = 1;
     if ((stream & 0xFFFFFF00ULL) == WIN32_IOB_TAG) fd = (int)(stream & 0xFF);
     if (!ufmt || !uva) return -1;
+    if (win32_narrow_refused(fd)) return -1;            /* W7p */
     return win32_vformat(fd, ufmt, uva);
 }
 
 /* api-ms-win-crt-stdio-l1-1-0.dll!puts(const char* s) -> >=0 / EOF.
  * Writes s + '\n' to stdout. */
 static long w32_puts(uint64_t *args) {
+    if (win32_narrow_refused(1)) return -1;             /* W7p */
     char s[1024];
     long n = strncpy_from_user(s, (const char *)(uintptr_t)args[0], sizeof(s));
     if (n < 0) return -1;             /* EOF */
@@ -18892,53 +19306,60 @@ static long w32_stdio_common_vswprintf(uint64_t *args) {
     uint64_t uva   = args[5];
     char fmt[1024];
     win32_wfmt_transcode(uwfmt, fmt, sizeof(fmt));
-    char tmp[1024];
-    long t = win32_format_core(-1, tmp, sizeof(tmp) - 1, fmt, uva);
-    size_t n = ((size_t)t < sizeof(tmp) - 1) ? (size_t)t : sizeof(tmp) - 1;
+    uint16_t tmp[1024];                                 /* W7p: the units */
+    long t = win32_format_core_w(-1, 0, tmp, sizeof(tmp) / 2 - 1, true, fmt, uva);
+    if (t < 0) return -1;
+    size_t n = (size_t)t < sizeof(tmp) / 2 - 1 ? (size_t)t : sizeof(tmp) / 2 - 1;
     if (ubuf && count > 0) {
         size_t maxc = (size_t)count - 1;          /* leave room for NUL */
         size_t w = n < maxc ? n : maxc;
-        for (size_t i = 0; i < w; i++) {
-            uint16_t wc = (uint16_t)(uint8_t)tmp[i];
-            (void)copy_to_user((void *)(uintptr_t)(ubuf + i * 2), &wc, 2);
-        }
+        (void)copy_to_user((void *)(uintptr_t)ubuf, tmp, w * 2);
         uint16_t z = 0;
         (void)copy_to_user((void *)(uintptr_t)(ubuf + w * 2), &z, 2);
     }
     return t;
 }
 
-/* fputws(const wchar_t* ws, FILE* stream) -> >=0 / WEOF. */
+/* W7p: the wide writes -- the units through win32_wstdio_out (a wide mode's
+ * UTF-16 or UTF-8 is the write's; a text stream's the "C" locale's bytes). */
+/* fputws(const wchar_t* ws, FILE* stream) -> 0 / -1 (WEOF; EILSEQ) */
 static long w32_fputws(uint64_t *a) {
     uint64_t stream = a[1];
     int fd = 1;
     if ((stream & 0xFFFFFF00ULL) == WIN32_IOB_TAG) fd = (int)(stream & 0xFF);
-    char s[1024];
-    int n = win32_wstr_to_k(a[0], s, sizeof(s));
-    win32_crt_write(fd, s, (size_t)n);
-    return n;
+    if (!a[0]) return -1;
+    uint16_t w[256];
+    for (uint64_t off = 0;; ) {
+        size_t n = 0;
+        for (; n < 256; n++) {
+            uint16_t c = 0;
+            if (copy_from_user(&c, (const void *)(uintptr_t)(a[0] + (off + n) * 2), 2) != 0) return -1;
+            if (!c) break;
+            w[n] = c;
+        }
+        if (n && win32_wstdio_out(fd, w, n, false) < 0) return -1;
+        if (n < 256) return 0;
+        off += n;
+    }
 }
-/* _putws(const wchar_t* ws): fputws to stdout + newline. */
+/* _putws(const wchar_t* ws): fputws to stdout and L'\n' -> 0 (measured) */
 static long w32_putws(uint64_t *a) {
-    char s[1024];
-    int n = win32_wstr_to_k(a[0], s, sizeof(s));
-    win32_crt_write(1, s, (size_t)n);
-    win32_crt_write(1, "\n", 1);
-    return n + 1;
+    uint64_t b[2] = { a[0], WIN32_IOB_TAG | 1 };
+    if (w32_fputws(b) < 0) return -1;
+    uint16_t nl = '\n';
+    return win32_wstdio_out(1, &nl, 1, false) < 0 ? -1 : 0;
 }
-/* fputwc(wchar_t c, FILE* stream) / putwchar(wchar_t c). */
+/* fputwc(wchar_t c, FILE* stream) / putwc / putwchar(wchar_t c) -> c / WEOF */
 static long w32_fputwc(uint64_t *a) {
-    uint64_t wc = a[0]; uint64_t stream = a[1];
+    uint16_t u = (uint16_t)a[0];
+    uint64_t stream = a[1];
     int fd = 1;
     if ((stream & 0xFFFFFF00ULL) == WIN32_IOB_TAG) fd = (int)(stream & 0xFF);
-    char c = (wc < 0x80) ? (char)wc : '?';
-    win32_crt_write(fd, &c, 1);
-    return (long)(uint16_t)wc;
+    return win32_wstdio_out(fd, &u, 1, false) < 0 ? 0xFFFF : (long)u;
 }
 static long w32_putwchar(uint64_t *a) {
-    char c = (a[0] < 0x80) ? (char)a[0] : '?';
-    win32_crt_write(1, &c, 1);
-    return (long)(uint16_t)a[0];
+    uint16_t u = (uint16_t)a[0];
+    return win32_wstdio_out(1, &u, 1, false) < 0 ? 0xFFFF : (long)u;
 }
 
 /* ============================================================
@@ -20138,17 +20559,19 @@ static long w32_fputc(uint64_t *a) {
     int  c  = (int)(unsigned char)a[0];
     int  fd = 1;
     if ((a[1] & 0xFFFFFF00ULL) == WIN32_IOB_TAG) fd = (int)(a[1] & 0xFF);
+    if (win32_narrow_refused(fd)) return -1;            /* W7p */
     char ch = (char)c;
     if (win32_crt_write(fd, &ch, 1) < 0) return -1;  /* EOF */
     return c;
 }
 /* W7l: putchar(c) == fputc(c, stdout); getchar() == fgetc(stdin) */
 static long w32_putchar(uint64_t *a) {
+    if (win32_narrow_refused(1)) return -1;             /* W7p */
     char ch = (char)(unsigned char)a[0];
     if (win32_crt_write(1, &ch, 1) < 0) return -1;
     return (long)(unsigned char)a[0];
 }
-static long w32_getchar(uint64_t *a) { (void)a; return win32_stdio_getc(0); }
+static long w32_getchar(uint64_t *a) { (void)a; if (win32_narrow_refused(0)) return -1; return win32_stdio_getc(0); }
 
 /* strnlen(s, max) over user memory. */
 static long w32_strnlen(uint64_t *a) {
@@ -27746,8 +28169,24 @@ static long w32_strtoul(uint64_t *a) {
  * on a file that is there. Reads and writes go through the text-mode
  * translation above; ungetc keeps its byte for the next read; feof and
  * ferror are the descriptor's flags; a seek forgets both and ungetc's byte. */
-static long win32_open_flags_of(const char *mode, int *flags, int *fmode) {
+/* W7p: a Unicode open: fopen's ccs=UTF-8 / UTF-16LE / UNICODE, _open's
+ * _O_U8TEXT / _O_U16TEXT / _O_WTEXT */
+#define W32U_U8    1
+#define W32U_U16   2
+#define W32U_WTEXT 3
+static bool win32_ci_prefix(const char *s, const char *p) {
+    for (; *p; s++, p++) {
+        char a = *s, b = *p;
+        if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+        if (a != b) return false;
+    }
+    return true;
+}
+/* -1 a mode that is not one, -2 a ccs= that is not one (the
+ * invalid-parameter path, measured) */
+static long win32_open_flags_of(const char *mode, int *flags, int *fmode, int *uni) {
     int plus = 0, x = 0, m = -1;
+    *uni = 0;
     for (int i = 1; mode[0] && mode[i] && mode[i] != ','; i++) {
         if (mode[i] == '+') plus = 1;
         else if (mode[i] == 'b') m = W32FD_BIN;
@@ -27761,7 +28200,63 @@ static long win32_open_flags_of(const char *mode, int *flags, int *fmode) {
     default:  return -1;
     }
     *fmode = m >= 0 ? m : win32_fmode_mode();
+    const char *c = mode;
+    while (*c && *c != ',') c++;
+    if (*c == ',') {                               /* W7p: ", ccs=ENCODING" (spaces anywhere) */
+        c++;
+        while (*c == ' ') c++;
+        if (!win32_ci_prefix(c, "CCS")) return -2;
+        c += 3;
+        while (*c == ' ') c++;
+        if (*c++ != '=') return -2;
+        while (*c == ' ') c++;
+        if (win32_ci_prefix(c, "UTF-8")) { *uni = W32U_U8; c += 5; }
+        else if (win32_ci_prefix(c, "UTF-16LE")) { *uni = W32U_U16; c += 8; }
+        else if (win32_ci_prefix(c, "UNICODE")) { *uni = W32U_WTEXT; c += 7; }
+        else return -2;
+        while (*c == ' ') c++;
+        if (*c) return -2;
+        if (*fmode == W32FD_BIN) *uni = 0;         /* 'b': no encoding (measured) */
+    }
     return 0;
+}
+/* W7p: a Unicode open's mode (measured on Windows 11: programs/win-wide47).
+ * A file empty when opened for writing gets the encoding's byte order mark
+ * (UTF-8's EF BB BF, else FF FE). Else, when it is read or appended to, the
+ * mark it has decides, and a read starts after it; with none, _O_WTEXT and
+ * UNICODE are the "C" locale's text, the others their own. A file written
+ * from its start keeps the encoding asked. */
+static int win32_open_unicode(long fd, uint64_t upath, int uni, int flags) {
+    int acc = flags & 3;
+    int enc = uni == W32U_U8 ? W32FD_U8 : W32FD_W16;
+    struct file *f = fd_lookup((int)fd);
+    if (!f) return enc;
+    long size = sys_lseek((int)fd, 0, 2);
+    (void)sys_lseek((int)fd, 0, 0);
+    if (acc != ABI_O_RDONLY && size == 0) {
+        static const uint8_t b8[3] = { 0xEF, 0xBB, 0xBF }, b16[2] = { 0xFF, 0xFE };
+        (void)file_write(f, enc == W32FD_U8 ? b8 : b16, enc == W32FD_U8 ? 3 : 2);
+        return enc;
+    }
+    if (size > 0 && (acc != ABI_O_WRONLY || (flags & ABI_O_APPEND))) {
+        uint8_t m[3] = { 0, 0, 0 };
+        long got = 0;
+        if (acc != ABI_O_WRONLY) {
+            got = file_read(f, m, 3);
+        } else {                                   /* appending: its start, read apart */
+            long rfd = sys_open((const char *)(uintptr_t)upath, ABI_O_RDONLY, 0);
+            struct file *rf = rfd >= 0 ? fd_lookup((int)rfd) : 0;
+            if (rf) got = file_read(rf, m, 3);
+            if (rfd >= 0) (void)sys_close((int)rfd);
+        }
+        int skip = 0;
+        if (got >= 3 && m[0] == 0xEF && m[1] == 0xBB && m[2] == 0xBF) { enc = W32FD_U8; skip = 3; }
+        else if (got >= 2 && m[0] == 0xFF && m[1] == 0xFE) { enc = W32FD_W16; skip = 2; }
+        else if (uni == W32U_WTEXT) enc = W32FD_TEXT;
+        if (acc != ABI_O_WRONLY) (void)sys_lseek((int)fd, skip, 0);
+        return enc;
+    }
+    return enc;
 }
 /* the CRT's errno for an open's -errno */
 static int win32_crt_errno_of(long rc) {
@@ -27771,20 +28266,23 @@ static int win32_crt_errno_of(long rc) {
     return 22;
 }
 static long win32_fopen_k(const char *path, const char *mode) {
-    int flags, fmode;
-    if (win32_open_flags_of(mode, &flags, &fmode) < 0) { win32_crt_errno(22); return 0; }
+    int flags, fmode, uni;
+    long ofr = win32_open_flags_of(mode, &flags, &fmode, &uni);
+    if (ofr == -2) { (void)win32_invalid_parameter(22); return 0; }     /* W7p: ccs= */
+    if (ofr < 0) { win32_crt_errno(22); return 0; }
     char kp[ABI_PATH_MAX]; win32_xlate_winpath(path,kp,sizeof(kp));
     uint64_t ubuf=WIN32_CRT_DATA_BASE+WIN32_CRT_PATHBUF; int di=0; while(kp[di])di++;
     if(copy_to_user((void*)(uintptr_t)ubuf,kp,(size_t)di+1)!=0)return 0;
     long fd=sys_open((const char*)(uintptr_t)ubuf,flags,0644);
     if(fd<0){ win32_crt_errno(win32_crt_errno_of(fd)); return 0; }
     if(fd>=W32FD_MAX){ (void)sys_close((int)fd); win32_crt_errno(24); return 0; }   /* EMFILE */
+    if(uni) fmode=win32_open_unicode(fd, ubuf, uni, flags);                        /* W7p */
     win32_fd_reset((int)fd, fmode);
     win32_fd_flag((int)fd, W32FD_FBUF|W32FD_FBSET, 0);  /* W7m: buffered, as the UCRT's */
     return (long)(WIN32_IOB_TAG|(uint64_t)((uint32_t)fd&0xFF));
 }
 static long w32_fopen(uint64_t *a) {
-    char path[ABI_PATH_MAX], mode[16];
+    char path[ABI_PATH_MAX], mode[64];                  /* W7p: room for ", ccs=UTF-16LE" */
     if(strncpy_from_user(path,(const char*)(uintptr_t)a[0],sizeof(path))<0)return 0;
     mode[0]=0; if(a[1])(void)strncpy_from_user(mode,(const char*)(uintptr_t)a[1],sizeof(mode));
     mode[sizeof(mode)-1]=0;
@@ -27805,6 +28303,17 @@ static long w32_fread(uint64_t *a){
     uint64_t want=sz*nm, done=0;
     if(win32_crt_flush(fd)<0)return 0;                   /* W7m */
     struct w32fd e=win32_fd_get(fd);
+    if(win32_mode_wide(e.mode)){                         /* W7p: the code units a wide read gives */
+        uint8_t kb[1024];
+        while(done<want){
+            size_t m=(size_t)(want-done<sizeof kb?want-done:sizeof kb);
+            long g=win32_wread_k(fd,kb,m);
+            if(g<=0){win32_fd_flag(fd,g<0?W32FD_FERR:W32FD_FEOF,0);break;}
+            if(copy_to_user((void*)(uintptr_t)(a[0]+done),kb,(size_t)g)!=0)break;
+            done+=(uint64_t)g;
+        }
+        return (long)(done/sz);
+    }
     if(e.flags&W32FD_UNGET){
         if(copy_to_user((void*)(uintptr_t)a[0],&e.unget,1)!=0)return 0;
         e.flags&=(uint8_t)~W32FD_UNGET; win32_fd_put(fd,e); done=1;
@@ -27830,6 +28339,7 @@ static long w32_fread(uint64_t *a){
 static long w32_fwrite(uint64_t *a){int fd=win32_file_fd(a[3]); if(fd<0)return 0; uint64_t sz=a[1],nm=a[2]; if(!sz||!nm)return 0;
     long w=win32_crt_write_u(fd,a[0],sz*nm); if(w<0){win32_fd_flag(fd,W32FD_FERR,0);return 0;} return (long)((uint64_t)w/sz);}
 static long w32_fputs(uint64_t *a){int fd=win32_file_fd(a[1]); if(fd<0)return -1;
+    if(win32_narrow_refused(fd))return -1;               /* W7p */
     char k[256];                                    /* W7l: any length, 0 as the UCRT answers */
     for(uint64_t off=0;;off+=sizeof k-1){         /* (it copies at most sizeof k - 1) */
         long r=strncpy_from_user(k,(const char*)(uintptr_t)(a[0]+off),sizeof k);
@@ -27837,8 +28347,8 @@ static long w32_fputs(uint64_t *a){int fd=win32_file_fd(a[1]); if(fd<0)return -1
         if(r&&win32_crt_write(fd,k,(size_t)r)<0){win32_fd_flag(fd,W32FD_FERR,0);return -1;}
         if((size_t)r<sizeof k-1)return 0;
     }}
-static long w32_fgetc(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return -1; return win32_stdio_getc(fd);}
-static long w32_fgets(uint64_t *a){int fd=win32_file_fd(a[2]); if(fd<0)return 0; int n=(int)(int32_t)a[1]; if(n<=1)return 0;
+static long w32_fgetc(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return -1; if(win32_narrow_refused(fd))return -1; return win32_stdio_getc(fd);}
+static long w32_fgets(uint64_t *a){int fd=win32_file_fd(a[2]); if(fd<0)return 0; if(win32_narrow_refused(fd))return 0; int n=(int)(int32_t)a[1]; if(n<=1)return 0;
     char kb[256]; int i=0,k=0,c=0;
     while(i<n-1){
         c=win32_stdio_getc(fd); if(c<0)break;
@@ -27856,14 +28366,15 @@ static long w32_fseek(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return -1
     struct w32fd e=win32_fd_get(fd);
     if(wh==1&&(e.flags&W32FD_UNGET))off-=1;            /* SEEK_CUR from where the program is */
     if(sys_lseek(fd,off,wh)<0)return -1;
-    win32_fd_flag(fd,0,W32FD_CTRLZ|W32FD_FEOF|W32FD_LOOK|W32FD_UNGET);
+    win32_fd_seeked(fd,W32FD_CTRLZ|W32FD_FEOF|W32FD_LOOK|W32FD_UNGET);
     return 0;}
 static long w32_ftell(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return -1;
+    (void)win32_crt_flush(fd);                          /* W7p: what waits, as its write makes it */
     long p=sys_lseek(fd,0,1); if(p<0)return -1;
-    struct w32fd e=win32_fd_get(fd); p+=(long)e.bufn;   /* W7m: what waits counts */
+    struct w32fd e=win32_fd_get(fd);
     return (e.flags&W32FD_UNGET)&&p>0?p-1:p;}
 static long w32_rewind(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd>=0){(void)win32_crt_flush(fd); (void)sys_lseek(fd,0,0);
-    win32_fd_flag(fd,0,W32FD_CTRLZ|W32FD_FEOF|W32FD_FERR|W32FD_LOOK|W32FD_UNGET);} return 0;}
+    win32_fd_seeked(fd,W32FD_CTRLZ|W32FD_FEOF|W32FD_FERR|W32FD_LOOK|W32FD_UNGET);} return 0;}
 static long w32_fileno(uint64_t *a){return win32_file_fd(a[0]);}
 static long w32_get_osfhandle(uint64_t *a){return (long)(int)a[0];}     /* HANDLE == fd */
 static long w32_isatty(uint64_t *a){(void)a;return 0;}                  /* batch, not a tty */
@@ -27875,8 +28386,9 @@ static long w32_setmode(uint64_t *a){
     if(fd<0||fd>=W32FD_MAX||!fd_lookup(fd)){ win32_invalid_parameter(9); return -1; }
     int mi=-1; for(int i=0;i<5;i++) if(g_w32fd_modes[i]==m) mi=i;
     if(mi<0){ win32_invalid_parameter(22); return -1; }
+    if(mi==3) mi=W32FD_W16;                             /* W7p: kept, and answered, as _O_WTEXT */
     struct w32fd e=win32_fd_get(fd);
-    long prev=(long)g_w32fd_modes[e.mode];
+    long prev=(long)g_w32fd_modes[e.mode==3?W32FD_W16:e.mode];
     if(e.mode!=mi){ e.mode=(uint8_t)mi; win32_fd_put(fd,e); }
     return prev;
 }
@@ -27899,12 +28411,12 @@ static long w32_open(uint64_t *a) {
     if (of & 0x0100) flags |= ABI_O_CREAT;
     if (of & 0x0200) flags |= ABI_O_TRUNC;
     if (of & 0x0400) flags |= ABI_O_EXCL;
-    int fmode = win32_fmode_mode();
+    int fmode = win32_fmode_mode(), uni = 0;
     if (of & 0x8000) fmode = W32FD_BIN;
     else if (of & 0x4000) fmode = W32FD_TEXT;
-    else if (of & 0x10000) fmode = 2;
-    else if (of & 0x20000) fmode = 3;
-    else if (of & 0x40000) fmode = 4;
+    else if (of & 0x40000) uni = W32U_U8;                    /* W7p: the mark decides */
+    else if (of & 0x20000) uni = W32U_U16;
+    else if (of & 0x10000) uni = W32U_WTEXT;
     uint32_t pm = (uint32_t)a[2];                               /* _S_IREAD 0x100, _S_IWRITE 0x80 */
     char kp[ABI_PATH_MAX]; win32_xlate_winpath(path, kp, sizeof(kp));
     uint64_t ubuf = WIN32_CRT_DATA_BASE + WIN32_CRT_PATHBUF; int di = 0; while (kp[di]) di++;
@@ -27912,6 +28424,7 @@ static long w32_open(uint64_t *a) {
     long fd = sys_open((const char *)(uintptr_t)ubuf, flags, (pm & 0x80) ? 0644 : 0444);
     if (fd < 0) { win32_crt_errno(win32_crt_errno_of(fd)); return -1; }
     if (fd >= W32FD_MAX) { (void)sys_close((int)fd); win32_crt_errno(24); return -1; }
+    if (uni) fmode = win32_open_unicode(fd, ubuf, uni, flags);   /* W7p */
     win32_fd_reset((int)fd, fmode);
     return fd;
 }
@@ -27929,6 +28442,14 @@ static long w32_lowio_read(uint64_t *a) {
     if (n == 0) return 0;
     if (!a[1] || n > 0x7FFFFFFFu) { win32_invalid_parameter(22); return -1; }
     struct w32fd e = win32_fd_get(fd);
+    if (win32_mode_wide(e.mode)) {                              /* W7p: UTF-16LE, an even count */
+        if (n & 1) { win32_invalid_parameter(22); return -1; }
+        uint8_t kb[2048];
+        long g = win32_wread_k(fd, kb, n < sizeof kb ? n : sizeof kb);
+        if (g < 0) return -1;
+        if (g > 0 && copy_to_user((void *)(uintptr_t)a[1], kb, (size_t)g) != 0) { win32_crt_errno(22); return -1; }
+        return g;
+    }
     if (e.mode == W32FD_BIN && !(e.flags & W32FD_LOOK)) {
         long g = sys_read(fd, (void *)(uintptr_t)a[1], n);
         if (g < 0) { win32_crt_errno(win32_crt_errno_of(g)); return -1; }
@@ -27946,6 +28467,10 @@ static long w32_lowio_write(uint64_t *a) {
     if (!win32_lowio_fd_ok(fd)) return -1;
     if (n == 0) return 0;
     if (!a[1]) { win32_invalid_parameter(22); return -1; }
+    if ((n & 1) && win32_mode_wide(win32_fd_get(fd).mode)) {   /* W7p: code units */
+        win32_invalid_parameter(22);
+        return -1;
+    }
     long w = win32_crt_write_ux(fd, a[1], n, false);           /* W7m: past stdio's buffer */
     if (w < 0) { win32_crt_errno(28); return -1; }              /* ENOSPC */
     return w;
@@ -27956,7 +28481,7 @@ static long win32_lowio_seek(int fd, int64_t off, int wh) {
     (void)win32_crt_flush(fd);                                  /* W7m */
     long p = sys_lseek(fd, off, wh);
     if (p < 0) { win32_crt_errno(p == -29 ? 29 : 22); return -1; }
-    win32_fd_flag(fd, 0, W32FD_CTRLZ | W32FD_LOOK);
+    win32_fd_seeked(fd, W32FD_CTRLZ | W32FD_LOOK);
     return p;
 }
 static long w32_lseek(uint64_t *a)    { return win32_lowio_seek((int)a[0], (int64_t)(int32_t)a[1], (int)a[2]); }
@@ -28135,6 +28660,7 @@ static long w32_vsscanf(uint64_t *a) {
 static long w32_vfscanf(uint64_t *a) {
     int fd = win32_file_fd(a[1]);
     if (fd < 0 || !a[2] || !a[4]) return -1;
+    if (win32_narrow_refused(fd)) return -1;      /* W7p */
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
     (void)win32_crt_flush(fd);                    /* W7m: what waits goes first */
@@ -28179,6 +28705,7 @@ static long w32_ferror(uint64_t *a){int fd=win32_file_fd(a[0]); return fd>=0&&(w
 static long w32_clearerr(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd>=0)win32_fd_flag(fd,0,W32FD_FEOF|W32FD_FERR); return 0;}
 static long w32_ungetc(uint64_t *a){int fd=win32_file_fd(a[1]); int c=(int)a[0];
     if(fd<0||c<0)return -1;
+    if(win32_narrow_refused(fd))return -1;               /* W7p */
     struct w32fd e=win32_fd_get(fd);
     e.flags=(uint8_t)((e.flags|W32FD_UNGET)&~W32FD_FEOF); e.unget=(uint8_t)c;
     win32_fd_put(fd,e);
@@ -28189,10 +28716,12 @@ static long w32_ungetc(uint64_t *a){int fd=win32_file_fd(a[1]); int c=(int)a[0];
 static long w32_freopen(uint64_t *a){
     int fd=win32_file_fd(a[2]); if(fd<0)return 0;
     (void)win32_crt_flush(fd);                           /* W7m */
-    char mode[16]; mode[0]=0; if(a[1])(void)strncpy_from_user(mode,(const char*)(uintptr_t)a[1],sizeof(mode));
+    char mode[64]; mode[0]=0; if(a[1])(void)strncpy_from_user(mode,(const char*)(uintptr_t)a[1],sizeof(mode));
     mode[sizeof(mode)-1]=0;
-    int flags,fmode;
-    if(win32_open_flags_of(mode,&flags,&fmode)<0){win32_crt_errno(22);return 0;}
+    int flags,fmode,uni;
+    long ofr=win32_open_flags_of(mode,&flags,&fmode,&uni);
+    if(ofr==-2){(void)win32_invalid_parameter(22);return 0;}     /* W7p */
+    if(ofr<0){win32_crt_errno(22);return 0;}
     if(!a[0]){ win32_fd_reset(fd,fmode); return (long)a[2]; }
     char path[ABI_PATH_MAX];
     if(strncpy_from_user(path,(const char*)(uintptr_t)a[0],sizeof(path))<0)return 0;
@@ -29380,7 +29909,7 @@ static long w32_fsopen(uint64_t *a) {   /* _fsopen(path, mode, shflag): no shari
     return w32_fopen(b);
 }
 static long win32_wfopen_k(uint64_t uwpath, uint64_t uwmode) {
-    char path[ABI_PATH_MAX], mode[16];
+    char path[ABI_PATH_MAX], mode[64];
     if (!uwpath || win32_w16_to_utf8(uwpath, -1, path, sizeof path) < 0) { win32_crt_errno(22); return 0; }
     if (!uwmode) { win32_crt_errno(22); return 0; }
     win32_wstr_to_k(uwmode, mode, sizeof mode);
@@ -29394,14 +29923,14 @@ static long win32_stdio_seek(int fd, int64_t off, int wh) {
     struct w32fd e = win32_fd_get(fd);
     if (wh == 1 && (e.flags & W32FD_UNGET)) off -= 1;
     if (sys_lseek(fd, off, wh) < 0) return -1;
-    win32_fd_flag(fd, 0, W32FD_CTRLZ | W32FD_FEOF | W32FD_LOOK | W32FD_UNGET);
+    win32_fd_seeked(fd, W32FD_CTRLZ | W32FD_FEOF | W32FD_LOOK | W32FD_UNGET);
     return 0;
 }
 static long win32_stdio_tell(int fd) {
+    (void)win32_crt_flush(fd);                     /* W7p: what waits, as its write makes it */
     long p = sys_lseek(fd, 0, 1);
     if (p < 0) return -1;
     struct w32fd e = win32_fd_get(fd);
-    p += (long)e.bufn;
     return (e.flags & W32FD_UNGET) && p > 0 ? p - 1 : p;
 }
 /* fflush(stream), fflush(NULL): every stream's; _flushall: their count */
@@ -29439,18 +29968,54 @@ static long w32_fsetpos(uint64_t *a) {
     if (fd < 0 || !a[1] || copy_from_user(&p, (const void *)(uintptr_t)a[1], 8) != 0) { win32_crt_errno(22); return 22; }
     return win32_stdio_seek(fd, p, 0);
 }
-/* fgetwc on a narrow stream in the "C" locale: one byte is one character */
+/* fgetwc: W7p -- a wide mode's code units, a binary stream's two bytes, a
+ * text stream's byte (one character in the "C" locale) */
 static long w32_fgetwc(uint64_t *a) {
     int fd = win32_file_fd(a[0]);
     if (fd < 0) return 0xFFFF;
-    int c = win32_stdio_getc(fd);
+    long c = win32_wgetc(fd);
     return c < 0 ? 0xFFFF : c;
 }
+/* ungetwc: a text stream's character back as its byte; a wide or binary
+ * stream's unit before what waits (W7p) */
 static long w32_ungetwc(uint64_t *a) {
     uint16_t wc = (uint16_t)a[0];
-    if (wc == 0xFFFF || wc > 0xFF) return 0xFFFF;
-    uint64_t b[2] = { wc, a[1] };
-    return w32_ungetc(b) < 0 ? 0xFFFF : wc;
+    int fd = win32_file_fd(a[1]);
+    if (wc == 0xFFFF || fd < 0) return 0xFFFF;
+    struct w32fd e = win32_fd_get(fd);
+    if (!win32_mode_wide(e.mode) && e.mode != W32FD_BIN) {
+        if (wc > 0xFF) return 0xFFFF;
+        uint64_t b[2] = { wc, a[1] };
+        return w32_ungetc(b) < 0 ? 0xFFFF : wc;
+    }
+    if (e.rpn + 2 > (int)sizeof e.rp) return 0xFFFF;
+    for (int j = e.rpn - 1; j >= 0; j--) e.rp[j + 2] = e.rp[j];
+    e.rp[0] = (uint8_t)wc;
+    e.rp[1] = (uint8_t)(wc >> 8);
+    e.rpn = (uint8_t)(e.rpn + 2);
+    e.flags &= (uint8_t)~W32FD_FEOF;
+    win32_fd_put(fd, e);
+    return wc;
+}
+/* W7p: fgetws(buf, n, stream): fgetwc's units to L'\n' (kept) or n - 1 of
+ * them, terminated; NULL when it read none */
+static long w32_fgetws(uint64_t *a) {
+    int fd = win32_file_fd(a[2]);
+    int n = (int)(int32_t)a[1];
+    if (fd < 0 || !a[0] || n <= 1) return 0;
+    int i = 0;
+    while (i < n - 1) {
+        long c = win32_wgetc(fd);
+        if (c < 0) break;
+        uint16_t u = (uint16_t)c;
+        if (copy_to_user((void *)(uintptr_t)(a[0] + (uint64_t)i * 2), &u, 2) != 0) return 0;
+        i++;
+        if (u == '\n') break;
+    }
+    if (i == 0) return 0;
+    uint16_t z = 0;
+    (void)copy_to_user((void *)(uintptr_t)(a[0] + (uint64_t)i * 2), &z, 2);
+    return (long)a[0];
 }
 
 /* -- kernel32's sync objects, the Ex forms -------------------------------- */
@@ -30420,6 +30985,24 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-stdio-l1-1-0.dll", "_lseeki64", w32_lseeki64 },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "_eof",      w32_eof },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby__setmode",   w32_setmode },
+    /* W7p: tobyrt.dll's -- the narrow stdio functions (a wide stream refused),
+     * the opens (a ccs= that is not one), setvbuf: the handler after */
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_stdio_common_vfprintf", w32_stdio_common_vfprintf },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_fputs",      w32_fputs },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_puts",       w32_puts },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_fputc",      w32_fputc },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_putchar",    w32_putchar },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_fgetc",      w32_fgetc },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_getchar",    w32_getchar },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_fgets",      w32_fgets },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_ungetc",     w32_ungetc },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_stdio_common_vfscanf", w32_vfscanf },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_fopen",      w32_fopen },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby__wfopen",    w32_wfopen },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby__fsopen",    w32_fsopen },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby__wfsopen",   w32_wfsopen },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_freopen",    w32_freopen },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_setvbuf",    w32_setvbuf },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby__set_fmode", w32_set_fmode },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby__get_fmode", w32_get_fmode },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby__open",      w32_open },
@@ -30476,6 +31059,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-stdio-l1-1-0.dll", "fgetwc",        w32_fgetwc },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "getwc",         w32_fgetwc },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "ungetwc",       w32_ungetwc },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fgetws",        w32_fgetws },                   /* W7p */
     { "api-ms-win-crt-time-l1-1-0.dll", "strftime",       w32_strftime },
     { "api-ms-win-crt-time-l1-1-0.dll", "wcsftime",       w32_wcsftime },
     { "api-ms-win-crt-time-l1-1-0.dll", "_Strftime",      w32_Strftime },
