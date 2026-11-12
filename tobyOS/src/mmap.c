@@ -338,7 +338,15 @@ static uint64_t find_free_region(struct vma_table *vt, uint64_t len) {
     return 0;
 }
 
+/* W7i: PROT_NONE leaves the user bit out. Until then a page that was there
+ * when it was mprotect'ed PROT_NONE stayed readable by the program (an entry
+ * with the user bit is readable: x86 has no "no access" entry), so only a
+ * page never touched faulted -- for a Linux program's mprotect(PROT_NONE)
+ * and for a Win32 program's PAGE_NOACCESS and PAGE_GUARD alike. An entry
+ * with no user bit faults on any access from user mode; the fault paths
+ * already refuse a present page the VMA allows no access to. */
 static uint32_t prot_to_vmm_flags(uint32_t prot) {
+    if (!(prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC))) return VMM_NX;
     uint32_t f = VMM_USER;
     if (prot & VMA_PROT_WRITE) f |= VMM_WRITE;
     if (!(prot & VMA_PROT_EXEC)) f |= VMM_NX;

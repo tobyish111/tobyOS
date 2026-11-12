@@ -417,7 +417,10 @@ static bool page_fault_resolve(uint64_t fault_addr, uint64_t error_code,
          * (segfault) rather than resolve-without-fixing. This closes an
          * infinite resolved-fault loop avenue and never destroys data. */
         if (pte && (*pte & PTE_PRESENT)) {
-            if ((error_code & PF_ERR_WRITE) && (v->flags & VMA_WRITE)) {
+            /* W7i: never on an entry with no user access (an mprotect
+             * PROT_NONE, src/mmap.c): granting write leaves it with none, and
+             * the write faults again, forever */
+            if ((error_code & PF_ERR_WRITE) && (v->flags & VMA_WRITE) && (*pte & PTE_USER)) {
                 *pte |= PTE_WRITABLE;
                 invlpg(page_va);
 #ifdef CHROMIUM_BOOT
@@ -601,7 +604,10 @@ int uaccess_prepare_read(uint64_t addr, uint64_t len) {
     uint64_t end = addr + len;
     for (; va < end; va += PAGE_SIZE) {
         uint64_t *pte = get_pte(p->cr3, va);
-        if (pte && (*pte & PTE_PRESENT)) continue;      /* readable already */
+        /* readable already -- W7i: unless PROT_NONE left it no user access
+         * (src/mmap.c): the handlers refuse it, and the copy is EFAULT, as
+         * Linux's (the kernel could read such a page; the program cannot) */
+        if (pte && (*pte & PTE_PRESENT) && (*pte & PTE_USER)) continue;
         uint64_t ec = PF_ERR_USER;                      /* read, not-present */
         if (page_fault_handler(va, ec, p))   continue;  /* demand/COW resolved */
         if (mmap_handle_page_fault(va, ec))  continue;
