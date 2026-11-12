@@ -2723,6 +2723,15 @@ W42 := programs/win-cxx42
 $(W42)/win-cxx42.exe: $(W42)/cxx42.cpp $(W42)/build.sh
 	bash $(W42)/build.sh "$(W39_VCVARS)" $(W42)
 
+# Track C/W7m: win-cxx44.exe (exit 46, as on Windows 11) -- the rest of what
+# msvcp140.dll asks: file streams and their seeks, std::filesystem, std::async
+# and the thread pool, wide streams on a path past ASCII, the time facets,
+# the "C" locale's facets and the kernel32 calls under them. Built only where
+# W39_VCVARS is (cl.exe /std:c++17); msvcp140.dll is win-cxx42's.
+W44 := programs/win-cxx44
+$(W44)/win-cxx44.exe: $(W44)/cxx44.cpp $(W44)/build.sh
+	bash $(W44)/build.sh "$(W39_VCVARS)" $(W44)
+
 # Track C/W7i: win-mem40.exe (exit 42, as on Windows 11) -- guard pages,
 # write watch, MEM_RESET, VirtualProtect on pages not committed, a touched
 # page made PAGE_NOACCESS, 1500 reservations, _resetstkoflw.
@@ -3305,6 +3314,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-exc38/dll38.dll \
                $(if $(W39_HAVE),programs/win-exc39/win-cxx39.exe) \
                $(if $(W39_HAVE),programs/win-cxx42/win-cxx42.exe) \
+               $(if $(W39_HAVE),programs/win-cxx44/win-cxx44.exe) \
                programs/win-mem40/win-mem40.exe \
                programs/win-msg41/win-msg41.exe \
                programs/win-text43/win-text43.exe \
@@ -4699,6 +4709,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    (cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 --owner=0 --group=0 \
 	        --numeric-owner -rf ../initrd.tar bin/win-cxx42.exe bin/msvcp140.dll); \
 	else echo "initrd: no MSVC build (W39_VCVARS): /bin/win-cxx42.exe left out"; fi
+	@# W7m: the rest of msvcp140's calls (its DLL is win-cxx42's, in /bin)
+	@if [ -f $(W44)/win-cxx44.exe ]; then \
+	    cp $(W44)/win-cxx44.exe $(INITRD_STAGE)/bin/ && \
+	    (cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 --owner=0 --group=0 \
+	        --numeric-owner -rf ../initrd.tar bin/win-cxx44.exe); \
+	else echo "initrd: no MSVC build (W39_VCVARS): /bin/win-cxx44.exe left out"; fi
 	@# the FHS's mount points and homes, as Linux's modes (finding 217)
 	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 --owner=0 --group=0 \
 	    --numeric-owner --no-recursion -rf ../initrd.tar mnt media srv home \
