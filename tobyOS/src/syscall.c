@@ -20973,9 +20973,88 @@ static long w32_CloseHandle(uint64_t *a) {
 #define WIN32_TLS_ARR_BYTES      0x80    /* C18b: per-thread TLS pointer array    */
 #define WIN32_TEB_SUSPEND_OFF    0x2F0   /* W7: the suspend count (CREATE_SUSPENDED) */
 #define WIN32_TLS_MAX            64
-static uint8_t g_win32_tls_used[WIN32_TLS_MAX];
+/* ---- W7n: what a Win32 process keeps of its own ---------------------------
+ * Its window classes and windows, its controls' stores, menus, bitmaps and
+ * memory DCs, timers, modal dialog, TLS indexes and environment were tables
+ * of the system's, and a GUI program's first RegisterClass or DialogBox
+ * reset them all when it saw no window of its own (C7's "fresh app"): a
+ * second GUI program pruned the first one's windows, took its class table
+ * and with it its window procedure (W7j found it: the parent then called the
+ * child's address), and wiped its menus, timers, TLS indexes and environment;
+ * a window timer was matched by the window's number alone, which is the
+ * descriptor's and so the same in two processes. Now each process has a
+ * record of its own, made part by part at the first use, kept by its thread
+ * group and its leader's creation time (a pid used again is another
+ * process); a record whose process is gone is freed for the next one.
+ * Measured on Windows 11 (programs/win-gui45). */
+enum { W32P_GUI, W32P_LB, W32P_CC, W32P_MENUS, W32P_BMP, W32P_MEMDC, W32P_TIMERS,
+       W32P_MODAL, W32P_ENV, W32P_TLS, W32P_N };
+#define WIN32_PS_MAX    32
+#define W32P_FALLBACK   65536u
+struct win32_pstate { int tgid; uint64_t born; void *part[W32P_N]; };
+static struct win32_pstate g_win32_ps[WIN32_PS_MAX];
+static struct win32_pstate g_win32_ps_spare;      /* no process, or no record free */
+static uint8_t g_win32_ps_fallback[W32P_FALLBACK];/* a part kmalloc could not give */
+static struct win32_pstate *g_win32_ps_cache;     /* the last caller's (all under the BKL) */
+static struct proc *g_win32_ps_cache_p;
+static uint64_t g_win32_ps_cache_born;
+static struct win32_pstate *g_win32_ps_lastwin;   /* the last to make a window (the harness's view) */
+static void win32_ps_free_parts(struct win32_pstate *s);   /* with the bitmaps */
+static bool win32_ps_live(const struct win32_pstate *s) {
+    struct proc *ld = s->tgid > 0 ? proc_lookup(s->tgid) : 0;
+    return ld && ld->created_ns == s->born && ld->state != PROC_TERMINATED && ld->state != PROC_UNUSED;
+}
+static struct win32_pstate *win32_ps_cur(void) {
+    struct proc *p = current_proc();
+    if (!p) return &g_win32_ps_spare;
+    if (g_win32_ps_cache && g_win32_ps_cache_p == p && g_win32_ps_cache_born == p->created_ns)
+        return g_win32_ps_cache;
+    int tg = p->is_thread ? p->tgid : p->pid;
+    struct proc *ld = p->is_thread ? proc_lookup(tg) : p;
+    uint64_t born = ld ? ld->created_ns : p->created_ns;
+    struct win32_pstate *s = 0;
+    for (int i = 0; i < WIN32_PS_MAX && !s; i++)
+        if (g_win32_ps[i].tgid == tg && g_win32_ps[i].born == born) s = &g_win32_ps[i];
+    for (int i = 0; i < WIN32_PS_MAX && !s; i++)
+        if (!g_win32_ps[i].tgid) s = &g_win32_ps[i];
+    for (int i = 0; i < WIN32_PS_MAX && !s; i++)
+        if (!win32_ps_live(&g_win32_ps[i])) { win32_ps_free_parts(&g_win32_ps[i]); s = &g_win32_ps[i]; }
+    if (!s) {
+        kprintf("[win32] pid %d: every process record is in use -- a shared one\n", p->pid);
+        return &g_win32_ps_spare;
+    }
+    if (s->tgid != tg || s->born != born) {
+        if (s == g_win32_ps_lastwin) g_win32_ps_lastwin = 0;
+        s->tgid = tg;
+        s->born = born;
+    }
+    g_win32_ps_cache = s;
+    g_win32_ps_cache_p = p;
+    g_win32_ps_cache_born = p->created_ns;
+    return s;
+}
+/* the caller's part `which` (size bytes), zeroed at its first use */
+static void *win32_ps_part(int which, size_t size) {
+    struct win32_pstate *s = win32_ps_cur();
+    if (!s->part[which]) {
+        void *m = kmalloc(size);
+        if (!m) {
+            kprintf("[win32] no memory for a process's record (%lu bytes)\n", (unsigned long)size);
+            return g_win32_ps_fallback;
+        }
+        memset(m, 0, size);
+        s->part[which] = m;
+    }
+    return s->part[which];
+}
+/* the record of thread group tg (the harness's question), or 0 */
+static struct win32_pstate *win32_ps_of(int tg) {
+    for (int i = 0; i < WIN32_PS_MAX; i++)
+        if (g_win32_ps[i].tgid == tg && win32_ps_live(&g_win32_ps[i])) return &g_win32_ps[i];
+    return 0;
+}
 
-static void win32_reset_tls(void) { memset(g_win32_tls_used, 0, sizeof(g_win32_tls_used)); }
+#define g_win32_tls_used ((uint8_t *)win32_ps_part(W32P_TLS, WIN32_TLS_MAX))
 
 /* kernel32!TlsAlloc() -> a free index, or TLS_OUT_OF_INDEXES (0xFFFFFFFF). */
 static long w32_TlsAlloc(uint64_t *a) {
@@ -21646,8 +21725,7 @@ struct win32_win {
     int      menu_open;   /* index of the top-level item whose dropdown is open (-1) */
 };
 
-static struct {
-    int  tgid;            /* owning process (thread group); 0 = none */
+struct win32_gui_core {   /* W7n: a process's own (its record's part) */
     bool quit;            /* PostQuitMessage seen (thread-wide) */
     int  quitcode;
     struct win32_win win[WIN32_MAX_WINDOWS];
@@ -21659,12 +21737,13 @@ static struct {
     struct win32_ctrl ctrl[WIN32_MAX_CTRLS];
     struct { uint64_t hwnd; uint32_t message; uint64_t wParam, lParam; } cmd_q[WIN32_CMDQ];
     int  cmd_head, cmd_tail;
-} g_win32_gui;
+};
+#define g_win32_gui (*(struct win32_gui_core *)win32_ps_part(W32P_GUI, sizeof(struct win32_gui_core)))
+_Static_assert(sizeof(struct win32_gui_core) <= W32P_FALLBACK, "a part fits the fallback");
 
-/* C13 LISTBOX item store, indexed by the control's slot. A separate static (not
- * in g_win32_gui); a listbox clears its slot on creation, so cross-app reuse is
- * safe. */
-static struct win32_lb g_win32_lb[WIN32_MAX_CTRLS];
+/* C13 LISTBOX item store, indexed by the control's slot (W7n: the
+ * process's own, as its controls are). */
+#define g_win32_lb ((struct win32_lb *)win32_ps_part(W32P_LB, sizeof(struct win32_lb) * WIN32_MAX_CTRLS))
 
 /* C25 comctl32 common-control store, indexed by the control's slot (parallel to
  * g_win32_lb). Rich enough for a ListView report grid, a TreeView, a multi-part
@@ -21695,7 +21774,8 @@ struct win32_cc {
     /* ToolbarWindow32: just a button count (drawn as a strip). */
     int  tb_n;
 };
-static struct win32_cc g_win32_cc[WIN32_MAX_CTRLS];
+#define g_win32_cc ((struct win32_cc *)win32_ps_part(W32P_CC, sizeof(struct win32_cc) * WIN32_MAX_CTRLS))
+_Static_assert(sizeof(struct win32_cc) * WIN32_MAX_CTRLS <= W32P_FALLBACK, "a part fits the fallback");
 
 /* True for the comctl32 control kinds that use g_win32_cc[] (C25). */
 static bool win32_is_comctl(int type) {
@@ -21716,13 +21796,6 @@ static struct win32_win *win32_win_alloc(void) {
     for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
         if (g_win32_gui.win[i].fd == 0) return &g_win32_gui.win[i];
     return NULL;
-}
-/* Count of live windows. */
-static int win32_win_count(void) {
-    int n = 0;
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
-        if (g_win32_gui.win[i].fd > 0) n++;
-    return n;
 }
 
 /* C12: case-insensitive string compare (for predefined control class names). */
@@ -21786,8 +21859,6 @@ static void win32_msg_push(int parent_fd, uint32_t message, uint64_t wParam, uin
 static bool win32_route_control_input(int parent_fd, const struct gui_event *ev);
 static void win32_draw_menu(int fd);                                   /* C15 menus */
 static bool win32_route_menu_input(int fd, const struct gui_event *ev);/* C15 menus */
-static void win32_reset_menus_timers(void);                            /* C15 fresh-app reset */
-static void win32_reset_env(void);                                     /* C16c env reset */
 
 /* C16d: all Win32 UI text (control labels, menus, MessageBox, file dialog) goes
  * through here so it renders as real TrueType when a font is available, falling
@@ -22028,26 +22099,35 @@ static int win32_poll_window_event(int fd, struct gui_event *out) {
 static uint64_t win32_class_wndproc(const char *name) {
     if (name && name[0]) {
         for (int i = 0; i < g_win32_gui.ncls; i++)
-            if (strcmp(g_win32_gui.cls[i].name, name) == 0)
+            if (win32_streq_ci(g_win32_gui.cls[i].name, name))
                 return g_win32_gui.cls[i].wndproc;
     }
     return g_win32_gui.ncls ? g_win32_gui.cls[g_win32_gui.ncls - 1].wndproc : 0;
+}
+/* W7n: a class CreateWindowEx can make a window of -- one the process
+ * registered, or the system's (a top-level BUTTON, EDIT, ... window takes
+ * the procedure it always took here) */
+static bool win32_class_known(const char *name) {
+    if (win32_ctrl_class(name)) return true;
+    for (int i = 0; i < g_win32_gui.ncls; i++)
+        if (win32_streq_ci(g_win32_gui.cls[i].name, name)) return true;
+    static const char *const sys[] = { "BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX", "SCROLLBAR",
+                                       "MDICLIENT", "#32770", "ComboLBox", "RichEdit20A", "RichEdit20W",
+                                       "SysListView32", "SysTreeView32", "SysTabControl32",
+                                       "msctls_statusbar32", "msctls_progress32", "ToolbarWindow32",
+                                       "ComboBoxEx32", "SysHeader32", "tooltips_class32" };
+    for (unsigned i = 0; i < sizeof sys / sizeof sys[0]; i++)
+        if (win32_streq_ci(sys[i], name)) return true;
+    return false;
 }
 
 /* RegisterClassA(&WNDCLASSA): record the class name (+0x40) -> WndProc (+0x08)
  * mapping, and default the trampoline's CRT slot to this WndProc (GetMessage
  * refines it per message for multi-window apps). */
 static long w32_RegisterClassA(uint64_t *a) {
-    /* New-GUI-app boundary: after retiring any windows left by a previous,
-     * now-exited GUI process, if none remain this is a fresh app -- reset the
-     * whole bridge so a leftover quit flag / class table can't leak in. (Apps
-     * register their class before creating windows; our apps use a single
-     * class, so this fires once per app.) */
+    /* W7n: no "fresh app" reset any more -- the class table is the process's
+     * own, and a class registered before a window was is still there */
     win32_prune_dead_windows();
-    if (win32_win_count() == 0) {
-        memset(&g_win32_gui, 0, sizeof(g_win32_gui));
-        win32_reset_menus_timers();   /* C15: HMENU/timer tokens don't survive a process exit */
-    }
 
     uint64_t wc = a[0];
     uint64_t wndproc = 0, cnameptr = 0;
@@ -22059,7 +22139,7 @@ static long w32_RegisterClassA(uint64_t *a) {
 
     int slot = -1;
     for (int i = 0; i < g_win32_gui.ncls; i++)
-        if (strcmp(g_win32_gui.cls[i].name, cname) == 0) { slot = i; break; }
+        if (win32_streq_ci(g_win32_gui.cls[i].name, cname)) { slot = i; break; }   /* W7n: case not minded */
     if (slot < 0 && g_win32_gui.ncls < WIN32_MAX_CLASSES) slot = g_win32_gui.ncls++;
     if (slot >= 0) {
         memcpy(g_win32_gui.cls[slot].name, cname, sizeof(g_win32_gui.cls[slot].name));
@@ -22169,6 +22249,12 @@ static long w32_CreateWindowExA(uint64_t *a) {
      * window. Its HWND is a tagged token; its id is hMenu (a9). A "BUTTON" with
      * a checkbox/radio/groupbox style is reclassified accordingly. */
     int ctype = win32_button_subkind(win32_ctrl_class(cname), style);
+    /* W7n: a class nobody registered makes no window (atoms -- a class
+     * named by a number -- are taken as before) */
+    if (cnameptr >= 0x10000 && !win32_class_known(cname)) {
+        win32_set_last_error(1407);              /* ERROR_CANNOT_FIND_WND_CLASS */
+        return 0;
+    }
     if (ctype && parent_fd) {
         char ktext[WIN32_CTRL_TEXT]; ktext[0] = '\0';
         if (name)
@@ -22185,8 +22271,7 @@ static long w32_CreateWindowExA(uint64_t *a) {
     long fd = sys_gui_create((uint32_t)w, (uint32_t)h, (const char *)(uintptr_t)name);
     if (fd < 0) return 0;                        /* NULL HWND */
 
-    struct proc *p = current_proc();
-    g_win32_gui.tgid   = p ? (p->is_thread ? p->tgid : p->pid) : 0;
+    g_win32_ps_lastwin = win32_ps_cur();         /* W7n: the harness's view */
     win->fd          = (int)fd;
     win->gwin        = win32_hdc_window((int)fd);  /* C18c: stash for pixel readback */
     win->w           = w;
@@ -22777,14 +22862,15 @@ static long w32_SendMessageA(uint64_t *a);   /* defined below; used by SendDlgIt
 
 /* The single active MODAL dialog (DialogBoxParamA). Modeless dialogs
  * (CreateDialogParamA) are ordinary windows in win[] flagged is_dialog. */
-static struct {
+struct win32_modal_state {   /* W7n: the process's own */
     int      fd;            /* dialog window fd (0 = none active) */
     uint64_t dlgproc;       /* the app's DialogProc */
     bool     init_pending;  /* WM_INITDIALOG not yet delivered */
     uint64_t init_param;    /* dwInitParam (WM_INITDIALOG lParam) */
     bool     ended;         /* EndDialog called */
     long     result;        /* EndDialog result */
-} g_win32_modal;
+};
+#define g_win32_modal (*(struct win32_modal_state *)win32_ps_part(W32P_MODAL, sizeof(struct win32_modal_state)))
 
 /* ---- little-endian readers over the copied template buffer (bounds-checked) */
 static uint16_t dlg_rd16(const uint8_t *b, int p, int len) {
@@ -22944,7 +23030,6 @@ static int win32_dlg_build(int dlg_id, uint64_t dlgproc, bool modeless) {
 
     /* Fresh-app boundary (a dialog-only app never calls RegisterClassA). */
     win32_prune_dead_windows();
-    if (win32_win_count() == 0) { memset(&g_win32_gui, 0, sizeof(g_win32_gui)); win32_reset_menus_timers(); }
     g_win32_gui.quit = false;
 
     struct win32_win *wslot = win32_win_alloc();
@@ -22965,8 +23050,7 @@ static int win32_dlg_build(int dlg_id, uint64_t dlgproc, bool modeless) {
     }
     if (fd < 0) return -1;
 
-    struct proc *cp = current_proc();
-    g_win32_gui.tgid = cp ? (cp->is_thread ? cp->tgid : cp->pid) : 0;
+    g_win32_ps_lastwin = win32_ps_cur();         /* W7n: the harness's view */
     memset(wslot, 0, sizeof(*wslot));
     wslot->fd = fd; wslot->w = cw; wslot->h = ch;
     wslot->wndproc = dlgproc;
@@ -23562,8 +23646,41 @@ static long w32_GetFileAttributesA(uint64_t *a) {
  * to the destination window via gui_window_blit. */
 #define WIN32_MAX_BITMAPS 8
 #define WIN32_MAX_MEMDC   4
-static struct { bool in_use; int w, h; uint32_t *pixels; } g_win32_bmp[WIN32_MAX_BITMAPS];
-static struct { bool in_use; int bmp; } g_win32_memdc[WIN32_MAX_MEMDC];
+struct win32_bmp_slot { bool in_use; int w, h; uint32_t *pixels; };
+struct win32_memdc_slot { bool in_use; int bmp; };
+#define g_win32_bmp ((struct win32_bmp_slot *)win32_ps_part(W32P_BMP, sizeof(struct win32_bmp_slot) * WIN32_MAX_BITMAPS))
+#define g_win32_memdc ((struct win32_memdc_slot *)win32_ps_part(W32P_MEMDC, sizeof(struct win32_memdc_slot) * WIN32_MAX_MEMDC))
+/* W7n: a record's parts freed (its process gone) -- the bitmaps' pixels too */
+static void win32_ps_free_parts(struct win32_pstate *s) {
+    struct win32_bmp_slot *b = (struct win32_bmp_slot *)s->part[W32P_BMP];
+    for (int i = 0; b && i < WIN32_MAX_BITMAPS; i++)
+        if (b[i].in_use && b[i].pixels) kfree(b[i].pixels);
+    for (int i = 0; i < W32P_N; i++) {
+        if (s->part[i]) kfree(s->part[i]);
+        s->part[i] = 0;
+    }
+    if (g_win32_ps_cache == s) g_win32_ps_cache = 0;
+    if (g_win32_ps_lastwin == s) g_win32_ps_lastwin = 0;
+    s->tgid = 0;
+    s->born = 0;
+}
+/* gdi32!GetObjectA(h, size, buf): a bitmap's BITMAP (32 bytes); the size it
+ * needs when buf is NULL; 0 for what is not a bitmap of the process's */
+static long w32_GetObjectA(uint64_t *a) {
+    uint64_t h = a[0];
+    if ((h & WIN32_TAG_MASK) != WIN32_BITMAP_TAG) return 0;
+    int s = (int)(h & 0xFF);
+    if (s < 0 || s >= WIN32_MAX_BITMAPS || !g_win32_bmp[s].in_use) return 0;
+    if (!a[2]) return 32;
+    if ((int32_t)a[1] < 32) return 0;
+    uint8_t b[32];
+    memset(b, 0, sizeof b);
+    int32_t w = g_win32_bmp[s].w, ht = g_win32_bmp[s].h, wb = w * 4;
+    uint16_t planes = 1, bpp = 32;
+    memcpy(&b[4], &w, 4); memcpy(&b[8], &ht, 4); memcpy(&b[12], &wb, 4);
+    memcpy(&b[16], &planes, 2); memcpy(&b[18], &bpp, 2);
+    return copy_to_user((void *)(uintptr_t)a[2], b, sizeof b) == 0 ? 32 : 0;
+}
 
 /* gdi32!CreateCompatibleDC(hdc) -> a memory HDC (tagged token), no bitmap yet. */
 static long w32_CreateCompatibleDC(uint64_t *a) {
@@ -23944,7 +24061,8 @@ static void win32_msg_push(int parent_fd, uint32_t message, uint64_t wParam, uin
 #define WIN32_MENU_ITEMS  8
 struct win32_menuitem { int id; bool is_popup; uint64_t submenu; char text[24]; };
 struct win32_menu { bool in_use; bool is_popup; int n; struct win32_menuitem items[WIN32_MENU_ITEMS]; };
-static struct win32_menu g_win32_menus[WIN32_MAX_MENUS];
+#define g_win32_menus ((struct win32_menu *)win32_ps_part(W32P_MENUS, sizeof(struct win32_menu) * WIN32_MAX_MENUS))
+_Static_assert(sizeof(struct win32_menu) * WIN32_MAX_MENUS <= W32P_FALLBACK, "a part fits the fallback");
 
 static struct win32_menu *win32_menu_find(uint64_t h) {
     if ((h & WIN32_TAG_MASK) != WIN32_MENU_TAG) return NULL;
@@ -24081,7 +24199,7 @@ static bool win32_route_menu_input(int fd, const struct gui_event *ev) {
 /* W7j: a timer with no window (SetTimer(NULL, ...)) is its thread group's
  * (owner) and has an id of the system's. */
 struct win32_timer { bool in_use; int fd, owner; uint64_t id, interval, next, proc; };
-static struct win32_timer g_win32_timers[WIN32_MAX_TIMERS];
+#define g_win32_timers ((struct win32_timer *)win32_ps_part(W32P_TIMERS, sizeof(struct win32_timer) * WIN32_MAX_TIMERS))
 static uint64_t g_win32_thread_timer_id = 0x7F00;
 static int win32_tgid(void) {
     struct proc *p = current_proc();
@@ -24206,16 +24324,16 @@ static long w32_toby_msgsvc(uint64_t *a) {
 
 /* Clear process-global menu + timer state on a fresh GUI app (alongside the
  * g_win32_gui memset; HMENU/timer tokens don't survive a process exit). */
-static void win32_reset_menus_timers(void) {
-    memset(g_win32_menus, 0, sizeof(g_win32_menus));
-    memset(g_win32_timers, 0, sizeof(g_win32_timers));
-    win32_reset_env();   /* C16c: per-app environment reseeds on next use */
-    win32_reset_tls();   /* C16e: per-app TLS index bitmap */
-}
 
 /* ---- menu shims (user32) ---- */
 static long w32_CreateMenu(uint64_t *a)      { (void)a; return win32_menu_alloc(false); }
 static long w32_CreatePopupMenu(uint64_t *a) { (void)a; return win32_menu_alloc(true); }
+/* W7n: GetMenuItemCount(hMenu) -> its items, -1 for no menu of the process's */
+static long w32_GetMenuItemCount(uint64_t *a) {
+    struct win32_menu *m = win32_menu_find(a[0]);
+    if (!m) { win32_set_last_error(1401 /* ERROR_INVALID_MENU_HANDLE */); return -1; }
+    return m->n;
+}
 static long w32_DestroyMenu(uint64_t *a) {
     struct win32_menu *m = win32_menu_find(a[0]);
     if (m) m->in_use = false;
@@ -25745,11 +25863,21 @@ static long w32_GetSaveFileNameA(uint64_t *a) { return win32_file_dialog(a[0], t
  * GetCommandLineW a UTF-16 copy. A small per-app environment block (seeded with
  * the usual Windows vars) backs GetEnvironmentVariableA/SetEnvironmentVariableA/
  * ExpandEnvironmentStringsA. */
-#define WIN32_ENV_MAX  16
+#define WIN32_ENV_MAX  48               /* W7n: an inherited environment is longer */
 #define ENV_NAME_LEN   32
-#define ENV_VAL_LEN    80
-static struct { bool in_use; char name[ENV_NAME_LEN], val[ENV_VAL_LEN]; } g_win32_env[WIN32_ENV_MAX];
-static bool g_win32_env_seeded;
+#define ENV_VAL_LEN    260
+/* W7n: the process's own environment, seeded at its first use from the block
+ * its CreateProcess gave it (WIN32_ENVBLK_BASE, the loader's page: the block
+ * the parent passed, or the parent's environment -- as Windows gives a
+ * child), else -- a program a native one started -- tobyOS's defaults */
+struct win32_envset {
+    bool seeded;
+    struct { bool in_use; char name[ENV_NAME_LEN], val[ENV_VAL_LEN]; } e[WIN32_ENV_MAX];
+};
+#define g_win32_envset (*(struct win32_envset *)win32_ps_part(W32P_ENV, sizeof(struct win32_envset)))
+#define g_win32_env (g_win32_envset.e)
+#define g_win32_env_seeded (g_win32_envset.seeded)
+_Static_assert(sizeof(struct win32_envset) <= W32P_FALLBACK, "a part fits the fallback");
 
 static int env_find(const char *name) {
     for (int i = 0; i < WIN32_ENV_MAX; i++)
@@ -25767,6 +25895,28 @@ static void env_seed(void) {
     if (g_win32_env_seeded) return;
     g_win32_env_seeded = true;
     memset(g_win32_env, 0, sizeof(g_win32_env));
+    {
+        static char blk[4096];                     /* (under the BKL) */
+        if (copy_from_user(blk, (const void *)(uintptr_t)WIN32_ENVBLK_BASE, sizeof blk) == 0) {
+            blk[sizeof blk - 1] = blk[sizeof blk - 2] = 0;
+            for (int i = 0; blk[i]; ) {
+                const char *ent = blk + i;
+                int n = (int)strlen(ent);
+                const char *eq = 0;                       /* "=C:=..." keeps its first '=' */
+                for (int k = 1; ent[0] && ent[k]; k++) if (ent[k] == '=') { eq = ent + k; break; }
+                if (eq) {
+                    char nm[ENV_NAME_LEN];
+                    int nl = (int)(eq - ent);
+                    if (nl >= ENV_NAME_LEN) nl = ENV_NAME_LEN - 1;
+                    memcpy(nm, ent, (size_t)nl);
+                    nm[nl] = 0;
+                    env_set_k(nm, eq + 1);
+                }
+                i += n + 1;
+            }
+            return;
+        }
+    }
     env_set_k("OS", "tobyOS");
     env_set_k("PATH", "C:\\bin");
     env_set_k("TEMP", "C:\\");
@@ -25778,8 +25928,6 @@ static void env_seed(void) {
     env_set_k("windir", "C:\\Windows");
     env_set_k("NUMBER_OF_PROCESSORS", "4");
 }
-/* C16: reset the per-app environment (next env call reseeds defaults). */
-static void win32_reset_env(void) { g_win32_env_seeded = false; memset(g_win32_env, 0, sizeof(g_win32_env)); }
 
 /* kernel32!GetCommandLineA() -> the CRT-page command-line string. */
 static long w32_GetCommandLineA(uint64_t *a) {
@@ -25814,7 +25962,19 @@ static long w32_GetCommandLineW(uint64_t *a) {
 /* The command line a CreateProcess call is starting a program with, for the
  * PE loader (pe_load_user runs inside proc_spawn, on the caller's thread):
  * one entry per thread in that call, for its length only. */
-static struct { struct proc *p; const char *cmd; } g_win32_spawn_cmd[8];
+static struct { struct proc *p; const char *cmd; const char *env; int envlen; } g_win32_spawn_cmd[8];
+/* W7n: the environment block ("N=V\0...\0") the CreateProcess call on the
+ * calling thread gives the program it is starting, or NULL -- for the PE
+ * loader, which runs inside the call */
+const char *win32_spawn_env(int *len) {
+    struct proc *me = current_proc();
+    for (int i = 0; me && i < (int)(sizeof g_win32_spawn_cmd / sizeof g_win32_spawn_cmd[0]); i++)
+        if (g_win32_spawn_cmd[i].p == me && g_win32_spawn_cmd[i].env) {
+            *len = g_win32_spawn_cmd[i].envlen;
+            return g_win32_spawn_cmd[i].env;
+        }
+    return 0;
+}
 const char *win32_spawn_cmdline(void) {
     struct proc *me = current_proc();
     for (int i = 0; me && i < (int)(sizeof g_win32_spawn_cmd / sizeof g_win32_spawn_cmd[0]); i++)
@@ -26014,6 +26174,8 @@ static long win32_create_process(const char *app, const char *cmd, const char *c
     char *pool = kmalloc(WIN32_CP_CMD_MAX), *envpool = 0, *cmd2 = 0;
     char **argv = kmalloc(sizeof(char *) * (WIN32_CP_ARGV_MAX + 1));
     char **envp = 0;
+    char *envblk = 0;                      /* W7n: the child's Win32 environment block */
+    int envblen = 0;
     char *kpath = kmalloc(ABI_PATH_MAX), *kcwd = kmalloc(ABI_PATH_MAX);
     int envc = 0, slot = -1, ph = -1;
     struct file *f[3] = { 0, 0, 0 };
@@ -26114,6 +26276,30 @@ static long win32_create_process(const char *app, const char *cmd, const char *c
         }
         envp[envc] = 0;
     }
+    /* W7n: the block the loader gives a PE child -- the one passed, else
+     * this process's own environment, as Windows gives it */
+    envblk = kmalloc(4096);
+    if (!envblk) { win32_set_last_error(8); goto out; }
+    if (uenv) {
+        for (int i = 0; i < envc; i++) {
+            int n = (int)strlen(envp[i]);
+            if (envblen + n + 2 > 4096) break;
+            memcpy(envblk + envblen, envp[i], (size_t)n + 1);
+            envblen += n + 1;
+        }
+    } else {
+        env_seed();
+        for (int i = 0; i < WIN32_ENV_MAX; i++) {
+            if (!g_win32_env[i].in_use) continue;
+            int nl = (int)strlen(g_win32_env[i].name), vl = (int)strlen(g_win32_env[i].val);
+            if (envblen + nl + vl + 3 > 4096) break;
+            memcpy(envblk + envblen, g_win32_env[i].name, (size_t)nl);
+            envblk[envblen + nl] = '=';
+            memcpy(envblk + envblen + nl + 1, g_win32_env[i].val, (size_t)vl + 1);
+            envblen += nl + vl + 2;
+        }
+    }
+    envblk[envblen] = 0;
 
     /* its standard handles */
     uint8_t sib[104];
@@ -26133,7 +26319,8 @@ static long win32_create_process(const char *app, const char *cmd, const char *c
     ph = win32_ph_alloc();
     if (ph < 0) { win32_set_last_error(8); goto out; }
     for (int i = 0; i < (int)(sizeof g_win32_spawn_cmd / sizeof g_win32_spawn_cmd[0]); i++)
-        if (!g_win32_spawn_cmd[i].p) { slot = i; g_win32_spawn_cmd[i].p = current_proc(); g_win32_spawn_cmd[i].cmd = cmd; break; }
+        if (!g_win32_spawn_cmd[i].p) { slot = i; g_win32_spawn_cmd[i].p = current_proc(); g_win32_spawn_cmd[i].cmd = cmd;
+                                       g_win32_spawn_cmd[i].env = envblk; g_win32_spawn_cmd[i].envlen = envblen; break; }
     struct proc_spec spec = {
         .path = kpath, .name = 0,
         .fd0 = f[0], .fd1 = f[1], .fd2 = f[2],
@@ -26142,7 +26329,7 @@ static long win32_create_process(const char *app, const char *cmd, const char *c
         .cwd = kcwd[0] ? kcwd : 0,
     };
     int pid = proc_spawn(&spec);
-    if (slot >= 0) { g_win32_spawn_cmd[slot].p = 0; g_win32_spawn_cmd[slot].cmd = 0; }
+    if (slot >= 0) { g_win32_spawn_cmd[slot].p = 0; g_win32_spawn_cmd[slot].cmd = 0; g_win32_spawn_cmd[slot].env = 0; }
     if (pid < 0) {
         kprintf("[win32] CreateProcess(%s): spawn failed (%d)\n", kpath, pid);
         g_win32_ph[ph].owner = 0;
@@ -26166,7 +26353,7 @@ static long win32_create_process(const char *app, const char *cmd, const char *c
     ret = 1;
 out:
     for (int i = 0; i < 3; i++) spawn_fd_put(f[i]);
-    kfree(pool); kfree(argv); kfree(kpath); kfree(kcwd); kfree(envpool); kfree(envp); kfree(cmd2);
+    kfree(pool); kfree(argv); kfree(kpath); kfree(kcwd); kfree(envpool); kfree(envp); kfree(cmd2); kfree(envblk);
     return ret;
 }
 
@@ -29868,6 +30055,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "user32.dll", "CreateMenu",             w32_CreateMenu },
     { "user32.dll", "CreatePopupMenu",        w32_CreatePopupMenu },
     { "user32.dll", "AppendMenuA",            w32_AppendMenuA },
+    { "user32.dll", "GetMenuItemCount",   w32_GetMenuItemCount },   /* W7n */
+    { "gdi32.dll",  "GetObjectA",         w32_GetObjectA },         /* W7n */
     { "user32.dll", "DestroyMenu",            w32_DestroyMenu },
     { "user32.dll", "SetMenu",                w32_SetMenu },
     { "user32.dll", "GetMenu",                w32_GetMenu },
@@ -30337,24 +30526,51 @@ long win32_dispatch(uint64_t func_index, uint64_t args_ptr) {
  * a given process (-1 if that process has no window yet); win32_gui_fill_color
  * reports the current FillRect colour so the harness can confirm a click
  * actually recoloured the window (real-mouse vs deterministic injection). */
+/* W7n: the harness runs in no Win32 process -- it asks of a thread group's
+ * record (and the last one asked of, or the last to make a window, is the
+ * one the fd questions are about) */
+static struct win32_pstate *g_win32_ps_view;
+static struct win32_gui_core *win32_ps_gui(struct win32_pstate *s) {
+    return s ? (struct win32_gui_core *)s->part[W32P_GUI] : 0;
+}
+static struct win32_gui_core *win32_view_gui(void) {
+    struct win32_gui_core *g = win32_ps_gui(g_win32_ps_view);
+    return g ? g : win32_ps_gui(g_win32_ps_lastwin);
+}
+static struct win32_win *win32_view_win(int fd) {
+    struct win32_gui_core *g = win32_view_gui();
+    for (int i = 0; g && fd > 0 && i < WIN32_MAX_WINDOWS; i++)
+        if (g->win[i].fd == fd) return &g->win[i];
+    return 0;
+}
 int win32_gui_window_fd(int tgid) {
-    if (g_win32_gui.tgid != tgid) return -1;
+    struct win32_pstate *s = win32_ps_of(tgid);
+    struct win32_gui_core *g = win32_ps_gui(s);
+    if (!g) return -1;
+    g_win32_ps_view = s;
     for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
-        if (g_win32_gui.win[i].fd > 0) return g_win32_gui.win[i].fd;   /* first live window */
+        if (g->win[i].fd > 0) return g->win[i].fd;   /* first live window */
     return -1;
 }
 uint32_t win32_gui_fill_color(void) {
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
-        if (g_win32_gui.win[i].fd > 0) return g_win32_gui.win[i].fill_color;
+    struct win32_gui_core *g = win32_view_gui();
+    for (int i = 0; g && i < WIN32_MAX_WINDOWS; i++)
+        if (g->win[i].fd > 0) return g->win[i].fill_color;
     return WIN32_FILL_DEFAULT;
 }
 /* C10: number of live windows owned by `tgid`, and a specific window's fill. */
 int win32_gui_window_count(int tgid) {
-    if (g_win32_gui.tgid != tgid) return 0;
-    return win32_win_count();
+    struct win32_pstate *s = win32_ps_of(tgid);
+    struct win32_gui_core *g = win32_ps_gui(s);
+    if (!g) return 0;
+    g_win32_ps_view = s;
+    int n = 0;
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
+        if (g->win[i].fd > 0) n++;
+    return n;
 }
 uint32_t win32_gui_fill_color_fd(int fd) {
-    struct win32_win *w = win32_win_find(fd);
+    struct win32_win *w = win32_view_win(fd);
     return w ? w->fill_color : 0;
 }
 
@@ -30370,7 +30586,7 @@ int win32_gui_ink_stats(int fd, int rx, int ry, int rw, int rh, uint32_t bg,
                         int *top_cx, int *bot_cx) {
     if (top_cx) *top_cx = -1;
     if (bot_cx) *bot_cx = -1;
-    struct win32_win *w = win32_win_find(fd);
+    struct win32_win *w = win32_view_win(fd);     /* W7n: the harness's view */
     if (!w || !w->gwin || rw <= 0 || rh <= 0) return 0;
     static uint32_t row[1024];
     if (rw > 1024) rw = 1024;

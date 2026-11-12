@@ -264,6 +264,11 @@ int win32_kpath_to_winpath(const char *kpath, char *out, int cap);
  * CreateProcess call is starting a program with, or NULL -- for the PE
  * loader, which runs inside that call (proc_spawn) on the same thread. */
 const char *win32_spawn_cmdline(void);
+/* W7n (src/syscall.c): the environment block ("N=V\0...\0") that call gives
+ * the program, or NULL; the loader maps it at WIN32_ENVBLK_BASE (one page,
+ * after the module table), where the program's environment is seeded from */
+const char *win32_spawn_env(int *len);
+#define WIN32_ENVBLK_BASE 0x000000003100A000ULL
 
 /* CRT data page layout (Track C). The ucrt startup reaches argc/argv/environ
  * through __p___argc / __p___argv / __p__environ, and _commode/_fmode through

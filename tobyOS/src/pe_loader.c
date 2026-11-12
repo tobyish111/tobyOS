@@ -2617,6 +2617,21 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         kprintf("[pe] failed mapping the module table\n");
         return -1;
     }
+    /* W7n: the environment a CreateProcess call gives the program -- its
+     * block, or its parent's environment -- on a page of its own, where the
+     * kernel32 shims seed the program's environment at its first use */
+    int envblen = 0;
+    const char *envblk = win32_spawn_env(&envblen);
+    if (envblk) {
+        if (!pe_map_user(WIN32_ENVBLK_BASE, WIN32_ENVBLK_BASE + PAGE_SIZE)) {
+            kprintf("[pe] failed mapping the environment page\n");
+            return -1;
+        }
+        unsigned long uf = uaccess_begin();
+        memset((void *)WIN32_ENVBLK_BASE, 0, PAGE_SIZE);
+        memcpy((void *)WIN32_ENVBLK_BASE, envblk, envblen < (int)PAGE_SIZE - 2 ? (size_t)envblen : PAGE_SIZE - 2);
+        uaccess_end(uf);
+    }
 
     /* ---- minimal TEB ---- the CRT startup reads gs:[0x30] (NtCurrentTeb).
      * Zero the page, then set the self-pointer + stack bounds. The proc's GS
@@ -2789,6 +2804,8 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
     (void)vmm_protect(WIN32_CRT_DATA_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
     /* W3: the module table (W4's runtime loads update it) and the TLS area */
     (void)vmm_protect(WIN32_MODTAB_BASE, WIN32_MODTAB_BYTES, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
+    if (envblk)                                       /* W7n: the environment page */
+        (void)vmm_protect(WIN32_ENVBLK_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
     if (c->tls_end > WIN32_TLS_BASE)
         (void)vmm_protect(WIN32_TLS_BASE, c->tls_end - WIN32_TLS_BASE,
                           VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
