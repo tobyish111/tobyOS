@@ -2773,6 +2773,15 @@ W46 := programs/win-post46
 $(W46)/win-post46.exe: $(W46)/post46.c
 	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W46)/post46.c -luser32 -lgdi32
 
+# Track C/W7p: win-wide47.exe (exit 49, as on Windows 11) -- the CRT's
+# wide text modes: _O_U16TEXT/_O_WTEXT (UTF-16LE) and _O_U8TEXT (UTF-8)
+# written and read, the narrow functions refused, fopen's ccs= and _open's
+# wide flags with their byte order marks, a "C" locale text stream's wide
+# characters, swprintf past ASCII.
+W47 := programs/win-wide47
+$(W47)/win-wide47.exe: $(W47)/wide47.c
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W47)/wide47.c
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3336,6 +3345,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-text43/win-text43.exe \
                programs/win-gui45/win-gui45.exe \
                programs/win-post46/win-post46.exe \
+               programs/win-wide47/win-wide47.exe \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3554,6 +3564,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-text43/win-text43.exe            $(INITRD_STAGE)/bin/win-text43.exe
 	cp programs/win-gui45/win-gui45.exe              $(INITRD_STAGE)/bin/win-gui45.exe
 	cp programs/win-post46/win-post46.exe            $(INITRD_STAGE)/bin/win-post46.exe
+	cp programs/win-wide47/win-wide47.exe            $(INITRD_STAGE)/bin/win-wide47.exe
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4564,7 +4575,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-so35.exe bin/win-jit36.exe bin/win-lj37.exe           \
 	    bin/win-cb38.exe bin/win-cb38s.exe bin/dll38.dll              \
 	    bin/win-mem40.exe bin/win-msg41.exe bin/win-text43.exe        \
-	    bin/win-gui45.exe bin/win-post46.exe                          \
+	    bin/win-gui45.exe bin/win-post46.exe bin/win-wide47.exe       \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
