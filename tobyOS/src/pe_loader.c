@@ -1757,7 +1757,15 @@ static int pe_bind_module(struct pe_ctx *c, int mi) {
                                            by_ord ? (uint32_t)(ent & 0xFFFFu) : 0, 0);
                 if (c->failed) return -1;          /* a forwarder's DLL failed */
                 if (va) {
+#ifndef PE_QUIET_BIND
+                    /* a line per import: ~35,000 of the Windows suite's ~38,000
+                     * serial lines. A box run builds with -DPE_QUIET_BIND -- at
+                     * 38400 baud they outrun the serial ring (256 KiB), which
+                     * drops what does not fit, verdicts too */
                     kprintf("[pe]   bind %s!%s -> %s@%p\n", dll, fname, to, (void *)va);
+#else
+                    (void)to;
+#endif
                 } else {
                     va = pe_missing_bind(c, dll, fname);
                     kprintf("[pe] unresolved import %s!%s -> missing-stub@%p\n",
