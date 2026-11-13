@@ -256,12 +256,18 @@ int main(int argc, char **argv) {
         bool other = g_work_tid != GetCurrentThreadId();
         CloseThreadpoolWork(w);
         PTP_TIMER t = CreateThreadpoolTimer(timer_cb, (PVOID)(intptr_t)1, 0);
-        ULARGE_INTEGER due; due.QuadPart = (ULONGLONG)-(30 * 10000LL);   // 30 ms from now
+        // 250 ms from now: "set, not yet run" holds only while this thread gets
+        // back from SetThreadpoolTimer before the due time. 30 ms did not on the
+        // EliteDesk: the boot harnesses run before its serial console turns
+        // asynchronous, so the kernel's line for the pool's new thread holds
+        // the caller ~32 ms at 38400 baud, and the 30 ms timer won or lost
+        // that race by chance (one box run each way). The checks are the same.
+        ULARGE_INTEGER due; due.QuadPart = (ULONGLONG)-(250 * 10000LL);
         FILETIME ft; ft.dwLowDateTime = due.LowPart; ft.dwHighDateTime = due.HighPart;
         SetThreadpoolTimer(t, &ft, 0, 0);
         bool set = IsThreadpoolTimerSet(t);
         int before = g_timer;
-        Sleep(200);
+        Sleep(600);
         int after = g_timer;
         SetThreadpoolTimer(t, 0, 0, 0);
         WaitForThreadpoolTimerCallbacks(t, TRUE);
