@@ -1292,22 +1292,169 @@ __declspec(dllimport) BOOL WINAPI __toby_GetMessageA(MSG *, HWND, UINT, UINT);
 __declspec(dllimport) BOOL WINAPI __toby_PeekMessageA(MSG *, HWND, UINT, UINT, UINT);
 __declspec(dllimport) BOOL WINAPI __toby_WaitMessage(void);
 
+/* ---- W7t: windows' text, ANSI and UTF-16 ---------------------------------
+ * A window is Unicode when its class was registered by RegisterClass(Ex)W (a
+ * system class's: when CreateWindowExW made it); its procedure takes
+ * WM_SETTEXT's text, WM_GETTEXT's buffer and the CREATESTRUCT in its kind,
+ * converted through the ANSI code page when the sender is of the other kind
+ * (a UTF-16 sender's WM_GETTEXT of n characters is an ANSI procedure's of 2n
+ * bytes; WM_GETTEXTLENGTH across kinds asks WM_GETTEXT too, to count the
+ * other kind's characters). Another process's text travels as UTF-8 (the
+ * kernel's); here it is the sender's kind again. Measured on Windows 11:
+ * programs/win-wtext51. */
+#define RT_MSG_KIND 11                       /* (hwnd): where it is (RT_WHERE), 0x100 Unicode */
+#define RT_WHERE(k)   ((k) & 0xFF)           /* 1 this thread's, 2 another thread's of this process,
+                                              * 3 another process's, 4 the kernel's (a dialog), 0 none */
+#define RT_UNICODE(k) (((k) & 0x100) != 0)
+static int rt_kind(HWND h) { return (int)__toby_msgsvc(RT_MSG_KIND, h, 0); }
+static void *rt_alloc(SIZE_T n) { return HeapAlloc(GetProcessHeap(), 0, n ? n : 1); }
+static void rt_free(void *p) { if (p) HeapFree(GetProcessHeap(), 0, p); }
+/* a NUL-terminated string in code page cp as UTF-16, and back */
+static LPWSTR rt_a2w(LPCSTR s, UINT cp) {
+    int n = MultiByteToWideChar(cp, 0, s, -1, 0, 0);
+    LPWSTR w = (LPWSTR)rt_alloc((SIZE_T)(n > 0 ? n : 1) * 2);
+    if (!w) return 0;
+    if (n <= 0 || !MultiByteToWideChar(cp, 0, s, -1, w, n)) w[0] = 0;
+    return w;
+}
+static LPSTR rt_w2a(LPCWSTR s, UINT cp) {
+    int n = WideCharToMultiByte(cp, 0, s, -1, 0, 0, 0, 0);
+    LPSTR a = (LPSTR)rt_alloc((SIZE_T)(n > 0 ? n : 1));
+    if (!a) return 0;
+    if (n <= 0 || !WideCharToMultiByte(cp, 0, s, -1, a, n, 0, 0)) a[0] = 0;
+    return a;
+}
+/* the procedure, called (cb: under the kernel-callback frame, as a message
+ * another thread sent is) */
+static ULONG64 rt_proc_call(ULONG64 proc, HWND h, UINT msg, WPARAM w, LPARAM l, BOOL cb) {
+    if (cb) return rt_call_callback(proc, (ULONG64)h, msg, (ULONG64)w, (ULONG64)l);
+    return (ULONG64)((RT_WNDPROC)proc)(h, msg, w, l);
+}
+/* a message from a sender of kind from_w (TRUE: UTF-16) to the procedure of
+ * a window of kind to_w */
+static ULONG64 rt_call_kind(ULONG64 proc, HWND h, UINT msg, WPARAM w, LPARAM l, BOOL from_w, BOOL to_w, BOOL cb) {
+    if (!from_w == !to_w || (msg != WM_SETTEXT && msg != WM_GETTEXT && msg != WM_GETTEXTLENGTH))
+        return rt_proc_call(proc, h, msg, w, l, cb);
+    if (msg == WM_SETTEXT) {
+        if (!l) return rt_proc_call(proc, h, msg, w, l, cb);
+        void *t = from_w ? (void *)rt_w2a((LPCWSTR)l, CP_ACP) : (void *)rt_a2w((LPCSTR)l, CP_ACP);
+        ULONG64 r = rt_proc_call(proc, h, msg, w, t ? (LPARAM)t : l, cb);
+        rt_free(t);
+        return r;
+    }
+    if (msg == WM_GETTEXTLENGTH) {
+        LONG64 n = (LONG64)rt_proc_call(proc, h, msg, w, l, cb);
+        if (n <= 0) return (ULONG64)n;
+        int k;
+        if (to_w) {                              /* a Unicode window's text, counted as ANSI */
+            LPWSTR b = (LPWSTR)rt_alloc((SIZE_T)(n + 1) * 2);
+            if (!b) return (ULONG64)n;
+            b[0] = 0;
+            LONG64 g = (LONG64)rt_proc_call(proc, h, WM_GETTEXT, (WPARAM)(n + 1), (LPARAM)b, cb);
+            if (g < 0) g = 0;
+            if (g > n) g = n;
+            k = g ? WideCharToMultiByte(CP_ACP, 0, b, (int)g, 0, 0, 0, 0) : 0;
+            rt_free(b);
+        } else {                                 /* an ANSI window's, counted as UTF-16 */
+            LPSTR b = (LPSTR)rt_alloc((SIZE_T)n + 1);
+            if (!b) return (ULONG64)n;
+            b[0] = 0;
+            LONG64 g = (LONG64)rt_proc_call(proc, h, WM_GETTEXT, (WPARAM)(n + 1), (LPARAM)b, cb);
+            if (g < 0) g = 0;
+            if (g > n) g = n;
+            k = g ? MultiByteToWideChar(CP_ACP, 0, b, (int)g, 0, 0) : 0;
+            rt_free(b);
+        }
+        return (ULONG64)(LONG64)k;
+    }
+    /* WM_GETTEXT */
+    LONG64 cap = (LONG64)w;
+    if (cap <= 0 || !l) return rt_proc_call(proc, h, msg, w, l, cb);
+    if (from_w) {                                /* the sender's UTF-16 buffer of w, the procedure's ANSI one of 2w */
+        LPSTR b = (LPSTR)rt_alloc((SIZE_T)cap * 2 + 1);
+        if (!b) return 0;
+        b[0] = 0;
+        LONG64 g = (LONG64)rt_proc_call(proc, h, msg, (WPARAM)(cap * 2), (LPARAM)b, cb);
+        if (g < 0) g = 0;
+        if (g > cap * 2) g = cap * 2;
+        LPWSTR o = (LPWSTR)l;
+        int n = g ? MultiByteToWideChar(CP_ACP, 0, b, (int)g, 0, 0) : 0;
+        LPWSTR t = n ? (LPWSTR)rt_alloc((SIZE_T)n * 2) : 0;
+        if (t) n = MultiByteToWideChar(CP_ACP, 0, b, (int)g, t, n); else n = 0;
+        if (n > cap - 1) n = (int)(cap - 1);
+        for (int i = 0; i < n; i++) o[i] = t[i];
+        o[n] = 0;
+        rt_free(t);
+        rt_free(b);
+        return (ULONG64)(LONG64)n;
+    }
+    {                                            /* the sender's ANSI buffer of w, the procedure's UTF-16 one of w */
+        LPWSTR b = (LPWSTR)rt_alloc((SIZE_T)cap * 2 + 2);
+        if (!b) return 0;
+        b[0] = 0;
+        LONG64 g = (LONG64)rt_proc_call(proc, h, msg, w, (LPARAM)b, cb);
+        if (g < 0) g = 0;
+        if (g > cap) g = cap;
+        LPSTR o = (LPSTR)l;
+        int n = g ? WideCharToMultiByte(CP_ACP, 0, b, (int)g, 0, 0, 0, 0) : 0;
+        LPSTR t = n ? (LPSTR)rt_alloc((SIZE_T)n) : 0;
+        if (t) n = WideCharToMultiByte(CP_ACP, 0, b, (int)g, t, n, 0, 0); else n = 0;
+        if (n > cap - 1) n = (int)(cap - 1);
+        for (int i = 0; i < n; i++) o[i] = t[i];
+        o[n] = 0;
+        rt_free(t);
+        rt_free(b);
+        return (ULONG64)(LONG64)n;
+    }
+}
+
 /* run the first message another thread sent this one */
 static void rt_run_sent(void) {
     struct rt_sent s;
     s.ticket = 0;                                /* the kernel fills it in */
     if (__toby_msgsvc(RT_MSG_TAKE, &s, 0) != 1) return;
+    BOOL from_w = (BOOL)((s.msg >> 32) & 1);     /* W7t: the sender's kind */
+    UINT msg = (UINT)s.msg;
     BYTE small[512];
     BYTE *buf = 0;
     if (s.need) {
         buf = s.need <= sizeof small ? small : (BYTE *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)s.need);
         if (buf) (void)__toby_msgsvc(RT_MSG_DATA, &s, buf);
     }
+    /* W7t: another process's WM_SETTEXT text and WM_GETTEXT answer travel as
+     * UTF-8; here they are the sender's kind */
+    void *t = 0;
+    LPARAM lp = (LPARAM)s.lp;
+    if (buf && s.proc && msg == WM_SETTEXT) {
+        LPWSTR w16 = rt_a2w((LPCSTR)buf, CP_UTF8);
+        if (w16 && !from_w) { t = rt_w2a(w16, CP_ACP); rt_free(w16); } else t = w16;
+        if (t) lp = (LPARAM)t;
+    } else if (buf && s.proc && msg == WM_GETTEXT) {
+        t = rt_alloc((SIZE_T)(s.wp + 1) * (from_w ? 2 : 1));
+        if (t) {
+            if (from_w) ((LPWSTR)t)[0] = 0; else ((LPSTR)t)[0] = 0;
+            lp = (LPARAM)t;
+        }
+    }
     if (s.proc)
-        s.result = rt_call_callback(s.proc, s.hwnd, s.msg, s.wp, s.lp);
+        s.result = rt_call_kind(s.proc, (HWND)s.hwnd, msg, (WPARAM)s.wp, lp, from_w,
+                                RT_UNICODE(rt_kind((HWND)s.hwnd)), TRUE);
     else
-        s.result = (ULONG64)__toby_SendMessageA((HWND)s.hwnd, (UINT)s.msg, (WPARAM)s.wp, (LPARAM)s.lp);
+        s.result = (ULONG64)__toby_SendMessageA((HWND)s.hwnd, msg, (WPARAM)s.wp, (LPARAM)s.lp);
+    if (buf && s.proc && msg == WM_GETTEXT && t) {   /* the answer, as UTF-8 for the kernel */
+        LONG64 r = (LONG64)s.result;
+        if (r < 0) r = 0;
+        if ((ULONG64)r > s.wp) r = (LONG64)s.wp;
+        if (from_w) ((LPWSTR)t)[r] = 0; else ((LPSTR)t)[r] = 0;
+        LPWSTR w16 = from_w ? 0 : rt_a2w((LPCSTR)t, CP_ACP);
+        LPCWSTR src = from_w ? (LPCWSTR)t : w16;
+        int n = src ? WideCharToMultiByte(CP_UTF8, 0, src, -1, (LPSTR)buf, (int)s.need, 0, 0) : 0;
+        if (n <= 0) buf[0] = 0;
+        buf[s.need - 1] = 0;
+        rt_free(w16);
+    }
     (void)__toby_msgsvc(RT_MSG_REPLY, &s, buf);
+    rt_free(t);
     if (buf && buf != small) HeapFree(GetProcessHeap(), 0, buf);
 }
 BOOL rt_GetMessageA(MSG *m, HWND h, UINT lo, UINT hi) {
@@ -1352,7 +1499,7 @@ static LRESULT rt_send(HWND h, UINT msg, WPARAM w, LPARAM l, UINT timeout, BOOL 
 static LRESULT rt_send_any(HWND h, UINT msg, WPARAM w, LPARAM l, BOOL wide) {
     ULONG64 proc = 0;
     if (__toby_msgsvc(RT_MSG_WNDPROC, h, &proc) == 1 && proc)    /* the calling thread's: a call */
-        return ((RT_WNDPROC)proc)(h, msg, w, l);
+        return (LRESULT)rt_call_kind(proc, h, msg, w, l, wide, RT_UNICODE(rt_kind(h)), FALSE);   /* W7t */
     BOOL ok;
     return rt_send(h, msg, w, l, ~0u, wide, &ok);
 }
@@ -1364,7 +1511,7 @@ static LRESULT rt_send_timeout(HWND h, UINT msg, WPARAM w, LPARAM l, UINT flags,
     ULONG64 proc = 0;
     LRESULT r;
     if (__toby_msgsvc(RT_MSG_WNDPROC, h, &proc) == 1 && proc) {
-        r = ((RT_WNDPROC)proc)(h, msg, w, l);
+        r = (LRESULT)rt_call_kind(proc, h, msg, w, l, wide, RT_UNICODE(rt_kind(h)), FALSE);   /* W7t */
     } else {
         BOOL ok;
         r = rt_send(h, msg, w, l, ms == ~0u ? ms - 1 : ms, wide, &ok);
@@ -1389,12 +1536,22 @@ BOOL rt_EnumWindows(WNDENUMPROC fn, LPARAM l) {
     return TRUE;
 }
 
-HWND rt_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y, int cx, int cy,
-                        HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
-    HWND h = __toby_CreateWindowExA(ex, cls, name, style, x, y, cx, cy, parent, menu, inst, param);
+/* CreateWindowEx's creation messages; W7t: the CREATESTRUCT's names in the
+ * window's kind (a W function's names for an ANSI window through the ANSI
+ * code page, an A function's for a Unicode one as UTF-16) */
+__declspec(dllimport) HWND WINAPI __toby_CreateWindowExW(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int,
+                                                        HWND, HMENU, HINSTANCE, LPVOID);
+static HWND rt_created(HWND h, BOOL wide, DWORD ex, const void *cls, const void *name, DWORD style, int x, int y,
+                       int cx, int cy, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
     ULONG64 proc = 0;
     if (!h || __toby_msgsvc(RT_MSG_WNDPROC, h, &proc) != 1 || !proc) return h;
-    CREATESTRUCTA cs;
+    void *tn = 0, *tc = 0;
+    if (!RT_UNICODE(rt_kind(h)) != !wide) {
+        if (name) tn = wide ? (void *)rt_w2a((LPCWSTR)name, CP_ACP) : (void *)rt_a2w((LPCSTR)name, CP_ACP);
+        if ((ULONG_PTR)cls >= 0x10000)
+            tc = wide ? (void *)rt_w2a((LPCWSTR)cls, CP_ACP) : (void *)rt_a2w((LPCSTR)cls, CP_ACP);
+    }
+    CREATESTRUCTA cs;                            /* CREATESTRUCTW's layout too */
     cs.lpCreateParams = param;
     cs.hInstance = inst;
     cs.hMenu = menu;
@@ -1404,8 +1561,8 @@ HWND rt_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, i
     cs.y = y;
     cs.x = x;
     cs.style = (LONG)style;
-    cs.lpszName = name;
-    cs.lpszClass = cls;
+    cs.lpszName = (LPCSTR)(tn ? tn : name);
+    cs.lpszClass = (LPCSTR)(tc ? tc : cls);
     cs.dwExStyle = ex;
     MINMAXINFO mmi;
     mmi.ptReserved.x = cx;   mmi.ptReserved.y = cy;
@@ -1414,22 +1571,79 @@ HWND rt_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, i
     mmi.ptMinTrackSize.x = 0; mmi.ptMinTrackSize.y = 0;
     mmi.ptMaxTrackSize.x = 4096; mmi.ptMaxTrackSize.y = 4096;
     ULONG64 hw = (ULONG64)h;
+    HWND r = h;
     (void)rt_call_callback(proc, hw, WM_GETMINMAXINFO, 0, (ULONG64)&mmi);
     if (!(LRESULT)rt_call_callback(proc, hw, WM_NCCREATE, 0, (ULONG64)&cs)) {
         (void)rt_call_callback(proc, hw, WM_NCDESTROY, 0, 0);
         (void)__toby_msgsvc(RT_MSG_ABORT, h, 0);
-        return 0;
+        r = 0;
+    } else {
+        RECT rc;
+        rc.left = x; rc.top = y; rc.right = x + cx; rc.bottom = y + cy;
+        (void)rt_call_callback(proc, hw, WM_NCCALCSIZE, FALSE, (ULONG64)&rc);
+        if ((LRESULT)rt_call_callback(proc, hw, WM_CREATE, 0, (ULONG64)&cs) == -1) {
+            (void)rt_call_callback(proc, hw, WM_DESTROY, 0, 0);
+            (void)rt_call_callback(proc, hw, WM_NCDESTROY, 0, 0);
+            (void)__toby_msgsvc(RT_MSG_ABORT, h, 0);
+            r = 0;
+        }
     }
-    RECT rc;
-    rc.left = x; rc.top = y; rc.right = x + cx; rc.bottom = y + cy;
-    (void)rt_call_callback(proc, hw, WM_NCCALCSIZE, FALSE, (ULONG64)&rc);
-    if ((LRESULT)rt_call_callback(proc, hw, WM_CREATE, 0, (ULONG64)&cs) == -1) {
-        (void)rt_call_callback(proc, hw, WM_DESTROY, 0, 0);
-        (void)rt_call_callback(proc, hw, WM_NCDESTROY, 0, 0);
-        (void)__toby_msgsvc(RT_MSG_ABORT, h, 0);
-        return 0;
-    }
-    return h;
+    rt_free(tn);
+    rt_free(tc);
+    return r;
+}
+HWND rt_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y, int cx, int cy,
+                        HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
+    HWND h = __toby_CreateWindowExA(ex, cls, name, style, x, y, cx, cy, parent, menu, inst, param);
+    return rt_created(h, FALSE, ex, cls, name, style, x, y, cx, cy, parent, menu, inst, param);
+}
+HWND rt_CreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR name, DWORD style, int x, int y, int cx, int cy,
+                        HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
+    HWND h = __toby_CreateWindowExW(ex, cls, name, style, x, y, cx, cy, parent, menu, inst, param);
+    return rt_created(h, TRUE, ex, cls, name, style, x, y, cx, cy, parent, menu, inst, param);
+}
+
+/* W7t: SetWindowText and GetWindowText(Length) send WM_SETTEXT and
+ * WM_GETTEXT(LENGTH) to the program's own windows (SetWindowText TRUE
+ * whatever the procedure answers); the kernel's set and read the text of
+ * the rest -- another process's window, a control, a dialog -- without a
+ * message (measured: programs/win-wtext51) */
+__declspec(dllimport) int WINAPI __toby_GetWindowTextA(HWND, LPSTR, int);
+__declspec(dllimport) int WINAPI __toby_GetWindowTextW(HWND, LPWSTR, int);
+__declspec(dllimport) int WINAPI __toby_GetWindowTextLengthA(HWND);
+__declspec(dllimport) int WINAPI __toby_GetWindowTextLengthW(HWND);
+__declspec(dllimport) BOOL WINAPI __toby_SetWindowTextA(HWND, LPCSTR);
+__declspec(dllimport) BOOL WINAPI __toby_SetWindowTextW(HWND, LPCWSTR);
+static BOOL rt_asks(HWND h) { int k = RT_WHERE(rt_kind(h)); return k == 1 || k == 2; }
+int rt_GetWindowTextA(HWND h, LPSTR b, int n) {
+    if (!rt_asks(h)) return __toby_GetWindowTextA(h, b, n);
+    if (n <= 0 || !b) return 0;
+    b[0] = 0;
+    return (int)rt_send_any(h, WM_GETTEXT, (WPARAM)n, (LPARAM)b, FALSE);
+}
+int rt_GetWindowTextW(HWND h, LPWSTR b, int n) {
+    if (!rt_asks(h)) return __toby_GetWindowTextW(h, b, n);
+    if (n <= 0 || !b) return 0;
+    b[0] = 0;
+    return (int)rt_send_any(h, WM_GETTEXT, (WPARAM)n, (LPARAM)b, TRUE);
+}
+int rt_GetWindowTextLengthA(HWND h) {
+    if (!rt_asks(h)) return __toby_GetWindowTextLengthA(h);
+    return (int)rt_send_any(h, WM_GETTEXTLENGTH, 0, 0, FALSE);
+}
+int rt_GetWindowTextLengthW(HWND h) {
+    if (!rt_asks(h)) return __toby_GetWindowTextLengthW(h);
+    return (int)rt_send_any(h, WM_GETTEXTLENGTH, 0, 0, TRUE);
+}
+BOOL rt_SetWindowTextA(HWND h, LPCSTR s) {
+    if (!rt_asks(h)) return __toby_SetWindowTextA(h, s);
+    (void)rt_send_any(h, WM_SETTEXT, 0, (LPARAM)s, FALSE);
+    return TRUE;
+}
+BOOL rt_SetWindowTextW(HWND h, LPCWSTR s) {
+    if (!rt_asks(h)) return __toby_SetWindowTextW(h, s);
+    (void)rt_send_any(h, WM_SETTEXT, 0, (LPARAM)s, TRUE);
+    return TRUE;
 }
 
 /* ---- W7k: the CRT's calls of the program's own code ---------------------- *

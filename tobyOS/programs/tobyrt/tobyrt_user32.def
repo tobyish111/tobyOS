@@ -10,3 +10,10 @@ EXPORTS
     __toby_GetMessageA
     __toby_PeekMessageA
     __toby_WaitMessage
+    __toby_CreateWindowExW
+    __toby_GetWindowTextA
+    __toby_GetWindowTextW
+    __toby_GetWindowTextLengthA
+    __toby_GetWindowTextLengthW
+    __toby_SetWindowTextA
+    __toby_SetWindowTextW

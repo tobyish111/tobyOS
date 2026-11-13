@@ -22198,7 +22198,8 @@ struct win32_win {
     int      menu_open;   /* index of the top-level item whose dropdown is open (-1) */
     int      owner_tid;   /* W7o: the thread that made it -- its messages are that thread's */
     char     cls[32];     /* W7r: its class's name (FindWindow, GetClassName) */
-    char     title[64];   /* W7r: its title (FindWindow, GetWindowText, WM_GETTEXT) */
+    char     title[128];  /* W7r: its title (FindWindow, GetWindowText, WM_GETTEXT); W7t: UTF-8 */
+    bool     unicode;     /* W7t: its procedure takes UTF-16 (IsWindowUnicode) */
 };
 /* W7o: a posted message, on thread `tid`'s queue (hwnd 0: a thread message) */
 struct win32_posted { int tid; uint32_t message; uint64_t hwnd, wParam, lParam; uint32_t time; };
@@ -22213,7 +22214,7 @@ struct win32_gui_core {   /* W7n: a process's own (its record's part) */
     int  postn;           /* W7o: the posted messages, in their order */
     struct win32_posted postq[WIN32_POSTQ];
     struct win32_win win[WIN32_MAX_WINDOWS];
-    struct { char name[32]; uint64_t wndproc; } cls[WIN32_MAX_CLASSES];
+    struct { char name[32]; uint64_t wndproc; bool unicode; } cls[WIN32_MAX_CLASSES];   /* W7t: name UTF-8; RegisterClassW's Unicode */
     int  ncls;
     /* C12: virtual child controls + a ring of WM_COMMAND notifications pending
      * delivery to a parent window. Both live here so the per-fresh-app memset
@@ -22648,6 +22649,127 @@ static int win32_poll_window_event(int fd, struct gui_event *out) {
     return gui_window_poll_event(f->win, out);
 }
 
+/* ---- W7t: windows' text -------------------------------------------------
+ * A class's and a window's name are UTF-8 here. The A functions see them
+ * through the ANSI code page (src/win32_nls.c: 1252; a character it lacks
+ * by best fit, else '?'), the W ones as UTF-16. */
+static int win32_utf8_put(uint32_t c, char *out, int o, int cap);
+static int win32_utf8_to_w16(const char *s, uint16_t *out, int cap);
+/* one character of UTF-8 at *pp (advanced past it); U+FFFD a bad one */
+static uint32_t win32_utf8_next(const char **pp) {
+    const unsigned char *p = (const unsigned char *)*pp;
+    uint32_t c = *p++;
+    int more = 0;
+    if (c >= 0xF0 && c < 0xF8) { c &= 0x07; more = 3; }
+    else if (c >= 0xE0 && c < 0xF0) { c &= 0x0F; more = 2; }
+    else if (c >= 0xC0 && c < 0xE0) { c &= 0x1F; more = 1; }
+    else if (c >= 0x80) c = 0xFFFD;
+    for (; more; more--) {
+        if ((*p & 0xC0) != 0x80) { c = 0xFFFD; break; }
+        c = (c << 6) | (*p++ & 0x3F);
+    }
+    *pp = (const char *)p;
+    return c;
+}
+/* ANSI (a kernel string of the ANSI code page's bytes) as UTF-8 */
+static void win32_acp_to_utf8(const char *in, char *out, int cap) {
+    uint32_t cp = w32nls_cp(0);
+    int o = 0;
+    for (; *in; in++) {
+        uint8_t b = (uint8_t)*in;
+        int r = win32_utf8_put(b < 0x80 ? b : w32nls_b2u(cp, b, false), out, o, cap);
+        if (r < 0) break;
+        o = r;
+    }
+    out[o] = 0;
+}
+/* UTF-8 as the ANSI code page's bytes (no NUL); the bytes, at most cap */
+static int win32_utf8_to_acp(const char *in, char *out, int cap) {
+    uint32_t cp = w32nls_cp(0);
+    int o = 0;
+    while (*in && o < cap) {
+        uint32_t c = win32_utf8_next(&in);
+        int b = c < 0x80 ? (int)c : c > 0xFFFF ? -1 : w32nls_u2b(cp, (uint16_t)c, false);
+        out[o++] = b < 0 ? '?' : (char)b;
+    }
+    return o;
+}
+/* its length as UTF-16 units, as ANSI bytes */
+static int win32_utf8_w16len(const char *s) {
+    int n = 0;
+    while (*s) n += win32_utf8_next(&s) > 0xFFFF ? 2 : 1;
+    return n;
+}
+static int win32_utf8_acplen(const char *s) {
+    int n = 0;
+    while (*s) { (void)win32_utf8_next(&s); n++; }
+    return n;
+}
+/* the program's string (UTF-16 when wide, else ANSI) as UTF-8 (cut to fit) */
+static void win32_user_text_utf8(uint64_t u, bool wide, char *out, int cap) {
+    int o = 0;
+    out[0] = 0;
+    if (!u) return;
+    uint32_t cp = w32nls_cp(0);
+    for (int i = 0; i < 4096; i++) {
+        uint32_t c;
+        if (wide) {
+            uint16_t w = 0;
+            if (copy_from_user(&w, (const void *)(uintptr_t)(u + (uint64_t)i * 2), 2) != 0 || !w) break;
+            c = w;
+            if (w >= 0xD800 && w < 0xDC00) {
+                uint16_t w2 = 0;
+                if (copy_from_user(&w2, (const void *)(uintptr_t)(u + (uint64_t)(i + 1) * 2), 2) == 0 &&
+                    w2 >= 0xDC00 && w2 < 0xE000) {
+                    c = 0x10000 + ((uint32_t)(w - 0xD800) << 10) + (uint32_t)(w2 - 0xDC00);
+                    i++;
+                } else c = 0xFFFD;
+            } else if (w >= 0xDC00 && w < 0xE000) c = 0xFFFD;
+        } else {
+            uint8_t b = 0;
+            if (copy_from_user(&b, (const void *)(uintptr_t)(u + (uint64_t)i), 1) != 0 || !b) break;
+            c = b < 0x80 ? b : w32nls_b2u(cp, b, false);
+        }
+        int r = win32_utf8_put(c, out, o, cap);
+        if (r < 0) break;
+        o = r;
+    }
+    out[o] = 0;
+}
+/* text (UTF-8) into the program's buffer of max characters (UTF-16 when
+ * wide, else ANSI), cut to max - 1, with its NUL: the characters copied */
+static int win32_text_answer(const char *t, bool wide, uint64_t dst, int max) {
+    if (max <= 0 || !dst) return 0;
+    int cap = max - 1 < 1023 ? max - 1 : 1023;
+    if (wide) {
+        uint16_t w[1024];
+        int n = win32_utf8_to_w16(t, w, cap);
+        w[n] = 0;
+        (void)copy_to_user((void *)(uintptr_t)dst, w, (size_t)(n + 1) * 2);
+        return n;
+    }
+    char b[1024];
+    int n = win32_utf8_to_acp(t, b, cap);
+    b[n] = 0;
+    (void)copy_to_user((void *)(uintptr_t)dst, b, (size_t)n + 1);
+    return n;
+}
+/* two names the same, neither's case counting (Unicode's case) */
+static bool win32_utf8_eq_ci(const char *a, const char *b) {
+    while (*a && *b) {
+        uint32_t x = win32_utf8_next(&a), y = win32_utf8_next(&b);
+        if (x == y) continue;
+        if (x > 0xFFFF || y > 0xFFFF || w32nls_uupper((uint16_t)x) != w32nls_uupper((uint16_t)y)) return false;
+    }
+    return !*a && !*b;
+}
+/* W7t: a class's kind: 1 Unicode, 0 ANSI, -1 none registered by that name */
+static int win32_class_unicode(const char *name) {
+    for (int i = 0; i < g_win32_gui.ncls; i++)
+        if (win32_utf8_eq_ci(g_win32_gui.cls[i].name, name)) return g_win32_gui.cls[i].unicode ? 1 : 0;
+    return -1;
+}
+
 /* Resolve a class name (or NULL) to its registered WndProc. Falls back to the
  * most-recently registered class so a single-class app is robust even if the
  * name match is imperfect (and so the very first window before any explicit
@@ -22655,7 +22777,7 @@ static int win32_poll_window_event(int fd, struct gui_event *out) {
 static uint64_t win32_class_wndproc(const char *name) {
     if (name && name[0]) {
         for (int i = 0; i < g_win32_gui.ncls; i++)
-            if (win32_streq_ci(g_win32_gui.cls[i].name, name))
+            if (win32_utf8_eq_ci(g_win32_gui.cls[i].name, name))
                 return g_win32_gui.cls[i].wndproc;
     }
     return g_win32_gui.ncls ? g_win32_gui.cls[g_win32_gui.ncls - 1].wndproc : 0;
@@ -22665,8 +22787,7 @@ static uint64_t win32_class_wndproc(const char *name) {
  * the procedure it always took here) */
 static bool win32_class_known(const char *name) {
     if (win32_ctrl_class(name)) return true;
-    for (int i = 0; i < g_win32_gui.ncls; i++)
-        if (win32_streq_ci(g_win32_gui.cls[i].name, name)) return true;
+    if (win32_class_unicode(name) >= 0) return true;
     static const char *const sys[] = { "BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX", "SCROLLBAR",
                                        "MDICLIENT", "#32770", "ComboLBox", "RichEdit20A", "RichEdit20W",
                                        "SysListView32", "SysTreeView32", "SysTabControl32",
@@ -22679,33 +22800,36 @@ static bool win32_class_known(const char *name) {
 
 /* RegisterClassA(&WNDCLASSA): record the class name (+0x40) -> WndProc (+0x08)
  * mapping, and default the trampoline's CRT slot to this WndProc (GetMessage
- * refines it per message for multi-window apps). */
-static long w32_RegisterClassA(uint64_t *a) {
+ * refines it per message for multi-window apps). W7t: RegisterClassW's
+ * class is Unicode -- its windows' procedures take UTF-16; WNDCLASSEX has
+ * the procedure and the name where WNDCLASS has them (RegisterClassExA/W). */
+static long win32_register_class(uint64_t wc, bool wide) {
     /* W7n: no "fresh app" reset any more -- the class table is the process's
      * own, and a class registered before a window was is still there */
     win32_prune_dead_windows();
 
-    uint64_t wc = a[0];
     uint64_t wndproc = 0, cnameptr = 0;
     (void)copy_from_user(&wndproc,  (const void *)(uintptr_t)(wc + 0x08), 8); /* lpfnWndProc */
     (void)copy_from_user(&cnameptr, (const void *)(uintptr_t)(wc + 0x40), 8); /* lpszClassName */
     char cname[32]; cname[0] = '\0';
-    if (cnameptr)
-        (void)strncpy_from_user(cname, (const char *)(uintptr_t)cnameptr, sizeof(cname));
+    if (cnameptr) win32_user_text_utf8(cnameptr, wide, cname, sizeof cname);
 
     int slot = -1;
     for (int i = 0; i < g_win32_gui.ncls; i++)
-        if (win32_streq_ci(g_win32_gui.cls[i].name, cname)) { slot = i; break; }   /* W7n: case not minded */
+        if (win32_utf8_eq_ci(g_win32_gui.cls[i].name, cname)) { slot = i; break; }   /* W7n: case not minded */
     if (slot < 0 && g_win32_gui.ncls < WIN32_MAX_CLASSES) slot = g_win32_gui.ncls++;
     if (slot >= 0) {
         memcpy(g_win32_gui.cls[slot].name, cname, sizeof(g_win32_gui.cls[slot].name));
         g_win32_gui.cls[slot].name[sizeof(g_win32_gui.cls[slot].name) - 1] = '\0';
         g_win32_gui.cls[slot].wndproc = wndproc;
+        g_win32_gui.cls[slot].unicode = wide;
     }
     (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_WNDPROC),
                        &wndproc, 8);
     return 1;   /* a non-zero class atom */
 }
+static long w32_RegisterClassA(uint64_t *a) { return win32_register_class(a[0], false); }
+static long w32_RegisterClassW(uint64_t *a) { return win32_register_class(a[0], true); }
 
 /* Allocate + initialise a virtual child control in the parent's client area.
  * `ktext` is a KERNEL string (or NULL); `style` drives radio grouping (WS_GROUP).
@@ -22783,13 +22907,17 @@ static int win32_ctrl_make(int parent_fd, int type, int x, int y, int w, int h,
 static void win32_win_setcls(struct win32_win *w, const char *cname) {
     const char *nm = cname;
     for (int i = 0; i < g_win32_gui.ncls; i++)
-        if (win32_streq_ci(g_win32_gui.cls[i].name, cname)) { nm = g_win32_gui.cls[i].name; break; }
+        if (win32_utf8_eq_ci(g_win32_gui.cls[i].name, cname)) { nm = g_win32_gui.cls[i].name; break; }
     size_t n = strlen(nm);
     if (n > sizeof w->cls - 1) n = sizeof w->cls - 1;
     memcpy(w->cls, nm, n);
     w->cls[n] = 0;
 }
-static long w32_CreateWindowExA(uint64_t *a) {
+/* W7t: CreateWindowExW too -- the class's name and the title UTF-16. A
+ * window is Unicode when its class is (a system class's: when the W
+ * function made it); an ANSI window's title from CreateWindowExW is what its
+ * procedure would be given, the text through the ANSI code page (measured). */
+static long win32_create_window(uint64_t *a, bool wide) {
     uint64_t cnameptr = a[1];
     uint64_t name     = a[2];
     uint32_t style    = (uint32_t)a[3];
@@ -22806,8 +22934,21 @@ static long w32_CreateWindowExA(uint64_t *a) {
     g_win32_gui.quit = false;    /* creating a window -> not in a quit state */
 
     char cname[32]; cname[0] = '\0';
-    if (cnameptr)
-        (void)strncpy_from_user(cname, (const char *)(uintptr_t)cnameptr, sizeof(cname));
+    if (cnameptr >= 0x10000) win32_user_text_utf8(cnameptr, wide, cname, sizeof cname);
+    int ckind = win32_class_unicode(cname);
+    bool unicode = ckind >= 0 ? ckind == 1 : wide;   /* W7t */
+    char t8[128];                                    /* W7t: the title, UTF-8 */
+    t8[0] = 0;
+    if (name) {
+        win32_user_text_utf8(name, wide, t8, sizeof t8);
+        if (wide && !unicode) {                      /* through the ANSI code page */
+            char ab[128], u8[128];
+            int n = win32_utf8_to_acp(t8, ab, (int)sizeof ab - 1);
+            ab[n] = 0;
+            win32_acp_to_utf8(ab, u8, sizeof u8);
+            memcpy(t8, u8, sizeof t8);
+        }
+    }
 
     /* A predefined control class (BUTTON/EDIT/STATIC/CHECKBOX/LISTBOX/SCROLLBAR;
      * C14: COMBOBOX/RADIO/GROUPBOX/SysTabControl32) with a parent creates a
@@ -22823,8 +22964,10 @@ static long w32_CreateWindowExA(uint64_t *a) {
     }
     if (ctype && parent_fd) {
         char ktext[WIN32_CTRL_TEXT]; ktext[0] = '\0';
-        if (name)
-            (void)strncpy_from_user(ktext, (const char *)(uintptr_t)name, sizeof(ktext));
+        if (name) {                                   /* W7t: a control's text is ANSI */
+            int n = win32_utf8_to_acp(t8, ktext, (int)sizeof ktext - 1);
+            ktext[n] = 0;
+        }
         int slot = win32_ctrl_make(parent_fd, ctype, (int)(int32_t)a[4],
                                    (int)(int32_t)a[5], w, h, (int)a[9],
                                    name ? ktext : NULL, style);
@@ -22834,7 +22977,7 @@ static long w32_CreateWindowExA(uint64_t *a) {
 
     struct win32_win *win = win32_win_alloc();
     if (!win) return 0;                          /* table full -> NULL HWND */
-    long fd = sys_gui_create((uint32_t)w, (uint32_t)h, (const char *)(uintptr_t)name);
+    long fd = sys_gui_create((uint32_t)w, (uint32_t)h, 0);
     if (fd < 0) return 0;                        /* NULL HWND */
     fd = win32_gwin_place((int)fd);              /* W7r: the system's number */
 
@@ -22842,6 +22985,7 @@ static long w32_CreateWindowExA(uint64_t *a) {
     win->owner_tid   = win32_tid();              /* W7o */
     win->fd          = (int)fd;
     win->gwin        = win32_hdc_window((int)fd);  /* C18c: stash for pixel readback */
+    if (win->gwin) (void)gui_window_set_title(win->gwin, t8);   /* W7t */
     win->w           = w;
     win->h           = h;
     win->wndproc     = win32_class_wndproc(cname);
@@ -22863,11 +23007,13 @@ static long w32_CreateWindowExA(uint64_t *a) {
     win->menu        = ((a[9] & WIN32_TAG_MASK) == WIN32_MENU_TAG) ? a[9] : 0;
     win->menu_open   = -1;
     win32_win_setcls(win, cname);                /* W7r */
-    win->title[0]    = 0;
-    if (name) (void)strncpy_from_user(win->title, (const char *)(uintptr_t)name, sizeof win->title);
+    memcpy(win->title, t8, sizeof win->title);   /* W7t */
     win->title[sizeof win->title - 1] = 0;
+    win->unicode     = unicode;
     return fd;   /* HWND == HDC == fd */
 }
+static long w32_CreateWindowExA(uint64_t *a) { return win32_create_window(a, false); }
+static long w32_CreateWindowExW(uint64_t *a) { return win32_create_window(a, true); }
 
 /* ShowWindow/UpdateWindow: a window -> queue its repaint; a control (C12) ->
  * queue its PARENT's repaint so the control gets drawn into it. */
@@ -22893,28 +23039,19 @@ static long w32_TranslateMessage(uint64_t *a) { (void)a; return 0; }
  * implement is the idiomatic WM_CLOSE -> DestroyWindow: a real app that doesn't
  * handle WM_CLOSE in its WndProc passes it here, and Windows responds by
  * destroying the window (which then sends WM_DESTROY). */
-static long w32_DefWindowProcA(uint64_t *a) {
+static long win32_defwindowproc(uint64_t *a, bool wide) {
     if ((uint32_t)a[1] == 0x0081 /* WM_NCCREATE */) return 1;   /* W7j: go on creating it */
     uint32_t dm = (uint32_t)a[1];
     if (dm == 0x000C || dm == 0x000D || dm == 0x000E) {          /* W7r: WM_SETTEXT, WM_GETTEXT, -LENGTH */
         struct win32_win *w = win32_win_find((int)a[0]);
         if (!w) return 0;
-        if (dm == 0x000C) {
-            w->title[0] = 0;
-            if (a[3]) (void)strncpy_from_user(w->title, (const char *)(uintptr_t)a[3], sizeof w->title);
-            w->title[sizeof w->title - 1] = 0;
+        if (dm == 0x000C) {                                      /* W7t: the text in the function's kind */
+            win32_user_text_utf8(a[3], wide, w->title, sizeof w->title);
             if (w->gwin) (void)gui_window_set_title(w->gwin, w->title);
             return 1;
         }
-        int n = (int)strlen(w->title);
-        if (dm == 0x000E) return n;
-        int max = (int)(int32_t)a[2];
-        if (max <= 0 || !a[3]) return 0;
-        if (n > max - 1) n = max - 1;
-        if (n) (void)copy_to_user((void *)(uintptr_t)a[3], w->title, (size_t)n);
-        char z = 0;
-        (void)copy_to_user((void *)(uintptr_t)(a[3] + (uint64_t)n), &z, 1);
-        return n;
+        if (dm == 0x000E) return wide ? win32_utf8_w16len(w->title) : win32_utf8_acplen(w->title);
+        return win32_text_answer(w->title, wide, a[3], (int)(int32_t)a[2]);
     }
     if ((uint32_t)a[1] == WM_CLOSE) {
         struct win32_win *w = win32_win_find((int)a[0]);
@@ -22922,6 +23059,8 @@ static long w32_DefWindowProcA(uint64_t *a) {
     }
     return 0;
 }
+static long w32_DefWindowProcA(uint64_t *a) { return win32_defwindowproc(a, false); }
+static long w32_DefWindowProcW(uint64_t *a) { return win32_defwindowproc(a, true); }   /* W7t */
 
 /* DestroyWindow(hwnd) -> TRUE. Arms GetMessage to deliver one WM_DESTROY for
  * THIS window (then retire it); the app's WndProc can PostQuitMessage. */
@@ -22937,6 +23076,13 @@ static long w32_IsWindow(uint64_t *a) {
     if (!a[0]) return 0;
     if (win32_ctrl_find(a[0])) return 1;
     return win32_win_any(a[0], 0) ? 1 : 0;            /* W7r: anyone's */
+}
+
+/* W7t: user32!IsWindowUnicode(hwnd): its procedure takes UTF-16 (anyone's window) */
+static long w32_IsWindowUnicode(uint64_t *a) {
+    if (!a[0] || win32_ctrl_find(a[0])) return 0;
+    struct win32_win *w = win32_win_any(a[0], 0);
+    return w && w->unicode ? 1 : 0;
 }
 
 /* InvalidateRect(hwnd, &RECT|NULL, erase) -> TRUE. Marks THIS window for a
@@ -23177,21 +23323,18 @@ static long win32_sent_queue(uint64_t uq) {
             }
         }
     } else if (q.msg == 0x000C /* WM_SETTEXT */ && q.lp) {
-        char t[512];
-        int n;
-        if (e->wide) n = win32_w16_to_utf8(q.lp, -1, t, sizeof t);
-        else { long r = strncpy_from_user(t, (const char *)(uintptr_t)q.lp, sizeof t); n = r < 0 ? 0 : (int)r; }
-        if (n < 0) n = 0;
-        if (n > (int)sizeof t - 1) n = (int)sizeof t - 1;
-        t[n] = 0;
-        e->data = kmalloc((size_t)n + 1);
-        if (e->data) { memcpy(e->data, t, (size_t)n + 1); e->dlen = (uint32_t)n + 1; e->kind = W32S_SETTEXT; }
+        char t[1024];                               /* W7t: UTF-8 across, either kind's */
+        win32_user_text_utf8(q.lp, e->wide, t, sizeof t);
+        size_t n = strlen(t);
+        e->data = kmalloc(n + 1);
+        if (e->data) { memcpy(e->data, t, n + 1); e->dlen = (uint32_t)n + 1; e->kind = W32S_SETTEXT; }
     } else if (q.msg == 0x000D /* WM_GETTEXT */ && q.lp && q.wp) {
         uint32_t n = q.wp > 4096 ? 4096 : (uint32_t)q.wp;
-        e->data = kmalloc(n);
+        uint32_t cap = n * 3 + 1;                   /* W7t: the answer comes back as UTF-8 */
+        e->data = kmalloc(cap);
         if (e->data) {
-            memset(e->data, 0, n);
-            e->dlen = n; e->kind = W32S_GETTEXT; e->ulp = q.lp; e->uwp = q.wp;
+            memset(e->data, 0, cap);
+            e->dlen = cap; e->kind = W32S_GETTEXT; e->ulp = q.lp; e->uwp = n;
         }
     }
     return (long)e->ticket;
@@ -23207,21 +23350,8 @@ static long win32_sent_wait(uint64_t ticket, uint64_t ures) {
         if (e->state == 3) {
             uint64_t r = e->result;
             if (e->kind == W32S_GETTEXT && e->ulp && e->uwp && e->dlen) {
-                e->data[e->dlen - 1] = 0;
-                if (e->wide) {
-                    uint16_t wb[512];
-                    int cap = e->uwp - 1 < 511 ? (int)e->uwp - 1 : 511;
-                    int n = win32_utf8_to_w16((const char *)e->data, wb, cap);
-                    wb[n] = 0;
-                    (void)copy_to_user((void *)(uintptr_t)e->ulp, wb, (size_t)(n + 1) * 2);
-                    r = (uint64_t)n;
-                } else {
-                    size_t n = strlen((const char *)e->data);
-                    if (n > e->uwp - 1) n = (size_t)e->uwp - 1;
-                    (void)copy_to_user((void *)(uintptr_t)e->ulp, e->data, n);
-                    char z = 0;
-                    (void)copy_to_user((void *)(uintptr_t)(e->ulp + n), &z, 1);
-                }
+                e->data[e->dlen - 1] = 0;           /* W7t: the UTF-8 answer in the sender's kind */
+                r = (uint64_t)win32_text_answer((const char *)e->data, e->wide, e->ulp, (int)e->uwp);
             }
             if (ures) (void)copy_to_user((void *)(uintptr_t)ures, &r, 8);
             win32_sent_free(e);
@@ -23230,11 +23360,17 @@ static long win32_sent_wait(uint64_t ticket, uint64_t ures) {
         if (!win32_sent_receiver(e)) { win32_sent_free(e); return 4; }
         if (win32_sent_waiting()) return 2;
         if (e->deadline && perf_now_ns() >= e->deadline) {
-            e->gone = true;
+            /* W7t: one its receiver has not taken yet is dropped -- never run
+             * (measured: a SendMessageTimeout that gave up is not run when the
+             * receiver next waits); one being run finishes, its answer nobody's */
+            if (e->state == 1) win32_sent_free(e); else e->gone = true;
             win32_set_last_error(1460);              /* ERROR_TIMEOUT */
             return 3;
         }
-        if (proc_wait_interrupted(current_proc())) { e->gone = true; return 5; }
+        if (proc_wait_interrupted(current_proc())) {
+            if (e->state == 1) win32_sent_free(e); else e->gone = true;
+            return 5;
+        }
         sys_nanosleep(1000000);
     }
 }
@@ -23245,9 +23381,10 @@ static long win32_sent_take(uint64_t uo) {
     struct win32_sent *e = win32_sent_mine(1);
     if (!e) return 0;
     struct win32_win *w = win32_win_find((int)e->hwnd);
-    uint64_t o[8] = { e->ticket, e->hwnd, e->msg, e->wp, e->lp, (w && !w->is_dialog) ? w->wndproc : 0,
-                      e->kind ? e->dlen : 0, 0 };
-    if (e->kind == W32S_GETTEXT) o[3] = e->dlen;
+    /* W7t: the sender's kind (1 SendMessageW's) above the message */
+    uint64_t o[8] = { e->ticket, e->hwnd, (uint64_t)e->msg | ((uint64_t)e->wide << 32), e->wp, e->lp,
+                      (w && !w->is_dialog) ? w->wndproc : 0, e->kind ? e->dlen : 0, 0 };
+    if (e->kind == W32S_GETTEXT) o[3] = e->uwp;
     if (copy_to_user((void *)(uintptr_t)uo, o, sizeof o) != 0) return 0;
     e->state = 2;
     return 1;
@@ -23565,8 +23702,8 @@ static long w32_PostThreadMessageA(uint64_t *a) {
  * last error as it was, for none (measured) */
 static bool win32_win_named(const struct win32_win *w, const char *cls, const char *title) {
     if (w->parent_fd) return false;
-    if (cls && !win32_streq_ci(w->cls, cls)) return false;
-    if (title && !win32_streq_ci(w->title, title)) return false;
+    if (cls && !win32_utf8_eq_ci(w->cls, cls)) return false;       /* W7t: UTF-8, Unicode's case */
+    if (title && !win32_utf8_eq_ci(w->title, title)) return false;
     return true;
 }
 static long win32_find_window(const char *cls, const char *title) {
@@ -23581,16 +23718,14 @@ static long win32_find_window(const char *cls, const char *title) {
     return 0;
 }
 static long w32_FindWindowA(uint64_t *a) {
-    char c[64], t[128];
+    char c[128], t[256];                                /* W7t: the ANSI names as UTF-8 */
     const char *cp = 0, *tp = 0;
     if (a[0] >= 0x10000) {
-        if (strncpy_from_user(c, (const char *)(uintptr_t)a[0], sizeof c) < 0) return 0;
-        c[sizeof c - 1] = 0;
+        win32_user_text_utf8(a[0], false, c, sizeof c);
         cp = c;
     } else if (a[0]) return 0;                          /* a class atom: none are kept */
     if (a[1]) {
-        if (strncpy_from_user(t, (const char *)(uintptr_t)a[1], sizeof t) < 0) return 0;
-        t[sizeof t - 1] = 0;
+        win32_user_text_utf8(a[1], false, t, sizeof t);
         tp = t;
     }
     return win32_find_window(cp, tp);
@@ -25434,6 +25569,20 @@ static long w32_toby_msgsvc(uint64_t *a) {
     case 8:  return win32_sent_data(a[1], a[2]);
     case 9:  return win32_sent_reply(a[1], a[2]);
     case 10: return win32_enum_windows(a[1], a[2]);
+    case 11: {          /* W7t: (hwnd) where it is -- 1 the calling thread's with a procedure,
+                         * 2 another thread's of this process, 3 another process's, 4 this
+                         * process's the kernel answers for (a dialog's); 0 none (a control) --
+                         * and 0x100 for a Unicode window */
+        if (!a[1] || win32_ctrl_find(a[1])) return 0;
+        struct win32_pstate *ps = 0;
+        struct win32_win *w = win32_win_any(a[1], &ps);
+        if (!w) return 0;
+        long r = w->unicode ? 0x100 : 0;
+        if (ps != win32_ps_cur()) return r | 3;
+        if (w->is_dialog || !w->wndproc) return r | 4;
+        if (w->owner_tid && w->owner_tid != win32_tid()) return r | 2;
+        return r | 1;
+    }
     }
     return 0;
 }
@@ -25694,36 +25843,55 @@ static bool win32_route_control_input(int parent_fd, const struct gui_event *ev)
     return false;
 }
 
-/* user32!GetWindowTextA(hwnd, buf, max) -> length copied (a control's text). */
-/* W7r: the text of a control, or a window's title (another process's too) */
-static const char *win32_text_of(uint64_t h, int *lim) {
+/* user32!GetWindowTextA(hwnd, buf, max) -> length copied (a control's text).
+ * W7r: a window's title too, another process's; W7t: GetWindowTextW, the
+ * title read as it is kept (tobyrt.dll's GetWindowText sends WM_GETTEXT to
+ * the program's own windows, these answer for the rest: another process's
+ * window is not asked, measured) -- a window that is none: 0, its buffer
+ * emptied, ERROR_INVALID_WINDOW_HANDLE */
+static bool win32_text_of(uint64_t h, char *t8, int cap) {
     struct win32_ctrl *c = win32_ctrl_find(h);
-    if (c) { *lim = (int)sizeof(c->text) - 1; return c->text; }
+    if (c) {                                             /* a control's: ANSI */
+        char k[sizeof c->text + 1];
+        memcpy(k, c->text, sizeof c->text);
+        k[sizeof c->text] = 0;
+        win32_acp_to_utf8(k, t8, cap);
+        return true;
+    }
     struct win32_win *w = win32_win_any(h, 0);
-    if (w) { *lim = (int)sizeof(w->title) - 1; return w->title; }
-    return 0;
+    if (!w) return false;
+    size_t n = strlen(w->title);
+    if (n > (size_t)cap - 1) n = (size_t)cap - 1;
+    memcpy(t8, w->title, n);
+    t8[n] = 0;
+    return true;
 }
-static long w32_GetWindowTextA(uint64_t *a) {
+static long win32_get_window_text(uint64_t *a, bool wide) {
+    char t[256];
     int max = (int)(int32_t)a[2];
-    if (max <= 0) return 0;
-    int n = 0, lim = 0;
-    const char *src = win32_text_of(a[0], &lim);
-    if (src) { while (n < lim && src[n]) n++; }
-    if (n > max - 1) n = max - 1;
-    if (src && n) (void)copy_to_user((void *)(uintptr_t)a[1], src, n);
-    char z = 0; (void)copy_to_user((void *)(uintptr_t)(a[1] + n), &z, 1);
-    return n;
+    if (!win32_text_of(a[0], t, sizeof t)) {
+        win32_set_last_error(1400);                      /* ERROR_INVALID_WINDOW_HANDLE */
+        if (max > 0 && a[1]) {
+            uint16_t z = 0;
+            (void)copy_to_user((void *)(uintptr_t)a[1], &z, wide ? 2 : 1);
+        }
+        return 0;
+    }
+    return win32_text_answer(t, wide, a[1], max);
 }
-/* W7r: GetWindowTextLengthA(hwnd) */
-static long w32_GetWindowTextLengthA(uint64_t *a) {
-    int n = 0, lim = 0;
-    const char *src = win32_text_of(a[0], &lim);
-    if (src) { while (n < lim && src[n]) n++; }
-    return n;
+static long w32_GetWindowTextA(uint64_t *a) { return win32_get_window_text(a, false); }
+static long w32_GetWindowTextW(uint64_t *a) { return win32_get_window_text(a, true); }
+/* W7r: GetWindowTextLengthA(hwnd); W7t: W, in UTF-16 units */
+static long win32_window_text_length(uint64_t h, bool wide) {
+    char t[256];
+    if (!win32_text_of(h, t, sizeof t)) { win32_set_last_error(1400); return 0; }
+    return wide ? win32_utf8_w16len(t) : win32_utf8_acplen(t);
 }
+static long w32_GetWindowTextLengthA(uint64_t *a) { return win32_window_text_length(a[0], false); }
+static long w32_GetWindowTextLengthW(uint64_t *a) { return win32_window_text_length(a[0], true); }
 /* W7r: GetClassNameA(hwnd, buf, max) -> the characters copied; a control's
  * is its system class's name */
-static long w32_GetClassNameA(uint64_t *a) {
+static long win32_get_class_name(uint64_t *a, bool wide) {
     const char *nm = 0;
     struct win32_ctrl *c = win32_ctrl_find(a[0]);
     if (c) {
@@ -25746,34 +25914,37 @@ static long w32_GetClassNameA(uint64_t *a) {
         if (w) nm = w->cls;
     }
     if (!nm) { win32_set_last_error(1400); return 0; }
-    int max = (int)(int32_t)a[2];
-    if (max <= 0 || !a[1]) return 0;
-    int n = (int)strlen(nm);
-    if (n > max - 1) n = max - 1;
-    if (n) (void)copy_to_user((void *)(uintptr_t)a[1], nm, (size_t)n);
-    char z = 0;
-    (void)copy_to_user((void *)(uintptr_t)(a[1] + (uint64_t)n), &z, 1);
-    return n;
+    return win32_text_answer(nm, wide, a[1], (int)(int32_t)a[2]);   /* W7t: either kind */
 }
+static long w32_GetClassNameA(uint64_t *a) { return win32_get_class_name(a, false); }
+static long w32_GetClassNameW(uint64_t *a) { return win32_get_class_name(a, true); }
 /* user32!SetWindowTextA(hwnd, text) -> TRUE. Sets a control's text + redraws;
- * W7r: a window's title (the program's own) */
-static long w32_SetWindowTextA(uint64_t *a) {
-    struct win32_ctrl *c = win32_ctrl_find(a[0]);
-    if (!c) {
-        struct win32_win *w = win32_win_find((int)a[0]);
-        if (!w) return 0;
-        w->title[0] = 0;
-        if (a[1]) (void)strncpy_from_user(w->title, (const char *)(uintptr_t)a[1], sizeof w->title);
-        w->title[sizeof w->title - 1] = 0;
-        if (w->gwin) (void)gui_window_set_title(w->gwin, w->title);
+ * W7r: a window's title; W7t: SetWindowTextW, and any process's window's --
+ * tobyrt.dll's SetWindowText sends WM_SETTEXT to the program's own windows,
+ * this sets the rest (another process's window is not asked, measured); a
+ * window that is none: TRUE all the same, ERROR_INVALID_WINDOW_HANDLE
+ * (measured) */
+static long win32_set_window_text(uint64_t h, uint64_t text, bool wide) {
+    char t[256];
+    win32_user_text_utf8(text, wide, t, sizeof t);
+    struct win32_ctrl *c = win32_ctrl_find(h);
+    if (c) {
+        int n = win32_utf8_to_acp(t, c->text, (int)sizeof c->text - 1);
+        c->text[n] = 0;
+        win32_refresh_controls(c->parent_fd);
         return 1;
     }
-    c->text[0] = 0;
-    if (a[1])
-        (void)strncpy_from_user(c->text, (const char *)(uintptr_t)a[1], sizeof(c->text));
-    win32_refresh_controls(c->parent_fd);
+    struct win32_win *w = win32_win_any(h, 0);
+    if (!w) { win32_set_last_error(1400); return 1; }
+    size_t n = strlen(t);
+    if (n > sizeof w->title - 1) n = sizeof w->title - 1;
+    memcpy(w->title, t, n);
+    w->title[n] = 0;
+    if (w->gwin) (void)gui_window_set_title(w->gwin, w->title);
     return 1;
 }
+static long w32_SetWindowTextA(uint64_t *a) { return win32_set_window_text(a[0], a[1], false); }
+static long w32_SetWindowTextW(uint64_t *a) { return win32_set_window_text(a[0], a[1], true); }
 
 /* C13: a control's slot index (for the parallel listbox store). */
 static int win32_ctrl_slot(const struct win32_ctrl *c) {
@@ -32264,6 +32435,18 @@ static const struct win32_shim g_win32_shims[] = {
      * trampoline (it calls the app's WndProc), so it's deliberately NOT here. */
     { "user32.dll", "RegisterClassA",    w32_RegisterClassA },
     { "user32.dll", "CreateWindowExA",   w32_CreateWindowExA },
+    /* W7t: the W functions; RegisterClassEx's WNDCLASSEX has its procedure and name where WNDCLASS has them */
+    { "user32.dll", "RegisterClassW",    w32_RegisterClassW },
+    { "user32.dll", "RegisterClassExA",  w32_RegisterClassA },
+    { "user32.dll", "RegisterClassExW",  w32_RegisterClassW },
+    { "user32.dll", "CreateWindowExW",   w32_CreateWindowExW },
+    { "user32.dll", "DefWindowProcW",    w32_DefWindowProcW },
+    { "user32.dll", "IsWindowUnicode",   w32_IsWindowUnicode },
+    { "user32.dll", "GetWindowTextW",       w32_GetWindowTextW },
+    { "user32.dll", "GetWindowTextLengthW", w32_GetWindowTextLengthW },
+    { "user32.dll", "SetWindowTextW",       w32_SetWindowTextW },
+    { "user32.dll", "GetClassNameW",        w32_GetClassNameW },
+    { "user32.dll", "InternalGetWindowText", w32_GetWindowTextW },
     { "user32.dll", "ShowWindow",        w32_ShowWindow },
     { "user32.dll", "UpdateWindow",      w32_UpdateWindow },
     { "user32.dll", "GetMessageA",       w32_GetMessageA },
@@ -32361,6 +32544,13 @@ static const struct win32_shim g_win32_shims[] = {
     { "user32.dll", "__toby_msgsvc",          w32_toby_msgsvc },      /* W7j: tobyrt.dll's */
     { "user32.dll", "__toby_CreateWindowExA", w32_CreateWindowExA },
     { "user32.dll", "__toby_SendMessageA",    w32_SendMessageA },
+    { "user32.dll", "__toby_CreateWindowExW", w32_CreateWindowExW },     /* W7t: tobyrt.dll's */
+    { "user32.dll", "__toby_GetWindowTextA",  w32_GetWindowTextA },
+    { "user32.dll", "__toby_GetWindowTextW",  w32_GetWindowTextW },
+    { "user32.dll", "__toby_GetWindowTextLengthA", w32_GetWindowTextLengthA },
+    { "user32.dll", "__toby_GetWindowTextLengthW", w32_GetWindowTextLengthW },
+    { "user32.dll", "__toby_SetWindowTextA",  w32_SetWindowTextA },
+    { "user32.dll", "__toby_SetWindowTextW",  w32_SetWindowTextW },
     { "user32.dll", "IsWindow",               w32_IsWindow },
     { "user32.dll", "DrawTextA",              w32_DrawTextA },
     { "user32.dll", "MessageBoxA",            w32_MessageBoxA },
