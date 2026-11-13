@@ -629,6 +629,45 @@ static void fsm_fsync_check(const char *fs, const char *mp) {
             sy == VFS_OK && after, fs, "fsync puts bytes on the device", msg);
 }
 
+/* A file's write time to the nanosecond, of a filesystem that keeps one
+ * (tmpfs, ext4, tobyfs -- FAT's are two seconds by its format, ramfs keeps
+ * none). Two writes 20 ms apart must read back in their order: a fast
+ * machine makes both in one second, and a filesystem of whole seconds gives
+ * them one time -- the EliteDesk failed win-cxx44's last_write_time check
+ * that way (std::filesystem asks a later file's time to be later, as NTFS's
+ * 100 ns times are), and QEMU, slow enough to cross a second between them,
+ * never did. utimens's nanoseconds must come back as given. */
+extern uint64_t perf_now_ns(void);
+static void fsm_subsec(const char *fs, const char *mp) {
+    char a[128], b[128], msg[192];
+    ksnprintf(a, sizeof a, "%s/nsa.txt", mp);
+    ksnprintf(b, sizeof b, "%s/nsb.txt", mp);
+    (void)vfs_unlink(a);
+    (void)vfs_unlink(b);
+    struct vfs_stat sa, sb;
+    int wa = vfs_write_all(a, "a", 1);
+    int ra = vfs_stat(a, &sa);
+    uint64_t t0 = perf_now_ns();
+    while (perf_now_ns() - t0 < 20000000ull) __asm__ volatile ("pause");
+    int wb = vfs_write_all(b, "b", 1);
+    int rb = vfs_stat(b, &sb);
+    bool later = sb.mtime > sa.mtime || (sb.mtime == sa.mtime && sb.mtime_ns > sa.mtime_ns);
+    ksnprintf(msg, sizeof msg, "rc=%d/%d/%d/%d first %lu.%09u then %lu.%09u (20 ms later)",
+              wa, ra, wb, rb, (unsigned long)sa.mtime, (unsigned)sa.mtime_ns,
+              (unsigned long)sb.mtime, (unsigned)sb.mtime_ns);
+    fsm_chk(wa == VFS_OK && ra == VFS_OK && wb == VFS_OK && rb == VFS_OK && later,
+            fs, "a write 20 ms later is later (nanoseconds)", msg);
+
+    int u = vfs_utimens(a, 1700000000ull, 123456789u, 1700000000ull, 123456789u);
+    int r2 = vfs_stat(a, &sa);
+    ksnprintf(msg, sizeof msg, "rc=%d/%d mtime %lu.%09u want 1700000000.123456789",
+              u, r2, (unsigned long)sa.mtime, (unsigned)sa.mtime_ns);
+    fsm_chk(u == VFS_OK && r2 == VFS_OK && sa.mtime == 1700000000ull && sa.mtime_ns == 123456789u,
+            fs, "utimens keeps nanoseconds", msg);
+    (void)vfs_unlink(a);
+    (void)vfs_unlink(b);
+}
+
 /* ---- formatting a REAL device, for host-side verification ------------
  *
  * fsm_run above proves the driver can read what the formatter wrote --
@@ -814,6 +853,7 @@ static void fsm_tobyfs_case(const char *label, uint8_t fill) {
     fsm_coherence(label, "/fsmtfs");
     fsm_unlink_open(label, "/fsmtfs");
     fsm_fsync_check(label, "/fsmtfs");
+    fsm_subsec(label, "/fsmtfs");
     (void)vfs_unmount("/fsmtfs");
 }
 
@@ -825,6 +865,7 @@ void fsmatrix_selftest(void) {
     fsm_run("tmpfs", "/tmp", true, true);
     fsm_coherence("tmpfs", "/tmp");
     fsm_unlink_open("tmpfs", "/tmp");
+    fsm_subsec("tmpfs", "/tmp");
 
     /* ramfs IS the root every session starts in, and nothing had ever run
      * the matrix against it. Work inside a subdirectory so a failed run
@@ -989,6 +1030,7 @@ void fsmatrix_selftest(void) {
                 fsm_coherence("ext4", "/fsm4");
                 fsm_unlink_open("ext4", "/fsm4");
                 fsm_fsync_check("ext4", "/fsm4");
+                fsm_subsec("ext4", "/fsm4");
                 (void)vfs_unmount("/fsm4");
             }
         }
