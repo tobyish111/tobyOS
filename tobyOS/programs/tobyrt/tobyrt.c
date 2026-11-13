@@ -1529,11 +1529,15 @@ LRESULT rt_SendMessageTimeoutW(HWND h, UINT msg, WPARAM w, LPARAM l, UINT flags,
 /* EnumWindows(proc, lParam): every process's top-level windows, until the
  * program's procedure answers FALSE */
 BOOL rt_EnumWindows(WNDENUMPROC fn, LPARAM l) {
-    ULONG64 hw[512];
-    LONG_PTR n = __toby_msgsvc(RT_MSG_ENUM, hw, (void *)(ULONG_PTR)512);
-    for (LONG_PTR i = 0; i < n; i++)
-        if (!fn((HWND)hw[i], l)) return FALSE;
-    return TRUE;
+    /* W7v: as many as there are (the system's 16384 at most) */
+    ULONG64 *hw = (ULONG64 *)HeapAlloc(GetProcessHeap(), 0, 16384 * sizeof(ULONG64));
+    if (!hw) return FALSE;
+    LONG_PTR n = __toby_msgsvc(RT_MSG_ENUM, hw, (void *)(ULONG_PTR)16384);
+    BOOL r = TRUE;
+    for (LONG_PTR i = 0; i < n && r; i++)
+        if (!fn((HWND)hw[i], l)) r = FALSE;
+    HeapFree(GetProcessHeap(), 0, hw);
+    return r;
 }
 
 /* CreateWindowEx's creation messages; W7t: the CREATESTRUCT's names in the
@@ -1702,6 +1706,19 @@ static int rt_msgbox(HWND owner, const void *text, const void *cap, UINT type, B
                     : __toby_MessageBoxA(owner, (LPCSTR)text, (LPCSTR)cap, type);
     rt_modal_loop(5);
     return (int)__toby_dlgsvc(6, 0, 0, 0, 0, 0);
+}
+/* W7v: DestroyWindow of the thread's own window calls its procedure with
+ * WM_DESTROY and WM_NCDESTROY before it returns (measured: programs/win-hwnd53),
+ * then the window is none (__toby_msgsvc 13); the rest are the kernel's */
+#define RT_MSG_DESTROYED 13
+__declspec(dllimport) BOOL WINAPI __toby_DestroyWindow(HWND);
+BOOL rt_DestroyWindow(HWND h) {
+    ULONG64 proc = 0;
+    if (__toby_msgsvc(RT_MSG_WNDPROC, h, &proc) != 1 || !proc) return __toby_DestroyWindow(h);
+    (void)rt_call_callback(proc, (ULONG64)h, WM_DESTROY, 0, 0);
+    (void)rt_call_callback(proc, (ULONG64)h, WM_NCDESTROY, 0, 0);
+    (void)__toby_msgsvc(RT_MSG_DESTROYED, h, 0);
+    return TRUE;
 }
 int rt_MessageBoxA(HWND owner, LPCSTR text, LPCSTR cap, UINT type) { return rt_msgbox(owner, text, cap, type, FALSE); }
 int rt_MessageBoxW(HWND owner, LPCWSTR text, LPCWSTR cap, UINT type) { return rt_msgbox(owner, text, cap, type, TRUE); }

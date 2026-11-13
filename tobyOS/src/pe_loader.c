@@ -1399,6 +1399,8 @@ static const char *const g_pe_rt_names[] = {
      * DialogBoxParamA's loops run what other threads send */
     "SleepEx", "WaitForSingleObjectEx", "WaitForMultipleObjectsEx", "MsgWaitForMultipleObjectsEx",
     "MessageBoxA", "MessageBoxW", "DialogBoxParamA",
+    /* W7v: DestroyWindow calls the window's procedure before it returns */
+    "DestroyWindow",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)

@@ -24,3 +24,4 @@ EXPORTS
     __toby_dlgsvc
     __toby_MessageBoxA
     __toby_MessageBoxW
+    __toby_DestroyWindow

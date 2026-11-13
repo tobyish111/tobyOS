@@ -22111,7 +22111,8 @@ static long w32_LeaveCriticalSection(uint64_t *a) {
  * -- stashes the message's target WndProc into the CRT slot the C7 trampoline
  * reads, so DispatchMessage calls the RIGHT window's WndProc with no asm change
  * (GetMessage and DispatchMessage are called in lock-step per message). */
-#define WIN32_MAX_WINDOWS 8
+#define WIN32_WCHUNK  32   /* W7v: a process's windows, in chunks that never move */
+#define WIN32_WCHUNKS 128  /* (4096) */
 #define WIN32_MAX_CLASSES 8
 #define WIN32_MAX_CTRLS   16   /* C12: BUTTON/EDIT child controls */
 #define WIN32_CMDQ        8    /* C12: pending WM_COMMAND ring     */
@@ -22200,6 +22201,12 @@ struct win32_win {
     char     cls[32];     /* W7r: its class's name (FindWindow, GetClassName) */
     char     title[128];  /* W7r: its title (FindWindow, GetWindowText, WM_GETTEXT); W7t: UTF-8 */
     bool     unicode;     /* W7t: its procedure takes UTF-16 (IsWindowUnicode) */
+    /* W7v: fd above is the HWND (the system's number, apart from any
+     * descriptor); gfd the descriptor of its desktop window, 0 while it has
+     * none (hidden, or the compositor full) */
+    int      gfd;
+    bool     visible;     /* shown: WS_VISIBLE, or ShowWindow since */
+    uint64_t userdata, style, exstyle, ident, hinst;   /* GetWindowLongPtr's */
 };
 /* W7o: a posted message, on thread `tid`'s queue (hwnd 0: a thread message) */
 struct win32_posted { int tid; uint32_t message; uint64_t hwnd, wParam, lParam; uint32_t time; };
@@ -22215,7 +22222,8 @@ struct win32_gui_core {   /* W7n: a process's own (its record's part) */
     int  quit_tid;        /* W7o: the thread that posted it (0: any) */
     int  postn;           /* W7o: the posted messages, in their order */
     struct win32_posted postq[WIN32_POSTQ];
-    struct win32_win win[WIN32_MAX_WINDOWS];
+    struct win32_win *wchunk[WIN32_WCHUNKS];   /* W7v: the windows, WIN32_WCHUNK a chunk */
+    int  nwin;                                 /* slots in the chunks there */
     struct { char name[32]; uint64_t wndproc; bool unicode; } cls[WIN32_MAX_CLASSES];   /* W7t: name UTF-8; RegisterClassW's Unicode */
     int  ncls;
     /* C12: virtual child controls + a ring of WM_COMMAND notifications pending
@@ -22277,57 +22285,118 @@ static bool win32_is_comctl(int type) {
            type == WIN32_CTRL_TOOLBAR;
 }
 
-/* Window-table entry for an HWND/HDC fd, or NULL. */
-static struct win32_win *win32_win_find(int fd) {
-    if (fd <= 0) return NULL;
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
-        if (g_win32_gui.win[i].fd == fd) return &g_win32_gui.win[i];
-    return NULL;
+/* ---- W7v: windows as many as a program makes ------------------------------
+ * W7r made an HWND the system's by moving the window's descriptor to
+ * 768..1023 -- 256 windows for the system, 8 for a process (its table), and
+ * each a desktop window (the compositor holds 32). Now an HWND is a number
+ * of the system's own, apart from any descriptor: 0x10000 + 2i for slot i of
+ * a registry of 16384 (whose: the thread group and its leader's creation
+ * time, and the window's place in that process's table); the next given is
+ * the one after the last given, so a number a destroyed window had is not
+ * given again at once (measured: a thousand made after a thousand destroyed
+ * are all new numbers). A process's windows live in chunks of 32 that never
+ * move (up to 4096). A window has a desktop window -- and a descriptor, its
+ * gfd, which the drawing and the input use -- once it is shown (WS_VISIBLE,
+ * ShowWindow) and while the compositor has room; a hidden one has none
+ * (measured: a window is not visible until shown). Measured on Windows 11:
+ * programs/win-hwnd53. */
+static struct window *win32_hdc_window(int fd);
+static struct win32_win *win32_win_find(int fd);
+#define WIN32_HWND_BASE 0x10000u
+#define WIN32_HWND_N    16384
+struct win32_hreg { int tgid; uint64_t born; int slot; };
+static struct win32_hreg g_win32_hreg[WIN32_HWND_N];
+static int g_win32_hreg_next;
+/* the process's window slot i (0 when its chunk is not there) */
+static struct win32_win *win32_win_at(struct win32_gui_core *g, int i) {
+    if (!g || i < 0 || i >= g->nwin) return 0;
+    struct win32_win *c = g->wchunk[i / WIN32_WCHUNK];
+    return c ? &c[i % WIN32_WCHUNK] : 0;
 }
-/* A free window slot, or NULL if the table is full. */
-static struct win32_win *win32_win_alloc(void) {
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
-        if (g_win32_gui.win[i].fd == 0) return &g_win32_gui.win[i];
-    return NULL;
+/* registry index of an HWND, -1 none */
+static int win32_hreg_ix(uint64_t h) {
+    if (h < WIN32_HWND_BASE || h >= WIN32_HWND_BASE + 2u * WIN32_HWND_N || (h & 1)) return -1;
+    return (int)((h - WIN32_HWND_BASE) / 2);
+}
+/* a new HWND for the calling process's slot, 0 when the system has none */
+static uint64_t win32_hwnd_new(int slot) {
+    struct win32_pstate *me = win32_ps_cur();
+    if (!me->tgid) return 0;
+    for (int k = 0; k < WIN32_HWND_N; k++) {
+        int i = (g_win32_hreg_next + k) % WIN32_HWND_N;
+        struct win32_hreg *e = &g_win32_hreg[i];
+        if (e->tgid) {
+            /* a number whose process is gone, or whose slot holds another window, is free */
+            struct win32_pstate *s = 0;
+            for (int j = 0; j < WIN32_PS_MAX && !s; j++)
+                if (g_win32_ps[j].tgid == e->tgid && g_win32_ps[j].born == e->born && win32_ps_live(&g_win32_ps[j]))
+                    s = &g_win32_ps[j];
+            struct win32_win *w = s ? win32_win_at((struct win32_gui_core *)s->part[W32P_GUI], e->slot) : 0;
+            if (w && (uint64_t)(uint32_t)w->fd == WIN32_HWND_BASE + 2u * (uint32_t)i) continue;
+        }
+        e->tgid = me->tgid;
+        e->born = me->born;
+        e->slot = slot;
+        g_win32_hreg_next = (i + 1) % WIN32_HWND_N;
+        return WIN32_HWND_BASE + 2u * (uint32_t)i;
+    }
+    return 0;
+}
+/* a free window slot of the calling process (a new chunk when all are
+ * taken), its index in *ix; 0 when none */
+static struct win32_win *win32_win_alloc_ix(int *ix) {
+    struct win32_gui_core *g = &g_win32_gui;
+    for (int i = 0; i < g->nwin; i++) {
+        struct win32_win *w = win32_win_at(g, i);
+        if (w && w->fd == 0) { *ix = i; return w; }
+    }
+    int c = g->nwin / WIN32_WCHUNK;
+    if (c >= WIN32_WCHUNKS) return 0;
+    struct win32_win *n = kmalloc(sizeof(struct win32_win) * WIN32_WCHUNK);
+    if (!n) return 0;
+    memset(n, 0, sizeof(struct win32_win) * WIN32_WCHUNK);
+    g->wchunk[c] = n;
+    *ix = g->nwin;
+    g->nwin += WIN32_WCHUNK;
+    return n;
+}
+/* the descriptor a window draws on (its desktop window's), -1 none; a
+ * number that is no window of the process's is taken as a descriptor (the
+ * kernel's own boxes) */
+static int win32_gfd(int h) {
+    if (h <= 0) return -1;
+    if ((uint32_t)h < WIN32_HWND_BASE) return h;
+    struct win32_win *w = win32_win_find(h);
+    return w && w->gfd > 0 ? w->gfd : -1;
 }
 
-/* ---- W7r: an HWND is the system's ---------------------------------------
- * A window's number was its process's descriptor: the same number named
- * another window, or none, in the next process, so no process could name
- * another's window (W7n's "not done": FindWindow, PostMessage and SendMessage
- * across processes). Now a window's descriptor moves, when the window is
- * made, to a number the system gives out (768..1023: a descriptor table
- * holds 1024): the same number in every process, and still the descriptor in
- * its own, where every path reads the window by it. The system keeps whose
- * each number is (the thread group and its leader's creation time); a number
- * whose window or process is gone names no window, and is given out again --
- * the one after the last given first, so an HWND kept past its window does
- * not name the next one at once. Measured on Windows 11: programs/win-xwin49. */
-#define WIN32_GWIN_BASE 768
-#define WIN32_GWIN_N    256
-struct win32_gwin { int tgid; uint64_t born; };
-static struct win32_gwin g_win32_gwin[WIN32_GWIN_N];
-static int g_win32_gwin_next;
+/* the calling process's window h (by its HWND), or NULL */
+static struct win32_win *win32_win_find(int fd) {
+    int ix = win32_hreg_ix((uint64_t)(uint32_t)fd);
+    if (fd <= 0 || ix < 0) return NULL;
+    const struct win32_hreg *e = &g_win32_hreg[ix];
+    struct win32_pstate *me = win32_ps_cur();
+    if (!e->tgid || e->tgid != me->tgid || e->born != me->born) return NULL;
+    struct win32_win *w = win32_win_at(&g_win32_gui, e->slot);
+    return (w && w->fd == fd) ? w : NULL;
+}
 /* the window numbered h, of any process (its record in *ps), or 0 */
 static struct win32_win *win32_gwin_win(uint64_t h, struct win32_pstate **ps) {
-    if (h < WIN32_GWIN_BASE || h >= WIN32_GWIN_BASE + WIN32_GWIN_N) return 0;
-    const struct win32_gwin *e = &g_win32_gwin[h - WIN32_GWIN_BASE];
+    int ix = win32_hreg_ix(h);
+    if (ix < 0) return 0;
+    const struct win32_hreg *e = &g_win32_hreg[ix];
     if (!e->tgid) return 0;
     for (int i = 0; i < WIN32_PS_MAX; i++) {
         struct win32_pstate *s = &g_win32_ps[i];
         if (s->tgid != e->tgid || s->born != e->born || !win32_ps_live(s)) continue;
-        struct win32_gui_core *g = (struct win32_gui_core *)s->part[W32P_GUI];
-        if (!g) return 0;
-        for (int k = 0; k < WIN32_MAX_WINDOWS; k++)
-            if (g->win[k].fd == (int)h) {
-                if (ps) *ps = s;
-                return &g->win[k];
-            }
-        return 0;
+        struct win32_win *w = win32_win_at((struct win32_gui_core *)s->part[W32P_GUI], e->slot);
+        if (!w || (uint64_t)(uint32_t)w->fd != h) return 0;
+        if (ps) *ps = s;
+        return w;
     }
     return 0;
 }
-/* the window h: the caller's own (by its descriptor), else another process's */
+/* the window h: the caller's own, else another process's */
 static struct win32_win *win32_win_any(uint64_t h, struct win32_pstate **ps) {
     if (!h || (h >> 32)) return 0;
     struct win32_win *w = win32_win_find((int)h);
@@ -22337,29 +22406,17 @@ static struct win32_win *win32_win_any(uint64_t h, struct win32_pstate **ps) {
     }
     return win32_gwin_win(h, ps);
 }
-/* a new window's descriptor, moved to the system's next free number; the
- * number (fd itself when none is free) */
-static int win32_gwin_place(int fd) {
-    struct proc *p = current_proc();
-    struct file **fds = p ? proc_fds(p) : 0;
-    struct win32_pstate *me = win32_ps_cur();
-    if (!fds || !me->tgid || fd < 0 || fd >= WIN32_GWIN_BASE || !fds[fd]) return fd;
-    for (int k = 0; k < WIN32_GWIN_N; k++) {
-        int i = (g_win32_gwin_next + k) % WIN32_GWIN_N;
-        int g = WIN32_GWIN_BASE + i;
-        if (fds[g]) continue;                            /* the program's own descriptor */
-        if (win32_gwin_win((uint64_t)g, 0)) continue;    /* another's window */
-        /* the descriptor moves: the window's file is its creator's alone
-         * (file_clone refuses a window, so dup2 cannot) */
-        fds[g] = fds[fd];
-        fds[fd] = 0;
-        fd_cloexec_set(p, g, 0);
-        g_win32_gwin[i].tgid = me->tgid;
-        g_win32_gwin[i].born = me->born;
-        g_win32_gwin_next = (i + 1) % WIN32_GWIN_N;
-        return g;
-    }
-    return fd;
+/* a desktop window for w (shown): its descriptor in w->gfd; false when the
+ * compositor has no room (w stays without one) */
+static bool win32_win_desktop(struct win32_win *w) {
+    if (w->gfd > 0) return true;
+    long gfd = sys_gui_create((uint32_t)(w->w > 0 ? w->w : 400), (uint32_t)(w->h > 0 ? w->h : 200), 0);
+    if (gfd <= 0) return false;
+    w->gfd = (int)gfd;
+    w->gwin = win32_hdc_window(w->fd);           /* C18c: stash for pixel readback */
+    if (w->gwin) (void)gui_window_set_title(w->gwin, w->title);
+    w->needs_paint = true;
+    return true;
 }
 
 /* C12: case-insensitive string compare (for predefined control class names). */
@@ -22445,6 +22502,7 @@ static bool win32_timer_take(uint64_t hf, uint32_t lo, uint32_t hi, bool remove,
                              struct win32_msg *m);                     /* C15 timers, W7o */
 /* C13: MessageBoxA (font section) draws via these, defined further below. */
 static struct window *win32_hdc_window(int fd);
+static int win32_gfd(int h);                                         /* W7v */
 extern uint64_t pit_ticks(void);
 extern uint32_t pit_hz(void);
 
@@ -22453,12 +22511,12 @@ extern uint32_t pit_hz(void);
  * reused, so we validate against the live fd table (per-process) rather than
  * keying on tgid: a dead predecessor's fd won't resolve to a window here. */
 static void win32_prune_dead_windows(void) {
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
-        int fd = g_win32_gui.win[i].fd;
-        if (fd <= 0) continue;
-        struct file *f = fd_lookup(fd);
-        if (!f || f->kind != FILE_KIND_WINDOW || !f->win)
-            g_win32_gui.win[i].fd = 0;
+    struct win32_gui_core *g = &g_win32_gui;          /* W7v: by the desktop window's descriptor */
+    for (int i = 0; i < g->nwin; i++) {
+        struct win32_win *w = win32_win_at(g, i);
+        if (!w || w->fd <= 0 || w->gfd <= 0) continue;
+        struct file *f = fd_lookup(w->gfd);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) { w->gfd = 0; w->gwin = 0; }
     }
 }
 /* Publish a window's WndProc into the CRT slot the DispatchMessage trampoline
@@ -22651,7 +22709,7 @@ void win32_gui_set_log(bool on) { g_win32_log_input = on; }
  * -- unlike sys_gui_poll_event, the caller here is a shim with a kernel
  * destination). Drains pending USB/PS2 input first, like the syscall does. */
 static int win32_poll_window_event(int fd, struct gui_event *out) {
-    struct file *f = fd_lookup(fd);
+    struct file *f = fd_lookup(win32_gfd(fd));       /* W7v: the window's desktop window */
     if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
     syscall_service_input();
     return gui_window_poll_event(f->win, out);
@@ -22936,7 +22994,6 @@ static long win32_create_window(uint64_t *a, bool wide) {
     if (h <= 0 || h > 4096) h = 200;
     /* Keep the parent link only if it references a live window of ours. */
     if (!win32_win_find(parent_fd)) parent_fd = 0;
-    (void)style;   /* WS_CHILD is implied by a non-NULL parent here */
 
     win32_prune_dead_windows();
     g_win32_gui.quit = false;    /* creating a window -> not in a quit state */
@@ -22983,17 +23040,17 @@ static long win32_create_window(uint64_t *a, bool wide) {
         return (long)(WIN32_CTRL_TAG | (uint64_t)slot);
     }
 
-    struct win32_win *win = win32_win_alloc();
-    if (!win) return 0;                          /* table full -> NULL HWND */
-    long fd = sys_gui_create((uint32_t)w, (uint32_t)h, 0);
-    if (fd < 0) return 0;                        /* NULL HWND */
-    fd = win32_gwin_place((int)fd);              /* W7r: the system's number */
+    int wix;
+    struct win32_win *win = win32_win_alloc_ix(&wix);
+    if (!win) { win32_set_last_error(1158); return 0; }   /* ERROR_NO_MORE_USER_HANDLES */
+    uint64_t hw = win32_hwnd_new(wix);           /* W7v: the system's number */
+    if (!hw) { win32_set_last_error(1158); return 0; }
+    long fd = (long)hw;
+    memset(win, 0, sizeof *win);
 
     g_win32_ps_lastwin = win32_ps_cur();         /* W7n: the harness's view */
     win->owner_tid   = win32_tid();              /* W7o */
     win->fd          = (int)fd;
-    win->gwin        = win32_hdc_window((int)fd);  /* C18c: stash for pixel readback */
-    if (win->gwin) (void)gui_window_set_title(win->gwin, t8);   /* W7t */
     win->w           = w;
     win->h           = h;
     win->wndproc     = win32_class_wndproc(cname);
@@ -23018,7 +23075,12 @@ static long win32_create_window(uint64_t *a, bool wide) {
     memcpy(win->title, t8, sizeof win->title);   /* W7t */
     win->title[sizeof win->title - 1] = 0;
     win->unicode     = unicode;
-    return fd;   /* HWND == HDC == fd */
+    win->style       = style;                    /* W7v */
+    win->exstyle     = (uint32_t)a[0];
+    win->ident       = ((a[9] & WIN32_TAG_MASK) == WIN32_MENU_TAG) ? 0 : a[9];
+    win->visible     = (style & 0x10000000u) != 0;     /* WS_VISIBLE */
+    if (win->visible) (void)win32_win_desktop(win);    /* hidden: no desktop window */
+    return fd;   /* HWND == HDC: the system's number */
 }
 static long w32_CreateWindowExA(uint64_t *a) { return win32_create_window(a, false); }
 static long w32_CreateWindowExW(uint64_t *a) { return win32_create_window(a, true); }
@@ -23033,9 +23095,34 @@ static long w32_ShowWindow(uint64_t *a) {
         if (pw) { pw->needs_paint = true; win32_refresh_controls(c->parent_fd); }
         return 1;
     }
-    struct win32_win *w = win32_win_find((int)a[0]); if (w) w->needs_paint = true; return 1;
+    /* W7v: a window shown gets its desktop window, hidden loses it; the
+     * answer: whether it was visible (measured) */
+    struct win32_win *w = win32_win_find((int)a[0]);
+    if (!w) { win32_set_last_error(1400); return 0; }
+    long was = w->visible ? 1 : 0;
+    if ((int)a[1] == 0) {                                 /* SW_HIDE */
+        w->visible = false;
+        w->style &= ~(uint64_t)0x10000000u;
+        if (w->gfd > 0 && !w->is_dialog) {
+            int gfd = w->gfd;
+            w->gfd = 0; w->gwin = 0;
+            (void)sys_close(gfd);
+        }
+        return was;
+    }
+    w->visible = true;
+    w->style |= 0x10000000u;
+    (void)win32_win_desktop(w);
+    w->needs_paint = true;
+    return was;
 }
-static long w32_UpdateWindow(uint64_t *a) { return w32_ShowWindow(a); }
+static long w32_UpdateWindow(uint64_t *a) {
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    if (c) { struct win32_win *pw = win32_win_find(c->parent_fd); if (pw) pw->needs_paint = true; return 1; }
+    struct win32_win *w = win32_win_find((int)a[0]);
+    if (w) w->needs_paint = true;
+    return w ? 1 : 0;
+}
 static long w32_PostQuitMessage(uint64_t *a) {
     g_win32_gui.quit = true; g_win32_gui.quitcode = (int)a[0];
     g_win32_gui.quit_tid = win32_tid();                    /* W7o: this thread's */
@@ -23093,6 +23180,55 @@ static long w32_IsWindowUnicode(uint64_t *a) {
     struct win32_win *w = win32_win_any(a[0], 0);
     return w && w->unicode ? 1 : 0;
 }
+
+/* W7v: user32!IsWindowVisible(hwnd): shown (WS_VISIBLE at its making, or
+ * ShowWindow since), anyone's window */
+static long w32_IsWindowVisible(uint64_t *a) {
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    if (c) return c->hidden ? 0 : 1;
+    struct win32_win *w = win32_win_any(a[0], 0);
+    return w && w->visible ? 1 : 0;
+}
+/* W7v: Get/SetWindowLongPtrA/W, Get/SetWindowLongA/W(hwnd, index[, value]):
+ * GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, GWL_EXSTYLE, GWLP_ID,
+ * GWLP_HWNDPARENT, GWLP_HINSTANCE; Set answers the value before. Another
+ * process's window is read, not written (ERROR_ACCESS_DENIED); an index of
+ * none: ERROR_INVALID_INDEX */
+static uint64_t *win32_long_slot(struct win32_win *w, int32_t idx) {
+    switch (idx) {
+    case -21: return &w->userdata;                 /* GWLP_USERDATA */
+    case -4:  return &w->wndproc;                  /* GWLP_WNDPROC */
+    case -16: return &w->style;                    /* GWL_STYLE */
+    case -20: return &w->exstyle;                  /* GWL_EXSTYLE */
+    case -12: return &w->ident;                    /* GWLP_ID */
+    case -6:  return &w->hinst;                    /* GWLP_HINSTANCE */
+    }
+    return 0;
+}
+static long win32_window_long(uint64_t *a, bool set, bool narrow) {
+    struct win32_pstate *ps = 0;
+    struct win32_win *w = win32_win_any(a[0], &ps);
+    if (!w) { win32_set_last_error(1400); return 0; }
+    int32_t idx = (int32_t)a[1];
+    if (idx == -8) {                               /* GWLP_HWNDPARENT */
+        if (set) { win32_set_last_error(5); return 0; }
+        return (long)(uint32_t)w->parent_fd;
+    }
+    uint64_t *v = win32_long_slot(w, idx);
+    if (!v) { win32_set_last_error(1413); return 0; }   /* ERROR_INVALID_INDEX */
+    uint64_t old = *v;
+    if (set) {
+        if (ps != win32_ps_cur()) { win32_set_last_error(5); return 0; }
+        win32_set_last_error(0);
+        *v = narrow ? (uint64_t)(uint32_t)a[2] : a[2];
+        if (idx == -16) w->visible = (*v & 0x10000000u) != 0;   /* WS_VISIBLE */
+    }
+    return narrow ? (long)(int32_t)old : (long)old;
+}
+static long w32_GetWindowLongPtrA(uint64_t *a) { return win32_window_long(a, false, false); }
+static long w32_SetWindowLongPtrA(uint64_t *a) { return win32_window_long(a, true, false); }
+static long w32_GetWindowLongA(uint64_t *a)    { return win32_window_long(a, false, true); }
+static long w32_SetWindowLongA(uint64_t *a)    { return win32_window_long(a, true, true); }
 
 /* InvalidateRect(hwnd, &RECT|NULL, erase) -> TRUE. Marks THIS window for a
  * repaint so the next GetMessage delivers it a WM_PAINT (e.g. after a click). */
@@ -23428,18 +23564,12 @@ static long win32_sent_reply(uint64_t uo, uint64_t ubuf) {
 }
 /* 10: the top-level windows of every process, into uh (cap of them) */
 static long win32_enum_windows(uint64_t uh, uint64_t cap) {
-    long n = 0;
-    for (int i = 0; i < WIN32_GWIN_N && (uint64_t)n < cap; i++) {
-        struct win32_win *w = win32_gwin_win((uint64_t)(WIN32_GWIN_BASE + i), 0);
+    long n = 0;                                      /* W7v: the registry's, every process's */
+    for (int i = 0; i < WIN32_HWND_N && (uint64_t)n < cap; i++) {
+        if (!g_win32_hreg[i].tgid) continue;
+        uint64_t h = WIN32_HWND_BASE + 2u * (uint32_t)i;
+        struct win32_win *w = win32_gwin_win(h, 0);
         if (!w || w->parent_fd) continue;
-        uint64_t h = (uint64_t)w->fd;
-        if (copy_to_user((void *)(uintptr_t)(uh + (uint64_t)n * 8), &h, 8) != 0) return n;
-        n++;
-    }
-    for (int i = 0; i < WIN32_MAX_WINDOWS && (uint64_t)n < cap; i++) {
-        struct win32_win *w = &g_win32_gui.win[i];
-        if (w->fd <= 0 || w->fd >= WIN32_GWIN_BASE || w->parent_fd) continue;
-        uint64_t h = (uint64_t)w->fd;
         if (copy_to_user((void *)(uintptr_t)(uh + (uint64_t)n * 8), &h, 8) != 0) return n;
         n++;
     }
@@ -23483,21 +23613,23 @@ static int win32_msg_take(struct win32_msg *m, uint64_t hf, uint32_t lo, uint32_
     /* WM_DESTROY: deliver, then retire the window (close its desktop window +
      * free the slot). C11: destroying a parent cascades to its children --
      * mark each child for destroy so it gets its own WM_DESTROY next. */
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
-        struct win32_win *w = &g->win[i];
-        if (!win32_win_mine(w, me) || !w->destroy) continue;
+    for (int i = 0; i < g->nwin; i++) {
+        struct win32_win *w = win32_win_at(g, i);
+        if (!w || !win32_win_mine(w, me) || !w->destroy) continue;
         if (!win32_message_ok((uint64_t)w->fd, WM_DESTROY, hf, lo, hi)) continue;
         int fd = w->fd;
         win32_stash_wndproc(w);
         m->hwnd = (uint64_t)fd; m->message = WM_DESTROY; m->time = win32_msg_time();
         if (!remove) return 1;
-        for (int j = 0; j < WIN32_MAX_WINDOWS; j++)
-            if (g->win[j].fd > 0 && g->win[j].parent_fd == fd)
-                g->win[j].destroy = true;               /* cascade to children */
+        for (int j = 0; j < g->nwin; j++) {
+            struct win32_win *cw = win32_win_at(g, j);
+            if (cw && cw->fd > 0 && cw->parent_fd == fd) cw->destroy = true;   /* cascade to children */
+        }
         if (g_win32_log_input)
             kprintf("[winpe] GetMessage hwnd=%d -> WM_DESTROY\n", fd);
-        w->fd = 0; w->destroy = false; w->needs_paint = false;  /* retire */
-        (void)sys_close(fd);                                    /* remove from desktop */
+        int gfd = w->gfd;                                       /* W7v */
+        w->fd = 0; w->gfd = 0; w->gwin = 0; w->destroy = false; w->needs_paint = false;  /* retire */
+        if (gfd > 0) (void)sys_close(gfd);                      /* remove from desktop */
         return 1;
     }
 
@@ -23525,9 +23657,10 @@ static int win32_msg_take(struct win32_msg *m, uint64_t hf, uint32_t lo, uint32_
 
     /* WM_PAINT for a window that needs one. (Controls are drawn into the
      * parent's backbuffer by EndPaint, after the app's own client paint.) */
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
-        struct win32_win *w = &g->win[i];
-        if (!win32_win_mine(w, me) || !w->needs_paint) continue;
+    for (int i = 0; i < g->nwin; i++) {
+        struct win32_win *w = win32_win_at(g, i);
+        if (!w || !win32_win_mine(w, me) || !w->needs_paint) continue;
+        if (w->gfd <= 0) { w->needs_paint = false; continue; }  /* W7v: hidden, nothing to paint */
         /* C14: a modeless dialog window is painted by the kernel (the app's
          * DialogProc doesn't), so handle its WM_PAINT here + keep looping. */
         if (w->is_dialog) { w->needs_paint = false; win32_dlg_paint(w->fd); continue; }
@@ -23543,9 +23676,9 @@ static int win32_msg_take(struct win32_msg *m, uint64_t hf, uint32_t lo, uint32_
      * control consumes it (the app sees only the resulting WM_COMMAND). An
      * event the filters do not ask for waits on the thread's queue; one
      * PeekMessage only looks at goes back to its front. */
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
-        struct win32_win *w = &g->win[i];
-        if (!win32_win_mine(w, me)) continue;
+    for (int i = 0; i < g->nwin; i++) {
+        struct win32_win *w = win32_win_at(g, i);
+        if (!w || !win32_win_mine(w, me) || w->gfd <= 0) continue;   /* W7v: input: a desktop window's */
         if (hf && hf != (uint64_t)w->fd) continue;
         struct gui_event ev;
         if (win32_poll_window_event(w->fd, &ev) <= 0) continue;
@@ -23638,9 +23771,9 @@ static uint32_t win32_qs_present(int me) {
         struct win32_win *pw = win32_win_find((int)g->cmd_q[g->cmd_tail].hwnd);
         if (!pw || win32_win_mine(pw, me)) k |= W32_QS_POST;
     }
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
-        struct win32_win *w = &g->win[i];
-        if (w->fd > 0 && win32_win_mine(w, me) && w->needs_paint && !w->is_dialog) k |= W32_QS_PAINT;
+    for (int i = 0; i < g->nwin; i++) {
+        struct win32_win *w = win32_win_at(g, i);
+        if (w && w->fd > 0 && w->gfd > 0 && win32_win_mine(w, me) && w->needs_paint && !w->is_dialog) k |= W32_QS_PAINT;
     }
     struct win32_msg m;
     if (win32_timer_take(0, 0, 0, false, me, &m)) k |= W32_QS_TIMER;
@@ -23870,15 +24003,11 @@ static long w32_PostMessageA(uint64_t *a) {
         return 0;
     }
     if (h == 0xFFFF) {
-        for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
-            if (g->win[i].fd > 0 && !g->win[i].parent_fd)
-                (void)win32_post(g->win[i].owner_tid ? g->win[i].owner_tid : win32_tid(),
-                                 (uint64_t)g->win[i].fd, msg, a[2], a[3], false);
-        struct win32_pstate *me = win32_ps_cur();
-        for (int i = 0; i < WIN32_GWIN_N; i++) {           /* W7r: the other processes' */
+        for (int i = 0; i < WIN32_HWND_N; i++) {           /* W7v: every process's, the registry's */
+            if (!g_win32_hreg[i].tgid) continue;
             struct win32_pstate *ps = 0;
-            struct win32_win *fw = win32_gwin_win((uint64_t)(WIN32_GWIN_BASE + i), &ps);
-            if (!fw || fw->parent_fd || ps == me) continue;
+            struct win32_win *fw = win32_gwin_win((uint64_t)(WIN32_HWND_BASE + 2u * (uint32_t)i), &ps);
+            if (!fw || fw->parent_fd) continue;
             (void)win32_post_g((struct win32_gui_core *)ps->part[W32P_GUI], fw->owner_tid ? fw->owner_tid : ps->tgid,
                                (uint64_t)fw->fd, msg, a[2], a[3], false);
         }
@@ -23936,13 +24065,10 @@ static bool win32_win_named(const struct win32_win *w, const char *cls, const ch
     return true;
 }
 static long win32_find_window(const char *cls, const char *title) {
-    for (int i = 0; i < WIN32_GWIN_N; i++) {
-        struct win32_win *w = win32_gwin_win((uint64_t)(WIN32_GWIN_BASE + i), 0);
+    for (int i = 0; i < WIN32_HWND_N; i++) {         /* W7v: the registry's */
+        if (!g_win32_hreg[i].tgid) continue;
+        struct win32_win *w = win32_gwin_win((uint64_t)(WIN32_HWND_BASE + 2u * (uint32_t)i), 0);
         if (w && win32_win_named(w, cls, title)) return w->fd;
-    }
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {       /* the process's own a number did not reach */
-        struct win32_win *w = &g_win32_gui.win[i];
-        if (w->fd > 0 && w->fd < WIN32_GWIN_BASE && win32_win_named(w, cls, title)) return w->fd;
     }
     return 0;
 }
@@ -24005,7 +24131,7 @@ static long w32_EndPaint(uint64_t *a) {
     if (win32_win_find(fd)) {
         win32_draw_controls(fd);   /* C12: overlay child controls on the app's paint */
         win32_draw_menu(fd);       /* C15: menu bar / dropdown on top */
-        (void)sys_gui_flip(fd);
+        (void)sys_gui_flip(win32_gfd(fd));
     }
     return 1;
 }
@@ -24052,7 +24178,7 @@ static long w32_FillRect(uint64_t *a) {
     struct win32_win *win = win32_win_find(fd);
     if (win) win->fill_color = color;
     uint32_t whlen = ((uint32_t)(w & 0xFFFF)) | ((uint32_t)(h & 0xFFFF) << 16);
-    (void)sys_gui_fill(fd, x, y, whlen, color);
+    (void)sys_gui_fill(win32_gfd(fd), x, y, whlen, color);
     return 1;
 }
 
@@ -24091,7 +24217,7 @@ static long w32_TextOutA(uint64_t *a) {
     uint32_t xy    = ((uint32_t)(x & 0xFFFF)) | ((uint32_t)(y & 0xFFFF) << 16);
     uint32_t bg    = (win ? win->fill_color : WIN32_FILL_DEFAULT) & 0x00FFFFFFu;
     int      scale = win ? win->font_scale : 1;
-    (void)sys_gui_text_scaled(fd, xy, (const char *)(uintptr_t)str, fg,
+    (void)sys_gui_text_scaled(win32_gfd(fd), xy, (const char *)(uintptr_t)str, fg,
                               bg | ((uint32_t)(scale & 0x7F) << 24));
     return 1;
 }
@@ -24217,7 +24343,7 @@ static long w32_DrawTextA(uint64_t *a) {
     if (fmt & 0x1u) x = rc[0] + ((rc[2] - rc[0]) - tw) / 2;   /* DT_CENTER  */
     if (fmt & 0x4u) y = rc[1] + ((rc[3] - rc[1]) - th) / 2;   /* DT_VCENTER */
     uint32_t xy = ((uint32_t)(x & 0xFFFF)) | ((uint32_t)(y & 0xFFFF) << 16);
-    (void)sys_gui_text_scaled(fd, xy, (const char *)(uintptr_t)a[1], w->text_color,
+    (void)sys_gui_text_scaled(win32_gfd(fd), xy, (const char *)(uintptr_t)a[1], w->text_color,
                               (w->fill_color & 0xFFFFFFu) | ((uint32_t)(scale & 0x7F) << 24));
     return th;
 }
@@ -24457,7 +24583,7 @@ static void win32_dlg_paint(int fd) {
     if (!win || !w) return;
     (void)gui_window_fill(win, 0, 0, w->w, w->h, w->fill_color & 0x00FFFFFFu);
     win32_draw_controls(fd);
-    (void)sys_gui_flip(fd);
+    (void)sys_gui_flip(win32_gfd(fd));
 }
 
 /* Build the dialog window + its controls from the RT_DIALOG template. Returns
@@ -24508,7 +24634,8 @@ static int win32_dlg_build(int dlg_id, uint64_t dlgproc, bool modeless) {
     win32_prune_dead_windows();
     g_win32_gui.quit = false;
 
-    struct win32_win *wslot = win32_win_alloc();
+    int wix;
+    struct win32_win *wslot = win32_win_alloc_ix(&wix);   /* W7v */
     if (!wslot) return -1;
     int fd = -1;
     if (cap_check(current_proc(), CAP_GUI, "DialogBox")) {
@@ -24525,12 +24652,17 @@ static int win32_dlg_build(int dlg_id, uint64_t dlgproc, bool modeless) {
         }
     }
     if (fd < 0) return -1;
-    fd = win32_gwin_place(fd);                   /* W7r: the system's number */
+    int dgfd = fd;                               /* W7v: the system's number, the descriptor apart */
+    uint64_t dhw = win32_hwnd_new(wix);
+    if (!dhw) { (void)sys_close(dgfd); return -1; }
+    fd = (int)dhw;
 
     g_win32_ps_lastwin = win32_ps_cur();         /* W7n: the harness's view */
     memset(wslot, 0, sizeof(*wslot));
     wslot->owner_tid = win32_tid();              /* W7o */
     wslot->fd = fd; wslot->w = cw; wslot->h = ch;
+    wslot->gfd = dgfd; wslot->visible = true;
+    wslot->gwin = win32_hdc_window(fd);
     wslot->wndproc = dlgproc;
     wslot->fill_color = 0x00DCDCDC;     /* dialog face gray */
     wslot->pen_color  = WIN32_PEN_DEFAULT;
@@ -24659,8 +24791,9 @@ static long win32_dlg_result(void) {
             if (g_win32_gui.ctrl[i].in_use && g_win32_gui.ctrl[i].parent_fd == fd)
                 g_win32_gui.ctrl[i].in_use = false;
         struct win32_win *w = win32_win_find(fd);
-        if (w) w->fd = 0;                            /* retire the window slot */
-        (void)sys_close(fd);                         /* remove from the desktop */
+        int gfd = w ? w->gfd : -1;                   /* W7v */
+        if (w) { w->fd = 0; w->gfd = 0; w->gwin = 0; }   /* retire the window slot */
+        if (gfd > 0) (void)sys_close(gfd);           /* remove from the desktop */
     }
     memset(&g_win32_modal, 0, sizeof(g_win32_modal));
     g_win32_gui.quit = false;
@@ -24717,7 +24850,7 @@ static void win32_box_draw(void) {
         int tw = (int)strlen(B->blabel[i]) * 8;
         (void)win32_ui_text(win, bx + (bw_ - tw) / 2, oky + bh / 2 - 4, B->blabel[i], 0x00101010, 0x00C0C0C0);
     }
-    (void)sys_gui_flip(B->fd);
+    (void)sys_gui_flip(win32_gfd(B->fd));
 }
 static long win32_box_begin(uint64_t owner, uint64_t utext, uint64_t ucap, uint32_t type, bool wide) {
     (void)owner;
@@ -24743,7 +24876,8 @@ static long win32_box_begin(uint64_t owner, uint64_t utext, uint64_t ucap, uint3
     }
     B->kind = kind;
     B->dflt = B->bid[0];
-    struct win32_win *slot = win32_win_alloc();
+    int bix;
+    struct win32_win *slot = win32_win_alloc_ix(&bix);  /* W7v */
     if (!slot || !cap_check(current_proc(), CAP_GUI, "MessageBox")) return 0;
     int fd = -1;
     struct window *bw = gui_window_create(W32_BOX_W, W32_BOX_H, cap[0] ? cap : "Message");
@@ -24757,10 +24891,14 @@ static long win32_box_begin(uint64_t owner, uint64_t utext, uint64_t ucap, uint3
         } else gui_window_close(bw);
     }
     if (fd < 0) return 0;
-    fd = win32_gwin_place(fd);                     /* a window of the system's */
+    int bgfd = fd;                                 /* W7v: a number of the system's, the descriptor apart */
+    uint64_t bhw = win32_hwnd_new(bix);
+    if (!bhw) { (void)sys_close(bgfd); return 0; }
+    fd = (int)bhw;
     memset(slot, 0, sizeof *slot);
     slot->owner_tid  = win32_tid();
     slot->fd = fd; slot->w = W32_BOX_W; slot->h = W32_BOX_H;
+    slot->gfd = bgfd; slot->visible = true;
     slot->gwin = win32_hdc_window(fd);
     slot->fill_color = 0x00DCDCDC;
     slot->pen_color  = WIN32_PEN_DEFAULT;
@@ -24854,8 +24992,9 @@ static long win32_box_end(void) {
     long r = B->result;
     if (B->fd > 0) {
         struct win32_win *w = win32_win_find(B->fd);
-        if (w) w->fd = 0;
-        (void)sys_close(B->fd);
+        int gfd = w ? w->gfd : -1;                   /* W7v */
+        if (w) { w->fd = 0; w->gfd = 0; w->gwin = 0; }
+        if (gfd > 0) (void)sys_close(gfd);
     }
     if (g_win32_log_input) kprintf("[winpe] MessageBox: closed -> %ld\n", r);
     memset(B, 0, sizeof *B);
@@ -25026,7 +25165,7 @@ static long w32_lstrlenA(uint64_t *a) {
 /* Resolve an HDC fd to the underlying compositor window (for the gui_window_*
  * drawing calls), or NULL. */
 static struct window *win32_hdc_window(int fd) {
-    struct file *f = fd_lookup(fd);
+    struct file *f = fd_lookup(win32_gfd(fd));       /* W7v: the window's desktop window */
     return (f && f->kind == FILE_KIND_WINDOW) ? f->win : NULL;
 }
 
@@ -25136,7 +25275,7 @@ static long w32_SetPixel(uint64_t *a) {
     int x = (int)(int32_t)a[1], y = (int)(int32_t)a[2];
     uint32_t cr = (uint32_t)a[3];
     uint32_t whlen = 1u | (1u << 16);           /* 1x1 */
-    (void)sys_gui_fill(fd, x, y, whlen, win32_colorref_to_xrgb(cr & 0xFFFFFFu));
+    (void)sys_gui_fill(win32_gfd(fd), x, y, whlen, win32_colorref_to_xrgb(cr & 0xFFFFFFu));
     return (long)(cr & 0xFFFFFFu);
 }
 
@@ -25349,6 +25488,9 @@ struct win32_memdc_slot { bool in_use; int bmp; };
 #define g_win32_memdc ((struct win32_memdc_slot *)win32_ps_part(W32P_MEMDC, sizeof(struct win32_memdc_slot) * WIN32_MAX_MEMDC))
 /* W7n: a record's parts freed (its process gone) -- the bitmaps' pixels too */
 static void win32_ps_free_parts(struct win32_pstate *s) {
+    struct win32_gui_core *gc = (struct win32_gui_core *)s->part[W32P_GUI];   /* W7v: its windows' chunks */
+    for (int i = 0; gc && i < WIN32_WCHUNKS; i++)
+        if (gc->wchunk[i]) { kfree(gc->wchunk[i]); gc->wchunk[i] = 0; }
     struct win32_bmp_slot *b = (struct win32_bmp_slot *)s->part[W32P_BMP];
     for (int i = 0; b && i < WIN32_MAX_BITMAPS; i++)
         if (b[i].in_use && b[i].pixels) kfree(b[i].pixels);
@@ -25736,7 +25878,7 @@ static void win32_draw_controls(int parent_fd) {
 static void win32_refresh_controls(int parent_fd) {
     win32_draw_controls(parent_fd);
     win32_draw_menu(parent_fd);   /* C15: menu bar / open dropdown on top */
-    (void)sys_gui_flip(parent_fd);
+    (void)sys_gui_flip(win32_gfd(parent_fd));
 }
 /* Queue a message (WM_COMMAND/WM_VSCROLL) for a parent window. */
 static void win32_msg_push(int parent_fd, uint32_t message, uint64_t wParam, uint64_t lParam) {
@@ -26016,9 +26158,9 @@ static long w32_toby_msgsvc(uint64_t *a) {
     case 3: {
         struct win32_win *w = win32_ctrl_find(a[1]) ? 0 : win32_win_find((int)a[1]);
         if (!w) return 0;
-        int fd = w->fd;
-        w->fd = 0; w->destroy = false; w->needs_paint = false;
-        (void)sys_close(fd);
+        int gfd = w->gfd;                                  /* W7v */
+        w->fd = 0; w->gfd = 0; w->gwin = 0; w->destroy = false; w->needs_paint = false;
+        if (gfd > 0) (void)sys_close(gfd);
         return 1;
     }
     /* W7r: the messages sent to another thread's window (above) */
@@ -26029,6 +26171,22 @@ static long w32_toby_msgsvc(uint64_t *a) {
     case 9:  return win32_sent_reply(a[1], a[2]);
     case 10: return win32_enum_windows(a[1], a[2]);
     case 12: return win32_apc_take(a[1]);          /* W7u: the thread's first APC */
+    case 13: {          /* W7v: (hwnd) destroyed now -- tobyrt.dll called its procedure with
+                         * WM_DESTROY and WM_NCDESTROY (measured: before DestroyWindow
+                         * returns); its children follow, the window is none */
+        struct win32_win *w = win32_ctrl_find(a[1]) ? 0 : win32_win_find((int)a[1]);
+        if (!w) return 0;
+        struct win32_gui_core *g = &g_win32_gui;
+        int h = w->fd;
+        for (int j = 0; j < g->nwin; j++) {
+            struct win32_win *cw = win32_win_at(g, j);
+            if (cw && cw->fd > 0 && cw->parent_fd == h) cw->destroy = true;
+        }
+        int gfd = w->gfd;
+        w->fd = 0; w->gfd = 0; w->gwin = 0; w->destroy = false; w->needs_paint = false;
+        if (gfd > 0) (void)sys_close(gfd);
+        return 1;
+    }
     case 11: {          /* W7t: (hwnd) where it is -- 1 the calling thread's with a procedure,
                          * 2 another thread's of this process, 3 another process's, 4 this
                          * process's the kernel answers for (a dialog's); 0 none (a control) --
@@ -32902,6 +33060,16 @@ static const struct win32_shim g_win32_shims[] = {
     { "user32.dll", "CreateWindowExW",   w32_CreateWindowExW },
     { "user32.dll", "DefWindowProcW",    w32_DefWindowProcW },
     { "user32.dll", "IsWindowUnicode",   w32_IsWindowUnicode },
+    { "user32.dll", "IsWindowVisible",   w32_IsWindowVisible },        /* W7v */
+    { "user32.dll", "__toby_DestroyWindow", w32_DestroyWindow },        /* tobyrt.dll's */
+    { "user32.dll", "GetWindowLongPtrA", w32_GetWindowLongPtrA },
+    { "user32.dll", "GetWindowLongPtrW", w32_GetWindowLongPtrA },
+    { "user32.dll", "SetWindowLongPtrA", w32_SetWindowLongPtrA },
+    { "user32.dll", "SetWindowLongPtrW", w32_SetWindowLongPtrA },
+    { "user32.dll", "GetWindowLongA",    w32_GetWindowLongA },
+    { "user32.dll", "GetWindowLongW",    w32_GetWindowLongA },
+    { "user32.dll", "SetWindowLongA",    w32_SetWindowLongA },
+    { "user32.dll", "SetWindowLongW",    w32_SetWindowLongA },
     { "user32.dll", "GetWindowTextW",       w32_GetWindowTextW },
     { "user32.dll", "GetWindowTextLengthW", w32_GetWindowTextLengthW },
     { "user32.dll", "SetWindowTextW",       w32_SetWindowTextW },
@@ -33607,8 +33775,10 @@ static struct win32_gui_core *win32_view_gui(void) {
 }
 static struct win32_win *win32_view_win(int fd) {
     struct win32_gui_core *g = win32_view_gui();
-    for (int i = 0; g && fd > 0 && i < WIN32_MAX_WINDOWS; i++)
-        if (g->win[i].fd == fd) return &g->win[i];
+    for (int i = 0; g && fd > 0 && i < g->nwin; i++) {
+        struct win32_win *w = win32_win_at(g, i);
+        if (w && w->fd == fd) return w;
+    }
     return 0;
 }
 int win32_gui_window_fd(int tgid) {
@@ -33616,14 +33786,18 @@ int win32_gui_window_fd(int tgid) {
     struct win32_gui_core *g = win32_ps_gui(s);
     if (!g) return -1;
     g_win32_ps_view = s;
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
-        if (g->win[i].fd > 0) return g->win[i].fd;   /* first live window */
+    for (int i = 0; i < g->nwin; i++) {           /* W7v: the first shown */
+        struct win32_win *w = win32_win_at(g, i);
+        if (w && w->fd > 0 && w->gfd > 0) return w->fd;
+    }
     return -1;
 }
 uint32_t win32_gui_fill_color(void) {
     struct win32_gui_core *g = win32_view_gui();
-    for (int i = 0; g && i < WIN32_MAX_WINDOWS; i++)
-        if (g->win[i].fd > 0) return g->win[i].fill_color;
+    for (int i = 0; g && i < g->nwin; i++) {
+        struct win32_win *w = win32_win_at(g, i);
+        if (w && w->fd > 0 && w->gfd > 0) return w->fill_color;
+    }
     return WIN32_FILL_DEFAULT;
 }
 /* C10: number of live windows owned by `tgid`, and a specific window's fill. */
@@ -33633,8 +33807,10 @@ int win32_gui_window_count(int tgid) {
     if (!g) return 0;
     g_win32_ps_view = s;
     int n = 0;
-    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
-        if (g->win[i].fd > 0) n++;
+    for (int i = 0; i < g->nwin; i++) {
+        struct win32_win *w = win32_win_at(g, i);
+        if (w && w->fd > 0) n++;
+    }
     return n;
 }
 uint32_t win32_gui_fill_color_fd(int fd) {
