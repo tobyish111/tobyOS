@@ -7754,7 +7754,7 @@ void _start(void) {
     defined(WINPE42A_BOOT) || defined(WINPE43A_BOOT) || defined(WINPE44A_BOOT) || \
     defined(WINPE45A_BOOT) || defined(WINPE46A_BOOT) || defined(WINPE47A_BOOT) || \
     defined(WINPE48A_BOOT) || defined(WINPE49A_BOOT) || defined(WINPE50A_BOOT) || \
-    defined(WINPE51A_BOOT) || defined(WINPE52A_BOOT)
+    defined(WINPE51A_BOOT) || defined(WINPE52A_BOOT) || defined(WINPE53A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
      * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / (with
      * one argument when the entry gives one). W7h:
@@ -8020,6 +8020,10 @@ void _start(void) {
 #ifdef WINPE52A_BOOT
             { "WINPE52A", "/bin/win-modal52.exe", "win-modal52.exe", 54,
               "MsgWaitForMultipleObjects, APCs, and MessageBox/DialogBox loops running other threads' messages (8 checks)" },
+#endif
+#ifdef WINPE53A_BOOT
+            { "WINPE53A", "/bin/win-hwnd53.exe", "win-hwnd53.exe", 55,
+              "as many windows as a program makes: 1000 + a child's 600, each the system's HWND (7 checks)" },
 #endif
         };
         win32_gui_set_log(true);

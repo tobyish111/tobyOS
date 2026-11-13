@@ -2829,6 +2829,15 @@ $(W52)/win-modal52.exe: $(W52)/modal52.c $(W52)/modal52.rc
 	windres -i $(W52)/modal52.rc -o $(W52)/modal52_res.o --target=pe-x86-64
 	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W52)/modal52.c $(W52)/modal52_res.o -luser32
 
+# Track C/W7v: win-hwnd53.exe (exit 55, as on Windows 11) -- as many windows
+# as a program makes: a thousand hidden windows in one process and six
+# hundred in its child, each the system's own HWND (FindWindow,
+# GetWindowThreadProcessId, PostMessage, SendMessage, EnumWindows), none after
+# DestroyWindow, the next thousand new numbers; shown, a window is visible.
+W53 := programs/win-hwnd53
+$(W53)/win-hwnd53.exe: $(W53)/hwnd53.c
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W53)/hwnd53.c -luser32
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3398,6 +3407,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-locale50/win-locale50.exe \
                programs/win-wtext51/win-wtext51.exe \
                programs/win-modal52/win-modal52.exe \
+               programs/win-hwnd53/win-hwnd53.exe \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3622,6 +3632,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-locale50/win-locale50.exe        $(INITRD_STAGE)/bin/win-locale50.exe
 	cp programs/win-wtext51/win-wtext51.exe          $(INITRD_STAGE)/bin/win-wtext51.exe
 	cp programs/win-modal52/win-modal52.exe          $(INITRD_STAGE)/bin/win-modal52.exe
+	cp programs/win-hwnd53/win-hwnd53.exe            $(INITRD_STAGE)/bin/win-hwnd53.exe
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4634,7 +4645,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-mem40.exe bin/win-msg41.exe bin/win-text43.exe        \
 	    bin/win-gui45.exe bin/win-post46.exe bin/win-wide47.exe       \
 	    bin/win-clock48.exe bin/win-xwin49.exe bin/win-locale50.exe   \
-	    bin/win-wtext51.exe bin/win-modal52.exe                       \
+	    bin/win-wtext51.exe bin/win-modal52.exe bin/win-hwnd53.exe    \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
