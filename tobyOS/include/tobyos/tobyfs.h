@@ -195,7 +195,13 @@ struct tfs_inode_disk {
      * disks still mount: those bytes were zero, and dbl_indirect==0 means
      * "no double-indirect blocks" -- identical to a freshly-created inode. */
     uint32_t dbl_indirect;           /* double-indirect block pointer */
-    uint8_t  pad[32];
+    /* The write time's nanoseconds, carved out of the former pad[] the same
+     * way: a legacy disk's zero bytes read as .000000000, its old whole
+     * second. Whole seconds alone gave two writes in one second one time --
+     * a fast machine's later file was not later (the EliteDesk, win-cxx44's
+     * std::filesystem check) and stat told Linux programs .000000000. */
+    uint32_t mtime_ns;
+    uint8_t  pad[28];
 };
 
 struct tfs_dirent_disk {

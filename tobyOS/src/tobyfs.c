@@ -146,10 +146,14 @@ static int read_block(struct tobyfs *fs, uint32_t blk, void *buf) {
  * resets every reboot and is not a timestamp at all despite looking like one.
  * lx_realtime_ns() is the same anchored realtime clock CLOCK_REALTIME uses,
  * so on-disk times now agree with what userspace sees. */
-static uint32_t tfs_now_secs(void) {
+/* ...and the nanoseconds with them (the inode's mtime_ns): stamp NODE's
+ * write time now */
+static void tfs_stamp(struct tfs_inode_disk *node) {
     extern uint64_t lx_realtime_ns(uint64_t mono_ns);
     extern uint64_t perf_now_ns(void);
-    return (uint32_t)(lx_realtime_ns(perf_now_ns()) / 1000000000ull);
+    uint64_t ns = lx_realtime_ns(perf_now_ns());
+    node->mtime = (uint32_t)(ns / 1000000000ull);
+    node->mtime_ns = (uint32_t)(ns % 1000000000ull);
 }
 
 static int write_block_raw(struct tobyfs *fs, uint32_t blk, const void *buf) {
@@ -862,6 +866,7 @@ static void tobyfs_inode_stat(struct tobyfs *fs, uint32_t ino,
     out->mtime = node.mtime;      /* slice 6 */
     out->atime = node.mtime;      /* no separate atime on disk */
     out->ctime = node.mtime;
+    out->mtime_ns = out->atime_ns = out->ctime_ns = node.mtime_ns;
     /* The inode number path_walk just resolved. This is what makes two
      * hard links to one file compare EQUAL -- tobyfs is the only
      * filesystem here that can create such a pair, so it is the only one
@@ -1166,7 +1171,7 @@ static long tobyfs_write(struct vfs_file *f, const void *buf, size_t n) {
             fs->txn_count + TFS_TXN_RESERVE > (int)TFS_TXN_MAX_BLOCKS) {
             size_t cur_end = f->pos + written;
             if (cur_end > h->node.size) h->node.size = (uint32_t)cur_end;
-            h->node.mtime = tfs_now_secs();
+            tfs_stamp(&h->node);
             handle_refresh_foreign(fs, h);   /* Phase G: keep nlink/mode */
             int crc = write_inode(fs, h->ino, &h->node);
             if (crc != VFS_OK) { journal_abort(fs); return crc; }
@@ -1232,7 +1237,7 @@ flush:
     {
         size_t newend = f->pos + written;
         if (newend > h->node.size) h->node.size = (uint32_t)newend;
-        h->node.mtime = tfs_now_secs();
+        tfs_stamp(&h->node);
         handle_refresh_foreign(fs, h);       /* Phase G: keep nlink/mode */
         int rc = write_inode(fs, h->ino, &h->node);
         if (rc != VFS_OK) { journal_abort(fs); return rc; }
@@ -1460,7 +1465,7 @@ static int tobyfs_create(void *mnt, const char *path,
     node.type  = TFS_TYPE_FILE;
     node.nlink = 1;
     node.size  = 0;
-    node.mtime = tfs_now_secs();
+    tfs_stamp(&node);
     node.mode  = mode ? mode : TFS_DEFAULT_FILE_MODE;
     node.uid   = uid;
     node.gid   = gid;
@@ -1508,7 +1513,7 @@ static int tobyfs_symlink(void *mnt, const char *path, const char *target,
     node.type  = TFS_TYPE_SYMLINK;
     node.nlink = 1;
     node.size  = (uint32_t)tlen;
-    node.mtime = tfs_now_secs();
+    tfs_stamp(&node);
     node.mode  = 00777u | TFS_MODE_VALID;     /* links are always lrwxrwxrwx */
     node.uid   = uid;                         /* the VFS's (finding 251): */
     node.gid   = gid;                         /* every link was root's */
@@ -1589,7 +1594,7 @@ static int tobyfs_mkdir(void *mnt, const char *path,
     node.type  = TFS_TYPE_DIR;
     node.nlink = 1;
     node.size  = 0;
-    node.mtime = tfs_now_secs();
+    tfs_stamp(&node);
     node.mode  = mode ? mode : TFS_DEFAULT_DIR_MODE;
     node.uid   = uid;
     node.gid   = gid;
@@ -1634,6 +1639,19 @@ static int tobyfs_utimes(void *mnt, const char *path,
     int rc = path_walk(fs, path, &ino, &node);
     if (rc != VFS_OK) return rc;
     node.mtime = (uint32_t)(mtime ? mtime : atime);
+    node.mtime_ns = 0;                       /* whole seconds asked */
+    return write_inode(fs, ino, &node);
+}
+/* ...to the nanosecond (vfs_utimens): the same, the nanoseconds kept */
+static int tobyfs_utimens(void *mnt, const char *path, uint64_t mtime, uint32_t mtime_ns,
+                          uint64_t atime, uint32_t atime_ns) {
+    struct tobyfs *fs = (struct tobyfs *)mnt;
+    uint32_t ino;
+    struct tfs_inode_disk node;
+    int rc = path_walk(fs, path, &ino, &node);
+    if (rc != VFS_OK) return rc;
+    node.mtime = (uint32_t)(mtime ? mtime : atime);
+    node.mtime_ns = (mtime ? mtime_ns : atime_ns) % 1000000000u;
     return write_inode(fs, ino, &node);
 }
 
@@ -1670,7 +1688,7 @@ static int tobyfs_truncate(void *mnt, const char *path, uint64_t length) {
     journal_begin(fs);
     if (length == 0) inode_free_blocks(fs, &node);
     node.size  = (uint32_t)length;
-    node.mtime = tfs_now_secs();
+    tfs_stamp(&node);
     rc = write_inode(fs, ino, &node);
     if (rc != VFS_OK) { journal_abort(fs); return rc; }
     return journal_commit(fs);
@@ -1694,7 +1712,7 @@ static int tobyfs_ftruncate(struct vfs_file *f, uint64_t length) {
     journal_begin(fs);
     if (length == 0) inode_free_blocks(fs, &h->node);
     h->node.size  = (uint32_t)length;
-    h->node.mtime = tfs_now_secs();
+    tfs_stamp(&h->node);
     handle_refresh_foreign(fs, h);           /* Phase G: keep nlink/mode */
     int rc = write_inode(fs, h->ino, &h->node);
     if (rc != VFS_OK) { journal_abort(fs); return rc; }
@@ -2053,6 +2071,7 @@ const struct vfs_ops tobyfs_ops = {
     .symlink  = tobyfs_symlink,  /* slice 7 */
     .readlink = tobyfs_readlink, /* slice 7 */
     .utimes   = tobyfs_utimes,   /* slice 6 */
+    .utimens  = tobyfs_utimens,  /* the nanoseconds too */
     .truncate = tobyfs_truncate, /* slice 6 */
     .ftruncate= tobyfs_ftruncate,/* slice 6 */
     .link     = tobyfs_link,     /* Phase G: hard links */
