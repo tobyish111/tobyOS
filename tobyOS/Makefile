@@ -133,6 +133,7 @@ C_SRCS := src/kernel.c \
           src/idt.c \
           src/isr.c \
           src/win32_seh.c \
+          src/win32_nls.c \
           src/pic.c \
           src/ioapic.c \
           src/irq.c \

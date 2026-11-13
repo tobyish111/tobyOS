@@ -72,6 +72,7 @@ int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/cap.h>
 #include <tobyos/uaccess.h>
 #include <tobyos/perf.h>
+#include <tobyos/w32nls.h>
 #include <tobyos/elf.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
@@ -18259,6 +18260,25 @@ static long win32_fd_write(int fd, const char *buf, size_t len) {
  * program's heap -- the CRT page keeps its pointer, made the first time a
  * descriptor's state is not the default: flags, the mode, the byte a pipe
  * gave after a '\r', ungetc's byte. No entry: text, nothing pending. */
+/* W7s: the C runtime's locale (with the code pages, below) */
+struct w32_tm;
+static int win32_lc_wc2mb(uint16_t u, uint16_t lo, uint8_t *b, int *took);
+static int win32_lc_mb2wc(const uint8_t *b, int n, uint32_t *c);
+static char win32_lc_decimal(void);
+static void win32_lc_num_in(char *s);
+static uint16_t win32_lc_ctype(int c);
+static uint16_t win32_lc_byte_unit(uint8_t b);
+static int win32_lc_mb_units(const uint8_t *b, int n, uint16_t *out, int cap);
+static long w32_lc_toupper(uint64_t *a);
+static long w32_lc_tolower(uint64_t *a);
+static int win32_lc_time_loc(void);
+static uint32_t win32_lc_time_cp(void);
+static void win32_lc_name8(int loc, uint32_t lt, char *b, int cap);
+static void win32_lc_pic8(int loc, uint32_t lt, const struct w32_tm *tm, char *b, int cap);
+static void win32_lc_bytes_utf8(const char *in, uint32_t cp, char *out, int cap);
+static int win32_lc_utf8_bytes(const char *in, uint32_t cp, char *out, int cap);
+static long win32_lcmap_case(int loc, uint32_t flags, uint64_t src, int32_t n, uint64_t dst, int32_t dn);
+static int win32_loc_of_name(uint64_t uname);
 #define WIN32_CRT_FDTAB 0xFD8          /* u64: the descriptors' table, 0 not made yet */
 #define W32FD_MAX       256            /* a FILE* token's fd is 8 bits */
 #define W32FD_CTRLZ     0x01           /* read a Ctrl-Z: _read answers 0 until a seek */
@@ -18784,7 +18804,21 @@ static long win32_wread_k(int fd, uint8_t *kb, size_t n) {
 static long win32_wgetc(int fd) {
     if (win32_crt_flush(fd) < 0) return -1;
     struct w32fd e = win32_fd_get(fd);
-    if (!win32_mode_wide(e.mode) && e.mode != W32FD_BIN) return win32_stdio_getc(fd);
+    if (!win32_mode_wide(e.mode) && e.mode != W32FD_BIN) {      /* W7s: LC_CTYPE's character */
+        int c0 = win32_stdio_getc(fd);
+        if (c0 < 0) return -1;
+        uint8_t b[4] = { (uint8_t)c0, 0, 0, 0 };
+        int nb = 1;
+        for (;;) {
+            uint32_t w;
+            int k = win32_lc_mb2wc(b, nb, &w);
+            if (k > 0) return w > 0xFFFF ? 0xFFFD : (long)w;
+            if (k == -1 || nb == 4) { win32_crt_errno(42); win32_fd_flag(fd, W32FD_FERR, 0); return -1; }
+            int c = win32_stdio_getc(fd);
+            if (c < 0) { win32_crt_errno(42); return -1; }
+            b[nb++] = (uint8_t)c;
+        }
+    }
     uint8_t b[2];
     if (e.mode == W32FD_BIN) {
         int k = 0;
@@ -18819,15 +18853,18 @@ static long win32_wstdio_out(int fd, const uint16_t *w, size_t n, bool qm) {
     char k[512];
     size_t kn = 0;
     for (size_t i = 0; i < n; i++) {
-        if (kn + 2 > sizeof k) {
+        if (kn + 4 > sizeof k) {
             if (win32_crt_write(fd, k, kn) < 0) goto ioerr;
             kn = 0;
         }
+        uint8_t cb[4];
+        int took = 1, kk = text ? win32_lc_wc2mb(w[i], i + 1 < n ? w[i + 1] : 0, cb, &took) : 0;   /* W7s */
         if (!text) {
             k[kn++] = (char)w[i];
             k[kn++] = (char)(w[i] >> 8);
-        } else if (w[i] <= 0xFF) {
-            k[kn++] = (char)w[i];
+        } else if (kk >= 0) {
+            for (int j = 0; j < kk; j++) k[kn++] = (char)cb[j];
+            i += (size_t)(took - 1);
         } else if (qm) {
             k[kn++] = '?';
         } else {
@@ -18911,7 +18948,13 @@ static void fb_putc(struct win32_fmtbuf *fb, char c) { fb_putu(fb, (uint8_t)c); 
 /* W7p: a wide character: a narrow printf writes its byte in the "C" locale,
  * and one past 0xFF fails it (EILSEQ, measured) */
 static void fb_putw(struct win32_fmtbuf *fb, uint16_t u) {
-    if (!fb->wide && u > 0xFF) { fb->err = 42; return; }
+    if (!fb->wide && u > 0x7F) {               /* W7s: LC_CTYPE's bytes */
+        uint8_t b[4];
+        int took, k = win32_lc_wc2mb(u, 0, b, &took);
+        if (k < 0) { fb->err = 42; return; }
+        for (int i = 0; i < k; i++) fb_putu(fb, b[i]);
+        return;
+    }
     fb_putu(fb, u);
 }
 static void fb_pad(struct win32_fmtbuf *fb, char c, int count) {
@@ -19082,7 +19125,7 @@ static long win32_format_core_w(int fd, char *cap, uint16_t *wcap, size_t cap_ma
              * "C" locale's character) */
             bool wch = (conv == 'C') || lmod;
             uint64_t raw = va_next(uva, &ai);
-            uint16_t u = wch ? (uint16_t)raw : (uint16_t)(uint8_t)raw;
+            uint16_t u = wch ? (uint16_t)raw : fb.wide ? win32_lc_byte_unit((uint8_t)raw) : (uint16_t)(uint8_t)raw;
             emit_field_u(&fb, &u, 1, width, left);
             break;
         }
@@ -19111,7 +19154,8 @@ static long win32_format_core_w(int fd, char *cap, uint16_t *wcap, size_t cap_ma
                 long n = strncpy_from_user(nb, (const char *)(uintptr_t)sp, sizeof(nb));
                 if (n < 0) { const char *bad = "(badptr)"; fb_write(&fb, bad, 8); break; }
                 if (n > lim) n = lim;
-                for (sl = 0; sl < (int)n; sl++) sbuf[sl] = (uint8_t)nb[sl];
+                if (fb.wide) sl = win32_lc_mb_units((const uint8_t *)nb, (int)n, sbuf, 1023);   /* W7s */
+                else for (sl = 0; sl < (int)n; sl++) sbuf[sl] = (uint8_t)nb[sl];
             }
             emit_field_u(&fb, sbuf, sl, width, left);
             break;
@@ -19126,6 +19170,10 @@ static long win32_format_core_w(int fd, char *cap, uint16_t *wcap, size_t cap_ma
             unsigned ff = (plus ? KMF_PLUS : 0u) | (space ? KMF_SPACE : 0u) | (alt ? KMF_HASH : 0u);
             char body[256]; int sgn = 0, special = 0;
             int bl = kmath_fmt_double(bits, conv, prec, ff, body, sizeof(body), &sgn, &special);
+            {                                      /* W7s: LC_NUMERIC's decimal point */
+                char dch = win32_lc_decimal();
+                if (dch != '.') for (int k = 0; k < bl; k++) if (body[k] == '.') body[k] = dch;
+            }
             if (sgn) pre[pl++] = (char)sgn;
             emit_field(&fb, pre, pl, body, bl, width, left, zero && !special);
             break;
@@ -20485,12 +20533,11 @@ static long w32_aligned_malloc(uint64_t *a) {
     return p ? (long)((p + al - 1) & ~(al - 1)) : 0;
 }
 /* ___mb_cur_max_func() -> MB_CUR_MAX: 1, the C locale's. */
-static long w32_mb_cur_max(uint64_t *a) { (void)a; return 1; }
 /* The C locale's wide-character classes, as the ucrt's ctype masks:
  * _UPPER 1, _LOWER 2, _DIGIT 4, _SPACE 8, _PUNCT 0x10, _CONTROL 0x20,
  * _BLANK 0x40 (the space only), _HEX 0x80, _ALPHA 0x100 (with UPPER/LOWER). */
 static uint16_t win32_wclass(uint32_t c) {
-    if (c > 0x7F) return 0;
+    if (c > 0x7F) return c > 0xFFFF ? 0 : (uint16_t)(w32nls_uclass((uint16_t)c) & 0x1FF);   /* W7s: Unicode's */
     uint16_t m = 0;
     if (c >= 'A' && c <= 'Z') m |= 0x101;
     if (c >= 'a' && c <= 'z') m |= 0x102;
@@ -20516,8 +20563,6 @@ static long w32_wctype(uint64_t *a) {
 }
 /* iswctype(c, mask) -> nonzero if c is of the class. */
 static long w32_iswctype(uint64_t *a) { return (win32_wclass((uint16_t)a[0]) & (uint16_t)a[1]) != 0; }
-static long w32_towupper(uint64_t *a) { uint32_t c = (uint16_t)a[0]; return (c >= 'a' && c <= 'z') ? (long)(c - 32) : (long)c; }
-static long w32_towlower(uint64_t *a) { uint32_t c = (uint16_t)a[0]; return (c >= 'A' && c <= 'Z') ? (long)(c + 32) : (long)c; }
 /* strxfrm(dst, src, n) / wcsxfrm: the C locale's collation is the bytes
  * themselves: the copy (when it fits in n), and the length. wcscoll = wcscmp. */
 static long w32_strxfrm(uint64_t *a) {
@@ -20542,16 +20587,6 @@ static long w32_wcsxfrm(uint64_t *a) {
         }
     return (long)len;
 }
-static long w32_wcscoll(uint64_t *a) {
-    for (uint64_t i = 0;; i++) {
-        uint16_t x = 0, y = 0;
-        (void)copy_from_user(&x, (const void *)(uintptr_t)(a[0] + i * 2), 2);
-        (void)copy_from_user(&y, (const void *)(uintptr_t)(a[1] + i * 2), 2);
-        if (x != y) return x < y ? -1 : 1;
-        if (!x) return 0;
-    }
-}
-static long w32_localeconv(uint64_t *a){ (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_LCONV); }
 static long w32_strerror(uint64_t *a)  { (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_STRERR); }
 
 /* fputc(c, FILE*) -> write one byte to the fd encoded in the FILE* token. */
@@ -21411,7 +21446,7 @@ static long w32_CloseHandle(uint64_t *a) {
  * process); a record whose process is gone is freed for the next one.
  * Measured on Windows 11 (programs/win-gui45). */
 enum { W32P_GUI, W32P_LB, W32P_CC, W32P_MENUS, W32P_BMP, W32P_MEMDC, W32P_TIMERS,
-       W32P_MODAL, W32P_ENV, W32P_TLS, W32P_N };
+       W32P_MODAL, W32P_ENV, W32P_TLS, W32P_LOC, W32P_N };
 #define WIN32_PS_MAX    32
 #define W32P_FALLBACK   65536u
 struct win32_pstate { int tgid; uint64_t born; void *part[W32P_N]; };
@@ -21470,6 +21505,16 @@ static void *win32_ps_part(int which, size_t size) {
     }
     return s->part[which];
 }
+/* W7s: the C runtime's locale, each category's (LC_ALL's slot unused): the
+ * w32nls locale + 1 (0 the C locale), its code page (0 the C locale's), and
+ * setlocale's answer; ubuf the program's memory the answers live in */
+struct win32_crtloc {
+    int8_t loc[6];
+    uint32_t cp[6];
+    char name[6][72];
+    uint64_t ubuf;
+};
+#define g_win32_loc (*(struct win32_crtloc *)win32_ps_part(W32P_LOC, sizeof(struct win32_crtloc)))
 /* the record of thread group tg (the harness's question), or 0 */
 static struct win32_pstate *win32_ps_of(int tg) {
     for (int i = 0; i < WIN32_PS_MAX; i++)
@@ -24377,13 +24422,6 @@ static long w32_lstrlenA(uint64_t *a) {
     return n < 0 ? 0 : (long)strlen(s);
 }
 /* kernel32!lstrcmpA(a, b) -> <0/0/>0 (used by dialog apps to compare text). */
-static long w32_lstrcmpA(uint64_t *a) {
-    char s1[128], s2[128];
-    s1[0] = s2[0] = 0;
-    if (a[0]) (void)strncpy_from_user(s1, (const char *)(uintptr_t)a[0], sizeof(s1));
-    if (a[1]) (void)strncpy_from_user(s2, (const char *)(uintptr_t)a[1], sizeof(s2));
-    return (long)strcmp(s1, s2);
-}
 
 /* ---- C11: more GDI (pens, lines, shapes) ----
  * These map a GDI device context (HDC == HWND == fd) onto the window's drawing
@@ -27922,51 +27960,6 @@ static int win32_k_to_wstr(uint64_t uwide, const char *s, int cap) {
     (void)copy_to_user((void *)(uintptr_t)(uwide + (uint64_t)i * 2), &z, 2);
     return i + 1;
 }
-/* MultiByteToWideChar(cp, flags, mbStr, cbMb, wStr, cchWide). cbMb<0 => NUL-term
- * (count includes the NUL). cchWide==0 => return required count. */
-static long w32_MultiByteToWideChar(uint64_t *a) {
-    int cb = (int)(int32_t)a[3];
-    char src[1024];
-    int n;
-    if (cb < 0) {
-        n = (int)strncpy_from_user(src, (const char *)(uintptr_t)a[2], sizeof(src));
-        if (n < 0) return 0;
-        n = (int)strlen(src) + 1;                /* include NUL */
-    } else {
-        n = cb < (int)sizeof(src) ? cb : (int)sizeof(src);
-        if (n && copy_from_user(src, (const void *)(uintptr_t)a[2], (size_t)n) != 0) return 0;
-    }
-    int cch = (int)(int32_t)a[5];
-    if (cch == 0) return n;                       /* size query */
-    int w = 0;
-    for (; w < n && w < cch; w++) {
-        uint16_t wc = (uint16_t)(uint8_t)src[w];
-        (void)copy_to_user((void *)(uintptr_t)(a[4] + (uint64_t)w * 2), &wc, 2);
-    }
-    return w;
-}
-/* WideCharToMultiByte(cp, flags, wStr, cchWide, mbStr, cbMb, defChar, usedDef). */
-static long w32_WideCharToMultiByte(uint64_t *a) {
-    int cch = (int)(int32_t)a[3];
-    char dst[1024];
-    int n;
-    if (cch < 0) { n = win32_wstr_to_k(a[2], dst, sizeof(dst)); n += 1; }   /* + NUL */
-    else {
-        n = 0;
-        for (; n < cch && n < (int)sizeof(dst) - 1; n++) {
-            uint16_t wc = 0;
-            if (copy_from_user(&wc, (const void *)(uintptr_t)(a[2] + (uint64_t)n * 2), 2) != 0) break;
-            dst[n] = (wc < 0x80) ? (char)wc : '?';
-        }
-        dst[n] = 0;
-    }
-    int cb = (int)(int32_t)a[5];
-    if (cb == 0) return n;                         /* size query */
-    int w = n < cb ? n : cb;
-    if (w && a[4]) (void)copy_to_user((void *)(uintptr_t)a[4], dst, (size_t)w);
-    return w;
-}
-
 /* ---- wide file APIs (SQLite's WinNT VFS) ---- */
 /* Translate a KERNEL Windows path string into a tobyOS path for the W side and
  * the CRT (W2: the one translation, win32_winpath_to_k -- kp is "" and the
@@ -28257,21 +28250,20 @@ static int win32_file_fd(uint64_t tok) {
 }
 
 /* ---- ctype (operate on the int arg) ---- */
-static long w32_isalnum(uint64_t *a){int c=(int)a[0];return (c>='0'&&c<='9')||(c>='A'&&c<='Z')||(c>='a'&&c<='z');}
-static long w32_isalpha(uint64_t *a){int c=(int)a[0];return (c>='A'&&c<='Z')||(c>='a'&&c<='z');}
-static long w32_isdigit(uint64_t *a){int c=(int)a[0];return c>='0'&&c<='9';}
-static long w32_isspace(uint64_t *a){int c=(int)a[0];return c==' '||c=='\t'||c=='\n'||c=='\r'||c=='\v'||c=='\f';}
-static long w32_isprint(uint64_t *a){int c=(int)a[0];return c>=0x20&&c<0x7F;}
-static long w32_tolower(uint64_t *a){int c=(int)a[0];return (c>='A'&&c<='Z')?c+32:c;}
-static long w32_toupper(uint64_t *a){int c=(int)a[0];return (c>='a'&&c<='z')?c-32:c;}
-/* C19b: remaining C-locale ctype predicates (real Lua's pattern matcher + libs). */
-static long w32_iscntrl(uint64_t *a){int c=(int)a[0];return (c>=0&&c<0x20)||c==0x7F;}
-static long w32_isgraph(uint64_t *a){int c=(int)a[0];return c>0x20&&c<0x7F;}
-static long w32_islower(uint64_t *a){int c=(int)a[0];return c>='a'&&c<='z';}
-static long w32_isupper(uint64_t *a){int c=(int)a[0];return c>='A'&&c<='Z';}
-static long w32_ispunct(uint64_t *a){int c=(int)a[0];return c>0x20&&c<0x7F&&
-    !((c>='0'&&c<='9')||(c>='A'&&c<='Z')||(c>='a'&&c<='z'));}
-static long w32_isxdigit(uint64_t *a){int c=(int)a[0];return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F');}
+/* W7s: the classes and case of LC_CTYPE's code page (the C locale's: ASCII's) */
+static long w32_isalnum(uint64_t *a){return (win32_lc_ctype((int)a[0])&0x107)!=0;}
+static long w32_isalpha(uint64_t *a){return (win32_lc_ctype((int)a[0])&0x103)!=0;}
+static long w32_isdigit(uint64_t *a){return (win32_lc_ctype((int)a[0])&0x04)!=0;}
+static long w32_isspace(uint64_t *a){return (win32_lc_ctype((int)a[0])&0x08)!=0;}
+static long w32_isprint(uint64_t *a){return (win32_lc_ctype((int)a[0])&0x157)!=0;}
+static long w32_tolower(uint64_t *a){return w32_lc_tolower(a);}
+static long w32_toupper(uint64_t *a){return w32_lc_toupper(a);}
+static long w32_iscntrl(uint64_t *a){return (win32_lc_ctype((int)a[0])&0x20)!=0;}
+static long w32_isgraph(uint64_t *a){return (win32_lc_ctype((int)a[0])&0x117)!=0;}
+static long w32_islower(uint64_t *a){return (win32_lc_ctype((int)a[0])&0x02)!=0;}
+static long w32_isupper(uint64_t *a){return (win32_lc_ctype((int)a[0])&0x01)!=0;}
+static long w32_ispunct(uint64_t *a){return (win32_lc_ctype((int)a[0])&0x10)!=0;}
+static long w32_isxdigit(uint64_t *a){return (win32_lc_ctype((int)a[0])&0x80)!=0;}
 
 /* ---- string (user memory) ---- */
 static long w32_strcmp(uint64_t *a) {
@@ -28610,22 +28602,18 @@ static long w32_pctype_func(uint64_t *a) {
     if (t) return (long)t;
     uint16_t tab[257];
     tab[0] = 0;                                                 /* EOF */
-    for (int c = 0; c < 256; c++) tab[c + 1] = c < 0x80 ? win32_ctype1(c) : 0;
+    for (int c = 0; c < 256; c++) tab[c + 1] = win32_lc_ctype(c);   /* W7s: LC_CTYPE's */
     uint64_t m = (uint64_t)win32_malloc_hdr_k(sizeof tab);
     if (!m || copy_to_user((void *)(uintptr_t)m, tab, sizeof tab) != 0) return 0;
     t = m + 2;
     (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_PCTYPE), &t, 8);
     return (long)t;
 }
-static long w32_iswalnum(uint64_t *a)  { int c = (int)(uint16_t)a[0]; return c < 0x80 && (win32_ctype1(c) & (0x04 | 0x100)) ? 1 : 0; }
+/* W7s: the wide classes are Unicode's in every locale (measured) */
+static long w32_iswalnum(uint64_t *a)  { return (win32_wclass((uint16_t)a[0]) & 0x107) != 0; }
 static long w32_iswdigit(uint64_t *a)  { int c = (int)(uint16_t)a[0]; return c >= '0' && c <= '9'; }
-static long w32_iswspace(uint64_t *a)  { int c = (int)(uint16_t)a[0]; return c < 0x80 && (win32_ctype1(c) & 0x08) ? 1 : 0; }
+static long w32_iswspace(uint64_t *a)  { return (win32_wclass((uint16_t)a[0]) & 0x08) != 0; }
 static long w32_iswxdigit(uint64_t *a) { int c = (int)(uint16_t)a[0]; return c < 0x80 && (win32_ctype1(c) & 0x80) ? 1 : 0; }
-/* btowc(c): the "C" locale's byte as itself; EOF: WEOF */
-static long w32_btowc(uint64_t *a) {
-    int c = (int)a[0];
-    return (c < 0 || c > 0xFF) ? 0xFFFF : c;
-}
 /* __strncnt(s, n): strnlen's */
 static long w32_strncnt(uint64_t *a) {
     uint64_t sp = a[0], n = a[1], k = 0;
@@ -28687,6 +28675,7 @@ static long w32_strtod(uint64_t *a) {
         return 0;
     }
     s[sizeof(s) - 1] = '\0';
+    win32_lc_num_in(s);                                 /* W7s */
     int consumed = 0;
     uint64_t bits = kmath_strtod(s, &consumed, 0);
     if (a[1]) { uint64_t ep = a[0] + (uint64_t)consumed; (void)copy_to_user((void *)(uintptr_t)a[1], &ep, 8); }
@@ -28697,6 +28686,7 @@ static long w32_atof(uint64_t *a) {
     char s[128];
     if (strncpy_from_user(s, (const char *)(uintptr_t)a[0], sizeof(s)) < 0) return 0;
     s[sizeof(s) - 1] = '\0';
+    win32_lc_num_in(s);                                 /* W7s */
     int consumed = 0;
     return (long)kmath_strtod(s, &consumed, 0);
 }
@@ -29136,7 +29126,12 @@ static long win32_vscanf(const char *s, size_t slen, uint64_t ufmt, uint64_t uva
         case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
             while (si < slen && w32_sc_isspace(s[si])) si++;
             int cons = 0; uint32_t fb = 0;
-            uint64_t db = kmath_strtod(s + si, &cons, &fb);
+            char nbuf[64];                                   /* W7s: LC_NUMERIC's decimal point */
+            size_t nk = 0;
+            while (nk < sizeof nbuf - 1 && si + nk < slen) { nbuf[nk] = s[si + nk]; nk++; }
+            nbuf[nk] = 0;
+            win32_lc_num_in(nbuf);
+            uint64_t db = kmath_strtod(nbuf, &cons, &fb);
             if (width > 0 && cons > width) cons = width;     /* approx width honouring */
             if (cons == 0) goto done;
             si += (size_t)cons;
@@ -29284,10 +29279,6 @@ static long w32_freopen(uint64_t *a){
     (void)sys_close(nfd); win32_fd_reset(nfd,W32FD_TEXT);
     win32_fd_reset(fd,fmode);
     return (long)a[2];}
-/* setlocale(cat, name) -> a stable "C" string; tobyOS is C-locale only. */
-static long w32_setlocale(uint64_t *a){(void)a;
-    uint64_t ub=WIN32_CRT_DATA_BASE+WIN32_CRT_PATHBUF; char c[2]={'C',0};
-    return (copy_to_user((void*)(uintptr_t)ub,c,2)==0)?(long)ub:0;}
 static long w32__configthreadlocale(uint64_t *a){(void)a;return 0;}     /* _DISABLE_PER_THREAD */
 
 /* ---- environment / process ---- */
@@ -30586,36 +30577,10 @@ static long w32_CreateSemaphoreExW(uint64_t *a) {   /* (sa, initial, max, name, 
 
 /* -- the "C" locale's character tables, as kernel32 answers them ---------- */
 /* UTF-16 code points 0..0xFF: their CT_CTYPE1 class (Latin-1's letters too) */
-static uint16_t win32_ctype1_w(uint32_t c) {
-    uint16_t f = 0x200;                                        /* C1_DEFINED */
-    if (c > 0xFF) return (c >= 0x100 && c < 0x250) ? (uint16_t)(0x200 | 0x100 | ((c & 1) ? 2 : 1)) : 0x200;
-    if (c < 0x20 || (c >= 0x7F && c < 0xA0)) f |= 0x20;        /* C1_CNTRL */
-    if ((c >= 9 && c <= 13) || c == ' ' || c == 0x85 || c == 0xA0) f |= 0x08;   /* C1_SPACE */
-    if (c == ' ' || c == '\t' || c == 0xA0) f |= 0x40;        /* C1_BLANK */
-    if (c >= '0' && c <= '9') f |= 0x04 | 0x80;                /* C1_DIGIT C1_XDIGIT */
-    if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) f |= 0x80;
-    if ((c >= 'A' && c <= 'Z') || (c >= 0xC0 && c <= 0xDE && c != 0xD7)) f |= 0x100 | 0x01;
-    if ((c >= 'a' && c <= 'z') || (c >= 0xDF && c <= 0xFF && c != 0xF7) || c == 0xAA || c == 0xB5 || c == 0xBA)
-        f |= 0x100 | 0x02;
-    if (((c > 0x20 && c < 0x7F) || (c > 0xA0 && c <= 0xFF)) && !(f & (0x100 | 0x04))) f |= 0x10;   /* C1_PUNCT */
-    if (c == 0xB2 || c == 0xB3 || c == 0xB9) f = (uint16_t)((f & ~0x10) | 0x04 | 0x10);
-    return f;
-}
-static uint32_t win32_wupper(uint32_t c) {
-    if (c >= 'a' && c <= 'z') return c - 32;
-    if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return c - 32;
-    if (c == 0xFF) return 0x178;
-    if (c == 0xB5) return 0x39C;
-    if (c >= 0x100 && c < 0x180 && (c & 1) && c != 0x131 && c != 0x138 && c != 0x149) return c - 1;
-    return c;
-}
-static uint32_t win32_wlower(uint32_t c) {
-    if (c >= 'A' && c <= 'Z') return c + 32;
-    if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return c + 32;
-    if (c == 0x178) return 0xFF;
-    if (c >= 0x100 && c < 0x180 && !(c & 1) && c != 0x130 && c != 0x138) return c + 1;
-    return c;
-}
+/* W7s: Windows' character classes and case mapping (src/win32_nls.c) */
+static uint16_t win32_ctype1_w(uint32_t c) { return c > 0xFFFF ? 0 : w32nls_uclass((uint16_t)c); }
+static uint32_t win32_wupper(uint32_t c) { return c > 0xFFFF ? c : w32nls_uupper((uint16_t)c); }
+static uint32_t win32_wlower(uint32_t c) { return c > 0xFFFF ? c : w32nls_ulower((uint16_t)c); }
 /* the program's UTF-16 string of n units (-1: to its NUL, which then counts) */
 static long win32_wlen(uint64_t u, int32_t n, bool *with_nul) {
     *with_nul = false;
@@ -30656,6 +30621,8 @@ static long w32_GetStringTypeW(uint64_t *a) {
  * character's case-folded weight, then each one's case) */
 static long w32_LCMapStringEx(uint64_t *a) {
     uint32_t flags = (uint32_t)a[1];
+    if (!(flags & 0x400) && (flags & 0x300))               /* W7s: case mapping, the locale's */
+        return win32_lcmap_case(win32_loc_of_name(a[0]), flags, a[2], (int32_t)a[3], a[4], (int32_t)a[5]);
     bool z;
     long n = win32_wlen(a[2], (int32_t)a[3], &z);
     int32_t dn = (int32_t)a[5];
@@ -30692,115 +30659,11 @@ static long w32_LCMapStringEx(uint64_t *a) {
     }
     return n;
 }
-/* CompareStringEx(name, flags, s1, n1, s2, n2, ver, res, param) ->
- * CSTR_LESS_THAN 1 / CSTR_EQUAL 2 / CSTR_GREATER_THAN 3: the case-folded
- * characters first, then (unless NORM_IGNORECASE / LINGUISTIC_IGNORECASE)
- * small letters before capitals, as a word sort orders them */
-static long w32_CompareStringEx(uint64_t *a) {
-    uint32_t flags = (uint32_t)a[1];
-    bool z1, z2;
-    long n1 = win32_wlen(a[2], (int32_t)a[3], &z1), n2 = win32_wlen(a[4], (int32_t)a[5], &z2);
-    if (n1 < 0 || n2 < 0 || !a[2] || !a[4]) return win32_fail(87);
-    if (z1) n1--;
-    if (z2) n2--;
-    bool icase = (flags & (0x1 | 0x10)) != 0;
-    int tie = 0;
-    long i = 0;
-    for (; i < n1 && i < n2; i++) {
-        uint32_t c1 = win32_wat(a[2], i), c2 = win32_wat(a[4], i);
-        uint32_t f1 = win32_wupper(c1), f2 = win32_wupper(c2);
-        if (f1 != f2) return f1 < f2 ? 1 : 3;
-        if (!tie && c1 != c2 && !icase) tie = (win32_ctype1_w(c1) & 0x02) ? 1 : 3;
-    }
-    if (n1 != n2) return n1 < n2 ? 1 : 3;
-    return tie ? tie : 2;
-}
-/* GetLocaleInfoEx(name, type, data, cch): the invariant locale's and
- * en-US's answers to the questions the C++ library and programs ask; a
- * number with LOCALE_RETURN_NUMBER */
-static long w32_GetLocaleInfoEx(uint64_t *a) {
-    char name[86];
-    name[0] = 0;
-    if (a[0]) win32_wstr_to_k(a[0], name, sizeof name);
-    bool inv = name[0] == 0;
-    bool us = inv || !strcmp(name, "en-US") || !strcmp(name, "!x-sys-default-locale");
-    if (!us) return win32_fail(87);
-    uint32_t type = (uint32_t)a[1] & 0x0FFFFFFFu;
-    bool num = ((uint32_t)a[1] & 0x20000000u) != 0;        /* LOCALE_RETURN_NUMBER */
-    static const char *const days[7] = { "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" };
-    static const char *const months[12] = { "January", "February", "March", "April", "May", "June", "July",
-                                            "August", "September", "October", "November", "December" };
-    char v[64];
-    uint32_t nv = 0;
-    bool isnum = false;
-    v[0] = 0;
-    switch (type) {
-    case 0x0E: ksnprintf(v, sizeof v, "."); break;                      /* LOCALE_SDECIMAL */
-    case 0x0F: ksnprintf(v, sizeof v, ","); break;                      /* LOCALE_STHOUSAND */
-    case 0x10: ksnprintf(v, sizeof v, "3;0"); break;                    /* LOCALE_SGROUPING */
-    case 0x14: ksnprintf(v, sizeof v, inv ? "\xC2\xA4" : "$"); break;   /* LOCALE_SCURRENCY */
-    case 0x16: ksnprintf(v, sizeof v, "."); break;                      /* LOCALE_SMONDECIMALSEP */
-    case 0x17: ksnprintf(v, sizeof v, ","); break;                      /* LOCALE_SMONTHOUSANDSEP */
-    case 0x50: ksnprintf(v, sizeof v, ""); break;                       /* LOCALE_SPOSITIVESIGN */
-    case 0x51: ksnprintf(v, sizeof v, "-"); break;                      /* LOCALE_SNEGATIVESIGN */
-    case 0x5C: ksnprintf(v, sizeof v, inv ? "" : "en-US"); break;       /* LOCALE_SNAME */
-    case 0x1001: ksnprintf(v, sizeof v, inv ? "Invariant Language" : "English"); break;
-    case 0x1002: ksnprintf(v, sizeof v, inv ? "Invariant Country" : "United States"); break;
-    case 0x0B: nv = 437; isnum = true; break;                           /* LOCALE_IDEFAULTCODEPAGE */
-    case 0x1004: nv = 1252; isnum = true; break;                        /* LOCALE_IDEFAULTANSICODEPAGE */
-    case 0x01: nv = inv ? 0x7F : 0x409; isnum = true; break;            /* LOCALE_ILANGUAGE */
-    case 0x1C: case 0x1E: ksnprintf(v, sizeof v, ":"); break;           /* LOCALE_SDATE? LOCALE_STIME */
-    case 0x1F: ksnprintf(v, sizeof v, inv ? "MM/dd/yyyy" : "M/d/yyyy"); break;          /* LOCALE_SSHORTDATE */
-    case 0x20: ksnprintf(v, sizeof v, inv ? "dddd, dd MMMM yyyy" : "dddd, MMMM d, yyyy"); break;
-    case 0x1003: ksnprintf(v, sizeof v, inv ? "HH:mm:ss" : "h:mm:ss tt"); break;        /* LOCALE_STIMEFORMAT */
-    case 0x28: ksnprintf(v, sizeof v, "AM"); break;                     /* LOCALE_S1159 */
-    case 0x29: ksnprintf(v, sizeof v, "PM"); break;                     /* LOCALE_S2359 */
-    case 0x100C: nv = 6; isnum = true; break;                           /* LOCALE_IFIRSTDAYOFWEEK: Sunday */
-    case 0x0D: nv = 1; isnum = true; break;                             /* LOCALE_IMEASURE: U.S. */
-    default:
-        if (type >= 0x2A && type <= 0x30) ksnprintf(v, sizeof v, "%s", days[type - 0x2A]);
-        else if (type >= 0x31 && type <= 0x37) { memcpy(v, days[type - 0x31], 3); v[3] = 0; }
-        else if (type >= 0x38 && type <= 0x43) ksnprintf(v, sizeof v, "%s", months[type - 0x38]);
-        else if (type >= 0x44 && type <= 0x4F) { memcpy(v, months[type - 0x44], 3); v[3] = 0; }
-        else return win32_fail(1004);                                   /* ERROR_INVALID_FLAGS */
-    }
-    uint32_t cch = (uint32_t)a[3];
-    if (num) {
-        if (!isnum) return win32_fail(1004);
-        if (!cch) return 2;
-        if (cch < 2) return win32_fail(122);
-        (void)copy_to_user((void *)(uintptr_t)a[2], &nv, 4);
-        return 2;
-    }
-    if (isnum) ksnprintf(v, sizeof v, "%u", nv);
-    long n = win32_put_w16(v, cch ? a[2] : 0, cch);
-    if (!cch) return n;                        /* (the size it needs, with the NUL) */
-    if (n > (long)cch - 1 && cch < (uint32_t)n) return win32_fail(122);
-    return n + 1;                              /* the characters with the NUL */
-}
-/* GetCPInfo(cp, CPINFO *): MaxCharSize, DefaultChar, LeadByte */
-static long w32_GetCPInfo(uint64_t *a) {
-    uint32_t cp = (uint32_t)a[0];
-    if (cp == 0 || cp == 3) cp = 1252;              /* CP_ACP, CP_THREAD_ACP */
-    if (cp == 1 || cp == 2) cp = 437;               /* CP_OEMCP, CP_MACCP */
-    uint8_t b[18];
-    memset(b, 0, sizeof b);
-    uint32_t max;
-    switch (cp) {
-    case 437: case 850: case 1250: case 1251: case 1252: case 1253: case 1254: case 20127: case 28591:
-        max = 1; break;
-    case 65001: max = 4; break;
-    case 65000: max = 5; break;
-    default: return win32_fail(87);
-    }
-    memcpy(&b[0], &max, 4);
-    b[4] = '?';
-    if (!a[1] || copy_to_user((void *)(uintptr_t)a[1], b, sizeof b) != 0) return win32_fail(87);
-    return 1;
-}
-
 /* -- strftime and its kin, the "C" locale's names --------------------------
- * %c is "%m/%d/%y %H:%M:%S", %x "%m/%d/%y", %X "%H:%M:%S" in the C locale;
+ * %c is "%m/%d/%y %H:%M:%S", %x "%m/%d/%y", %X "%H:%M:%S" in the C locale
+ * for msvcp140's _Strftime (W7m); W7s: strftime's %c is C99's ("%a %b %e
+ * %H:%M:%S %Y", measured), and a named LC_TIME gives its own names and its
+ * short, long and time pictures (%x %#x %X %c %#c %p %r);
  * '#' takes the leading zeros away (the UCRT's); the zone is UTC. The names
  * a time-facet passes (_Strftime's last argument) are the C locale's when
  * NULL, as msvcp140's are here (_Gettnames answers NULL). */
@@ -30829,7 +30692,7 @@ static int win32_iso_week(const struct w32_tm *t, long *iy) {
 }
 /* format into out (cap bytes, with the NUL); the length, or 0 when it does
  * not fit (and out[0] = 0), as strftime answers */
-static size_t win32_strftime_k(char *out, size_t cap, const char *fmt, const struct w32_tm *t) {
+static size_t win32_strftime_k(char *out, size_t cap, const char *fmt, const struct w32_tm *t, int loc, bool c99c) {
     size_t o = 0;
 #define W32F_PUT(s) do { const char *_s = (s); while (*_s) { if (o + 1 >= cap) goto full; out[o++] = *_s++; } } while (0)
     for (const char *f = fmt; *f; f++) {
@@ -30837,9 +30700,37 @@ static size_t win32_strftime_k(char *out, size_t cap, const char *fmt, const str
         f++;
         bool alt = false;
         if (*f == '#') { alt = true; f++; }
-        char b[64];
+        char b[192];
         b[0] = 0;
         int wd = t->wday >= 0 && t->wday < 7 ? t->wday : 0, mo = t->mon >= 0 && t->mon < 12 ? t->mon : 0;
+        if (loc >= 0) {                        /* W7s: a named LC_TIME's */
+            int done = 1;
+            switch (*f) {
+            case 'a': win32_lc_name8(loc, 0x31u + (uint32_t)((wd + 6) % 7), b, sizeof b); break;
+            case 'A': win32_lc_name8(loc, 0x2Au + (uint32_t)((wd + 6) % 7), b, sizeof b); break;
+            case 'b': case 'h': win32_lc_name8(loc, 0x44u + (uint32_t)mo, b, sizeof b); break;
+            case 'B': win32_lc_name8(loc, 0x38u + (uint32_t)mo, b, sizeof b); break;
+            case 'p': win32_lc_name8(loc, t->hour < 12 ? 0x28u : 0x29u, b, sizeof b); break;
+            case 'x': win32_lc_pic8(loc, alt ? 0x20u : 0x1Fu, t, b, sizeof b); break;
+            case 'X': case 'r': win32_lc_pic8(loc, 0x1003u, t, b, sizeof b); break;
+            case 'c': {
+                win32_lc_pic8(loc, alt ? 0x20u : 0x1Fu, t, b, sizeof b);
+                size_t l = strlen(b);
+                if (l + 2 < sizeof b) { b[l++] = ' '; win32_lc_pic8(loc, 0x1003u, t, b + l, (int)(sizeof b - l)); }
+                break;
+            }
+            default: done = 0;
+            }
+            if (done) { W32F_PUT(b); continue; }
+        }
+        if (*f == 'c' && !alt && c99c) {       /* W7s: strftime's C locale: C99's */
+            char d3[4], m3[4];
+            memcpy(d3, g_w32_days[wd], 3); d3[3] = 0;
+            memcpy(m3, g_w32_months[mo], 3); m3[3] = 0;
+            ksnprintf(b, sizeof b, "%s %s %2d %02d:%02d:%02d %d", d3, m3, t->mday, t->hour, t->min, t->sec, t->year + 1900);
+            W32F_PUT(b);
+            continue;
+        }
         int h12 = t->hour % 12 ? t->hour % 12 : 12;
         const char *z2 = alt ? "%d" : "%02d", *z3 = alt ? "%d" : "%03d";
         switch (*f) {
@@ -30905,28 +30796,39 @@ full:
 static bool win32_get_tm(uint64_t utm, struct w32_tm *t) {
     return utm && copy_from_user(t, (const void *)(uintptr_t)utm, sizeof *t) == 0;
 }
-/* strftime(s, max, fmt, tm) / _Strftime(s, max, fmt, tm, names) */
-static long win32_strftime_u(uint64_t us, uint64_t max, uint64_t ufmt, uint64_t utm) {
-    char fmt[256], out[1024];
+/* strftime(s, max, fmt, tm) / _Strftime(s, max, fmt, tm, names): W7s --
+ * the format and the answer in LC_TIME's code page, the engine's UTF-8
+ * between */
+static long win32_strftime_u(uint64_t us, uint64_t max, uint64_t ufmt, uint64_t utm, bool c99c) {
+    char fmt[256], f8[512], out[1024], ob[1024];
     struct w32_tm t;
     if (!us || !ufmt || !max || !win32_get_tm(utm, &t)) { win32_crt_errno(22); return 0; }
     if (strncpy_from_user(fmt, (const char *)(uintptr_t)ufmt, sizeof fmt) < 0) { win32_crt_errno(22); return 0; }
-    size_t cap = max < sizeof out ? (size_t)max : sizeof out;
-    size_t n = win32_strftime_k(out, cap, fmt, &t);
-    if (!n && fmt[0]) { char z = 0; (void)copy_to_user((void *)(uintptr_t)us, &z, 1); win32_crt_errno(34); return 0; }
-    (void)copy_to_user((void *)(uintptr_t)us, out, n + 1);
-    return (long)n;
+    fmt[sizeof fmt - 1] = 0;
+    uint32_t cp = win32_lc_time_cp();
+    win32_lc_bytes_utf8(fmt, cp, f8, sizeof f8);
+    size_t n = win32_strftime_k(out, sizeof out, f8, &t, win32_lc_time_loc(), c99c);
+    int bn = win32_lc_utf8_bytes(out, cp, ob, (int)sizeof ob - 1);
+    if ((!n && f8[0]) || (uint64_t)bn + 1 > max) {
+        char z = 0;
+        (void)copy_to_user((void *)(uintptr_t)us, &z, 1);
+        win32_crt_errno(34);
+        return 0;
+    }
+    ob[bn] = 0;
+    (void)copy_to_user((void *)(uintptr_t)us, ob, (size_t)bn + 1);
+    return bn;
 }
-static long w32_strftime(uint64_t *a)  { return win32_strftime_u(a[0], a[1], a[2], a[3]); }
-static long w32_Strftime(uint64_t *a)  { return win32_strftime_u(a[0], a[1], a[2], a[3]); }
+static long w32_strftime(uint64_t *a)  { return win32_strftime_u(a[0], a[1], a[2], a[3], true); }
+static long w32_Strftime(uint64_t *a)  { return win32_strftime_u(a[0], a[1], a[2], a[3], false); }
 /* wcsftime(s, max, fmt, tm) / _Wcsftime(s, max, fmt, tm, names): the format
  * narrowed (its characters past ASCII kept as they are) */
-static long win32_wcsftime_u(uint64_t us, uint64_t max, uint64_t ufmt, uint64_t utm) {
+static long win32_wcsftime_u(uint64_t us, uint64_t max, uint64_t ufmt, uint64_t utm, bool c99c) {
     char fmt[256], out[1024];
     struct w32_tm t;
     if (!us || !ufmt || !max || !win32_get_tm(utm, &t)) { win32_crt_errno(22); return 0; }
     if (win32_w16_to_utf8(ufmt, -1, fmt, sizeof fmt) < 0) { win32_crt_errno(22); return 0; }
-    size_t n = win32_strftime_k(out, sizeof out, fmt, &t);
+    size_t n = win32_strftime_k(out, sizeof out, fmt, &t, win32_lc_time_loc(), c99c);
     uint16_t w[1024];
     int wn = win32_utf8_to_w16(out, w, 1023);
     if ((uint64_t)wn + 1 > max || (!n && fmt[0])) {
@@ -30938,8 +30840,1138 @@ static long win32_wcsftime_u(uint64_t us, uint64_t max, uint64_t ufmt, uint64_t 
     (void)copy_to_user((void *)(uintptr_t)us, w, (size_t)(wn + 1) * 2);
     return wn;
 }
-static long w32_wcsftime(uint64_t *a) { return win32_wcsftime_u(a[0], a[1], a[2], a[3]); }
-static long w32_Wcsftime(uint64_t *a) { return win32_wcsftime_u(a[0], a[1], a[2], a[3]); }
+static long w32_wcsftime(uint64_t *a) { return win32_wcsftime_u(a[0], a[1], a[2], a[3], true); }
+static long w32_Wcsftime(uint64_t *a) { return win32_wcsftime_u(a[0], a[1], a[2], a[3], false); }
+
+
+/* ---- W7s: named locales and code pages -------------------------------------
+ * kernel32's code pages (MultiByteToWideChar / WideCharToMultiByte through
+ * each code page's table and its best fit, UTF-8 as Windows reads it), the
+ * locales' data (GetLocaleInfoEx/W/A and the defaults: ANSI 1252, OEM 437,
+ * en-US), case mapping, collation, and the number, date and time formats --
+ * src/win32_nls.c over what Windows 11 answers (src/win32_nls_data.h). The
+ * C runtime's locale: setlocale and _wsetlocale take a locale's name
+ * ("de-DE", "de-DE.UTF-8"), its English name ("German_Germany.1252",
+ * "German") or a code page alone (".1251", ".UTF-8") and answer as the UCRT
+ * does, per category; printf, strtod and scanf take LC_NUMERIC's decimal
+ * point; strftime and wcsftime LC_TIME's names and formats; the multibyte
+ * conversions, the ctype functions and table, toupper and towupper
+ * LC_CTYPE's code page; strcoll and its kin LC_COLLATE's order (the string
+ * sort); localeconv the locale's separators and currency. Measured on
+ * Windows 11: programs/win-locale50, logs/w32/w7s-probe*.c. */
+
+/* a program's UTF-16 string (n units, or to its NUL when n < 0) into a
+ * kmalloc'd copy, NUL-terminated; its length in *len; NULL a fault */
+static uint16_t *win32_w16_dup(uint64_t u, long n, int *len) {
+    if (!u) return 0;
+    long cnt = n;
+    if (n < 0) {
+        for (cnt = 0;; cnt++) {
+            uint16_t w = 1;
+            if (copy_from_user(&w, (const void *)(uintptr_t)(u + (uint64_t)cnt * 2), 2) != 0) return 0;
+            if (!w) break;
+            if (cnt > 0x100000) return 0;
+        }
+    }
+    uint16_t *s = kmalloc((size_t)(cnt + 1) * 2);
+    if (!s) return 0;
+    if (cnt && copy_from_user(s, (const void *)(uintptr_t)u, (size_t)cnt * 2) != 0) { kfree(s); return 0; }
+    s[cnt] = 0;
+    *len = (int)cnt;
+    return s;
+}
+/* a UTF-16 answer of n units (+ its NUL) to (dst, cch): cch 0 the size; too
+ * small ERROR_INSUFFICIENT_BUFFER */
+static long win32_w16_answer(const uint16_t *s, int n, uint64_t dst, int cch) {
+    if (cch == 0) return n + 1;
+    if (cch < n + 1 || !dst) return win32_fail(122);
+    if (copy_to_user((void *)(uintptr_t)dst, s, (size_t)n * 2) != 0) return win32_fail(998);
+    uint16_t z = 0;
+    (void)copy_to_user((void *)(uintptr_t)(dst + (uint64_t)n * 2), &z, 2);
+    return n + 1;
+}
+static int win32_w16len(const uint16_t *s) { int n = 0; while (s && s[n]) n++; return n; }
+
+/* -- code pages ------------------------------------------------------------ */
+/* one character's UTF-16 into the code page: bytes in b (1..4), -1 none
+ * (nobf: no best fit); hi a high surrogate to pair with lo (0 none) */
+static int win32_cp_put(uint32_t cp, uint16_t u, uint16_t lo, bool nobf, uint8_t *b, int *took) {
+    *took = 1;
+    if (cp == W32NLS_UTF8) {
+        uint32_t c = u;
+        if (u >= 0xD800 && u <= 0xDBFF && lo >= 0xDC00 && lo <= 0xDFFF) {
+            c = 0x10000u + (((uint32_t)u - 0xD800u) << 10) + (uint32_t)(lo - 0xDC00u);
+            *took = 2;
+        } else if (u >= 0xD800 && u <= 0xDFFF) return -1;
+        if (c < 0x80) { b[0] = (uint8_t)c; return 1; }
+        if (c < 0x800) { b[0] = (uint8_t)(0xC0 | (c >> 6)); b[1] = (uint8_t)(0x80 | (c & 0x3F)); return 2; }
+        if (c < 0x10000) {
+            b[0] = (uint8_t)(0xE0 | (c >> 12)); b[1] = (uint8_t)(0x80 | ((c >> 6) & 0x3F));
+            b[2] = (uint8_t)(0x80 | (c & 0x3F)); return 3;
+        }
+        b[0] = (uint8_t)(0xF0 | (c >> 18)); b[1] = (uint8_t)(0x80 | ((c >> 12) & 0x3F));
+        b[2] = (uint8_t)(0x80 | ((c >> 6) & 0x3F)); b[3] = (uint8_t)(0x80 | (c & 0x3F)); return 4;
+    }
+    if (u >= 0xD800 && u <= 0xDBFF && lo >= 0xDC00 && lo <= 0xDFFF) *took = 2;   /* a pair: one default */
+    int r = (u >= 0xD800 && u <= 0xDFFF) ? -1 : w32nls_u2b(cp, u, nobf);
+    if (r < 0) return -1;
+    b[0] = (uint8_t)r;
+    return 1;
+}
+static long w32_GetACP(uint64_t *a)   { (void)a; return w32nls_cp(0); }
+static long w32_GetOEMCP(uint64_t *a) { (void)a; return w32nls_cp(1); }
+static long w32_IsValidCodePage(uint64_t *a) {
+    uint32_t cp = (uint32_t)a[0];
+    return cp > 3 && w32nls_cp(cp) == cp ? 1 : 0;
+}
+/* GetCPInfo(cp, CPINFO *): MaxCharSize, DefaultChar '?', no lead bytes */
+static long w32_GetCPInfo(uint64_t *a) {
+    uint32_t cp = w32nls_cp((uint32_t)a[0]);
+    if (!cp) return win32_fail(87);
+    uint8_t b[20];
+    memset(b, 0, sizeof b);
+    uint32_t max = cp == W32NLS_UTF8 ? 4 : 1;
+    memcpy(&b[0], &max, 4);
+    b[4] = '?';
+    if (!a[1] || copy_to_user((void *)(uintptr_t)a[1], b, 18) != 0) return win32_fail(87);
+    return 1;
+}
+/* MultiByteToWideChar(cp, flags, src, cb, dst, cch) */
+static long w32_MultiByteToWideChar(uint64_t *a) {
+    uint32_t cp = w32nls_cp((uint32_t)a[0]), fl = (uint32_t)a[1];
+    int cb = (int)(int32_t)a[3], cch = (int)(int32_t)a[5];
+    if (!cp || !a[2] || cb == 0 || cb < -1 || cch < 0 || (cch && !a[4])) return win32_fail(87);
+    if (cp == W32NLS_UTF8 && (fl & ~8u)) return win32_fail(1004);            /* ERROR_INVALID_FLAGS */
+    bool strict = (fl & 8u) != 0;                                            /* MB_ERR_INVALID_CHARS */
+    uint8_t in[264];
+    uint16_t ob[256];
+    int have = 0, on = 0;
+    long pos = 0, out = 0;
+    bool end = false;
+    for (;;) {
+        while (!end && have < 256) {                                         /* refill */
+            int want = 256 - have;
+            if (cb >= 0) { if (pos >= cb) { end = true; break; } if (want > cb - pos) want = (int)(cb - pos); }
+            else if (want > 64) want = 64;
+            if (copy_from_user(in + have, (const void *)(uintptr_t)(a[2] + (uint64_t)pos), (size_t)want) != 0) {
+                if (want == 1) return win32_fail(87);
+                want = 1;                                                    /* near a page's end: bytewise */
+                if (copy_from_user(in + have, (const void *)(uintptr_t)(a[2] + (uint64_t)pos), 1) != 0) return win32_fail(87);
+            }
+            if (cb < 0) {                                                    /* to the NUL, which counts */
+                int k = 0;
+                while (k < want && in[have + k]) k++;
+                if (k < want) { want = k + 1; end = true; }
+            }
+            have += want;
+            pos += want;
+        }
+        if (!have) break;
+        uint32_t c;
+        int took;
+        if (cp == W32NLS_UTF8) {
+            bool bad;
+            took = w32nls_utf8_dec(in, have, &c, &bad);
+            if (took < 0) { c = 0xFFFD; bad = true; took = have; }          /* cut short by the end */
+            if (bad && strict) return win32_fail(1113);                      /* ERROR_NO_UNICODE_TRANSLATION */
+        } else {
+            c = w32nls_b2u(cp, in[0], strict);
+            if (c == 0xFFFF && strict) return win32_fail(1113);
+            if (c == 0xFFFF) c = w32nls_b2u(cp, in[0], false);
+            took = 1;
+        }
+        int nu = c > 0xFFFF ? 2 : 1;
+        if (cch) {
+            if (out + nu > cch) return win32_fail(122);
+            if (on + 2 > 256) { (void)copy_to_user((void *)(uintptr_t)(a[4] + (uint64_t)(out - on) * 2), ob, (size_t)on * 2); on = 0; }
+            if (nu == 2) { c -= 0x10000; ob[on++] = (uint16_t)(0xD800 + (c >> 10)); ob[on++] = (uint16_t)(0xDC00 + (c & 0x3FF)); }
+            else ob[on++] = (uint16_t)c;
+        }
+        out += nu;
+        for (int k = took; k < have; k++) in[k - took] = in[k];
+        have -= took;
+    }
+    if (cch && on) (void)copy_to_user((void *)(uintptr_t)(a[4] + (uint64_t)(out - on) * 2), ob, (size_t)on * 2);
+    return out;
+}
+/* WideCharToMultiByte(cp, flags, src, cch, dst, cb, defchar, useddef) */
+static long w32_WideCharToMultiByte(uint64_t *a) {
+    uint32_t cp = w32nls_cp((uint32_t)a[0]), fl = (uint32_t)a[1];
+    int cch = (int)(int32_t)a[3], cb = (int)(int32_t)a[5];
+    if (!cp || !a[2] || cch == 0 || cch < -1 || cb < 0 || (cb && !a[4])) return win32_fail(87);
+    int n;
+    uint16_t *s = win32_w16_dup(a[2], cch, &n);
+    if (!s) return win32_fail(87);
+    if (cch < 0) n++;                                          /* the NUL counts */
+    uint8_t def = '?';
+    if (a[6] && cp != W32NLS_UTF8) (void)copy_from_user(&def, (const void *)(uintptr_t)a[6], 1);
+    bool nobf = (fl & 0x400u) != 0, used = false;              /* WC_NO_BEST_FIT_CHARS */
+    long out = 0;
+    uint8_t ob[256];
+    int on = 0;
+    for (int i = 0; i < n; ) {
+        uint8_t b[4];
+        int took;
+        int k = win32_cp_put(cp, s[i], i + 1 < n ? s[i + 1] : 0, nobf, b, &took);
+        if (k < 0) {
+            if (cp == W32NLS_UTF8) {
+                if (fl & 0x80u) { kfree(s); return win32_fail(1113); }   /* WC_ERR_INVALID_CHARS */
+                b[0] = 0xEF; b[1] = 0xBF; b[2] = 0xBD; k = 3;
+            } else { b[0] = def; k = 1; used = true; }
+        }
+        if (cb) {
+            if (out + k > cb) { kfree(s); return win32_fail(122); }
+            if (on + k > 256) { (void)copy_to_user((void *)(uintptr_t)(a[4] + (uint64_t)(out - on)), ob, (size_t)on); on = 0; }
+            for (int j = 0; j < k; j++) ob[on++] = b[j];
+        }
+        out += k;
+        i += took;
+    }
+    if (cb && on) (void)copy_to_user((void *)(uintptr_t)(a[4] + (uint64_t)(out - on)), ob, (size_t)on);
+    kfree(s);
+    if (a[7]) { int32_t u = used ? 1 : 0; (void)copy_to_user((void *)(uintptr_t)a[7], &u, 4); }
+    return out;
+}
+
+/* -- locales: the defaults, names, data --------------------------------------- */
+static long w32_GetUserDefaultLCID(uint64_t *a) { (void)a; return (long)w32nls_lcid(w32nls_user_default()); }
+static long w32_GetUserDefaultLangID(uint64_t *a) { (void)a; return (long)(w32nls_lcid(w32nls_user_default()) & 0xFFFF); }
+static long w32_GetUserDefaultLocaleName(uint64_t *a) {
+    const uint16_t *s = w32nls_info(w32nls_user_default(), 0x5C);
+    return win32_w16_answer(s, win32_w16len(s), a[0], (int)(int32_t)a[1]);
+}
+/* a locale's name argument: NULL the user's; else its string (-1 none such) */
+static int win32_loc_of_name(uint64_t uname) {
+    if (!uname) return w32nls_user_default();
+    int n;
+    uint16_t *s = win32_w16_dup(uname, -1, &n);
+    if (!s) return -1;
+    int loc = n > 85 ? -1 : w32nls_find(s);
+    kfree(s);
+    return loc;
+}
+static long w32_LocaleNameToLCID(uint64_t *a) {
+    int loc = win32_loc_of_name(a[0]);
+    if (loc < 0) { win32_set_last_error(87); return 0; }
+    return (long)w32nls_lcid(loc);
+}
+static long w32_LCIDToLocaleName(uint64_t *a) {
+    int loc = w32nls_find_lcid((uint32_t)a[0]);
+    if (loc < 0) return win32_fail(87);
+    const uint16_t *s = w32nls_info(loc, 0x5C);
+    return win32_w16_answer(s, win32_w16len(s), a[1], (int)(int32_t)a[2]);
+}
+static long w32_IsValidLocaleName(uint64_t *a) { return a[0] && win32_loc_of_name(a[0]) >= 0 ? 1 : 0; }
+static long w32_IsValidLocale(uint64_t *a) { return w32nls_find_lcid((uint32_t)a[0]) >= 0 ? 1 : 0; }
+/* the locale's value of an LCTYPE: W (ansi false) or in its ANSI code page
+ * (LOCALE_USE_CP_ACP: 1252); LOCALE_RETURN_NUMBER a DWORD; the genitive
+ * month names with LOCALE_RETURN_GENITIVE_NAMES */
+static long win32_locinfo(int loc, uint32_t lt, uint64_t dst, int cch, bool ansi) {
+    if (loc < 0) return win32_fail(87);
+    if (cch < 0 || (cch && !dst)) return win32_fail(87);
+    uint32_t t = lt & 0x07FFFFFFu;
+    if (lt & 0x20000000u) {                                         /* LOCALE_RETURN_NUMBER */
+        if (!w32nls_info_is_number(t) || !w32nls_info(loc, t)) return win32_fail(1004);
+        int need = ansi ? 4 : 2;
+        if (!cch) return need;
+        if (cch < need) return win32_fail(122);
+        uint32_t v = w32nls_info_number(loc, t);
+        (void)copy_to_user((void *)(uintptr_t)dst, &v, 4);
+        return need;
+    }
+    const uint16_t *s = 0;
+    if ((lt & 0x10000000u) && ((t >= 0x38 && t <= 0x43) || t == 0x100E))
+        s = w32nls_genitive(loc, t == 0x100E ? 12 : (int)(t - 0x38));
+    if (!s) s = w32nls_info(loc, t);
+    if (!s) return win32_fail(1004);                                /* ERROR_INVALID_FLAGS */
+    int n = win32_w16len(s);
+    if (!ansi) return win32_w16_answer(s, n, dst, cch);
+    uint32_t cp = (lt & 0x40000000u) ? w32nls_cp(0) : w32nls_info_number(loc, 0x1004);
+    uint8_t b[512];
+    int bn = 0;
+    for (int i = 0; i < n && bn < 500; ) {
+        uint8_t c[4];
+        int took, k = win32_cp_put(w32nls_cp(cp) ? cp : w32nls_cp(0), s[i], s[i + 1], false, c, &took);
+        if (k < 0) { c[0] = '?'; k = 1; }
+        for (int j = 0; j < k; j++) b[bn++] = c[j];
+        i += took;
+    }
+    if (!cch) return bn + 1;
+    if (cch < bn + 1) return win32_fail(122);
+    b[bn] = 0;
+    return copy_to_user((void *)(uintptr_t)dst, b, (size_t)bn + 1) == 0 ? bn + 1 : win32_fail(998);
+}
+static long w32_GetLocaleInfoEx(uint64_t *a) { return win32_locinfo(win32_loc_of_name(a[0]), (uint32_t)a[1], a[2], (int)(int32_t)a[3], false); }
+static long w32_GetLocaleInfoW(uint64_t *a)  { return win32_locinfo(w32nls_find_lcid((uint32_t)a[0]), (uint32_t)a[1], a[2], (int)(int32_t)a[3], false); }
+static long w32_GetLocaleInfoA(uint64_t *a)  { return win32_locinfo(w32nls_find_lcid((uint32_t)a[0]), (uint32_t)a[1], a[2], (int)(int32_t)a[3], true); }
+
+/* -- case mapping and collation --------------------------------------------------- */
+/* LCMapStringEx's and LCMapStringW's case mapping (the sort key as before) */
+static long win32_lcmap_case(int loc, uint32_t flags, uint64_t src, int32_t n, uint64_t dst, int32_t dn) {
+    if (loc < 0) return win32_fail(87);
+    int len;
+    uint16_t *s = win32_w16_dup(src, n, &len);
+    if (!s || n == 0 || dn < 0 || (dn && !dst)) { if (s) kfree(s); return win32_fail(87); }
+    int cnt = n < 0 ? len + 1 : len;                                /* -1: the NUL counts */
+    w32nls_case_map(loc, flags, s, len);
+    long r;
+    if (!dn) r = cnt;
+    else if (dn < cnt) r = win32_fail(122);
+    else r = copy_to_user((void *)(uintptr_t)dst, s, (size_t)cnt * 2) == 0 ? cnt : win32_fail(998);
+    kfree(s);
+    return r;
+}
+/* CompareStringEx/W/A: CSTR_LESS_THAN 1, CSTR_EQUAL 2, CSTR_GREATER_THAN 3 */
+static long win32_compare_w(int loc, uint32_t flags, uint64_t s1, int32_t n1, uint64_t s2, int32_t n2) {
+    if (loc < 0 || !s1 || !s2) return win32_fail(87);
+    int l1, l2;
+    uint16_t *a1 = win32_w16_dup(s1, n1, &l1);
+    uint16_t *a2 = a1 ? win32_w16_dup(s2, n2, &l2) : 0;
+    long r = (a1 && a2) ? w32nls_compare(loc, flags, a1, l1, a2, l2) : win32_fail(87);
+    if (a1) kfree(a1);
+    if (a2) kfree(a2);
+    return r;
+}
+/* a program's narrow string (n bytes, or to its NUL) in code page cp, as UTF-16 */
+static uint16_t *win32_mb_dup(uint64_t u, long n, uint32_t cp, int *len) {
+    if (!u) return 0;
+    long cnt = n;
+    if (n < 0) {
+        for (cnt = 0;; cnt++) {
+            uint8_t b = 1;
+            if (copy_from_user(&b, (const void *)(uintptr_t)(u + (uint64_t)cnt), 1) != 0) return 0;
+            if (!b) break;
+            if (cnt > 0x100000) return 0;
+        }
+    }
+    uint8_t *b = kmalloc((size_t)cnt + 1);
+    uint16_t *s = kmalloc((size_t)(cnt + 1) * 2);
+    if (!b || !s || (cnt && copy_from_user(b, (const void *)(uintptr_t)u, (size_t)cnt) != 0)) {
+        if (b) kfree(b);
+        if (s) kfree(s);
+        return 0;
+    }
+    int o = 0;
+    for (long i = 0; i < cnt; ) {
+        if (cp == W32NLS_UTF8) {
+            uint32_t c; bool bad;
+            int k = w32nls_utf8_dec(b + i, (int)(cnt - i), &c, &bad);
+            if (k < 0) { c = 0xFFFD; k = (int)(cnt - i); }
+            if (c > 0xFFFF) { c -= 0x10000; s[o++] = (uint16_t)(0xD800 + (c >> 10)); s[o++] = (uint16_t)(0xDC00 + (c & 0x3FF)); }
+            else s[o++] = (uint16_t)c;
+            i += k;
+        } else {
+            s[o++] = cp ? w32nls_b2u(cp, b[i], false) : b[i];
+            i++;
+        }
+    }
+    s[o] = 0;
+    kfree(b);
+    *len = o;
+    return s;
+}
+static long w32_CompareStringEx(uint64_t *a) {
+    return win32_compare_w(win32_loc_of_name(a[0]), (uint32_t)a[1], a[2], (int32_t)a[3], a[4], (int32_t)a[5]);
+}
+static long w32_CompareStringW(uint64_t *a) {
+    return win32_compare_w(w32nls_find_lcid((uint32_t)a[0]), (uint32_t)a[1], a[2], (int32_t)a[3], a[4], (int32_t)a[5]);
+}
+static long w32_CompareStringA(uint64_t *a) {
+    int loc = w32nls_find_lcid((uint32_t)a[0]);
+    if (loc < 0 || !a[2] || !a[4]) return win32_fail(87);
+    uint32_t cp = w32nls_info_number(loc, 0x1004);
+    int l1, l2;
+    uint16_t *s1 = win32_mb_dup(a[2], (int32_t)a[3], cp, &l1);
+    uint16_t *s2 = s1 ? win32_mb_dup(a[4], (int32_t)a[5], cp, &l2) : 0;
+    long r = (s1 && s2) ? w32nls_compare(loc, (uint32_t)a[1], s1, l1, s2, l2) : win32_fail(87);
+    if (s1) kfree(s1);
+    if (s2) kfree(s2);
+    return r;
+}
+/* CompareStringOrdinal(s1, n1, s2, n2, ignorecase): the units, uppercased
+ * when ignorecase */
+static long w32_CompareStringOrdinal(uint64_t *a) {
+    int l1, l2;
+    uint16_t *s1 = win32_w16_dup(a[0], (int32_t)a[1], &l1);
+    uint16_t *s2 = s1 ? win32_w16_dup(a[2], (int32_t)a[3], &l2) : 0;
+    if (!s1 || !s2) { if (s1) kfree(s1); if (s2) kfree(s2); return win32_fail(87); }
+    long r = 2;
+    for (int i = 0; r == 2; i++) {
+        if (i >= l1 || i >= l2) { r = l1 == l2 ? 2 : l1 < l2 ? 1 : 3; break; }
+        uint16_t x = s1[i], y = s2[i];
+        if (a[4]) { x = w32nls_uupper(x); y = w32nls_uupper(y); }
+        if (x != y) r = x < y ? 1 : 3;
+    }
+    kfree(s1);
+    kfree(s2);
+    return r;
+}
+/* lstrcmp(i)A/W: the user's locale's order (NORM_IGNORECASE for the i's), as
+ * -1 / 0 / 1 */
+static long win32_lstrcmp(uint64_t s1, uint64_t s2, bool wide, bool icase) {
+    uint16_t z = 0;
+    int l1, l2;
+    uint16_t *a1 = s1 ? (wide ? win32_w16_dup(s1, -1, &l1) : win32_mb_dup(s1, -1, w32nls_cp(0), &l1)) : 0;
+    uint16_t *a2 = s2 ? (wide ? win32_w16_dup(s2, -1, &l2) : win32_mb_dup(s2, -1, w32nls_cp(0), &l2)) : 0;
+    int r = w32nls_compare(w32nls_user_default(), icase ? 1u : 0u, a1 ? a1 : &z, a1 ? l1 : 0, a2 ? a2 : &z, a2 ? l2 : 0);
+    if (a1) kfree(a1);
+    if (a2) kfree(a2);
+    return r - 2;
+}
+static long w32_lstrcmpA(uint64_t *a)  { return win32_lstrcmp(a[0], a[1], false, false); }
+static long w32_lstrcmpW(uint64_t *a)  { return win32_lstrcmp(a[0], a[1], true, false); }
+static long w32_lstrcmpiA(uint64_t *a) { return win32_lstrcmp(a[0], a[1], false, true); }
+static long w32_lstrcmpiW(uint64_t *a) { return win32_lstrcmp(a[0], a[1], true, true); }
+
+/* -- numbers, dates, times ------------------------------------------------------- */
+static void win32_systime_now(struct w32nls_time *t) {
+    int64_t s = (int64_t)(lx_realtime_ns(perf_now_ns()) / 1000000000ull);
+    int64_t days = s / 86400, rem = s % 86400;
+    int64_t z = days + 719468, era = (z >= 0 ? z : z - 146096) / 146097;
+    int doe = (int)(z - era * 146097);
+    int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int y = (int)(yoe + era * 400), doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int mp = (5 * doy + 2) / 153, d = doy - (153 * mp + 2) / 5 + 1, m = mp + (mp < 10 ? 3 : -9);
+    t->year = y + (m <= 2); t->month = m; t->day = d;
+    t->hour = (int)(rem / 3600); t->min = (int)(rem / 60 % 60); t->sec = (int)(rem % 60);
+}
+/* SYSTEMTIME (NULL: now): wYear, wMonth, wDayOfWeek, wDay, wHour, wMinute, wSecond */
+static bool win32_get_systime(uint64_t u, struct w32nls_time *t) {
+    if (!u) { win32_systime_now(t); return true; }
+    uint16_t st[8];
+    if (copy_from_user(st, (const void *)(uintptr_t)u, sizeof st) != 0) return false;
+    if (st[1] < 1 || st[1] > 12 || st[3] < 1 || st[3] > 31 || st[4] > 23 || st[5] > 59 || st[6] > 59) return false;
+    t->year = st[0]; t->month = st[1]; t->day = st[3]; t->hour = st[4]; t->min = st[5]; t->sec = st[6];
+    return true;
+}
+static long win32_fmt_answer(const uint16_t *o, int n, uint64_t dst, int cch) {
+    if (n < 0) return win32_fail(122);
+    return win32_w16_answer(o, n, dst, cch);
+}
+/* GetDateFormatEx/W: the picture given, else the locale's short, long or
+ * year-month one (DATE_SHORTDATE 1, DATE_LONGDATE 2, DATE_YEARMONTH 8) */
+static long win32_date_format(int loc, uint32_t flags, uint64_t ust, uint64_t ufmt, uint64_t dst, int cch) {
+    struct w32nls_time t;
+    if (loc < 0 || cch < 0 || !win32_get_systime(ust, &t)) return win32_fail(87);
+    int pl;
+    uint16_t *pic = ufmt ? win32_w16_dup(ufmt, -1, &pl) : 0;
+    const uint16_t *p = pic ? pic : w32nls_info(loc, (flags & 2u) ? 0x20u : (flags & 8u) ? 0x1006u : 0x1Fu);
+    uint16_t o[256];
+    int n = w32nls_fmt_picture(loc, p, &t, o, 255);
+    if (pic) kfree(pic);
+    return win32_fmt_answer(o, n, dst, cch);
+}
+/* GetTimeFormatEx/W: the picture given, else the locale's; TIME_NOSECONDS
+ * and its kin take their fields out */
+static long win32_time_format(int loc, uint32_t flags, uint64_t ust, uint64_t ufmt, uint64_t dst, int cch) {
+    struct w32nls_time t;
+    if (loc < 0 || cch < 0 || !win32_get_systime(ust, &t)) return win32_fail(87);
+    int pl;
+    uint16_t *pic = ufmt ? win32_w16_dup(ufmt, -1, &pl) : 0;
+    const uint16_t *p = pic ? pic : w32nls_info(loc, 0x1003);
+    uint16_t p2[128], o[256];
+    w32nls_time_picture(p, flags & 0xFu, p2, 128);
+    int n = w32nls_fmt_picture(loc, p2, &t, o, 255);
+    if (pic) kfree(pic);
+    return win32_fmt_answer(o, n, dst, cch);
+}
+static long w32_GetDateFormatEx(uint64_t *a) { return win32_date_format(win32_loc_of_name(a[0]), (uint32_t)a[1], a[2], a[3], a[4], (int)(int32_t)a[5]); }
+static long w32_GetDateFormatW(uint64_t *a)  { return win32_date_format(w32nls_find_lcid((uint32_t)a[0]), (uint32_t)a[1], a[2], a[3], a[4], (int)(int32_t)a[5]); }
+static long w32_GetTimeFormatEx(uint64_t *a) { return win32_time_format(win32_loc_of_name(a[0]), (uint32_t)a[1], a[2], a[3], a[4], (int)(int32_t)a[5]); }
+static long w32_GetTimeFormatW(uint64_t *a)  { return win32_time_format(w32nls_find_lcid((uint32_t)a[0]), (uint32_t)a[1], a[2], a[3], a[4], (int)(int32_t)a[5]); }
+/* GetNumberFormatEx/W(locale, flags, value, NUMBERFMTW *, out, cch) */
+static long win32_number_format(int loc, uint64_t uval, uint64_t ufmt, uint64_t dst, int cch) {
+    if (loc < 0 || cch < 0 || !uval) return win32_fail(87);
+    int vl;
+    uint16_t *v = win32_w16_dup(uval, -1, &vl);
+    if (!v || vl > 60) { if (v) kfree(v); return win32_fail(87); }
+    char val[64];
+    for (int i = 0; i <= vl; i++) val[i] = v[i] < 0x80 ? (char)v[i] : '?';
+    kfree(v);
+    struct w32nls_numfmt nf;
+    w32nls_numfmt_of(loc, &nf);
+    if (ufmt) {                        /* NUMBERFMTW: digits, lzero, grouping, dec, thou, negorder */
+        uint8_t f[40];
+        if (copy_from_user(f, (const void *)(uintptr_t)ufmt, sizeof f) != 0) return win32_fail(87);
+        uint32_t d, lz, g, ng; uint64_t pd, pt;
+        memcpy(&d, f, 4); memcpy(&lz, f + 4, 4); memcpy(&g, f + 8, 4);
+        memcpy(&pd, f + 16, 8); memcpy(&pt, f + 24, 8); memcpy(&ng, f + 32, 4);
+        nf.digits = (int)d; nf.lzero = (int)lz; nf.negorder = (int)ng;
+        nf.ngroup = 0; nf.repeat = true;
+        if (g == 32) { nf.group[0] = 3; nf.group[1] = 2; nf.ngroup = 2; }
+        else if (g) { nf.group[0] = (int)g; nf.ngroup = 1; }
+        int l;
+        uint16_t *s = pd ? win32_w16_dup(pd, -1, &l) : 0;
+        if (s) { int i = 0; for (; s[i] && i < 7; i++) nf.dec[i] = s[i]; nf.dec[i] = 0; kfree(s); }
+        s = pt ? win32_w16_dup(pt, -1, &l) : 0;
+        if (s) { int i = 0; for (; s[i] && i < 7; i++) nf.thou[i] = s[i]; nf.thou[i] = 0; kfree(s); }
+    }
+    uint16_t o[256];
+    int n = w32nls_fmt_number(&nf, val, o, 255);
+    if (n == -2) return win32_fail(87);
+    return win32_fmt_answer(o, n, dst, cch);
+}
+static long w32_GetNumberFormatEx(uint64_t *a) { return win32_number_format(win32_loc_of_name(a[0]), a[2], a[3], a[4], (int)(int32_t)a[5]); }
+static long w32_GetNumberFormatW(uint64_t *a)  { return win32_number_format(w32nls_find_lcid((uint32_t)a[0]), a[2], a[3], a[4], (int)(int32_t)a[5]); }
+
+/* -- the C runtime's locale ------------------------------------------------------ */
+#define W32LC_ALL 0
+#define W32LC_COLLATE 1
+#define W32LC_CTYPE 2
+#define W32LC_MONETARY 3
+#define W32LC_NUMERIC 4
+#define W32LC_TIME 5
+static int win32_loc_parse(const char *in, int *loc, uint32_t *cp, char *ans, int cap);
+static void win32_loc_refresh(void);
+/* setlocale(category, name) */
+static const char *const g_w32lc_names[6] = { "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MONETARY", "LC_NUMERIC", "LC_TIME" };
+static void win32_lc_answer_all(char *out, int cap) {
+    struct win32_crtloc *L = &g_win32_loc;
+    bool same = true;
+    for (int c = 2; c <= 5; c++) if (strcmp(L->name[c], L->name[1])) same = false;
+    if (same) { ksnprintf(out, (size_t)cap, "%s", L->name[1][0] ? L->name[1] : "C"); return; }
+    int o = 0;
+    for (int c = 1; c <= 5 && o < cap - 1; c++)
+        o += ksnprintf(out + o, (size_t)(cap - o), "%s%s=%s", c > 1 ? ";" : "", g_w32lc_names[c], L->name[c][0] ? L->name[c] : "C");
+}
+/* the per-process memory the answers live in: LC_ALL's at 0 (wide at
+ * 2048), localeconv's strings at 512 and 1024, the locales' wide names at
+ * 3072 (___lc_locale_name_func's), each category's own answer from 4096
+ * (wide from 5120) -- one answer does not overwrite another's (measured: a
+ * program holds setlocale(LC_NUMERIC, NULL) and setlocale(LC_TIME, NULL)
+ * both) */
+static uint64_t win32_lc_ubuf(void) {
+    struct win32_crtloc *L = &g_win32_loc;
+    if (!L->ubuf) L->ubuf = win32_malloc_hdr(8192);
+    return L->ubuf;
+}
+static uint64_t win32_lc_answer_at(int cat, bool wide) {
+    uint64_t ub = win32_lc_ubuf();
+    if (!ub) return 0;
+    if (!cat) return ub + (wide ? 2048 : 0);
+    return wide ? ub + 5120 + 256 * (uint64_t)cat : ub + 4096 + 128 * (uint64_t)cat;
+}
+static char *win32_setlocale_k(int cat, const char *name, char *ans, int cap) {
+    struct win32_crtloc *L = &g_win32_loc;
+    if (cat < 0 || cat > 5) return 0;
+    if (!name) {
+        if (cat == W32LC_ALL) win32_lc_answer_all(ans, cap);
+        else ksnprintf(ans, (size_t)cap, "%s", L->name[cat][0] ? L->name[cat] : "C");
+        return ans;
+    }
+    if (cat == W32LC_ALL && !strncmp(name, "LC_", 3)) {            /* the composite answer back */
+        const char *p = name;
+        while (*p) {
+            int c = 1;
+            for (; c <= 5; c++) { int k = (int)strlen(g_w32lc_names[c]); if (!strncmp(p, g_w32lc_names[c], (size_t)k) && p[k] == '=') { p += k + 1; break; } }
+            if (c > 5) return 0;
+            char one[72];
+            int k = 0;
+            while (*p && *p != ';' && k < 71) one[k++] = *p++;
+            one[k] = 0;
+            if (*p == ';') p++;
+            if (!win32_setlocale_k(c, one, ans, cap)) return 0;
+        }
+        win32_lc_answer_all(ans, cap);
+        return ans;
+    }
+    int loc;
+    uint32_t cp;
+    char a1[72];
+    if (win32_loc_parse(name, &loc, &cp, a1, sizeof a1) < 0) return 0;
+    for (int c = (cat == W32LC_ALL ? 1 : cat); c <= (cat == W32LC_ALL ? 5 : cat); c++) {
+        L->loc[c] = (int8_t)(loc + 1);
+        L->cp[c] = cp;
+        memcpy(L->name[c], a1, sizeof a1);
+    }
+    win32_loc_refresh();
+    if (cat == W32LC_ALL) win32_lc_answer_all(ans, cap);
+    else ksnprintf(ans, (size_t)cap, "%s", a1);
+    return ans;
+}
+static long w32_setlocale(uint64_t *a) {
+    char name[96], ans[400];
+    const char *np = 0;
+    if (a[1]) {
+        if (strncpy_from_user(name, (const char *)(uintptr_t)a[1], sizeof name) < 0) return 0;
+        name[sizeof name - 1] = 0;
+        np = name;
+    }
+    if (!win32_setlocale_k((int)a[0], np, ans, sizeof ans)) return 0;
+    uint64_t ub = win32_lc_answer_at((int)a[0], false);
+    if (!ub) return 0;
+    return copy_to_user((void *)(uintptr_t)ub, ans, strlen(ans) + 1) == 0 ? (long)ub : 0;
+}
+static long w32_wsetlocale(uint64_t *a) {
+    char name[96], ans[400];
+    const char *np = 0;
+    if (a[1]) {
+        if (win32_w16_to_utf8(a[1], -1, name, sizeof name) < 0) return 0;
+        np = name;
+    }
+    if (!win32_setlocale_k((int)a[0], np, ans, sizeof ans)) return 0;
+    uint64_t ub = win32_lc_answer_at((int)a[0], true);
+    if (!ub) return 0;
+    uint16_t w[400];
+    int n = 0;
+    for (; ans[n] && n < 399; n++) w[n] = (uint8_t)ans[n];
+    w[n] = 0;
+    return copy_to_user((void *)(uintptr_t)ub, w, (size_t)(n + 1) * 2) == 0 ? (long)ub : 0;
+}
+/* the CRT's view after a change: the ctype table, ___lc_locale_name_func's names */
+static void win32_loc_refresh(void) {
+    struct win32_crtloc *L = &g_win32_loc;
+    uint64_t t = 0;
+    (void)copy_from_user(&t, (const void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_PCTYPE), 8);
+    if (t) (void)copy_to_user((void *)(uintptr_t)t, w32nls_pctype(L->cp[W32LC_CTYPE] == W32NLS_UTF8 ? 0 : L->cp[W32LC_CTYPE]), 512);
+    uint64_t ub = win32_lc_ubuf();
+    if (!ub) return;
+    for (int c = 1; c <= 5; c++) {             /* wide locale names at ub + 3072 + c * 32 */
+        uint64_t p = 0;
+        int loc = L->loc[c] - 1;
+        if (loc >= 0) {
+            const uint16_t *s = w32nls_info(loc, 0x5C);
+            int n = win32_w16len(s);
+            p = ub + 3072 + (uint64_t)c * 32;
+            (void)copy_to_user((void *)(uintptr_t)p, s, (size_t)(n + 1) * 2);
+        }
+        (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_LCNAMES + (uint64_t)c * 8), &p, 8);
+    }
+}
+/* a code page suffix: 65001 for UTF-8's spellings, else its number; 0 none
+ * of tobyOS's */
+static uint32_t win32_loc_cpname(const char *s) {
+    if (!strcmp(s, "utf8") || !strcmp(s, "UTF8") || !strcmp(s, "utf-8") || !strcmp(s, "UTF-8") || !strcmp(s, "Utf-8") ||
+        !strcmp(s, "Utf8"))
+        return W32NLS_UTF8;
+    uint32_t v = 0;
+    for (const char *p = s; *p; p++) { if (*p < '0' || *p > '9') return 0; v = v * 10 + (uint32_t)(*p - '0'); }
+    if (v == W32NLS_UTF8) return v;
+    return v > 3 && w32nls_cp(v) == v ? v : 0;
+}
+static bool win32_w16_eq_ci(const uint16_t *w, const char *s, int n) {
+    for (int i = 0; i < n; i++) {
+        uint16_t c = w[i];
+        char d = s[i];
+        if (!c) return false;
+        if (c >= 'A' && c <= 'Z') c = (uint16_t)(c + 32);
+        if (d >= 'A' && d <= 'Z') d = (char)(d + 32);
+        if (c != (uint16_t)(uint8_t)d) return false;
+    }
+    return !w[n];
+}
+static void win32_w16_ascii(const uint16_t *w, char *out, int cap) {
+    int i = 0;
+    for (; w && w[i] && i < cap - 1; i++) out[i] = w[i] < 0x80 ? (char)w[i] : '?';
+    out[i] = 0;
+}
+/* setlocale's names (measured): "C"; "" the user's (English_United States.1252);
+ * ".cp" the user's with that code page; "ll-CC" and "ll" (a locale's name,
+ * as given; ".UTF-8" its only suffix); "Language[_Country][.cp]" by the
+ * English names (the language's first country) */
+static int win32_loc_parse(const char *in, int *loc, uint32_t *cp, char *ans, int cap) {
+    if (!strcmp(in, "C")) { *loc = -1; *cp = 0; ans[0] = 0; ksnprintf(ans, (size_t)cap, "C"); return 0; }
+    char base[72], suf[24];
+    int b = 0, s = 0;
+    const char *p = in;
+    while (*p && *p != '.' && b < 71) base[b++] = *p++;
+    base[b] = 0;
+    suf[0] = 0;
+    if (*p == '.') { p++; while (*p && s < 23) suf[s++] = *p++; suf[s] = 0; }
+    if (*p) return -1;
+    uint32_t scp = 0;
+    if (s) { scp = win32_loc_cpname(suf); if (!scp) return -1; }
+    int l = -1;
+    bool english = false;
+    if (!b) {                                                     /* "" or ".cp": the user's */
+        if (in[0] && !s) return -1;
+        l = w32nls_user_default();
+        english = true;
+    } else {
+        bool bcp = true;                                          /* ll, ll-CC */
+        for (int i = 0; i < b; i++)
+            if (!((base[i] >= 'a' && base[i] <= 'z') || (base[i] >= 'A' && base[i] <= 'Z') || base[i] == '-')) bcp = false;
+        int dash = 0;
+        for (int i = 0; i < b; i++) if (base[i] == '-') dash++;
+        if (bcp && (dash == 1 || (dash == 0 && b <= 3 && base[0] >= 'a'))) {
+            for (int k = 0; k < w32nls_nloc() && l < 0; k++) {
+                if (dash && win32_w16_eq_ci(w32nls_info(k, 0x5C), base, b)) l = k;
+                else if (!dash && win32_w16_eq_ci(w32nls_info(k, 0x59), base, b)) l = k;   /* ISO 639 */
+            }
+            if (l < 0) return -1;
+            if (s && scp != W32NLS_UTF8) return -1;               /* "de-DE.1251": no */
+            *loc = l;
+            *cp = s ? scp : w32nls_info_number(l, 0x1004);
+            ksnprintf(ans, (size_t)cap, "%s", in);
+            return 0;
+        }
+        char lang[48], ctry[48];                                  /* Language[_Country] */
+        int i = 0, j = 0;
+        while (base[i] && base[i] != '_' && i < 47) { lang[i] = base[i]; i++; }
+        lang[i] = 0;
+        ctry[0] = 0;
+        if (base[i] == '_') { i++; while (base[i] && j < 47) ctry[j++] = base[i++]; ctry[j] = 0; }
+        for (int k = 0; k < w32nls_nloc() && l < 0; k++) {
+            if (!win32_w16_eq_ci(w32nls_info(k, 0x1001), lang, (int)strlen(lang))) continue;
+            if (ctry[0] && !win32_w16_eq_ci(w32nls_info(k, 0x1002), ctry, (int)strlen(ctry))) continue;
+            if (!w32nls_info(k, 0x5C)[0]) continue;               /* not the invariant one */
+            l = k;
+        }
+        if (l < 0) return -1;
+        english = true;
+    }
+    if (!english) return -1;
+    *loc = l;
+    *cp = s ? scp : w32nls_info_number(l, 0x1004);
+    char ln[48], cn[48];
+    win32_w16_ascii(w32nls_info(l, 0x1001), ln, sizeof ln);
+    win32_w16_ascii(w32nls_info(l, 0x1002), cn, sizeof cn);
+    if (*cp == W32NLS_UTF8) ksnprintf(ans, (size_t)cap, "%s_%s.utf8", ln, cn);
+    else ksnprintf(ans, (size_t)cap, "%s_%s.%u", ln, cn, *cp);
+    return 0;
+}
+/* LC_CTYPE's character to bytes (1..4) in its code page -- the C locale's
+ * bytes to 0xFF; a code page's own or best fit; -1 none */
+static int win32_lc_wc2mb(uint16_t u, uint16_t lo, uint8_t *b, int *took) {
+    uint32_t cp = g_win32_loc.cp[W32LC_CTYPE];
+    *took = 1;
+    if (!cp) { if (u > 0xFF) return -1; b[0] = (uint8_t)u; return 1; }
+    return win32_cp_put(cp, u, lo, false, b, took);
+}
+/* LC_CTYPE's bytes b[0..n) to one character: the bytes it takes (>= 1), -1
+ * not one (EILSEQ), -2 cut short */
+static int win32_lc_mb2wc(const uint8_t *b, int n, uint32_t *c) {
+    uint32_t cp = g_win32_loc.cp[W32LC_CTYPE];
+    if (n <= 0) return -2;
+    if (!cp) { *c = b[0]; return 1; }
+    if (cp == W32NLS_UTF8) {
+        bool bad;
+        int k = w32nls_utf8_dec(b, n, c, &bad);
+        if (k < 0) return -2;
+        return bad ? -1 : k;
+    }
+    uint16_t u = w32nls_b2u(cp, b[0], true);
+    if (u == 0xFFFF) return -1;
+    *c = u;
+    return 1;
+}
+/* LC_NUMERIC's decimal point (its first character, ASCII) */
+static char win32_lc_decimal(void) {
+    int loc = g_win32_loc.loc[W32LC_NUMERIC] - 1;
+    if (loc < 0) return '.';
+    const uint16_t *d = w32nls_info(loc, 0x0E);
+    return d && d[0] && d[0] < 0x80 ? (char)d[0] : '.';
+}
+/* a number's text for kmath_strtod: LC_NUMERIC's decimal point as '.', a '.'
+ * no point (strtod("1.5") is 1 in de-DE, measured) */
+static void win32_lc_num_in(char *s) {
+    char d = win32_lc_decimal();
+    if (d == '.') return;
+    for (; *s; s++) {
+        if (*s == d) *s = '.';
+        else if (*s == '.') *s = '\x01';
+    }
+}
+/* -- the multibyte conversions -- */
+static long w32_mb_cur_max(uint64_t *a) { (void)a; return g_win32_loc.cp[W32LC_CTYPE] == W32NLS_UTF8 ? 4 : 1; }
+static long w32_lc_codepage_func(uint64_t *a) { (void)a; return (long)g_win32_loc.cp[W32LC_CTYPE]; }
+/* mbtowc(pwc, s, n) */
+static long w32_mbtowc(uint64_t *a) {
+    if (!a[1]) return 0;
+    uint8_t b[4];
+    int n = a[2] > 4 ? 4 : (int)a[2];
+    if (n <= 0) return -1;
+    if (copy_from_user(b, (const void *)(uintptr_t)a[1], 1) != 0) return -1;
+    if (!b[0]) { if (a[0]) { uint16_t z = 0; (void)copy_to_user((void *)(uintptr_t)a[0], &z, 2); } return 0; }
+    for (int i = 1; i < n; i++) if (copy_from_user(&b[i], (const void *)(uintptr_t)(a[1] + (uint64_t)i), 1) != 0 || !b[i]) { n = i; break; }
+    uint32_t c;
+    int k = win32_lc_mb2wc(b, n, &c);
+    if (k < 0 || c > 0xFFFF) { win32_crt_errno(42); return -1; }
+    if (a[0]) { uint16_t w = (uint16_t)c; (void)copy_to_user((void *)(uintptr_t)a[0], &w, 2); }
+    return k;
+}
+static long w32_mblen(uint64_t *a) {
+    uint64_t b[3] = { 0, a[0], a[1] };
+    return w32_mbtowc(b);
+}
+/* wctomb(s, wc) */
+static long w32_wctomb(uint64_t *a) {
+    if (!a[0]) return 0;
+    uint8_t b[4];
+    int took, k = win32_lc_wc2mb((uint16_t)a[1], 0, b, &took);
+    if (k < 0) { win32_crt_errno(42); return -1; }
+    return copy_to_user((void *)(uintptr_t)a[0], b, (size_t)k) == 0 ? k : -1;
+}
+static long w32_btowc(uint64_t *a) {
+    int c = (int)a[0];
+    if (c < 0 || c > 0xFF) return 0xFFFF;
+    uint8_t b = (uint8_t)c;
+    uint32_t w;
+    return win32_lc_mb2wc(&b, 1, &w) == 1 ? (long)w : 0xFFFF;
+}
+static long w32_wctob(uint64_t *a) {
+    uint8_t b[4];
+    int took, k = win32_lc_wc2mb((uint16_t)a[0], 0, b, &took);
+    return k == 1 ? (long)b[0] : -1;
+}
+/* mbstowcs(dst, src, n): the units (no NUL), -1 EILSEQ */
+static long w32_mbstowcs(uint64_t *a) {
+    uint32_t cp = g_win32_loc.cp[W32LC_CTYPE];
+    int len;
+    uint8_t probe = 0;
+    if (!a[1] || copy_from_user(&probe, (const void *)(uintptr_t)a[1], 1) != 0) { win32_crt_errno(22); return -1; }
+    long cnt = 0;
+    for (;; cnt++) { uint8_t c; if (copy_from_user(&c, (const void *)(uintptr_t)(a[1] + (uint64_t)cnt), 1) != 0 || !c) break; }
+    uint8_t *b = kmalloc((size_t)cnt + 1);
+    if (!b) return -1;
+    (void)copy_from_user(b, (const void *)(uintptr_t)a[1], (size_t)cnt);
+    long o = 0;
+    for (long i = 0; i < cnt; ) {
+        uint32_t c;
+        int k = win32_lc_mb2wc(b + i, (int)(cnt - i), &c);
+        if (k < 0) { kfree(b); win32_crt_errno(42); return -1; }
+        int nu = c > 0xFFFF ? 2 : 1;
+        if (a[0]) {
+            if ((uint64_t)(o + nu) > a[2]) break;
+            uint16_t w[2];
+            if (nu == 2) { uint32_t v = c - 0x10000; w[0] = (uint16_t)(0xD800 + (v >> 10)); w[1] = (uint16_t)(0xDC00 + (v & 0x3FF)); }
+            else w[0] = (uint16_t)c;
+            (void)copy_to_user((void *)(uintptr_t)(a[0] + (uint64_t)o * 2), w, (size_t)nu * 2);
+        }
+        o += nu;
+        i += k;
+    }
+    kfree(b);
+    if (a[0] && (uint64_t)o < a[2]) { uint16_t z = 0; (void)copy_to_user((void *)(uintptr_t)(a[0] + (uint64_t)o * 2), &z, 2); }
+    (void)cp; (void)len;
+    return o;
+}
+/* wcstombs(dst, src, n): the bytes (no NUL), -1 EILSEQ */
+static long w32_wcstombs(uint64_t *a) {
+    int n;
+    uint16_t *s = win32_w16_dup(a[1], -1, &n);
+    if (!s) { win32_crt_errno(22); return -1; }
+    long o = 0;
+    for (int i = 0; i < n; ) {
+        uint8_t b[4];
+        int took, k = win32_lc_wc2mb(s[i], s[i + 1], b, &took);
+        if (k < 0) { kfree(s); win32_crt_errno(42); return -1; }
+        if (a[0]) {
+            if ((uint64_t)(o + k) > a[2]) break;
+            (void)copy_to_user((void *)(uintptr_t)(a[0] + (uint64_t)o), b, (size_t)k);
+        }
+        o += k;
+        i += took;
+    }
+    kfree(s);
+    if (a[0] && (uint64_t)o < a[2]) { uint8_t z = 0; (void)copy_to_user((void *)(uintptr_t)(a[0] + (uint64_t)o), &z, 1); }
+    return o;
+}
+/* mbrtowc(pwc, s, n, state) / wcrtomb(s, wc, state) / mbrlen(s, n, state): no shift state */
+static long w32_mbrtowc(uint64_t *a) {
+    if (!a[1]) return 0;
+    uint8_t b[4];
+    int n = a[2] > 4 ? 4 : (int)a[2];
+    if (n <= 0) return -2;
+    for (int i = 0; i < n; i++) if (copy_from_user(&b[i], (const void *)(uintptr_t)(a[1] + (uint64_t)i), 1) != 0) { n = i; break; }
+    if (n && !b[0]) { if (a[0]) { uint16_t z = 0; (void)copy_to_user((void *)(uintptr_t)a[0], &z, 2); } return 0; }
+    uint32_t c;
+    int k = win32_lc_mb2wc(b, n, &c);
+    if (k == -2) return -2;
+    if (k < 0 || c > 0xFFFF) { win32_crt_errno(42); return -1; }
+    if (a[0]) { uint16_t w = (uint16_t)c; (void)copy_to_user((void *)(uintptr_t)a[0], &w, 2); }
+    return k;
+}
+static long w32_mbrlen(uint64_t *a) {
+    uint64_t b[4] = { 0, a[0], a[1], a[2] };
+    return w32_mbrtowc(b);
+}
+static long w32_wcrtomb(uint64_t *a) {
+    if (!a[0]) return 1;
+    uint64_t b[2] = { a[0], a[1] };
+    return w32_wctomb(b);
+}
+/* -- the ctype functions: LC_CTYPE's table -- */
+static uint16_t win32_lc_ctype(int c) {
+    if (c < 0 || c > 255) return 0;
+    uint32_t cp = g_win32_loc.cp[W32LC_CTYPE];
+    return w32nls_pctype(cp == W32NLS_UTF8 ? 0 : cp)[c];
+}
+static long w32_lc_toupper(uint64_t *a) {
+    int c = (int)a[0];
+    if (c < 0 || c > 255) return c;
+    uint32_t cp = g_win32_loc.cp[W32LC_CTYPE];
+    return w32nls_toupper_tab(cp == W32NLS_UTF8 ? 0 : cp)[c];
+}
+static long w32_lc_tolower(uint64_t *a) {
+    int c = (int)a[0];
+    if (c < 0 || c > 255) return c;
+    uint32_t cp = g_win32_loc.cp[W32LC_CTYPE];
+    return w32nls_tolower_tab(cp == W32NLS_UTF8 ? 0 : cp)[c];
+}
+/* towupper / towlower: the C locale's ASCII only; a named one's below 256
+ * through its code page's byte table (the UCRT's: towupper(0xFF) is 0x9F in
+ * a 1252 locale, measured), above it Unicode's */
+static long w32_towupper(uint64_t *a) {
+    uint16_t c = (uint16_t)a[0];
+    uint32_t cp = g_win32_loc.cp[W32LC_CTYPE];
+    if (!cp) return (c >= 'a' && c <= 'z') ? c - 32 : c;
+    if (c < 256 && cp != W32NLS_UTF8) return w32nls_toupper_tab(cp)[c];
+    return w32nls_uupper(c);
+}
+static long w32_towlower(uint64_t *a) {
+    uint16_t c = (uint16_t)a[0];
+    uint32_t cp = g_win32_loc.cp[W32LC_CTYPE];
+    if (!cp) return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    if (c < 256 && cp != W32NLS_UTF8) return w32nls_tolower_tab(cp)[c];
+    return w32nls_ulower(c);
+}
+/* -- collation and case-blind comparison -- */
+static long win32_coll(uint64_t s1, uint64_t s2, long n, bool wide, bool icase) {
+    int loc = g_win32_loc.loc[W32LC_COLLATE] - 1;
+    uint32_t cp = g_win32_loc.cp[W32LC_COLLATE];
+    int l1, l2;
+    uint16_t *a1 = wide ? win32_w16_dup(s1, -1, &l1) : win32_mb_dup(s1, -1, cp ? cp : 28591, &l1);
+    uint16_t *a2 = a1 ? (wide ? win32_w16_dup(s2, -1, &l2) : win32_mb_dup(s2, -1, cp ? cp : 28591, &l2)) : 0;
+    if (!a1 || !a2) { if (a1) kfree(a1); if (a2) kfree(a2); win32_crt_errno(22); return 0x7FFFFFFF; }
+    if (n >= 0) { if (l1 > n) l1 = (int)n; if (l2 > n) l2 = (int)n; }
+    long r;
+    if (loc < 0) {                                       /* the C locale: the units (folded for the i's) */
+        r = 0;
+        for (int i = 0; !r; i++) {
+            if (i >= l1 || i >= l2) { r = l1 < l2 ? -1 : l1 > l2 ? 1 : 0; break; }
+            uint16_t x = a1[i], y = a2[i];
+            if (icase) { if (x >= 'A' && x <= 'Z') x += 32; if (y >= 'A' && y <= 'Z') y += 32; }
+            if (x != y) r = x < y ? -1 : 1;
+        }
+    } else r = w32nls_compare(loc, 0x1000u | (icase ? 1u : 0u), a1, l1, a2, l2) - 2;   /* SORT_STRINGSORT */
+    kfree(a1);
+    kfree(a2);
+    return r;
+}
+static long w32_strcoll(uint64_t *a)    { return win32_coll(a[0], a[1], -1, false, false); }
+static long w32_wcscoll(uint64_t *a)    { return win32_coll(a[0], a[1], -1, true, false); }
+static long w32_stricoll(uint64_t *a)   { return win32_coll(a[0], a[1], -1, false, true); }
+static long w32_wcsicoll(uint64_t *a)   { return win32_coll(a[0], a[1], -1, true, true); }
+static long w32_strncoll(uint64_t *a)   { return win32_coll(a[0], a[1], (long)a[2], false, false); }
+static long w32_wcsncoll(uint64_t *a)   { return win32_coll(a[0], a[1], (long)a[2], true, false); }
+/* _stricmp / _strnicmp: LC_CTYPE's tolower, the difference of the first
+ * bytes that differ; _wcsicmp / _wcsnicmp: towlower's */
+static long win32_icmp(uint64_t s1, uint64_t s2, long n, bool wide) {
+    for (long i = 0; n < 0 || i < n; i++) {
+        uint16_t x = 0, y = 0;
+        if (wide) {
+            if (copy_from_user(&x, (const void *)(uintptr_t)(s1 + (uint64_t)i * 2), 2) != 0 ||
+                copy_from_user(&y, (const void *)(uintptr_t)(s2 + (uint64_t)i * 2), 2) != 0) return 0x7FFFFFFF;
+            uint64_t ax[1] = { x }, ay[1] = { y };
+            x = (uint16_t)w32_towlower(ax); y = (uint16_t)w32_towlower(ay);
+        } else {
+            uint8_t bx = 0, by = 0;
+            if (copy_from_user(&bx, (const void *)(uintptr_t)(s1 + (uint64_t)i), 1) != 0 ||
+                copy_from_user(&by, (const void *)(uintptr_t)(s2 + (uint64_t)i), 1) != 0) return 0x7FFFFFFF;
+            uint64_t ax[1] = { bx }, ay[1] = { by };
+            x = (uint16_t)w32_lc_tolower(ax); y = (uint16_t)w32_lc_tolower(ay);
+        }
+        if (x != y) return (long)x - (long)y;
+        if (!x) return 0;
+    }
+    return 0;
+}
+static long w32_stricmp(uint64_t *a)  { return win32_icmp(a[0], a[1], -1, false); }
+static long w32_strnicmp(uint64_t *a) { return win32_icmp(a[0], a[1], (long)a[2], false); }
+static long w32_wcsicmp(uint64_t *a)  { return win32_icmp(a[0], a[1], -1, true); }
+static long w32_wcsnicmp(uint64_t *a) { return win32_icmp(a[0], a[1], (long)a[2], true); }
+/* -- localeconv: LC_NUMERIC's and LC_MONETARY's, in their code pages -- */
+static long w32_localeconv(uint64_t *a) {
+    (void)a;
+    struct win32_crtloc *L = &g_win32_loc;
+    uint64_t ub = win32_lc_ubuf();
+    uint64_t lc = WIN32_CRT_DATA_BASE + WIN32_CRT_LCONV;
+    if (!ub) return (long)lc;
+    uint8_t s[512];                                       /* the strings, at ub + 512 */
+    uint16_t ws[256];                                     /* the wide ones, at ub + 1024 */
+    int so = 0, wo = 0;
+    uint64_t ptr[10], wptr[8];
+    int8_t fx[8];
+    int ln = L->loc[W32LC_NUMERIC] - 1, lm = L->loc[W32LC_MONETARY] - 1;
+    uint32_t cpn = L->cp[W32LC_NUMERIC], cpm = L->cp[W32LC_MONETARY];
+    /* one field: the locale's LCTYPE (or a fixed text) in the code page */
+    #define W32LC_FIELD(idx, loc, lt, cp, fixed) do { \
+        ptr[idx] = ub + 512 + (uint64_t)so; \
+        const uint16_t *v_ = (loc) >= 0 ? w32nls_info((loc), (lt)) : 0; \
+        if ((loc) >= 0 && v_) { \
+            for (int i_ = 0; v_[i_] && so < 500; ) { uint8_t c_[4]; int t_, k_ = win32_cp_put((cp) ? (cp) : w32nls_cp(0), v_[i_], v_[i_ + 1], false, c_, &t_); \
+                if (k_ < 0) { c_[0] = '?'; k_ = 1; } for (int j_ = 0; j_ < k_; j_++) s[so++] = c_[j_]; i_ += t_; } \
+        } else { for (const char *f_ = (fixed); *f_; f_++) s[so++] = (uint8_t)*f_; } \
+        s[so++] = 0; } while (0)
+    W32LC_FIELD(0, ln, 0x0E, cpn, ".");                   /* decimal_point */
+    W32LC_FIELD(1, ln, 0x0F, cpn, "");                    /* thousands_sep */
+    ptr[2] = ub + 512 + (uint64_t)so;                     /* grouping: "3;0" as "\3" */
+    {
+        const uint16_t *g = ln >= 0 ? w32nls_info(ln, 0x10) : 0;
+        for (int i = 0; g && g[i]; i++)
+            if (g[i] >= '1' && g[i] <= '9') s[so++] = (uint8_t)(g[i] - '0');
+        s[so++] = 0;
+    }
+    W32LC_FIELD(3, lm, 0x15, cpm, "");                    /* int_curr_symbol (LOCALE_SINTLSYMBOL) */
+    W32LC_FIELD(4, lm, 0x14, cpm, "");                    /* currency_symbol */
+    W32LC_FIELD(5, lm, 0x16, cpm, "");                    /* mon_decimal_point */
+    W32LC_FIELD(6, lm, 0x17, cpm, "");                    /* mon_thousands_sep */
+    ptr[7] = ub + 512 + (uint64_t)so;                     /* mon_grouping */
+    {
+        const uint16_t *g = lm >= 0 ? w32nls_info(lm, 0x18) : 0;
+        for (int i = 0; g && g[i]; i++)
+            if (g[i] >= '1' && g[i] <= '9') s[so++] = (uint8_t)(g[i] - '0');
+        s[so++] = 0;
+    }
+    W32LC_FIELD(8, lm, 0x50, cpm, "");                    /* positive_sign */
+    W32LC_FIELD(9, lm, 0x51, cpm, "");                    /* negative_sign */
+    #undef W32LC_FIELD
+    /* the frac digits and the currency's places, CHAR_MAX in the C locale */
+    if (lm < 0) { for (int i = 0; i < 8; i++) fx[i] = 127; }
+    else {
+        static const int8_t neg[16][3] = { {1,0,0},{1,0,1},{1,0,3},{1,0,2},{0,0,0},{0,0,1},{0,0,3},{0,0,2},
+                                           {0,1,1},{1,1,1},{0,1,2},{1,1,2},{1,1,3},{0,1,4},{1,1,0},{0,1,0} };
+        static const int8_t pos[4][2] = { {1,0},{0,0},{1,1},{0,1} };
+        uint32_t ic = w32nls_info_number(lm, 0x1B), inc = w32nls_info_number(lm, 0x1C);
+        fx[0] = (int8_t)w32nls_info_number(lm, 0x1A);    /* int_frac_digits */
+        fx[1] = (int8_t)w32nls_info_number(lm, 0x19);    /* frac_digits */
+        fx[2] = pos[ic & 3][0]; fx[3] = pos[ic & 3][1];  /* p_cs_precedes, p_sep_by_space */
+        fx[4] = neg[inc & 15][0]; fx[5] = neg[inc & 15][1];
+        fx[6] = 1;                                        /* p_sign_posn */
+        fx[7] = neg[inc & 15][2];                         /* n_sign_posn */
+    }
+    /* the wide fields */
+    {
+        const uint32_t wl[8] = { 0x0E, 0x0F, 0x15, 0x14, 0x16, 0x17, 0x50, 0x51 };
+        for (int k = 0; k < 8; k++) {
+            int loc = k < 2 ? ln : lm;
+            wptr[k] = ub + 1024 + (uint64_t)wo * 2;
+            const uint16_t *v = loc >= 0 ? w32nls_info(loc, wl[k]) : 0;
+            if (!v) { if (k == 0) ws[wo++] = '.'; }
+            else for (int i = 0; v[i] && wo < 250; i++) ws[wo++] = v[i];
+            ws[wo++] = 0;
+        }
+    }
+    (void)copy_to_user((void *)(uintptr_t)(ub + 512), s, (size_t)so);
+    (void)copy_to_user((void *)(uintptr_t)(ub + 1024), ws, (size_t)wo * 2);
+    uint8_t st[152];
+    memset(st, 0, sizeof st);
+    memcpy(st, ptr, 80);
+    memcpy(st + 80, fx, 8);
+    memcpy(st + 88, wptr, 64);
+    (void)copy_to_user((void *)(uintptr_t)lc, st, sizeof st);
+    return (long)lc;
+}
+/* _gmtime64_s(struct tm *, const __time64_t *) -> 0 / EINVAL */
+static long w32_gmtime64_s(uint64_t *a) {
+    int64_t t = 0;
+    if (!a[0] || !a[1] || copy_from_user(&t, (const void *)(uintptr_t)a[1], 8) != 0 || t < 0) return 22;
+    int64_t days = t / 86400, rem = t % 86400;
+    int64_t z = days + 719468, era = (z >= 0 ? z : z - 146096) / 146097;
+    int doe = (int)(z - era * 146097);
+    int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int y = (int)(yoe + era * 400), doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int mp = (5 * doy + 2) / 153, d = doy - (153 * mp + 2) / 5 + 1, m = mp + (mp < 10 ? 3 : -9);
+    y += (m <= 2);
+    static const int cum[12] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+    int leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    int32_t tm[9] = { (int32_t)(rem % 60), (int32_t)(rem / 60 % 60), (int32_t)(rem / 3600), d, m - 1, y - 1900,
+                      (int32_t)((days + 4) % 7), cum[m - 1] + d - 1 + (leap && m > 2), 0 };
+    return copy_to_user((void *)(uintptr_t)a[0], tm, sizeof tm) == 0 ? 0 : 22;
+}
+/* -- the conversions the printf engine, the wide stdio and strftime use -- */
+static uint16_t win32_lc_byte_unit(uint8_t b) {
+    uint32_t cp = g_win32_loc.cp[W32LC_CTYPE];
+    if (!cp || b < 0x80) return b;
+    if (cp == W32NLS_UTF8) return 0xFFFD;
+    return w32nls_b2u(cp, b, false);
+}
+/* LC_CTYPE's bytes as UTF-16 units (a wprintf's %hs) */
+static int win32_lc_mb_units(const uint8_t *b, int n, uint16_t *out, int cap) {
+    uint32_t cp = g_win32_loc.cp[W32LC_CTYPE];
+    int o = 0;
+    for (int i = 0; i < n && o < cap; ) {
+        if (cp == W32NLS_UTF8) {
+            uint32_t c;
+            bool bad;
+            int k = w32nls_utf8_dec(b + i, n - i, &c, &bad);
+            if (k < 0) { c = 0xFFFD; k = n - i; }
+            if (c > 0xFFFF) {
+                if (o + 2 > cap) break;
+                c -= 0x10000;
+                out[o++] = (uint16_t)(0xD800 + (c >> 10));
+                out[o++] = (uint16_t)(0xDC00 + (c & 0x3FF));
+            } else out[o++] = (uint16_t)c;
+            i += k;
+        } else {
+            out[o++] = win32_lc_byte_unit(b[i]);
+            i++;
+        }
+    }
+    return o;
+}
+static int win32_lc_time_loc(void) { return g_win32_loc.loc[W32LC_TIME] - 1; }
+static uint32_t win32_lc_time_cp(void) { return g_win32_loc.cp[W32LC_TIME]; }
+/* a locale's name (an LCTYPE) as UTF-8 */
+static void win32_lc_name8(int loc, uint32_t lt, char *b, int cap) {
+    const uint16_t *s = w32nls_info(loc, lt);
+    int o = 0;
+    for (int i = 0; s && s[i]; i++) {
+        int r = win32_utf8_put(s[i], b, o, cap);
+        if (r < 0) break;
+        o = r;
+    }
+    b[o] = 0;
+}
+/* a locale's picture (an LCTYPE) for the time tm, as UTF-8 */
+static void win32_lc_pic8(int loc, uint32_t lt, const struct w32_tm *tm, char *b, int cap) {
+    struct w32nls_time t = { tm->year + 1900, tm->mon + 1, tm->mday, tm->hour, tm->min, tm->sec };
+    uint16_t o[160];
+    int n = w32nls_fmt_picture(loc, w32nls_info(loc, lt), &t, o, 159);
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        int r = win32_utf8_put(o[i], b, k, cap);
+        if (r < 0) break;
+        k = r;
+    }
+    b[k] = 0;
+}
+/* strftime's format and answer: bytes in LC_TIME's code page <-> UTF-8 */
+static void win32_lc_bytes_utf8(const char *in, uint32_t cp, char *out, int cap) {
+    int o = 0;
+    for (; *in; in++) {
+        uint8_t b = (uint8_t)*in;
+        if (cp == W32NLS_UTF8 || b < 0x80) { if (o < cap - 1) out[o++] = (char)b; continue; }
+        uint32_t c = cp ? w32nls_b2u(cp, b, false) : b;
+        int r = win32_utf8_put(c, out, o, cap);
+        if (r < 0) break;
+        o = r;
+    }
+    out[o] = 0;
+}
+static int win32_lc_utf8_bytes(const char *in, uint32_t cp, char *out, int cap) {
+    int o = 0, n = (int)strlen(in);
+    for (int i = 0; i < n && o < cap; ) {
+        if (cp == W32NLS_UTF8) { out[o++] = in[i++]; continue; }
+        uint32_t c;
+        bool bad;
+        int k = w32nls_utf8_dec((const uint8_t *)in + i, n - i, &c, &bad);
+        if (k <= 0) { c = '?'; k = 1; }
+        int b = !cp ? (c <= 0xFF ? (int)c : -1) : (c > 0xFFFF ? -1 : w32nls_u2b(cp, (uint16_t)c, false));
+        out[o++] = b < 0 ? '?' : (char)b;
+        i += k;
+    }
+    return o;
+}
+/* W7s: LCMapStringW(lcid, flags, src, n, dst, dn) */
+static long w32_LCMapStringW(uint64_t *a) {
+    uint32_t flags = (uint32_t)a[1];
+    if (!(flags & 0x400) && (flags & 0x300))
+        return win32_lcmap_case(w32nls_find_lcid((uint32_t)a[0]), flags, a[2], (int32_t)a[3], a[4], (int32_t)a[5]);
+    uint64_t b[9] = { 0, a[1], a[2], a[3], a[4], a[5], 0, 0, 0 };
+    return w32_LCMapStringEx(b);
+}
 
 /* -- the rest: _seh_filter_dll, strtof, logf ------------------------------- */
 /* a DLL's CRT start's filter: nothing of the UCRT's own is a DLL's to take */
@@ -30952,6 +31984,7 @@ static long w32_strtof(uint64_t *a) {
         return 0;
     }
     s[sizeof(s) - 1] = '\0';
+    win32_lc_num_in(s);                                 /* W7s */
     int consumed = 0;
     uint32_t fb = 0;
     (void)kmath_strtod(s, &consumed, &fb);
@@ -31094,7 +32127,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__toby_abort",           w32_abort },
     { "api-ms-win-crt-locale-l1-1-0.dll", "_lock_locales",          w32_zero_locale },   /* W7k */
     { "api-ms-win-crt-locale-l1-1-0.dll", "_unlock_locales",        w32_zero_locale },
-    { "api-ms-win-crt-locale-l1-1-0.dll", "___lc_codepage_func",    w32_zero_locale },
+    { "api-ms-win-crt-locale-l1-1-0.dll", "___lc_codepage_func",    w32_lc_codepage_func },    /* W7s */
     { "api-ms-win-crt-locale-l1-1-0.dll", "___lc_collate_cp_func",  w32_zero_locale },
     { "api-ms-win-crt-locale-l1-1-0.dll", "___lc_locale_name_func", w32_lc_locale_name_func },
     { "api-ms-win-crt-locale-l1-1-0.dll", "__pctype_func",          w32_pctype_func },
@@ -31134,14 +32167,23 @@ static const struct win32_shim g_win32_shims[] = {
 
     /* ---- C4: the extra ucrt surface a C++ .exe pulls in ---- */
     /* convert (multibyte/wide -- not on the integer-printf path; minimal) */
-    { "api-ms-win-crt-convert-l1-1-0.dll", "mbrtowc",                w32_one },
-    { "api-ms-win-crt-convert-l1-1-0.dll", "wcrtomb",                w32_one },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "mbrtowc",                w32_mbrtowc },             /* W7s */
+    { "api-ms-win-crt-convert-l1-1-0.dll", "wcrtomb",                w32_wcrtomb },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "mbrlen",                 w32_mbrlen },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "mbstowcs",               w32_mbstowcs },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "wcstombs",               w32_wcstombs },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "mbtowc",                 w32_mbtowc },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "wctomb",                 w32_wctomb },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "mblen",                  w32_mblen },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "wctob",                  w32_wctob },
     /* filesystem: stdio FILE locking -- single-threaded, no-op */
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_lock_file",          w32_zero },
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_unlock_file",        w32_zero },
     /* locale */
     { "api-ms-win-crt-locale-l1-1-0.dll", "localeconv",              w32_localeconv },
     { "api-ms-win-crt-locale-l1-1-0.dll", "setlocale",              w32_setlocale },
+    { "api-ms-win-crt-locale-l1-1-0.dll", "_wsetlocale",            w32_wsetlocale },          /* W7s */
+    { "api-ms-win-crt-time-l1-1-0.dll",   "_gmtime64_s",            w32_gmtime64_s },
     { "api-ms-win-crt-locale-l1-1-0.dll", "_configthreadlocale",    w32__configthreadlocale },
     /* runtime extras */
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_errno",                 w32_errno },
@@ -31511,7 +32553,16 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-string-l1-1-0.dll", "strspn",   w32_strspn },
     { "api-ms-win-crt-string-l1-1-0.dll", "strcspn",  w32_strcspn },
     { "api-ms-win-crt-string-l1-1-0.dll", "strpbrk",  w32_strpbrk },
-    { "api-ms-win-crt-string-l1-1-0.dll", "strcoll",  w32_strcmp },  /* C-locale == strcmp */
+    { "api-ms-win-crt-string-l1-1-0.dll", "strcoll",  w32_strcoll },   /* W7s: LC_COLLATE's */
+    { "api-ms-win-crt-string-l1-1-0.dll", "_strncoll", w32_strncoll },
+    { "api-ms-win-crt-string-l1-1-0.dll", "_wcsncoll", w32_wcsncoll },
+    { "api-ms-win-crt-string-l1-1-0.dll", "_stricoll", w32_stricoll },
+    { "api-ms-win-crt-string-l1-1-0.dll", "_wcsicoll", w32_wcsicoll },
+    { "api-ms-win-crt-string-l1-1-0.dll", "_stricmp", w32_stricmp },
+    { "api-ms-win-crt-string-l1-1-0.dll", "_strcmpi", w32_stricmp },
+    { "api-ms-win-crt-string-l1-1-0.dll", "_strnicmp", w32_strnicmp },
+    { "api-ms-win-crt-string-l1-1-0.dll", "_wcsicmp", w32_wcsicmp },
+    { "api-ms-win-crt-string-l1-1-0.dll", "_wcsnicmp", w32_wcsnicmp },
     { "api-ms-win-crt-string-l1-1-0.dll", "_strdup",  w32_strdup },
     { "api-ms-win-crt-private-l1-1-0.dll", "memchr",  w32_memchr },
     { "api-ms-win-crt-private-l1-1-0.dll", "memmove", w32_memmove },
@@ -31609,6 +32660,38 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "CompareStringEx",             w32_CompareStringEx },
     { "kernel32.dll", "GetLocaleInfoEx",             w32_GetLocaleInfoEx },
     { "kernel32.dll", "GetCPInfo",                   w32_GetCPInfo },
+    /* W7s: code pages, locales, collation, formats */
+    { "kernel32.dll", "GetACP",                      w32_GetACP },
+    { "kernel32.dll", "GetOEMCP",                    w32_GetOEMCP },
+    { "kernel32.dll", "IsValidCodePage",             w32_IsValidCodePage },
+    { "kernel32.dll", "GetUserDefaultLCID",          w32_GetUserDefaultLCID },
+    { "kernel32.dll", "GetSystemDefaultLCID",        w32_GetUserDefaultLCID },
+    { "kernel32.dll", "GetThreadLocale",             w32_GetUserDefaultLCID },
+    { "kernel32.dll", "GetUserDefaultLangID",        w32_GetUserDefaultLangID },
+    { "kernel32.dll", "GetSystemDefaultLangID",      w32_GetUserDefaultLangID },
+    { "kernel32.dll", "GetUserDefaultUILanguage",    w32_GetUserDefaultLangID },
+    { "kernel32.dll", "GetSystemDefaultUILanguage",  w32_GetUserDefaultLangID },
+    { "kernel32.dll", "GetUserDefaultLocaleName",    w32_GetUserDefaultLocaleName },
+    { "kernel32.dll", "GetSystemDefaultLocaleName",  w32_GetUserDefaultLocaleName },
+    { "kernel32.dll", "LocaleNameToLCID",            w32_LocaleNameToLCID },
+    { "kernel32.dll", "LCIDToLocaleName",            w32_LCIDToLocaleName },
+    { "kernel32.dll", "IsValidLocaleName",           w32_IsValidLocaleName },
+    { "kernel32.dll", "IsValidLocale",               w32_IsValidLocale },
+    { "kernel32.dll", "GetLocaleInfoW",              w32_GetLocaleInfoW },
+    { "kernel32.dll", "GetLocaleInfoA",              w32_GetLocaleInfoA },
+    { "kernel32.dll", "LCMapStringW",                w32_LCMapStringW },
+    { "kernel32.dll", "CompareStringW",              w32_CompareStringW },
+    { "kernel32.dll", "CompareStringA",              w32_CompareStringA },
+    { "kernel32.dll", "CompareStringOrdinal",        w32_CompareStringOrdinal },
+    { "kernel32.dll", "lstrcmpW",                    w32_lstrcmpW },
+    { "kernel32.dll", "lstrcmpiA",                   w32_lstrcmpiA },
+    { "kernel32.dll", "lstrcmpiW",                   w32_lstrcmpiW },
+    { "kernel32.dll", "GetNumberFormatEx",           w32_GetNumberFormatEx },
+    { "kernel32.dll", "GetNumberFormatW",            w32_GetNumberFormatW },
+    { "kernel32.dll", "GetDateFormatEx",             w32_GetDateFormatEx },
+    { "kernel32.dll", "GetDateFormatW",              w32_GetDateFormatW },
+    { "kernel32.dll", "GetTimeFormatEx",             w32_GetTimeFormatEx },
+    { "kernel32.dll", "GetTimeFormatW",              w32_GetTimeFormatW },
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_wmkdir",  w32_wmkdir },
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_wrmdir",  w32_wrmdir },
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_wremove", w32_wremove },
