@@ -2809,6 +2809,15 @@ W50 := programs/win-locale50
 $(W50)/win-locale50.exe: $(W50)/locale50.c
 	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W50)/locale50.c
 
+# Track C/W7t: win-wtext51.exe (exit 53, as on Windows 11) -- windows' text
+# in UTF-16 and ANSI: RegisterClassW's Unicode windows, CreateWindowExW,
+# IsWindowUnicode, GetWindowTextW/A, SetWindowTextW/A and WM_SETTEXT /
+# WM_GETTEXT converted to the window's kind, DefWindowProcW, GetClassNameW;
+# another process's title set and read without a message.
+W51 := programs/win-wtext51
+$(W51)/win-wtext51.exe: $(W51)/wtext51.c
+	TMP='C:\t' TEMP='C:\t' $(W33_GCC) -O1 -o $@ $(W51)/wtext51.c -luser32
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -3376,6 +3385,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                programs/win-clock48/win-clock48.exe \
                programs/win-xwin49/win-xwin49.exe \
                programs/win-locale50/win-locale50.exe \
+               programs/win-wtext51/win-wtext51.exe \
                programs/win-life30/life30a.dll \
                programs/win-life30/life30c.dll \
                programs/win-life30/life30n.dll \
@@ -3598,6 +3608,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/win-clock48/win-clock48.exe          $(INITRD_STAGE)/bin/win-clock48.exe
 	cp programs/win-xwin49/win-xwin49.exe            $(INITRD_STAGE)/bin/win-xwin49.exe
 	cp programs/win-locale50/win-locale50.exe        $(INITRD_STAGE)/bin/win-locale50.exe
+	cp programs/win-wtext51/win-wtext51.exe          $(INITRD_STAGE)/bin/win-wtext51.exe
 	cp programs/win-life30/life30a.dll               $(INITRD_STAGE)/bin/life30a.dll
 	cp programs/win-life30/life30c.dll               $(INITRD_STAGE)/bin/life30c.dll
 	cp programs/win-life30/life30n.dll               $(INITRD_STAGE)/bin/life30n.dll
@@ -4610,6 +4621,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-mem40.exe bin/win-msg41.exe bin/win-text43.exe        \
 	    bin/win-gui45.exe bin/win-post46.exe bin/win-wide47.exe       \
 	    bin/win-clock48.exe bin/win-xwin49.exe bin/win-locale50.exe   \
+	    bin/win-wtext51.exe                                           \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
