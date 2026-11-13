@@ -7753,7 +7753,7 @@ void _start(void) {
     defined(WINPE39A_BOOT) || defined(WINPE40A_BOOT) || defined(WINPE41A_BOOT) || \
     defined(WINPE42A_BOOT) || defined(WINPE43A_BOOT) || defined(WINPE44A_BOOT) || \
     defined(WINPE45A_BOOT) || defined(WINPE46A_BOOT) || defined(WINPE47A_BOOT) || \
-    defined(WINPE48A_BOOT) || defined(WINPE49A_BOOT)
+    defined(WINPE48A_BOOT) || defined(WINPE49A_BOOT) || defined(WINPE50A_BOOT)
     /* Track C, phase 1 (docs/roadmap-2026-11.md) -- stock console .exes, each
      * default-linked (DYNAMIC_BASE, so loaded slid), spawned from / (with
      * one argument when the entry gives one). W7h:
@@ -8007,6 +8007,10 @@ void _start(void) {
 #ifdef WINPE49A_BOOT
             { "WINPE49A", "/bin/win-xwin49.exe", "win-xwin49.exe", 51,
               "windows named across processes and threads: FindWindow, PostMessage, SendMessage (12 checks)" },
+#endif
+#ifdef WINPE50A_BOOT
+            { "WINPE50A", "/bin/win-locale50.exe", "win-locale50.exe", 52,
+              "named locales and code pages: conversions, setlocale, the CRT in a locale, NLS data, collation, formats (12 checks)" },
 #endif
         };
         win32_gui_set_log(true);
