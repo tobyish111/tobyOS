@@ -1395,6 +1395,10 @@ static const char *const g_pe_rt_names[] = {
      * CREATESTRUCT too); another process's window not asked */
     "CreateWindowExW", "GetWindowTextA", "GetWindowTextW", "GetWindowTextLengthA",
     "GetWindowTextLengthW", "SetWindowTextA", "SetWindowTextW",
+    /* W7u: an alertable wait runs the thread's APCs; MessageBox's and
+     * DialogBoxParamA's loops run what other threads send */
+    "SleepEx", "WaitForSingleObjectEx", "WaitForMultipleObjectsEx", "MsgWaitForMultipleObjectsEx",
+    "MessageBoxA", "MessageBoxW", "DialogBoxParamA",
 };
 static bool pe_rt_name(const char *func) {
     for (unsigned i = 0; i < sizeof g_pe_rt_names / sizeof g_pe_rt_names[0]; i++)

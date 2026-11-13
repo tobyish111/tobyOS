@@ -62,6 +62,13 @@ EXPORTS
     GetWindowTextLengthW = rt_GetWindowTextLengthW
     SetWindowTextA = rt_SetWindowTextA
     SetWindowTextW = rt_SetWindowTextW
+    SleepEx = rt_SleepEx
+    WaitForSingleObjectEx = rt_WaitForSingleObjectEx
+    WaitForMultipleObjectsEx = rt_WaitForMultipleObjectsEx
+    MsgWaitForMultipleObjectsEx = rt_MsgWaitForMultipleObjectsEx
+    MessageBoxA = rt_MessageBoxA
+    MessageBoxW = rt_MessageBoxW
+    DialogBoxParamA = rt_DialogBoxParamA
     strcpy_s = rt_strcpy_s
     strcat_s = rt_strcat_s
     __stdio_common_vsprintf_s = rt_stdio_common_vsprintf_s

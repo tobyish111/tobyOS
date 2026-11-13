@@ -17,3 +17,10 @@ EXPORTS
     __toby_GetWindowTextLengthW
     __toby_SetWindowTextA
     __toby_SetWindowTextW
+    __toby_SleepEx
+    __toby_WaitForSingleObjectEx
+    __toby_WaitForMultipleObjectsEx
+    __toby_MsgWaitForMultipleObjectsEx
+    __toby_dlgsvc
+    __toby_MessageBoxA
+    __toby_MessageBoxW

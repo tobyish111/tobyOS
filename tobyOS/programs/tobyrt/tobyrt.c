@@ -1646,6 +1646,71 @@ BOOL rt_SetWindowTextW(HWND h, LPCWSTR s) {
     return TRUE;
 }
 
+/* ---- W7u: APCs, and the modal loops that run what other threads send ----
+ * An alertable wait the kernel stops for an APC queued to the thread
+ * (WAIT_IO_COMPLETION): the APCs run here, in their order, then the wait
+ * returns. MessageBox and DialogBoxParamA run their loops here, as
+ * GetMessage does: a message another thread sent runs when the kernel says
+ * one waits, a posted one is dispatched to its window. Measured on Windows
+ * 11: programs/win-modal52. */
+#define RT_MSG_APC 12
+__declspec(dllimport) DWORD WINAPI __toby_SleepEx(DWORD, BOOL);
+__declspec(dllimport) DWORD WINAPI __toby_WaitForSingleObjectEx(HANDLE, DWORD, BOOL);
+__declspec(dllimport) DWORD WINAPI __toby_WaitForMultipleObjectsEx(DWORD, const HANDLE *, BOOL, DWORD, BOOL);
+__declspec(dllimport) DWORD WINAPI __toby_MsgWaitForMultipleObjectsEx(DWORD, const HANDLE *, DWORD, DWORD, DWORD);
+__declspec(dllimport) LONG_PTR WINAPI __toby_dlgsvc(ULONG64, ULONG64, ULONG64, ULONG64, ULONG64, ULONG64);
+__declspec(dllimport) int WINAPI __toby_MessageBoxA(HWND, LPCSTR, LPCSTR, UINT);
+__declspec(dllimport) int WINAPI __toby_MessageBoxW(HWND, LPCWSTR, LPCWSTR, UINT);
+static void rt_run_apcs(void) {
+    ULONG64 a[2];
+    while (__toby_msgsvc(RT_MSG_APC, a, 0) == 1)
+        ((PAPCFUNC)a[0])((ULONG_PTR)a[1]);
+}
+DWORD rt_SleepEx(DWORD ms, BOOL alertable) {
+    DWORD r = __toby_SleepEx(ms, alertable);
+    if (r == WAIT_IO_COMPLETION) rt_run_apcs();
+    return r;
+}
+DWORD rt_WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable) {
+    DWORD r = __toby_WaitForSingleObjectEx(h, ms, alertable);
+    if (r == WAIT_IO_COMPLETION) rt_run_apcs();
+    return r;
+}
+DWORD rt_WaitForMultipleObjectsEx(DWORD n, const HANDLE *hs, BOOL all, DWORD ms, BOOL alertable) {
+    DWORD r = __toby_WaitForMultipleObjectsEx(n, hs, all, ms, alertable);
+    if (r == WAIT_IO_COMPLETION) rt_run_apcs();
+    return r;
+}
+DWORD rt_MsgWaitForMultipleObjectsEx(DWORD n, const HANDLE *hs, DWORD ms, DWORD mask, DWORD flags) {
+    DWORD r = __toby_MsgWaitForMultipleObjectsEx(n, hs, ms, mask, flags);
+    if (r == WAIT_IO_COMPLETION) rt_run_apcs();
+    return r;
+}
+/* the box's or the dialog's loop: op the pump's (5 or 3) */
+static void rt_modal_loop(ULONG64 op) {
+    MSG m;
+    for (;;) {
+        LONG_PTR r = __toby_dlgsvc(op, (ULONG64)&m, 0, 0, 0, 0);
+        if (r == RT_GOT_SENT) { rt_run_sent(); continue; }
+        if (!r) break;
+        if (m.message != WM_NULL || m.hwnd) (void)rt_DispatchMessageA(&m);
+    }
+}
+static int rt_msgbox(HWND owner, const void *text, const void *cap, UINT type, BOOL wide) {
+    if (!__toby_dlgsvc(4, (ULONG64)owner, (ULONG64)text, (ULONG64)cap, (ULONG64)type, (ULONG64)wide))
+        return wide ? __toby_MessageBoxW(owner, (LPCWSTR)text, (LPCWSTR)cap, type)
+                    : __toby_MessageBoxA(owner, (LPCSTR)text, (LPCSTR)cap, type);
+    rt_modal_loop(5);
+    return (int)__toby_dlgsvc(6, 0, 0, 0, 0, 0);
+}
+int rt_MessageBoxA(HWND owner, LPCSTR text, LPCSTR cap, UINT type) { return rt_msgbox(owner, text, cap, type, FALSE); }
+int rt_MessageBoxW(HWND owner, LPCWSTR text, LPCWSTR cap, UINT type) { return rt_msgbox(owner, text, cap, type, TRUE); }
+INT_PTR rt_DialogBoxParamA(HINSTANCE inst, LPCSTR tmpl, HWND parent, DLGPROC proc, LPARAM init) {
+    (void)__toby_dlgsvc(0, (ULONG64)inst, (ULONG64)tmpl, (ULONG64)parent, (ULONG64)proc, (ULONG64)init);
+    rt_modal_loop(3);
+    return (INT_PTR)__toby_dlgsvc(2, 0, 0, 0, 0, 0);
+}
+
 /* ---- W7k: the CRT's calls of the program's own code ---------------------- *
  * The UCRT calls code a program gave it: the invalid-parameter handler
  * (_set_invalid_parameter_handler) when a checked function finds a bad

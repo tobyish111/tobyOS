@@ -21446,7 +21446,7 @@ static long w32_CloseHandle(uint64_t *a) {
  * process); a record whose process is gone is freed for the next one.
  * Measured on Windows 11 (programs/win-gui45). */
 enum { W32P_GUI, W32P_LB, W32P_CC, W32P_MENUS, W32P_BMP, W32P_MEMDC, W32P_TIMERS,
-       W32P_MODAL, W32P_ENV, W32P_TLS, W32P_LOC, W32P_N };
+       W32P_MODAL, W32P_ENV, W32P_TLS, W32P_LOC, W32P_BOX, W32P_N };
 #define WIN32_PS_MAX    32
 #define W32P_FALLBACK   65536u
 struct win32_pstate { int tgid; uint64_t born; void *part[W32P_N]; };
@@ -22207,6 +22207,8 @@ struct win32_posted { int tid; uint32_t message; uint64_t hwnd, wParam, lParam; 
 static int win32_tid(void) { struct proc *p = current_proc(); return p ? p->pid : 0; }
 static int win32_tgid(void);                                     /* (with the timers) */
 
+#define WIN32_QSN  32        /* W7u: threads whose new input is kept */
+#define WIN32_APCQ 32        /* W7u: APCs queued at once */
 struct win32_gui_core {   /* W7n: a process's own (its record's part) */
     bool quit;            /* PostQuitMessage seen (thread-wide) */
     int  quitcode;
@@ -22222,8 +22224,14 @@ struct win32_gui_core {   /* W7n: a process's own (its record's part) */
     struct win32_ctrl ctrl[WIN32_MAX_CTRLS];
     struct { uint64_t hwnd; uint32_t message; uint64_t wParam, lParam; } cmd_q[WIN32_CMDQ];
     int  cmd_head, cmd_tail;
+    struct { int tid; uint32_t chg; } qs[WIN32_QSN];          /* W7u: what came since each thread last looked (QS_*) */
+    struct { int tid; uint64_t fn, arg; } apcq[WIN32_APCQ];   /* W7u: QueueUserAPC's, in their order */
+    int  apcn;
 };
 #define g_win32_gui (*(struct win32_gui_core *)win32_ps_part(W32P_GUI, sizeof(struct win32_gui_core)))
+static void win32_qs_mark(struct win32_gui_core *g, int tid, uint32_t bits);   /* W7u */
+static uint32_t win32_qs_kind(uint32_t msg);
+static void win32_qs_clear(int tid);
 _Static_assert(sizeof(struct win32_gui_core) <= W32P_FALLBACK, "a part fits the fallback");
 
 /* C13 LISTBOX item store, indexed by the control's slot (W7n: the
@@ -23031,6 +23039,7 @@ static long w32_UpdateWindow(uint64_t *a) { return w32_ShowWindow(a); }
 static long w32_PostQuitMessage(uint64_t *a) {
     g_win32_gui.quit = true; g_win32_gui.quitcode = (int)a[0];
     g_win32_gui.quit_tid = win32_tid();                    /* W7o: this thread's */
+    win32_qs_mark(&g_win32_gui, win32_tid(), 0x0108u);     /* W7u: QS_POSTMESSAGE */
     return 0;
 }
 static long w32_TranslateMessage(uint64_t *a) { (void)a; return 0; }
@@ -23186,6 +23195,7 @@ static bool win32_post_g(struct win32_gui_core *g, int tid, uint64_t hwnd, uint3
                          uint64_t lp, bool front) {
     if (!g || g->postn >= WIN32_POSTQ) return false;
     struct win32_posted e = { tid, msg, hwnd, wp, lp, win32_msg_time() };
+    if (!front) win32_qs_mark(g, tid, win32_qs_kind(msg));   /* W7u: new (put back: not) */
     if (front) {
         memmove(&g->postq[1], &g->postq[0], (size_t)g->postn * sizeof e);
         g->postq[0] = e;
@@ -23570,6 +23580,223 @@ static int win32_msg_take(struct win32_msg *m, uint64_t hf, uint32_t lo, uint32_
     }
     return 0;
 }
+/* ---- W7u: what came since a thread last looked; waiting for it -----------
+ * A thread's queue keeps which kinds of input came since the thread last
+ * looked at it (PeekMessage, GetMessage, GetQueueStatus clear them; MsgWait
+ * does not -- measured): a posted message (QS_POSTMESSAGE |
+ * QS_ALLPOSTMESSAGE), hardware input brought onto the queue (QS_KEY,
+ * QS_MOUSE). A message another thread sends, a due timer and a window to
+ * paint count while they wait. MsgWaitForMultipleObjects(Ex) returns
+ * WAIT_OBJECT_0 + n for new input of the kinds asked for -- before the
+ * objects -- (MWMO_INPUTAVAILABLE: any there), else WAIT_OBJECT_0 + i for a
+ * signalled object (bWaitAll / MWMO_WAITALL: every object and new input,
+ * WAIT_OBJECT_0), WAIT_TIMEOUT, or WAIT_IO_COMPLETION with an APC queued to
+ * the thread (MWMO_ALERTABLE; tobyrt.dll runs it). QueueUserAPC queues one;
+ * SleepEx, WaitForSingleObjectEx and WaitForMultipleObjectsEx alertable stop
+ * for it the same way. Measured on Windows 11: programs/win-modal52. */
+#define W32_QS_KEY    0x0001u
+#define W32_QS_MOUSE  0x0006u
+#define W32_QS_POST   0x0108u          /* QS_POSTMESSAGE | QS_ALLPOSTMESSAGE */
+#define W32_QS_TIMER  0x0010u
+#define W32_QS_PAINT  0x0020u
+#define W32_QS_SEND   0x0040u
+#define W32_WAIT_IO_COMPLETION 0xC0u
+/* the kind of input a message on the queue is */
+static uint32_t win32_qs_kind(uint32_t msg) {
+    if (msg >= 0x0100 && msg <= 0x0109) return W32_QS_KEY;          /* WM_KEYFIRST..WM_KEYLAST */
+    if (msg >= 0x0200 && msg <= 0x020E) return msg == 0x0200 ? 0x0002u : 0x0004u;   /* move, buttons */
+    if (msg == 0x0113) return W32_QS_TIMER;
+    if (msg == 0x000F) return W32_QS_PAINT;
+    return W32_QS_POST;
+}
+static void win32_qs_mark(struct win32_gui_core *g, int tid, uint32_t bits) {
+    if (!g || tid <= 0) return;
+    int fr = -1;
+    for (int i = 0; i < WIN32_QSN; i++) {
+        if (g->qs[i].tid == tid) { g->qs[i].chg |= bits; return; }
+        if (fr < 0 && (!g->qs[i].tid || !win32_thread_live(g->qs[i].tid))) fr = i;
+    }
+    if (fr >= 0) { g->qs[fr].tid = tid; g->qs[fr].chg = bits; }
+}
+static uint32_t win32_qs_chg(int tid) {
+    struct win32_gui_core *g = &g_win32_gui;
+    for (int i = 0; i < WIN32_QSN; i++) if (g->qs[i].tid == tid) return g->qs[i].chg;
+    return 0;
+}
+static void win32_qs_clear(int tid) {
+    struct win32_gui_core *g = &g_win32_gui;
+    for (int i = 0; i < WIN32_QSN; i++) if (g->qs[i].tid == tid) g->qs[i].chg = 0;
+}
+/* the kinds there are now (posted, sent, a due timer, a window to paint) */
+static uint32_t win32_qs_present(int me) {
+    struct win32_gui_core *g = &g_win32_gui;
+    uint32_t k = 0;
+    for (int i = 0; i < g->postn; i++)
+        if (g->postq[i].tid == me) k |= win32_qs_kind(g->postq[i].message);
+    if (g->quit && (!g->quit_tid || g->quit_tid == me)) k |= W32_QS_POST;
+    if (g->cmd_head != g->cmd_tail) {
+        struct win32_win *pw = win32_win_find((int)g->cmd_q[g->cmd_tail].hwnd);
+        if (!pw || win32_win_mine(pw, me)) k |= W32_QS_POST;
+    }
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
+        struct win32_win *w = &g->win[i];
+        if (w->fd > 0 && win32_win_mine(w, me) && w->needs_paint && !w->is_dialog) k |= W32_QS_PAINT;
+    }
+    struct win32_msg m;
+    if (win32_timer_take(0, 0, 0, false, me, &m)) k |= W32_QS_TIMER;
+    if (win32_sent_waiting()) k |= W32_QS_SEND;
+    return k;
+}
+/* the kinds new since the thread last looked */
+static uint32_t win32_qs_new(int me) {
+    uint32_t k = win32_qs_chg(me) | (win32_qs_present(me) & (W32_QS_SEND | W32_QS_TIMER | W32_QS_PAINT));
+    return k;
+}
+/* hardware input of the thread's windows onto its queue (one event), new */
+static void win32_qs_pull(int me) {
+    struct win32_gui_core *g = &g_win32_gui;
+    int before = g->postn;
+    struct win32_msg m;
+    if (!win32_msg_take(&m, 0, 0, 0, false)) return;
+    if (g->postn > before) win32_qs_mark(g, me, win32_qs_kind(m.message));
+}
+/* QueueUserAPC's queue */
+static bool win32_apc_pending(int tid) {
+    struct win32_gui_core *g = &g_win32_gui;
+    for (int i = 0; i < g->apcn; i++) if (g->apcq[i].tid == tid) return true;
+    return false;
+}
+/* __toby_msgsvc 12: the calling thread's first APC {fn, arg} into uo: 1, or 0 none */
+static long win32_apc_take(uint64_t uo) {
+    struct win32_gui_core *g = &g_win32_gui;
+    int me = win32_tid();
+    for (int i = 0; i < g->apcn; i++) {
+        if (g->apcq[i].tid != me) continue;
+        uint64_t o[2] = { g->apcq[i].fn, g->apcq[i].arg };
+        memmove(&g->apcq[i], &g->apcq[i + 1], (size_t)(g->apcn - i - 1) * sizeof g->apcq[0]);
+        g->apcn--;
+        return copy_to_user((void *)(uintptr_t)uo, o, sizeof o) == 0 ? 1 : 0;
+    }
+    return 0;
+}
+/* kernel32!QueueUserAPC(fn, hThread, data): onto the thread's queue (this
+ * process's or another's) -> nonzero; no thread: 0, ERROR_INVALID_HANDLE */
+static long w32_QueueUserAPC(uint64_t *a) {
+    uint64_t h = a[1];
+    int tid;
+    if ((int64_t)h == -2) tid = win32_tid();                     /* GetCurrentThread() */
+    else if ((h & 0xFF00000000000000ULL) == WIN32_THREAD_TAG) tid = (int)(h & 0xFFFFFFFFULL);
+    else { win32_set_last_error(WIN32_ERR_INVALID_HANDLE); return 0; }
+    struct proc *t = tid > 0 ? proc_lookup(tid) : 0;
+    if (!a[0] || !t || t->state == PROC_TERMINATED || t->state == PROC_UNUSED) {
+        win32_set_last_error(WIN32_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    int ttg = t->is_thread ? t->tgid : t->pid;
+    struct win32_gui_core *g = &g_win32_gui;
+    if (ttg != win32_tgid()) {
+        struct win32_pstate *ps = win32_ps_of(ttg);
+        g = ps ? win32_ps_gui_make(ps) : 0;
+        if (!g) { win32_set_last_error(WIN32_ERR_INVALID_HANDLE); return 0; }
+    }
+    if (g->apcn >= WIN32_APCQ) { win32_set_last_error(8); return 0; }
+    g->apcq[g->apcn].tid = tid;
+    g->apcq[g->apcn].fn = a[0];
+    g->apcq[g->apcn].arg = a[2];
+    g->apcn++;
+    return 1;
+}
+/* user32!MsgWaitForMultipleObjects(n, handles, bWaitAll, ms, mask) and
+ * ...Ex(n, handles, ms, mask, flags) */
+static long win32_msgwait(uint32_t n, uint64_t uh, bool all, uint32_t ms, uint32_t mask, uint32_t flags) {
+    uint64_t hs[64];
+    if (n > 63 || (n && (!uh || copy_from_user(hs, (const void *)(uintptr_t)uh, (size_t)n * 8) != 0))) {
+        win32_set_last_error(87);                          /* ERROR_INVALID_PARAMETER */
+        return (long)WIN32_WAIT_FAILED;
+    }
+    int me = win32_tid();
+    uint64_t deadline = ms == 0xFFFFFFFFu ? 0 : perf_now_ns() + (uint64_t)ms * 1000000ull;
+    for (;;) {
+        if ((flags & 0x2u) && win32_apc_pending(me)) return W32_WAIT_IO_COMPLETION;   /* MWMO_ALERTABLE */
+        if (mask & (W32_QS_KEY | W32_QS_MOUSE)) win32_qs_pull(me);
+        uint32_t k = (flags & 0x4u) ? win32_qs_present(me) : win32_qs_new(me);       /* MWMO_INPUTAVAILABLE */
+        bool in = (k & mask) != 0;
+        if (all) {
+            if (in && (!n || win32_wait(hs, n, true, 0) == 0)) return 0;
+        } else {
+            if (in) return (long)n;
+            if (n) {
+                uint32_t r = win32_wait(hs, n, false, 0);
+                if (r != WIN32_WAIT_TIMEOUT) return (long)r;
+            }
+        }
+        if ((deadline && perf_now_ns() >= deadline) || !ms) return WIN32_WAIT_TIMEOUT;
+        if (proc_wait_interrupted(current_proc())) return WIN32_WAIT_TIMEOUT;
+        sys_nanosleep(1000000);
+    }
+}
+static long w32_MsgWaitForMultipleObjects(uint64_t *a) {
+    return win32_msgwait((uint32_t)a[0], a[1], a[2] != 0, (uint32_t)a[3], (uint32_t)a[4], 0);
+}
+static long w32_MsgWaitForMultipleObjectsEx(uint64_t *a) {
+    return win32_msgwait((uint32_t)a[0], a[1], (a[4] & 1) != 0, (uint32_t)a[2], (uint32_t)a[3], (uint32_t)a[4]);
+}
+/* user32!GetQueueStatus(flags): the kinds there (high word) and new (low);
+ * the new ones are seen then */
+static long w32_GetQueueStatus(uint64_t *a) {
+    uint32_t fl = (uint32_t)a[0];
+    int me = win32_tid();
+    win32_qs_pull(me);
+    uint32_t pres = win32_qs_present(me) & fl, nw = win32_qs_new(me) & fl;
+    win32_qs_clear(me);
+    return (long)((pres << 16) | nw);
+}
+/* kernel32!SleepEx(ms, alertable), WaitForSingleObjectEx(h, ms, alertable),
+ * WaitForMultipleObjectsEx(n, hs, all, ms, alertable): alertable, they stop
+ * for an APC queued to the thread (WAIT_IO_COMPLETION; tobyrt.dll runs it) */
+static long w32_Sleep(uint64_t *a);
+static long w32_WaitForSingleObject(uint64_t *a);
+static long w32_SleepEx(uint64_t *a) {
+    if (!a[1]) { uint64_t b[1] = { a[0] }; (void)w32_Sleep(b); return 0; }
+    uint32_t ms = (uint32_t)a[0];
+    int me = win32_tid();
+    uint64_t deadline = ms == 0xFFFFFFFFu ? 0 : perf_now_ns() + (uint64_t)ms * 1000000ull;
+    for (;;) {
+        if (win32_apc_pending(me)) return W32_WAIT_IO_COMPLETION;
+        if ((deadline && perf_now_ns() >= deadline) || !ms) return 0;
+        if (proc_wait_interrupted(current_proc())) return 0;
+        sys_nanosleep(1000000);
+    }
+}
+static long win32_wait_alertable(const uint64_t *hs, uint32_t n, bool all, uint32_t ms, bool one) {
+    int me = win32_tid();
+    uint64_t deadline = ms == 0xFFFFFFFFu ? 0 : perf_now_ns() + (uint64_t)ms * 1000000ull;
+    for (;;) {
+        if (win32_apc_pending(me)) return W32_WAIT_IO_COMPLETION;
+        long r;
+        if (one) { uint64_t b[2] = { hs[0], 0 }; r = w32_WaitForSingleObject(b); }
+        else r = (long)win32_wait(hs, n, all, 0);
+        if (r != (long)WIN32_WAIT_TIMEOUT) return r;
+        if ((deadline && perf_now_ns() >= deadline) || !ms) return WIN32_WAIT_TIMEOUT;
+        if (proc_wait_interrupted(current_proc())) return WIN32_WAIT_TIMEOUT;
+        sys_nanosleep(1000000);
+    }
+}
+static long w32_WaitForSingleObjectEx(uint64_t *a) {
+    if (!a[2]) { uint64_t b[2] = { a[0], a[1] }; return w32_WaitForSingleObject(b); }
+    return win32_wait_alertable(&a[0], 1, false, (uint32_t)a[1], true);
+}
+static long w32_WaitForMultipleObjectsEx(uint64_t *a) {
+    uint32_t n = (uint32_t)a[0];
+    uint64_t hs[64];
+    if (n < 1 || n > 64 || !a[1] || copy_from_user(hs, (const void *)(uintptr_t)a[1], (size_t)n * 8) != 0) {
+        win32_set_last_error(87);
+        return (long)WIN32_WAIT_FAILED;
+    }
+    if (!a[4]) return (long)win32_wait(hs, n, a[2] != 0, (uint32_t)a[3]);
+    return win32_wait_alertable(hs, n, a[2] != 0, (uint32_t)a[3], false);
+}
+
 /* a window filter that is no window of the process's */
 static bool win32_hwnd_filter_bad(uint64_t hf) {
     return hf && hf != (uint64_t)-1 && ((hf >> 32) || !win32_win_find((int)hf));
@@ -23585,6 +23812,7 @@ static long win32_getmessage(uint64_t *a, bool sent) {
         if (sent && win32_sent_waiting()) return WIN32_GOT_SENT;    /* W7r: tobyrt.dll runs it */
         int r = win32_msg_take(&m, hf, lo, hi, true);
         if (r) {
+            win32_qs_clear(win32_tid());                /* W7u: looked */
             win32_msgtime_set(m.time);                  /* W7q */
             if (copy_to_user((void *)(uintptr_t)umsg, &m, sizeof m) != 0) return -1;
             return r == 2 ? 0 : 1;
@@ -23606,6 +23834,7 @@ static long win32_peekmessage(uint64_t *a, bool sent) {
     if (sent && win32_sent_waiting()) return WIN32_GOT_SENT;        /* W7r */
     struct win32_msg m;
     int r = win32_msg_take(&m, hf, lo, hi, (fl & 1) != 0);
+    win32_qs_clear(win32_tid());                        /* W7u: looked */
     if (!r) {
         if (!(fl & 2)) sched_yield();
         return 0;
@@ -23999,12 +24228,23 @@ static long w32_DrawTextA(uint64_t *a) {
  * RETRYCANCEL), draws it, and BLOCKS (a kernel poll loop, sched_yield-ing so the
  * rest of the system runs) until a button is clicked / Enter / the box is closed
  * -- then tears it down and returns the matching ID. */
-static long w32_MessageBoxA(uint64_t *a) {
-    char text[128], cap[40];
-    text[0] = cap[0] = 0;
-    if (a[1]) (void)strncpy_from_user(text, (const char *)(uintptr_t)a[1], sizeof(text));
-    if (a[2]) (void)strncpy_from_user(cap,  (const char *)(uintptr_t)a[2], sizeof(cap));
-    uint32_t kind = (uint32_t)a[3] & 0xFu;
+static long win32_msgbox_k(const char *text, const char *cap, uint32_t type);
+/* W7u: MessageBoxW too -- the text through the ANSI code page; tobyrt.dll's
+ * MessageBox runs a loop of its own (below), this is its fallback */
+static long win32_msgbox_user(uint64_t *a, bool wide) {
+    char t8[256], c8[128], text[128], cap[40];
+    win32_user_text_utf8(a[1], wide, t8, sizeof t8);
+    win32_user_text_utf8(a[2], wide, c8, sizeof c8);
+    int n = win32_utf8_to_acp(t8, text, (int)sizeof text - 1);
+    text[n] = 0;
+    n = win32_utf8_to_acp(c8, cap, (int)sizeof cap - 1);
+    cap[n] = 0;
+    return win32_msgbox_k(text, cap, (uint32_t)a[3]);
+}
+static long w32_MessageBoxA(uint64_t *a) { return win32_msgbox_user(a, false); }
+static long w32_MessageBoxW(uint64_t *a) { return win32_msgbox_user(a, true); }
+static long win32_msgbox_k(const char *text, const char *cap, uint32_t type) {
+    uint32_t kind = type & 0xFu;
 
     /* Button set for the requested type. */
     const char *blabel[3]; int bid[3]; int nb = 0;
@@ -24430,11 +24670,230 @@ static long win32_dlg_result(void) {
 
 /* The dialog service the modal trampoline calls (BEGIN/PUMP/RESULT). Hidden
  * from GetProcAddress consumers -- it's an internal helper, not a real API. */
+/* ---- W7u: modal loops that run what other threads send ------------------
+ * On Windows a MessageBox and a DialogBox run a message loop of their own:
+ * the thread runs what other threads send to its windows and dispatches
+ * what is posted to them while the box is open, and the box is a window
+ * like another ("#32770", its caption the title: FindWindow finds it,
+ * WM_COMMAND posted to it closes it). tobyrt.dll's MessageBox and
+ * DialogBoxParamA run that loop now (as GetMessage does, running a sent
+ * message where __toby_dlgsvc says one waits), over these:
+ *   4 BOX(owner, text, caption, type, wide): the box made -- the window the
+ *     old kernel box drew (its size and buttons where they were), now one of
+ *     the process's windows; 0 when one is open already (the caller then
+ *     uses the kernel's box, __toby_MessageBoxA/W)
+ *   5 BOXPUMP(&msg): 0 the box ended; WIN32_GOT_SENT; 1 a message to
+ *     dispatch (posted to another of the thread's windows, or WM_NULL)
+ *   6 BOXEND: the answer, the box gone
+ *   3 PUMP(&msg): the modal dialog's pump (1's) with the thread's sent and
+ *     posted messages first. Measured on Windows 11: programs/win-modal52. */
+struct win32_box_state {       /* the process's own; one box at a time */
+    int      fd;               /* its window (0: none) */
+    int      nb, bid[3], dflt;
+    uint32_t kind;
+    bool     ended;
+    long     result;
+    uint64_t deadline;         /* the old box's safety cap (pit ticks) */
+    char     text[128];
+    const char *blabel[3];
+};
+#define g_win32_box (*(struct win32_box_state *)win32_ps_part(W32P_BOX, sizeof(struct win32_box_state)))
+#define W32_BOX_W 340
+#define W32_BOX_H 150
+static void win32_box_draw(void) {
+    struct win32_box_state *B = &g_win32_box;
+    struct window *win = win32_hdc_window(B->fd);
+    if (!win) return;
+    const int bw_ = 80, bh = 28, gap = 12, oky = W32_BOX_H - 46;
+    int total = B->nb * bw_ + (B->nb - 1) * gap;
+    int bx0 = (W32_BOX_W - total) / 2;
+    (void)gui_window_fill(win, 0, 0, W32_BOX_W, W32_BOX_H, 0x00DCDCDC);
+    (void)win32_ui_text(win, 16, 26, B->text, 0x00101010, 0x00DCDCDC);
+    for (int i = 0; i < B->nb; i++) {
+        int bx = bx0 + i * (bw_ + gap);
+        (void)gui_window_fill(win, bx, oky, bw_, bh, 0x00C0C0C0);
+        (void)gui_window_rect(win, bx, oky, bw_, bh, 0x00303030);
+        (void)gui_window_rect(win, bx + 1, oky + 1, bw_ - 2, bh - 2, 0x00F0F0F0);
+        int tw = (int)strlen(B->blabel[i]) * 8;
+        (void)win32_ui_text(win, bx + (bw_ - tw) / 2, oky + bh / 2 - 4, B->blabel[i], 0x00101010, 0x00C0C0C0);
+    }
+    (void)sys_gui_flip(B->fd);
+}
+static long win32_box_begin(uint64_t owner, uint64_t utext, uint64_t ucap, uint32_t type, bool wide) {
+    (void)owner;
+    struct win32_box_state *B = &g_win32_box;
+    if (B->fd) return 0;
+    char t8[256], c8[128], cap[64];
+    win32_user_text_utf8(utext, wide, t8, sizeof t8);
+    win32_user_text_utf8(ucap, wide, c8, sizeof c8);
+    int n = win32_utf8_to_acp(t8, B->text, (int)sizeof B->text - 1);
+    B->text[n] = 0;
+    n = win32_utf8_to_acp(c8, cap, (int)sizeof cap - 1);
+    cap[n] = 0;
+    uint32_t kind = type & 0xFu;
+    switch (kind) {
+    case MB_OKCANCEL:         B->blabel[0]="OK";    B->bid[0]=IDOK;    B->blabel[1]="Cancel"; B->bid[1]=IDCANCEL; B->nb=2; break;
+    case MB_YESNO:            B->blabel[0]="Yes";   B->bid[0]=IDYES;   B->blabel[1]="No";     B->bid[1]=IDNO;     B->nb=2; break;
+    case MB_YESNOCANCEL:      B->blabel[0]="Yes";   B->bid[0]=IDYES;   B->blabel[1]="No";     B->bid[1]=IDNO;
+                              B->blabel[2]="Cancel"; B->bid[2]=IDCANCEL; B->nb=3; break;
+    case MB_RETRYCANCEL:      B->blabel[0]="Retry"; B->bid[0]=IDRETRY; B->blabel[1]="Cancel"; B->bid[1]=IDCANCEL; B->nb=2; break;
+    case MB_ABORTRETRYIGNORE: B->blabel[0]="Abort"; B->bid[0]=IDABORT; B->blabel[1]="Retry";  B->bid[1]=IDRETRY;
+                              B->blabel[2]="Ignore"; B->bid[2]=IDIGNORE; B->nb=3; break;
+    default:                  B->blabel[0]="OK";    B->bid[0]=IDOK;    B->nb=1; kind = MB_OK; break;
+    }
+    B->kind = kind;
+    B->dflt = B->bid[0];
+    struct win32_win *slot = win32_win_alloc();
+    if (!slot || !cap_check(current_proc(), CAP_GUI, "MessageBox")) return 0;
+    int fd = -1;
+    struct window *bw = gui_window_create(W32_BOX_W, W32_BOX_H, cap[0] ? cap : "Message");
+    if (bw) {
+        struct file *bf = (struct file *)kmalloc(sizeof(*bf));
+        if (bf) {
+            memset(bf, 0, sizeof(*bf));
+            bf->kind = FILE_KIND_WINDOW; bf->win = bw;
+            fd = fd_alloc_into(current_proc(), bf);
+            if (fd < 0) { kfree(bf); gui_window_close(bw); }
+        } else gui_window_close(bw);
+    }
+    if (fd < 0) return 0;
+    fd = win32_gwin_place(fd);                     /* a window of the system's */
+    memset(slot, 0, sizeof *slot);
+    slot->owner_tid  = win32_tid();
+    slot->fd = fd; slot->w = W32_BOX_W; slot->h = W32_BOX_H;
+    slot->gwin = win32_hdc_window(fd);
+    slot->fill_color = 0x00DCDCDC;
+    slot->pen_color  = WIN32_PEN_DEFAULT;
+    slot->font_scale = 1; slot->text_color = 0x00101010; slot->bk_mode = 2;
+    slot->is_dialog  = true;
+    slot->unicode    = wide;
+    memcpy(slot->cls, "#32770", 7);
+    {
+        const char *t = c8[0] ? c8 : "Message";
+        size_t tn = strlen(t);
+        if (tn > sizeof slot->title - 1) tn = sizeof slot->title - 1;
+        memcpy(slot->title, t, tn);
+        slot->title[tn] = 0;
+    }
+    B->fd = fd;
+    B->ended = false;
+    B->result = B->dflt;
+    uint64_t hz = pit_hz(); if (!hz) hz = 100;
+    B->deadline = pit_ticks() + 20 * hz;           /* ~20 s, as the old box */
+    win32_box_draw();
+    if (g_win32_log_input) kprintf("[winpe] MessageBox: '%s' (modal, %d buttons) -- waiting\n", B->text, B->nb);
+    return fd;
+}
+/* WM_COMMAND (an id) or WM_CLOSE to the box: one of its buttons ends it;
+ * IDCANCEL with no Cancel button is OK's for an MB_OK box */
+static void win32_box_msg(uint32_t msg, uint64_t wp) {
+    struct win32_box_state *B = &g_win32_box;
+    int id;
+    if (msg == WM_COMMAND) id = (int)(wp & 0xFFFF);
+    else if (msg == WM_CLOSE) id = IDCANCEL;
+    else return;
+    bool has = false;
+    for (int i = 0; i < B->nb; i++) if (B->bid[i] == id) has = true;
+    if (!has && id == IDCANCEL && B->kind == MB_OK) { id = IDOK; has = true; }
+    if (!has) return;
+    B->ended = true;
+    B->result = id;
+}
+static long win32_box_pump(uint64_t msgptr) {
+    struct win32_box_state *B = &g_win32_box;
+    struct win32_msg m;
+    memset(&m, 0, sizeof m);
+    int me = win32_tid();
+    if (!B->fd || B->ended) { (void)copy_to_user((void *)(uintptr_t)msgptr, &m, sizeof m); return 0; }
+    if (win32_sent_waiting()) return WIN32_GOT_SENT;
+    struct win32_gui_core *g = &g_win32_gui;
+    for (int i = 0; i < g->postn; ) {               /* the thread's posted messages */
+        struct win32_posted e = g->postq[i];
+        if (e.tid != me) { i++; continue; }
+        memmove(&g->postq[i], &g->postq[i + 1], (size_t)(g->postn - i - 1) * sizeof e);
+        g->postn--;
+        if (e.hwnd == (uint64_t)B->fd) {
+            win32_box_msg(e.message, e.wParam);
+            if (B->ended) return 0;
+            continue;
+        }
+        m.hwnd = e.hwnd; m.message = e.message; m.wParam = e.wParam; m.lParam = e.lParam; m.time = e.time;
+        struct win32_win *w = (e.hwnd >> 32) ? 0 : win32_win_find((int)e.hwnd);
+        if (w) win32_stash_wndproc(w);
+        win32_msgtime_set(m.time);
+        return copy_to_user((void *)(uintptr_t)msgptr, &m, sizeof m) == 0 ? 1 : 0;
+    }
+    struct gui_event ev;                            /* the box's own input, as the old box */
+    if (win32_poll_window_event(B->fd, &ev) > 0) {
+        const int bw_ = 80, bh = 28, gap = 12, oky = W32_BOX_H - 46;
+        int total = B->nb * bw_ + (B->nb - 1) * gap;
+        int bx0 = (W32_BOX_W - total) / 2;
+        if (ev.type == GUI_EV_CLOSE) { B->ended = true; B->result = (B->kind == MB_OK) ? IDOK : IDCANCEL; }
+        else if (ev.type == GUI_EV_MOUSE_DOWN && ev.y >= oky && ev.y < oky + bh) {
+            for (int i = 0; i < B->nb; i++) {
+                int bx = bx0 + i * (bw_ + gap);
+                if (ev.x >= bx && ev.x < bx + bw_) { B->ended = true; B->result = B->bid[i]; break; }
+            }
+        } else if (ev.type == GUI_EV_KEY && (ev.key == '\n' || ev.key == '\r' || ev.key == ' ')) {
+            B->ended = true; B->result = B->dflt;
+        } else if (ev.type == GUI_EV_KEY && ev.key == 0x1B) {
+            win32_box_msg(WM_COMMAND, IDCANCEL);
+        }
+        if (B->ended) return 0;
+    }
+    if (pit_ticks() >= B->deadline) { B->ended = true; B->result = B->dflt; return 0; }
+    struct win32_win *bw = win32_win_find(B->fd);
+    if (bw && bw->needs_paint) { bw->needs_paint = false; win32_box_draw(); }
+    if (proc_wait_interrupted(current_proc())) { B->ended = true; return 0; }
+    sys_nanosleep(1000000);
+    m.message = WM_NULL;
+    return copy_to_user((void *)(uintptr_t)msgptr, &m, sizeof m) == 0 ? 1 : 0;
+}
+static long win32_box_end(void) {
+    struct win32_box_state *B = &g_win32_box;
+    long r = B->result;
+    if (B->fd > 0) {
+        struct win32_win *w = win32_win_find(B->fd);
+        if (w) w->fd = 0;
+        (void)sys_close(B->fd);
+    }
+    if (g_win32_log_input) kprintf("[winpe] MessageBox: closed -> %ld\n", r);
+    memset(B, 0, sizeof *B);
+    return r;
+}
+/* 3: the modal dialog's pump, the thread's sent and posted messages first
+ * (after WM_INITDIALOG) */
+static long win32_dlg_pump_rt(uint64_t msgptr) {
+    if (g_win32_modal.fd > 0 && !g_win32_modal.ended && !g_win32_modal.init_pending) {
+        if (win32_sent_waiting()) return WIN32_GOT_SENT;
+        int me = win32_tid();
+        struct win32_gui_core *g = &g_win32_gui;
+        for (int i = 0; i < g->postn; i++) {
+            struct win32_posted *e = &g->postq[i];
+            if (e->tid != me) continue;
+            struct win32_msg m;
+            memset(&m, 0, sizeof m);
+            m.hwnd = e->hwnd; m.message = e->message; m.wParam = e->wParam; m.lParam = e->lParam; m.time = e->time;
+            struct win32_win *w = (e->hwnd >> 32) ? 0 : win32_win_find((int)e->hwnd);
+            if (w) win32_stash_wndproc(w);
+            memmove(e, e + 1, (size_t)(g->postn - i - 1) * sizeof *e);
+            g->postn--;
+            win32_msgtime_set(m.time);
+            return copy_to_user((void *)(uintptr_t)msgptr, &m, sizeof m) == 0 ? 1 : 0;
+        }
+    }
+    return win32_dlg_pump(msgptr);
+}
+
 static long w32_toby_dlgsvc(uint64_t *a) {
     switch (a[0]) {
     case 0: return win32_dlg_begin(a[1], a[2], a[3], a[4], a[5]);
     case 1: return win32_dlg_pump(a[1]);
     case 2: return win32_dlg_result();
+    case 3: return win32_dlg_pump_rt(a[1]);                 /* W7u: tobyrt.dll's loops */
+    case 4: return win32_box_begin(a[1], a[2], a[3], (uint32_t)a[4], a[5] != 0);
+    case 5: return win32_box_pump(a[1]);
+    case 6: return win32_box_end();
     default: return 0;
     }
 }
@@ -25569,6 +26028,7 @@ static long w32_toby_msgsvc(uint64_t *a) {
     case 8:  return win32_sent_data(a[1], a[2]);
     case 9:  return win32_sent_reply(a[1], a[2]);
     case 10: return win32_enum_windows(a[1], a[2]);
+    case 12: return win32_apc_take(a[1]);          /* W7u: the thread's first APC */
     case 11: {          /* W7t: (hwnd) where it is -- 1 the calling thread's with a procedure,
                          * 2 another thread's of this process, 3 another process's, 4 this
                          * process's the kernel answers for (a dialog's); 0 none (a control) --
@@ -32554,6 +33014,16 @@ static const struct win32_shim g_win32_shims[] = {
     { "user32.dll", "IsWindow",               w32_IsWindow },
     { "user32.dll", "DrawTextA",              w32_DrawTextA },
     { "user32.dll", "MessageBoxA",            w32_MessageBoxA },
+    { "user32.dll", "MessageBoxW",            w32_MessageBoxW },              /* W7u */
+    { "user32.dll", "__toby_MessageBoxA",     w32_MessageBoxA },              /* tobyrt.dll's fallback */
+    { "user32.dll", "__toby_MessageBoxW",     w32_MessageBoxW },
+    { "user32.dll", "MsgWaitForMultipleObjects",   w32_MsgWaitForMultipleObjects },
+    { "user32.dll", "MsgWaitForMultipleObjectsEx", w32_MsgWaitForMultipleObjectsEx },
+    { "user32.dll", "__toby_MsgWaitForMultipleObjectsEx", w32_MsgWaitForMultipleObjectsEx },
+    { "user32.dll", "GetQueueStatus",         w32_GetQueueStatus },
+    { "user32.dll", "__toby_SleepEx",         w32_SleepEx },
+    { "user32.dll", "__toby_WaitForSingleObjectEx",    w32_WaitForSingleObjectEx },
+    { "user32.dll", "__toby_WaitForMultipleObjectsEx", w32_WaitForMultipleObjectsEx },
     { "user32.dll", "SetScrollRange",         w32_SetScrollRange },
     { "user32.dll", "SetScrollPos",           w32_SetScrollPos },
     { "user32.dll", "GetScrollPos",           w32_GetScrollPos },
@@ -32714,7 +33184,10 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "OutputDebugStringW",  w32_zero },
     { "kernel32.dll", "GetDiskFreeSpaceW",   w32_GetDiskFreeSpaceW },
     { "kernel32.dll", "SetFileTime",         w32_SetFileTime },
-    { "kernel32.dll", "WaitForSingleObjectEx", w32_WaitForSingleObject },
+    { "kernel32.dll", "WaitForSingleObjectEx", w32_WaitForSingleObjectEx },   /* W7u: alertable */
+    { "kernel32.dll", "WaitForMultipleObjectsEx", w32_WaitForMultipleObjectsEx },
+    { "kernel32.dll", "SleepEx",              w32_SleepEx },
+    { "kernel32.dll", "QueueUserAPC",         w32_QueueUserAPC },
 
     /* ---- C18a: the C-runtime breadth SQLite pulls in ---- */
     /* ctype */
